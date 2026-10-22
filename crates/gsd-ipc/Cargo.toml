@@ -1,0 +1,33 @@
+[package]
+name = "gsd-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "IPC layer for GSD-Core: Unix domain sockets for control plane, memfd/shared memory for Nexus CRDT state"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["os", "network-programming", "ipc", "system"]
+keywords = ["ipc", "unix-socket", "shared-memory", "memfd", "grpc", "uds"]
+
+[dependencies]
+tokio = { workspace = true }
+tokio-uring = { workspace = true }
+tonic = { workspace = true, features = ["tls", "transport", "codegen"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+mio = { workspace = true }
+socket2 = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

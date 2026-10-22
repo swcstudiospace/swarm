@@ -1,0 +1,47 @@
+[package]
+name = "gsd-security"
+version = "0.1.0"
+edition = "2021"
+description = "Security Sandbox for GSD-Core: thread isolation, capability tokens, audit logging, PII redaction"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["security", "sandbox", "audit", "encryption"]
+keywords = ["security", "sandbox", "audit", "pii", "capability", "isolation"]
+
+[dependencies]
+tokio = { workspace = true }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-proto = { path = "../gsd-proto" }
+gsd-serde = { path = "../gsd-serde" }
+regex = { workspace = true }
+blake3 = { workspace = true }
+jsonwebtoken = { workspace = true }
+josekit = { workspace = true }
+ring = { version = "0.17", features = ["std"] }
+aes-gcm = { workspace = true }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+crossbeam = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

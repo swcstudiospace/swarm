@@ -1,0 +1,44 @@
+[package]
+name = "gsd-state"
+version = "0.1.0"
+edition = "2021"
+description = "State Store for GSD-Core: versioned, branchable, mergeable session state with conflict resolution"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["database", "storage", "data-structures"]
+keywords = ["state", "storage", "checkpoint", "branch", "merge"]
+
+[dependencies]
+tokio = { workspace = true }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-proto = { path = "../gsd-proto" }
+gsd-serde = { path = "../gsd-serde" }
+gsd-ipc = { path = "../gsd-ipc" }
+gsd-governor = { path = "../gsd-governor" }
+gsd-observability = { path = "../gsd-observability" }
+gsd-security = { path = "../gsd-security" }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "sqlite", "json", "uuid"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script", "streams"] }
+aws-sdk-s3 = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+crossbeam = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "sqlite"] }
