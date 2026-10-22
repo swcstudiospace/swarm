@@ -478,6 +478,7 @@ mod tests {
     use gsd_proto::gsd::v1::SubagentType;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::Notify;
 
     fn task(id: &str, priority: i32, agent: &str, deps: &[&str]) -> Task {
         Task {
@@ -824,6 +825,10 @@ mod tests {
     async fn continuous_refills_on_completion_while_rounds_barrier() {
         async fn events(mode: DispatchMode) -> Vec<String> {
             let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            // Fired by c's worker once "start:c" is recorded. Continuous mode holds "a" until then, so the
+            // overlap is forced rather than hoped for. Rounds mode admits c only after "a" has ended, so there
+            // "a" must not wait on it.
+            let c_started = Arc::new(Notify::new());
             let tasks = vec![
                 task("a", 0, "w", &[]),
                 task("b", 0, "w", &[]),
@@ -837,11 +842,19 @@ mod tests {
             // Two slots for "w" so a completion frees a slot while "a" still runs.
             config.agent_max_parallel.insert("w".to_string(), 2);
             let l = Arc::clone(&log);
+            let signal = Arc::clone(&c_started);
             run_force_parallel(built(tasks), config, move |t: Task| {
                 let l = Arc::clone(&l);
+                let signal = Arc::clone(&signal);
                 async move {
                     let id = task_key(&t).to_string();
                     l.lock().expect("log").push(format!("start:{id}"));
+                    if id == "c" {
+                        signal.notify_one();
+                    }
+                    if id == "a" && mode == DispatchMode::Continuous {
+                        signal.notified().await;
+                    }
                     let delay = if id == "a" { 80 } else { 10 };
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     l.lock().expect("log").push(format!("end:{id}"));
