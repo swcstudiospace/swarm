@@ -16,6 +16,7 @@ gsd-pool = { path = "../gsd-pool" }
 gsd-governor = { path = "../gsd-governor" }
 gsd-observability = { path = "../gsd-observability" }
 gsd-failure = { path = "../gsd-failure" }
+gsd-nexus = { path = "../gsd-nexus" }
 petgraph = { workspace = true }
 topo = { workspace = true }
 dashmap = { workspace = true }

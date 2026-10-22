@@ -11,6 +11,7 @@ pub mod dynamic;
 pub mod force_parallel_dispatch;
 pub mod hitl;
 pub mod matrix_join;
+pub mod nexus_barrier_join;
 pub mod policy;
 pub mod policy_config;
 pub mod ready_frontier;
@@ -27,6 +28,7 @@ pub use force_parallel_dispatch::{
 };
 pub use hitl::*;
 pub use matrix_join::*;
+pub use nexus_barrier_join::*;
 pub use policy::*;
 pub use policy_config::*;
 pub use ready_frontier::*;
