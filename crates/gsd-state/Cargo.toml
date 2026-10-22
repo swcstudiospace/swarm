@@ -13,13 +13,10 @@ tokio = { workspace = true }
 gsd-runtime = { path = "../gsd-runtime" }
 gsd-proto = { path = "../gsd-proto" }
 gsd-serde = { path = "../gsd-serde" }
-gsd-ipc = { path = "../gsd-ipc" }
-gsd-governor = { path = "../gsd-governor" }
 gsd-observability = { path = "../gsd-observability" }
-gsd-security = { path = "../gsd-security" }
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "sqlite", "json", "uuid"] }
-redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script", "streams"] }
-aws-sdk-s3 = { workspace = true }
+gsd-governor = { path = "../gsd-governor" }
+gsd-scheduler = { path = "../gsd-scheduler" }
+gsd-pool = { path = "../gsd-pool" }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
@@ -27,6 +24,7 @@ ulid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
+prost-types = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
