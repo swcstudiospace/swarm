@@ -627,3 +627,34 @@ Second review (a general reviewer, same phase): also CONDITIONAL, with these rul
 - Core guest for unknown: `cd /tmp/gsd-wasmer-spike/guest && RUSTUP_TOOLCHAIN=1.98.1 cargo build --target wasm32-unknown-unknown --release` fails in getrandom 0.4.3 [RUN].
 
 These runs happened after the parts were drafted, and the orchestrator executed them. The spike code is not committed, per the report-only rule.
+
+## 13 Amendment 2026-10-22: runtime change (user decision)
+
+The user chose: keep the `wasm32-wasip2` target and change the runtime. Sections 1 to 12 describe the earlier Wasmer 7.5.0 route. Where they conflict with this section, this section governs.
+
+### 13.1 Decision
+
+- D-P3-5: the sandbox runtime is wasmtime 50.0.0, with the `component-model` feature (crate `wasmtime`) and the `p2` feature (crate `wasmtime-wasi`). Target: `wasm32-wasip2`, kept.
+- Supersedes D-P3-1 (the wasip1 pin change) and O2 as recorded in section 8. O2 becomes: the wasip2 component-model canonical ABI carries the frozen JSON bytes as `list<u8>` through a WIT `invoke` export. The wire shape is unchanged.
+- Wasmer 7.5.0 remains unable to run components (section 2.2). It is no longer the sandbox runtime.
+
+### 13.2 Evidence (measured)
+
+- The WIT guest (`gsd:spike@0.1.0`, world `spike`, export `invoke: func(input: list<u8>) -> list<u8>`) builds for `wasm32-wasip2` as a component of 80,066 bytes (header `00 61 73 6d 0d 00 01 00`).
+- Host: wasmtime 50.0.0, deny-by-default WASI 0.2 (`WasiCtxBuilder::new().build()`, no environment, no preopens, no inherited stdio). Built with rustc and cargo 1.98.1 in 25 min 45 s.
+- Run output (`/tmp/gsd-wasmer-spike/run-wasmtime-wasip2.txt`, exit 0): compile_ms 205.358; instantiate_ms 0.423; invoke_warm_p50_us 1.350; invoke_warm_p95_us 1.480; module_bytes 80066; module_kind component; wasi_policy deny-by-default. 200 timed round trips with a 1003-byte TaskId payload; each sample checks output equals input.
+- The dealloc caveat in section 3.2 does not apply to this run: the canonical ABI owns the list buffers. The caveat still applies to the retired Wasmer harness.
+
+### 13.3 What is still open
+
+- S-17 and Q-1: the denial of WASI imports is now enforced by the WASI 0.2 context, not by host stubs. The errno and error-code mapping must be re-measured on this runtime before S-17 is signed.
+- The fault-injection scope (section 6.3) must be re-checked against wasmtime traps and fuel. The earlier Wasmer mapping in section 6.3 is not carried over.
+- The compile/stub table (section 4) is still valid for the target, because the target is unchanged.
+- The pins are not yet changed in the repo. Cargo.toml still declares `wasmer = "=7.5.0"`. Changing it to wasmtime is a separate commit, after the component gate in Phase 10.
+- A10 review of this runtime change is pending. The earlier A10 conditions (section 11) still apply where they name fuel, the trap mapping, and the import allowlist.
+
+### 13.4 Reproduction
+
+- Guest: `cd /tmp/gsd-wasmer-spike/guest && RUSTUP_TOOLCHAIN=1.98.1 cargo build --target wasm32-wasip2 --release` (2 min 23 s).
+- Host: `cd /tmp/gsd-wasmer-spike/wasmtime-host && RUSTUP_TOOLCHAIN=1.98.1 cargo build --release` (25 min 45 s).
+- Run: `/tmp/gsd-wasmer-spike/wasmtime-host/target/release/gsd-wasmer-spike-wasmtime /tmp/gsd-wasmer-spike/guest/target/wasm32-wasip2/release/gsd_wasmer_spike_guest.wasm` (exit 0).
