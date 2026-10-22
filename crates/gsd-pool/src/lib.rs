@@ -11,6 +11,16 @@ use gsd_proto::gsd::v1::{ChatThreadId, SubagentType, ThreadStateKind};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
+pub mod handle_registry;
+pub mod thread_state_machine;
+pub mod thread_state_transition_table;
+
+pub use handle_registry::{ChatThreadHandle, HandleRegistry};
+pub use thread_state_machine::transition;
+pub use thread_state_transition_table::{
+    allowed_successors, is_legal_transition, ThreadPhase, BLOCK_REASON_KEY,
+};
+
 /// Result type for pool operations
 pub type PoolResult<T> = std::result::Result<T, PoolError>;
 
@@ -172,26 +182,6 @@ impl ThreadPool {
 
     pub fn metrics(&self) -> &PoolMetrics {
         &self.metrics
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ChatThreadHandle {
-    id: ChatThreadId,
-    subagent_type: SubagentType,
-}
-
-impl ChatThreadHandle {
-    pub fn new(id: ChatThreadId, subagent_type: SubagentType) -> Self {
-        Self { id, subagent_type }
-    }
-
-    pub fn id(&self) -> &ChatThreadId {
-        &self.id
-    }
-
-    pub fn subagent_type(&self) -> &SubagentType {
-        &self.subagent_type
     }
 }
 
