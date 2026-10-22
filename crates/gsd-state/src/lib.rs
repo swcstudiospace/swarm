@@ -4,6 +4,8 @@
 
 pub mod session_create;
 pub mod session_dispatch;
+pub mod session_join;
+pub mod session_teardown;
 
 pub use session_create::{
     bind_thread, create_session, initial_snapshot, CreateError, CreateResult, ThreadBinding,
@@ -11,6 +13,16 @@ pub use session_create::{
 };
 pub use session_dispatch::{
     admit_thread, dispatch_session, handoff_thread, DispatchError, DispatchResult,
+};
+pub use session_join::{
+    cancel_channel, cancel_marker_key, collect_matrix_completions, collect_nexus_completions,
+    CancelControl, CancelMarker, CancelSignal, CancelTiming, CompletionLedger, Emit,
+    JoinCompletion, JoinContext, JoinError, JoinKey, JoinResult, StageEmit, TerminalReason,
+    CANCEL_GRACE, SHUTDOWN_BUDGET, TERMINAL_REASON_KEY,
+};
+pub use session_teardown::{
+    teardown_thread, Amounts, Disposition, Placement, Teardown, TeardownError, TeardownReport,
+    TeardownResult,
 };
 use std::sync::Arc;
 
