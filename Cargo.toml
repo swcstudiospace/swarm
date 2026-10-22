@@ -12,9 +12,10 @@ members = [
     "crates/gsd-nexus",
     "crates/gsd-failure",
     "crates/gsd-state",
+    "crates/gsd-adapter",
 ]
-# ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli, adapter and sdk have invalid or nested manifests.
-exclude = ["crates/gsd-ipc", "crates/gsd-cli", "crates/gsd-adapter", "crates/gsd-sdk"]
+# ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli and sdk have invalid or nested manifests.
+exclude = ["crates/gsd-ipc", "crates/gsd-cli", "crates/gsd-sdk"]
 
 [workspace.dependencies]
 tokio = { version = "1.40", features = ["full", "rt-multi-thread", "macros", "io-util", "net", "time", "sync", "fs", "process", "signal"] }
