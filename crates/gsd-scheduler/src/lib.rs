@@ -5,16 +5,20 @@
 
 pub mod clock;
 pub mod dag;
+pub mod dag_build;
 pub mod dynamic;
 pub mod hitl;
 pub mod policy;
+pub mod ready_frontier;
 pub mod semaphore;
 
 pub use clock::*;
 pub use dag::*;
+pub use dag_build::*;
 pub use dynamic::*;
 pub use hitl::*;
 pub use policy::*;
+pub use ready_frontier::*;
 pub use semaphore::*;
 
 use dashmap::DashMap;
