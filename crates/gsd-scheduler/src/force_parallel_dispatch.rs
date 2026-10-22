@@ -389,12 +389,29 @@ where
                 self.limiter.on_failure(now, &id);
                 TaskOutcome::Failed {
                     code: ErrorCode::Internal.as_str(),
-                    message: format!("{WORKER_FAILURE_CODE}: worker panicked: {join_error}"),
+                    message: panic_message(join_error),
                 }
             }
         };
         self.report.outcomes.push((id, outcome));
     }
+}
+
+/// Failure text for a worker that panicked or was cancelled.
+///
+/// Built only from the panic payload. `JoinError`'s display embeds tokio's process-wide task id,
+/// which differs between runs, so it must never reach a completion record.
+fn panic_message(join_error: JoinError) -> String {
+    let payload = match join_error.try_into_panic() {
+        Ok(payload) => payload,
+        Err(_) => return format!("{WORKER_FAILURE_CODE}: worker task was cancelled"),
+    };
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    format!("{WORKER_FAILURE_CODE}: worker panicked: {detail}")
 }
 
 /// Dispatches every task of `built` through `worker` and returns once no task can run.
@@ -647,6 +664,29 @@ mod tests {
             other => panic!("expected E-INTERNAL failure, got {other:?}"),
         }
         assert!(report.undispatched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn panic_message_is_identical_across_dispatches() {
+        async fn panic_text() -> String {
+            let tasks = vec![task("b", 0, "w", &[])];
+            let report = run_force_parallel(built(tasks), serial(1), |t: Task| async move {
+                if task_key(&t) == "b" {
+                    panic!("boom");
+                }
+                Ok(())
+            })
+            .await
+            .expect("dispatch");
+            match report.outcomes.iter().find(|(i, _)| i == "b") {
+                Some((_, TaskOutcome::Failed { message, .. })) => message.clone(),
+                other => panic!("expected failure, got {other:?}"),
+            }
+        }
+        let first = panic_text().await;
+        let second = panic_text().await;
+        assert_eq!(first, second);
+        assert_eq!(first, "E-INTERNAL: worker panicked: boom");
     }
 
     #[tokio::test]
