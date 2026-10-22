@@ -7,8 +7,8 @@
 //! repeated, so a re-emitted completion never applies twice.
 //!
 //! Cancel follows the runner's flag rule. A [`CancelMarker`] is written at `cancel/<corr>` with the
-//! sanitized correlation id. Each running task then has [`CancelTiming::cooperative`] (10 s) to finish
-//! inside [`CancelTiming::budget`] (15 s). A task still running when that window closes is stopped and
+//! sanitized correlation id. Each running task then has [`CancelTiming::cooperative`] (3 s) to stop, walked
+//! in [`CANCEL_SLICE`] (500 ms) slices. A task still running when that window closes is force-dropped and
 //! ends `CANCELLED_TIMED_OUT` with `metadata["terminal_reason"] = "timed_out"`. A task that returns a
 //! failure after the marker was set, inside the window, ends `CANCELLED_TIMED_OUT` with reason
 //! `cancelled`. A task that returns success keeps `SUCCEEDED`.
@@ -17,9 +17,9 @@
 //! and each started thread ends `CANCELLED_TIMED_OUT` with reason `timed_out`. Stage merges that had not
 //! returned by then are discarded; no retention semantics are implemented.
 //!
-//! A nexus participant's `E-TIMEOUT` straggler ends `FAILED`, as the n3 hook 3 "thread-timeout ⇒ FAILED"
-//! fixture requires. A `RateLimited` matrix outcome leaves its thread `RUNNING`; retry belongs to the
-//! caller and its backoff rule is not implemented.
+//! A nexus participant's `E-TIMEOUT` straggler ends `CANCELLED_TIMED_OUT` with reason `timed_out`, the same
+//! terminal a matrix task stopped at the window ends. A `RateLimited` matrix outcome leaves its thread
+//! `RUNNING`; retry belongs to the caller and its backoff rule is not implemented.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -40,14 +40,17 @@ use tokio::time::sleep;
 use crate::session_create::{thread_for_task, PHASE_KEY};
 use crate::session_dispatch::{admit_thread, handoff_thread, DispatchError};
 
-/// Cooperative wait a cancelled task has before it is stopped. `SWARM_CANCEL_GRACE_S`.
-pub const CANCEL_GRACE: Duration = Duration::from_secs(10);
-/// Budget the cooperative wait sits inside. `SWARM_SHUTDOWN_BUDGET_S`.
-pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(15);
+/// Total cooperative wait a cancelled task has before it is force-dropped. The bound is 3 s, walked in
+/// [`CANCEL_SLICE`] slices. `SWARM_CANCEL_GRACE_S`.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(3);
+/// Granularity of the cooperative wait: the window is walked in 500 ms slices.
+pub const CANCEL_SLICE: Duration = Duration::from_millis(500);
 /// Metadata key on a [`ThreadState`] holding the [`TerminalReason`] of a `CANCELLED_TIMED_OUT` thread.
 pub const TERMINAL_REASON_KEY: &str = "terminal_reason";
 /// Prefix of the cancel marker key, `cancel/<correlation id>`.
 pub const CANCEL_KEY_PREFIX: &str = "cancel/";
+/// Code of a nexus partial-join timeout, as the nexus barrier join sets it on a straggler.
+const PARTIAL_JOIN_TIMEOUT: &str = "E-TIMEOUT";
 
 /// Result type for session join operations.
 pub type JoinResult<T> = Result<T, JoinError>;
@@ -55,16 +58,6 @@ pub type JoinResult<T> = Result<T, JoinError>;
 /// Typed refusal or failure from a session join.
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
-    /// The cooperative window is longer than the budget it must sit inside.
-    #[error(
-        "cancel timing invalid: cooperative window {cooperative:?} exceeds the budget {budget:?}"
-    )]
-    Timing {
-        /// Cooperative window requested.
-        cooperative: Duration,
-        /// Budget it must fit in.
-        budget: Duration,
-    },
     /// Join attempts start at 1.
     #[error("join attempt must be at least 1")]
     InvalidAttempt,
@@ -172,34 +165,18 @@ impl TerminalReason {
     }
 }
 
-/// Cooperative window and budget a cancel runs under.
+/// Cooperative window a cancel runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelTiming {
-    /// Time a running task has to finish after the marker is set.
+    /// Total time a running task has to stop after the marker is set. Forced-drop after it.
     pub cooperative: Duration,
-    /// Budget the cooperative window must fit inside.
-    pub budget: Duration,
 }
 
 impl Default for CancelTiming {
     fn default() -> Self {
         Self {
             cooperative: CANCEL_GRACE,
-            budget: SHUTDOWN_BUDGET,
         }
-    }
-}
-
-impl CancelTiming {
-    /// Refuses a cooperative window longer than the budget.
-    pub fn validate(self) -> JoinResult<()> {
-        if self.cooperative > self.budget {
-            return Err(JoinError::Timing {
-                cooperative: self.cooperative,
-                budget: self.budget,
-            });
-        }
-        Ok(())
     }
 }
 
@@ -302,7 +279,7 @@ pub struct JoinContext {
     pub join_seq: u64,
     /// Attempt of the join, starting at 1.
     pub attempt: u32,
-    /// Cooperative window and budget.
+    /// Cooperative window.
     pub timing: CancelTiming,
     /// Cancel marker the run observes.
     pub cancel: CancelSignal,
@@ -310,7 +287,6 @@ pub struct JoinContext {
 
 impl JoinContext {
     fn check(&self) -> JoinResult<()> {
-        self.timing.validate()?;
         if self.attempt == 0 {
             return Err(JoinError::InvalidAttempt);
         }
@@ -526,7 +502,7 @@ where
                 {
                     let mut guard = ctx.session.lock();
                     for record in merge.log.records() {
-                        if let Some(terminal) = terminal_for(&record.outcome, false, false) {
+                        if let Some(terminal) = nexus_terminal_for(&record.outcome) {
                             apply_terminal_to_task(&mut guard, &record.key.task_id, terminal)?;
                         }
                     }
@@ -598,10 +574,16 @@ where
     }
 }
 
-/// Resolves once the marker is set and the cooperative window has elapsed after it.
+/// Resolves once the marker is set and the cooperative window has elapsed after it. The window is walked
+/// in [`CANCEL_SLICE`] slices and never runs past `cooperative`.
 async fn forced_after(cancel: CancelSignal, cooperative: Duration) {
     cancel.cancelled().await;
-    sleep(cooperative).await;
+    let mut waited = Duration::ZERO;
+    while waited < cooperative {
+        let slice = CANCEL_SLICE.min(cooperative - waited);
+        sleep(slice).await;
+        waited += slice;
+    }
 }
 
 /// Refuses unless every task in `ids` is bound to a thread that is IDLE.
@@ -712,6 +694,17 @@ fn terminal_for(outcome: &TaskOutcome, forced: bool, cooperative: bool) -> Optio
         TaskOutcome::Completed => Some(Terminal::Succeeded),
         TaskOutcome::Failed { .. } => Some(Terminal::Failed),
         TaskOutcome::RateLimited { .. } => None,
+    }
+}
+
+/// Maps a nexus record to its terminal. An `E-TIMEOUT` straggler ends `CANCELLED_TIMED_OUT` (`timed_out`),
+/// as a matrix task stopped at the window does. Every other outcome maps as in [`terminal_for`].
+fn nexus_terminal_for(outcome: &TaskOutcome) -> Option<Terminal> {
+    match outcome {
+        TaskOutcome::Failed { code, .. } if *code == PARTIAL_JOIN_TIMEOUT => {
+            Some(Terminal::Cancelled(TerminalReason::TimedOut))
+        }
+        other => terminal_for(other, false, false),
     }
 }
 
@@ -935,16 +928,10 @@ mod tests {
     }
 
     #[test]
-    fn default_timing_is_ten_inside_fifteen() {
+    fn default_timing_is_three_seconds_in_half_second_slices() {
         let timing = CancelTiming::default();
-        assert_eq!(timing.cooperative, Duration::from_secs(10));
-        assert_eq!(timing.budget, Duration::from_secs(15));
-        assert!(timing.validate().is_ok());
-        let inverted = CancelTiming {
-            cooperative: Duration::from_secs(16),
-            budget: Duration::from_secs(15),
-        };
-        assert!(inverted.validate().is_err());
+        assert_eq!(timing.cooperative, Duration::from_secs(3));
+        assert_eq!(CANCEL_SLICE, Duration::from_millis(500));
     }
 
     #[test]
@@ -1037,7 +1024,6 @@ mod tests {
         let (control, signal) = cancel_channel();
         let timing = CancelTiming {
             cooperative: Duration::from_millis(30),
-            budget: Duration::from_millis(500),
         };
         let ctx = context(&session, 7, timing, signal);
         let mut ledger = CompletionLedger::default();
@@ -1083,8 +1069,7 @@ mod tests {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
         let timing = CancelTiming {
-            cooperative: Duration::from_secs(5),
-            budget: Duration::from_secs(6),
+            cooperative: Duration::from_secs(3),
         };
         let ctx = context(&session, 2, timing, signal);
         let mut ledger = CompletionLedger::default();
@@ -1183,8 +1168,14 @@ mod tests {
         .await?;
         assert_eq!(first.stages[0].emit, Emit::Collected);
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
-        // A nexus straggler is FAILED, not CANCELLED_TIMED_OUT (n3 hook 3).
-        assert_eq!(phase(&session, "th2")?, ThreadPhase::Failed);
+        // A nexus straggler ends CANCELLED_TIMED_OUT (timed_out), not FAILED.
+        assert_eq!(phase(&session, "th2")?, ThreadPhase::CancelledTimedOut);
+        assert_eq!(
+            metadata_of(&session, "th2")
+                .get(TERMINAL_REASON_KEY)
+                .map(String::as_str),
+            Some("timed_out")
+        );
 
         let counter = Arc::clone(&calls);
         let second = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
@@ -1203,7 +1194,6 @@ mod tests {
         let (control, signal) = cancel_channel();
         let timing = CancelTiming {
             cooperative: Duration::from_millis(30),
-            budget: Duration::from_millis(500),
         };
         let ctx = context(&session, 5, timing, signal);
         let mut ledger = CompletionLedger::default();
