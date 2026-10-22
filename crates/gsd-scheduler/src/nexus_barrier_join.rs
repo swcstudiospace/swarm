@@ -7,7 +7,8 @@
 //! A stage publishes one request per participant on `<join>/stage/<n>/request`, correlated by task
 //! id. Participants answer on `<join>/stage/<n>/reply` with a [`ParticipantReply`]. The barrier waits
 //! until every participant has answered or the stage deadline passes. A participant still silent at
-//! the deadline becomes a named partial-join timeout. A failed participant becomes a failed input.
+//! the deadline becomes a named partial-join timeout, whose session terminal is `CANCELLED_TIMED_OUT`.
+//! A failed participant becomes a failed input.
 //! Both are values in the stage log, so neither can stop the join. The stage is merged in
 //! [`CompletionKey`] order, the same log shape as [`crate::matrix_join`], and the next stage is
 //! released only after that merge.
@@ -153,7 +154,8 @@ pub enum JoinTerminal {
 pub struct NexusJoinReport {
     /// Merged stages in release order.
     pub stages: Vec<StageMerge>,
-    /// Task ids that missed a stage deadline, in merge order. Each is a named partial-join timeout.
+    /// Task ids that missed a stage deadline, in merge order. Each is a named partial-join timeout that
+    /// ends `CANCELLED_TIMED_OUT` (`timed_out`) in the session join.
     pub partial_timeouts: Vec<String>,
     /// Task ids whose participant failed, in merge order.
     pub failed: Vec<String>,

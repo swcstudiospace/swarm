@@ -18,7 +18,7 @@ pub use session_join::{
     cancel_channel, cancel_marker_key, collect_matrix_completions, collect_nexus_completions,
     CancelControl, CancelMarker, CancelSignal, CancelTiming, CompletionLedger, Emit,
     JoinCompletion, JoinContext, JoinError, JoinKey, JoinResult, StageEmit, TerminalReason,
-    CANCEL_GRACE, SHUTDOWN_BUDGET, TERMINAL_REASON_KEY,
+    CANCEL_GRACE, TERMINAL_REASON_KEY,
 };
 pub use session_teardown::{
     teardown_thread, Amounts, Disposition, Placement, Teardown, TeardownError, TeardownReport,
