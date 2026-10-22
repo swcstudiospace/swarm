@@ -1,0 +1,29 @@
+[package]
+name = "gsd-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "SDKs for GSD-Core: Python, TypeScript, Go clients with async iterators for streaming events"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["api-client", "sdk", "development-tools"]
+keywords = ["sdk", "python", "typescript", "go", "async", "streaming"]
+
+[dependencies]
+# This crate provides the Rust bindings; language-specific SDKs are in subdirectories
+# Python SDK in gsd-sdk/python/
+# TypeScript SDK in gsd-sdk/typescript/
+# Go SDK in gsd-sdk/go/
+
+[workspace]
+members = [
+    "python",
+    "typescript", 
+    "go",
+]
+
+[workspace.dependencies]
+# Python SDK dependencies would go here
+# TypeScript SDK dependencies would go here
+# Go SDK dependencies would go here
+
+[dev-dependencies]

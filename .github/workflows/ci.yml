@@ -42,3 +42,12 @@ jobs:
       - name: omp package suite
         working-directory: omp
         run: bun run test
+  rust:
+    name: rust (build and test, locked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (locked)
+        run: cargo build --workspace --locked
+      - name: Test (locked)
+        run: cargo test --workspace --locked --no-fail-fast
