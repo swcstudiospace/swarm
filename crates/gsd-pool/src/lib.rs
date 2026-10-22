@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use gsd_proto::gsd::v1::{ChatThreadId, SubagentType, ThreadStateKind};
@@ -12,14 +12,18 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 pub mod handle_registry;
+pub mod hook_dispatch;
 pub mod thread_state_machine;
 pub mod thread_state_transition_table;
+pub mod warm_reuse;
 
 pub use handle_registry::{ChatThreadHandle, HandleRegistry};
+pub use hook_dispatch::{LifecycleDispatcher, LifecycleEvent, LifecycleObserver};
 pub use thread_state_machine::transition;
 pub use thread_state_transition_table::{
     allowed_successors, is_legal_transition, ThreadPhase, BLOCK_REASON_KEY,
 };
+pub use warm_reuse::{CheckpointHook, WarmPool};
 
 /// Result type for pool operations
 pub type PoolResult<T> = std::result::Result<T, PoolError>;
@@ -79,24 +83,32 @@ pub struct ThreadPool {
     /// Keyed by `ChatThreadId::value`: the generated proto id type has no `Eq`/`Hash`.
     threads: Arc<DashMap<String, Arc<parking_lot::Mutex<ThreadEntry>>>>,
     warm_pool: Arc<RwLock<WarmPool>>,
-    lifecycle_hooks: Arc<RwLock<LifecycleHooks>>,
+    lifecycle: LifecycleDispatcher,
     metrics: Arc<PoolMetrics>,
 }
 
 impl ThreadPool {
     pub fn new(config: PoolConfig) -> Self {
+        let warm_pool = WarmPool::new(
+            config.warm_pool_size,
+            Duration::from_secs(config.eviction_grace_secs),
+        );
         Self {
             config,
             threads: Arc::new(DashMap::new()),
-            warm_pool: Arc::new(RwLock::new(WarmPool::new())),
-            lifecycle_hooks: Arc::new(RwLock::new(LifecycleHooks::new())),
+            warm_pool: Arc::new(RwLock::new(warm_pool)),
+            lifecycle: LifecycleDispatcher::default(),
             metrics: Arc::new(PoolMetrics::new()),
         }
     }
 
     pub async fn acquire(&self, subagent_type: SubagentType) -> PoolResult<ChatThreadHandle> {
         // Try to get from warm pool first
-        if let Some(handle) = self.warm_pool.write().pop(&subagent_type) {
+        let warm = self
+            .warm_pool
+            .write()
+            .pop(&subagent_type, gsd_runtime::clock::now());
+        if let Some(handle) = warm {
             self.metrics.inc_acquired_from_warm();
             return Ok(handle);
         }
@@ -114,12 +126,10 @@ impl ThreadPool {
             let mut entry = entry.lock();
             entry.state = ThreadStateKind::Idle;
 
-            // Return to warm pool if there's space
-            if self.warm_pool.read().len() < self.config.warm_pool_size {
-                self.warm_pool
-                    .write()
-                    .push(entry.subagent_type.clone(), handle.clone());
-            }
+            // Park in the warm pool; the pool refuses it when full.
+            self.warm_pool
+                .write()
+                .push(&entry.subagent_type, handle, gsd_runtime::clock::now());
         }
 
         self.metrics.inc_released();
@@ -156,8 +166,9 @@ impl ThreadPool {
             Arc::new(parking_lot::Mutex::new(entry)),
         );
 
-        // Run on_create hooks
-        self.run_hooks(LifecycleEvent::OnCreate, &thread_id).await?;
+        // Notify observers of creation
+        self.lifecycle
+            .dispatch(&LifecycleEvent::OnCreate(thread_id.clone()));
 
         // Initialize thread
         {
@@ -168,16 +179,7 @@ impl ThreadPool {
             entry.lock().state = ThreadStateKind::Running;
         }
 
-        // Run on_initialize hooks
-        self.run_hooks(LifecycleEvent::OnInitialize, &thread_id)
-            .await?;
-
         Ok(handle)
-    }
-
-    async fn run_hooks(&self, event: LifecycleEvent, thread_id: &ChatThreadId) -> PoolResult<()> {
-        let hooks = self.lifecycle_hooks.read();
-        hooks.run(event, thread_id)
     }
 
     pub fn metrics(&self) -> &PoolMetrics {
@@ -192,83 +194,6 @@ struct ThreadEntry {
     handle: ChatThreadHandle,
     created_at: Instant,
     last_checkpoint: Option<Instant>,
-}
-
-struct WarmPool {
-    /// Keyed by `SubagentType::value`.
-    pool: DashMap<String, Vec<ChatThreadHandle>>,
-}
-
-impl WarmPool {
-    fn new() -> Self {
-        Self {
-            pool: DashMap::new(),
-        }
-    }
-
-    fn pop(&self, subagent_type: &SubagentType) -> Option<ChatThreadHandle> {
-        self.pool
-            .get_mut(subagent_type.value.as_str())
-            .and_then(|mut v| v.pop())
-    }
-
-    fn push(&self, subagent_type: SubagentType, handle: ChatThreadHandle) {
-        self.pool
-            .entry(subagent_type.value)
-            .or_default()
-            .push(handle);
-    }
-
-    fn len(&self) -> usize {
-        self.pool.iter().map(|v| v.len()).sum()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum LifecycleEvent {
-    OnCreate,
-    OnInitialize,
-    OnAssign,
-    OnSuspend,
-    OnResume,
-    OnCheckpoint,
-    OnComplete,
-    OnFailure,
-    OnTerminate,
-}
-
-struct LifecycleHooks {
-    hooks: DashMap<LifecycleEvent, Vec<Box<dyn Fn(&ChatThreadId) -> PoolResult<()> + Send + Sync>>>,
-}
-
-impl LifecycleHooks {
-    fn new() -> Self {
-        let hooks = DashMap::new();
-        for event in [
-            LifecycleEvent::OnCreate,
-            LifecycleEvent::OnInitialize,
-            LifecycleEvent::OnAssign,
-            LifecycleEvent::OnSuspend,
-            LifecycleEvent::OnResume,
-            LifecycleEvent::OnCheckpoint,
-            LifecycleEvent::OnComplete,
-            LifecycleEvent::OnFailure,
-            LifecycleEvent::OnTerminate,
-        ] {
-            hooks.insert(event, Vec::new());
-        }
-        Self { hooks }
-    }
-
-    /// Runs every hook registered for `event`, stopping at the first error.
-    fn run(&self, event: LifecycleEvent, thread_id: &ChatThreadId) -> PoolResult<()> {
-        if let Some(hooks) = self.hooks.get(&event) {
-            for hook in hooks.value() {
-                hook(thread_id)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 struct PoolMetrics {
