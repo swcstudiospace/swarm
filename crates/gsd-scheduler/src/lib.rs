@@ -10,7 +10,9 @@ pub mod dag_build;
 pub mod dynamic;
 pub mod force_parallel_dispatch;
 pub mod hitl;
+pub mod matrix_join;
 pub mod policy;
+pub mod policy_config;
 pub mod ready_frontier;
 pub mod semaphore;
 
@@ -24,7 +26,9 @@ pub use force_parallel_dispatch::{
     DispatchReport, TaskFailure, TaskOutcome,
 };
 pub use hitl::*;
+pub use matrix_join::*;
 pub use policy::*;
+pub use policy_config::*;
 pub use ready_frontier::*;
 pub use semaphore::*;
 
