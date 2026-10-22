@@ -597,6 +597,15 @@ Reviewer: a10-security, advisory only; the human owner decides. Overall verdict:
 
 Items A10 must review, from sections 6.2 to 6.3 and 9: exceptions E-01 to E-16; faults S-01 to S-24; questions Q-1 to Q-7; findings F-01 to F-07; the T-01 to T-04 fixes.
 
+Second review (a general reviewer, same phase): also CONDITIONAL, with these rulings.
+
+- S-10 is rejected as written. Python truth returns E-INTERNAL for an unknown error code at exit 2, so the expected code is E-INTERNAL. The planner amends R:193-194 in writing.
+- S-08: the depth value 32 is only an example. Define depth and mirror it in omp/src/tools.ts before the test runs.
+- S-16: add a positive control, so a correctly minted token passes, plus cases for missing aud, wrong iss and missing iss.
+- S-13: the default leeway is 60 s, so the gate sets leeway 0 for per-call tokens.
+- Before C3, 21 conditions apply, including: the T-01 to T-04 fixes; the revocation check on the gate (N-4); F-07 fixed or its type deleted; the secret kept out of Debug (N-2); invalid PII regexes refused (N-1); denial records fsynced or the tamper-evidence claim removed (N-3); enable_sandbox wired or deleted (N-5); and a test for every S-item needed for C3, because gsd-security has no tests (N-7).
+- New findings N-1 to N-7 are recorded in the second review. Round-trip success is implied by exit 0, since the host prints no separate line for it.
+
 ---
 
 ## 12 Reproduction
