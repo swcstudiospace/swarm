@@ -1443,6 +1443,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
+ "gsd-failure",
  "gsd-proto",
  "gsd-runtime",
  "gsd-serde",
