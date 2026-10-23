@@ -1,0 +1,14 @@
+[package]
+name = "gsd-sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Wasmtime sandbox host for the GSD-Core guest: module identity, loading, limits and the typed invoke boundary"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+
+[dependencies]
+gsd-failure = { path = "../gsd-failure" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
