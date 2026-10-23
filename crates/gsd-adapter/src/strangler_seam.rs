@@ -16,6 +16,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use gsd_failure::{error_code_from_python, ErrorCode};
+use gsd_route::{
+    check_safe_id, count_state, empty_status, finish, history_fields, jstr, obj_get, parse_json,
+    push_latest, run_log_counts, satisfied_ids, status_list, status_row, to_python_json, Fields,
+    Json, LatestRow, ReadArgs, StatusRow, Task,
+};
+use gsd_route::{parse_orch_status_read, Reply, SeamError};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
@@ -24,438 +30,6 @@ pub const INPUT_CAP_BYTES: usize = 100_000;
 
 /// Stderr characters kept in a usage-error message (`swarm/script_base.py` tail rule).
 const STDERR_TAIL_CHARS: usize = 400;
-
-/// Deepest JSON nesting the parser accepts.
-const MAX_JSON_DEPTH: usize = 128;
-
-/// Null returned by reference for absent fields.
-static NULL_JSON: Json = Json::Null;
-
-/// Order-preserving JSON value that renders exactly as Python's `json.dumps(value, indent=2)`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Json {
-    /// JSON `null` (Python `None`).
-    Null,
-    /// JSON boolean (Python `bool`).
-    Bool(bool),
-    /// JSON integer (Python `int`).
-    Int(i64),
-    /// JSON number with a fraction or exponent (Python `float`).
-    Float(f64),
-    /// JSON string (Python `str`).
-    Str(String),
-    /// JSON array (Python `list`).
-    Arr(Vec<Json>),
-    /// JSON object with insertion-ordered keys (Python `dict`).
-    Obj(Vec<(String, Json)>),
-}
-
-/// Builds a string value.
-pub fn jstr(text: &str) -> Json {
-    Json::Str(text.to_string())
-}
-
-/// Renders `value` exactly as Python's `json.dumps(value, indent=2)` with `ensure_ascii`.
-pub fn to_python_json(value: &Json) -> String {
-    let mut out = String::new();
-    write_value(value, 0, &mut out);
-    out
-}
-
-fn push_indent(out: &mut String, level: usize) {
-    for _ in 0..level {
-        out.push_str("  ");
-    }
-}
-
-fn write_value(value: &Json, level: usize, out: &mut String) {
-    match value {
-        Json::Null => out.push_str("null"),
-        Json::Bool(true) => out.push_str("true"),
-        Json::Bool(false) => out.push_str("false"),
-        Json::Int(number) => out.push_str(&number.to_string()),
-        Json::Float(number) => out.push_str(&py_float(*number)),
-        Json::Str(text) => write_str(text, out),
-        Json::Arr(items) => {
-            if items.is_empty() {
-                out.push_str("[]");
-                return;
-            }
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push('\n');
-                push_indent(out, level + 1);
-                write_value(item, level + 1, out);
-            }
-            out.push('\n');
-            push_indent(out, level);
-            out.push(']');
-        }
-        Json::Obj(fields) => {
-            if fields.is_empty() {
-                out.push_str("{}");
-                return;
-            }
-            out.push('{');
-            for (index, (key, item)) in fields.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push('\n');
-                push_indent(out, level + 1);
-                write_str(key, out);
-                out.push_str(": ");
-                write_value(item, level + 1, out);
-            }
-            out.push('\n');
-            push_indent(out, level);
-            out.push('}');
-        }
-    }
-}
-
-/// Writes a JSON string with Python's `ensure_ascii` escaping.
-fn write_str(text: &str, out: &mut String) {
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) >= 0x20 && (c as u32) < 0x7f => out.push(c),
-            c => {
-                let mut units = [0u16; 2];
-                for unit in c.encode_utf16(&mut units).iter() {
-                    out.push_str(&format!("\\u{:04x}", unit));
-                }
-            }
-        }
-    }
-    out.push('"');
-}
-
-/// Formats a float the way Python's `float.__repr__` does.
-pub fn py_float(number: f64) -> String {
-    if number.is_nan() {
-        return "NaN".to_string();
-    }
-    if number.is_infinite() {
-        return if number > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        };
-    }
-    let magnitude = number.abs();
-    if magnitude != 0.0 && (magnitude >= 1e16 || magnitude < 1e-4) {
-        let scientific = format!("{:e}", number);
-        let parts = scientific
-            .split_once('e')
-            .map(|(mantissa, exponent)| (mantissa.to_string(), exponent.to_string()));
-        return match parts {
-            Some((mantissa, exponent)) => {
-                let (sign, digits) = match exponent.strip_prefix('-') {
-                    Some(rest) => ('-', rest.to_string()),
-                    None => ('+', exponent.clone()),
-                };
-                format!("{mantissa}e{sign}{digits:0>2}")
-            }
-            None => scientific,
-        };
-    }
-    let fixed = format!("{}", number);
-    if fixed.contains('.') {
-        fixed
-    } else {
-        format!("{fixed}.0")
-    }
-}
-
-/// Parses JSON text into an order-preserving [`Json`], keeping Python's int/float split.
-pub fn parse_json(text: &str) -> Result<Json, SeamError> {
-    let mut parser = Parser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    let value = parser.value(0).ok_or_else(invalid_json)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err(invalid_json());
-    }
-    Ok(value)
-}
-
-fn invalid_json() -> SeamError {
-    SeamError::new(ErrorCode::Input, "invalid JSON")
-}
-
-struct Parser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl Parser<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn eat(&mut self, byte: u8) -> Option<()> {
-        if self.peek() == Some(byte) {
-            self.pos += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Option<Json> {
-        if depth > MAX_JSON_DEPTH {
-            return None;
-        }
-        self.skip_ws();
-        match self.peek()? {
-            b'{' => self.object(depth),
-            b'[' => self.array(depth),
-            b'"' => self.string().map(Json::Str),
-            b't' => self.literal(b"true", Json::Bool(true)),
-            b'f' => self.literal(b"false", Json::Bool(false)),
-            b'n' => self.literal(b"null", Json::Null),
-            b'-' | b'0'..=b'9' => self.number(),
-            _ => None,
-        }
-    }
-
-    fn literal(&mut self, word: &[u8], value: Json) -> Option<Json> {
-        if self.bytes.get(self.pos..)?.starts_with(word) {
-            self.pos += word.len();
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Option<Json> {
-        self.eat(b'{')?;
-        let mut fields: Vec<(String, Json)> = Vec::new();
-        self.skip_ws();
-        if self.eat(b'}').is_some() {
-            return Some(Json::Obj(fields));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            self.eat(b':')?;
-            let value = self.value(depth + 1)?;
-            upsert(&mut fields, key, value);
-            self.skip_ws();
-            if self.eat(b',').is_some() {
-                continue;
-            }
-            self.eat(b'}')?;
-            return Some(Json::Obj(fields));
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Option<Json> {
-        self.eat(b'[')?;
-        let mut items: Vec<Json> = Vec::new();
-        self.skip_ws();
-        if self.eat(b']').is_some() {
-            return Some(Json::Arr(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            if self.eat(b',').is_some() {
-                continue;
-            }
-            self.eat(b']')?;
-            return Some(Json::Arr(items));
-        }
-    }
-
-    fn string(&mut self) -> Option<String> {
-        self.eat(b'"')?;
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            let byte = self.peek()?;
-            self.pos += 1;
-            match byte {
-                b'"' => break,
-                b'\\' => {
-                    let escape = self.peek()?;
-                    self.pos += 1;
-                    match escape {
-                        b'"' => buf.push(b'"'),
-                        b'\\' => buf.push(b'\\'),
-                        b'/' => buf.push(b'/'),
-                        b'b' => buf.push(0x08),
-                        b'f' => buf.push(0x0c),
-                        b'n' => buf.push(b'\n'),
-                        b'r' => buf.push(b'\r'),
-                        b't' => buf.push(b'\t'),
-                        b'u' => {
-                            let decoded = self.unicode_escape()?;
-                            let mut encoded = [0u8; 4];
-                            buf.extend_from_slice(decoded.encode_utf8(&mut encoded).as_bytes());
-                        }
-                        _ => return None,
-                    }
-                }
-                0x00..=0x1f => return None,
-                other => buf.push(other),
-            }
-        }
-        String::from_utf8(buf).ok()
-    }
-
-    fn unicode_escape(&mut self) -> Option<char> {
-        let first = self.hex4()?;
-        if (0xD800..0xDC00).contains(&first) {
-            if self.bytes.get(self.pos..self.pos + 2) == Some(&b"\\u"[..]) {
-                let save = self.pos;
-                self.pos += 2;
-                let second = self.hex4()?;
-                if (0xDC00..0xE000).contains(&second) {
-                    let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
-                    return Some(char::from_u32(code).unwrap_or('\u{FFFD}'));
-                }
-                self.pos = save;
-            }
-            return Some('\u{FFFD}');
-        }
-        Some(char::from_u32(first).unwrap_or('\u{FFFD}'))
-    }
-
-    fn hex4(&mut self) -> Option<u32> {
-        let slice = self.bytes.get(self.pos..self.pos + 4)?;
-        let text = std::str::from_utf8(slice).ok()?;
-        let value = u32::from_str_radix(text, 16).ok()?;
-        self.pos += 4;
-        Some(value)
-    }
-
-    fn number(&mut self) -> Option<Json> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        let mut is_float = false;
-        while let Some(byte) = self.peek() {
-            match byte {
-                b'0'..=b'9' => self.pos += 1,
-                b'.' | b'e' | b'E' | b'+' | b'-' => {
-                    is_float = true;
-                    self.pos += 1;
-                }
-                _ => break,
-            }
-        }
-        let text = std::str::from_utf8(self.bytes.get(start..self.pos)?).ok()?;
-        if is_float {
-            text.parse::<f64>().ok().map(Json::Float)
-        } else {
-            text.parse::<i64>().ok().map(Json::Int)
-        }
-    }
-}
-
-/// Inserts or replaces `key`, keeping the first insertion position (Python `dict` semantics).
-fn upsert<V>(items: &mut Vec<(String, V)>, key: String, value: V) {
-    match items.iter().position(|(existing, _)| *existing == key) {
-        Some(index) => items[index].1 = value,
-        None => items.push((key, value)),
-    }
-}
-
-/// Looks up `key` in an ordered object's fields.
-fn obj_get<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
-    fields
-        .iter()
-        .find(|(name, _)| name.as_str() == key)
-        .map(|(_, value)| value)
-}
-
-/// A failure carrying one taxonomy code and the Python-shaped message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeamError {
-    code: ErrorCode,
-    message: String,
-}
-
-impl SeamError {
-    /// Builds an error whose message is prefixed `CODE: ` the way `SwarmError` formats it.
-    pub fn new(code: ErrorCode, message: impl AsRef<str>) -> Self {
-        Self {
-            code,
-            message: format!("{}: {}", code.as_str(), message.as_ref()),
-        }
-    }
-
-    /// Builds an error whose message is used verbatim (generic Python exceptions carry no prefix).
-    pub fn unprefixed(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
-    }
-
-    /// Returns the taxonomy code.
-    pub fn code(&self) -> ErrorCode {
-        self.code
-    }
-
-    /// Returns the message as Python would print it.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// Renders the `SwarmError.to_dict()` shape: `code`, `message`, `details`, `handling`.
-    pub fn to_json(&self) -> Json {
-        Json::Obj(vec![
-            ("code".to_string(), jstr(self.code.as_str())),
-            ("message".to_string(), jstr(&self.message)),
-            ("details".to_string(), Json::Obj(Vec::new())),
-            ("handling".to_string(), jstr(handling(self.code))),
-        ])
-    }
-}
-
-/// The standard handling text for a code (`swarm/errors.py::_HANDLING`).
-fn handling(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::Input => "Nack + task.status FAILED; notify artifact producer",
-        ErrorCode::Timeout => "Checkpoint, release lease, requeue once, then ESCALATED",
-        ErrorCode::Dep => "Exponential backoff 1s→60s (jitter, max 5), then degraded mode",
-        ErrorCode::Capacity => "Refuse bid; backpressure in next heartbeat",
-        ErrorCode::Contract => "Bounded fix loop per agent spec",
-        ErrorCode::Policy => "Fail-closed; escalate to A10/A01",
-        ErrorCode::Internal => "Checkpoint + crash; A01 requeue; 3 strikes ⇒ ESCALATED",
-    }
-}
-
-/// The stdout and exit code of one invocation, as the caller would see them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reply {
-    /// Exit code: 0 success, 1 expected failure, 2 error.
-    pub exit_code: i32,
-    /// Stdout bytes: one JSON object followed by a newline.
-    pub stdout: String,
-}
 
 /// One frozen script invocation, identical for both engines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -880,74 +454,6 @@ impl CoreBackend for PythonEngine {
     }
 }
 
-/// Parsed flags of the read-only `orch_status` route (argparse-compatible for the accepted subset).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReadArgs {
-    /// `--json` was given.
-    pub json: bool,
-    /// `--root` or `--repo` value.
-    pub root: Option<String>,
-    /// `--correlation-id` value.
-    pub correlation_id: Option<String>,
-    /// `--task-id` value.
-    pub task_id: Option<String>,
-    /// `--history` value.
-    pub history: Option<String>,
-}
-
-/// Parses `orch_status` argv for the read-only route. Returns `None` for any flag outside the read
-/// subset (`--transition`, `--ingest`, `--advisory`, `--reason`, unknown tokens), so the caller
-/// routes that call to Python.
-pub fn parse_orch_status_read(argv: &[String]) -> Option<ReadArgs> {
-    let mut out = ReadArgs::default();
-    let mut index = 0;
-    while index < argv.len() {
-        let token = argv[index].as_str();
-        let (name, inline) = match token.split_once('=') {
-            Some((head, value)) if head.starts_with("--") => (head, Some(value.to_string())),
-            _ => (token, None),
-        };
-        match name {
-            "--json" | "--dry-run" => {
-                if inline.is_some() {
-                    return None;
-                }
-                if name == "--json" {
-                    out.json = true;
-                }
-            }
-            "--root" | "--repo" | "--correlation-id" | "--task-id" | "--history" => {
-                let value = match inline {
-                    Some(value) => value,
-                    None => {
-                        index += 1;
-                        let next = argv.get(index)?;
-                        if next.starts_with('-') {
-                            return None;
-                        }
-                        next.clone()
-                    }
-                };
-                match name {
-                    "--root" | "--repo" => out.root = Some(value),
-                    "--correlation-id" => out.correlation_id = Some(value),
-                    "--task-id" => out.task_id = Some(value),
-                    _ => out.history = Some(value),
-                }
-            }
-            _ => return None,
-        }
-        index += 1;
-    }
-    Some(out)
-}
-
-/// Task Store rows served by the Rust engine.
-type Fields = Vec<(String, Json)>;
-
-/// Latest verdict per gate: gate name and the full verdict row.
-type LatestRow = (String, Fields);
-
 /// The Rust engine. Serves the read-only `orch_status` route; other entrypoints refuse with `E-DEP`.
 pub struct RustEngine {
     runtime: tokio::runtime::Runtime,
@@ -1028,65 +534,6 @@ impl CoreBackend for RustEngine {
     fn lane_verb(&self, call: &Invocation) -> Result<Reply, SeamError> {
         Err(no_route(&call.script))
     }
-}
-
-/// Appends the `agent` and `script` keys every Python script adds, and renders stdout.
-fn finish(mut fields: Fields, call: &Invocation) -> Reply {
-    fields.push(("agent".to_string(), jstr(&call.agent)));
-    fields.push(("script".to_string(), jstr(&call.script)));
-    Reply {
-        exit_code: 0,
-        stdout: format!("{}\n", to_python_json(&Json::Obj(fields))),
-    }
-}
-
-/// Returns true for an id matching `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` without `..`.
-pub fn is_safe_id(value: &str) -> bool {
-    let length = value.chars().count();
-    (1..=128).contains(&length)
-        && value
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !value.contains("..")
-}
-
-fn broken_id_rule(value: &str) -> &'static str {
-    if value.is_empty() {
-        "is empty"
-    } else if value.chars().count() > 128 {
-        "is longer than 128 characters"
-    } else if !value
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-    {
-        "does not start with a letter or digit"
-    } else if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        "contains a character outside [A-Za-z0-9._-]"
-    } else {
-        "contains '..'"
-    }
-}
-
-fn check_safe_id(value: &str, what: &str) -> Result<(), SeamError> {
-    if is_safe_id(value) {
-        return Ok(());
-    }
-    Err(SeamError::new(
-        ErrorCode::Input,
-        format!(
-            "invalid {what}: {} characters, {}; expected [A-Za-z0-9._-], starting alphanumeric, no '..', at most 128 chars",
-            value.chars().count(),
-            broken_id_rule(value)
-        ),
-    ))
 }
 
 fn io_error(error: std::io::Error) -> SeamError {
@@ -1224,87 +671,6 @@ fn row_fields(row: &SqliteRow) -> Result<Fields, SeamError> {
     Ok(fields)
 }
 
-/// A task row as `TaskStore._row` shapes it: JSON columns parsed, `notes_json` attached.
-#[derive(Debug, Clone)]
-struct Task {
-    task_id: String,
-    state: String,
-    fields: Fields,
-    notes: Json,
-    deps: Vec<Json>,
-}
-
-impl Task {
-    fn field(&self, key: &str) -> &Json {
-        obj_get(&self.fields, key).unwrap_or(&NULL_JSON)
-    }
-
-    fn note(&self, key: &str) -> &Json {
-        match &self.notes {
-            Json::Obj(fields) => obj_get(fields, key).unwrap_or(&NULL_JSON),
-            _ => &NULL_JSON,
-        }
-    }
-}
-
-fn task_from_fields(mut fields: Fields) -> Result<Task, SeamError> {
-    for column in ["inputs", "outputs", "acceptance", "budget", "depends_on"] {
-        let default = if column == "budget" { "{}" } else { "[]" };
-        let parsed = match obj_get(&fields, column) {
-            Some(Json::Str(text)) if !text.is_empty() => parse_json(text)?,
-            None | Some(Json::Null) | Some(Json::Str(_)) => parse_json(default)?,
-            Some(_) => {
-                return Err(SeamError::new(
-                    ErrorCode::Internal,
-                    format!("{column} is not text"),
-                ))
-            }
-        };
-        upsert(&mut fields, column.to_string(), parsed);
-    }
-    let task_id = match obj_get(&fields, "task_id") {
-        Some(Json::Str(id)) => id.clone(),
-        _ => {
-            return Err(SeamError::new(
-                ErrorCode::Internal,
-                "task row without task_id",
-            ))
-        }
-    };
-    let state = match obj_get(&fields, "state") {
-        Some(Json::Str(state)) => state.clone(),
-        _ => {
-            return Err(SeamError::new(
-                ErrorCode::Internal,
-                "task row without state",
-            ))
-        }
-    };
-    let notes = match obj_get(&fields, "notes") {
-        Some(Json::Str(text)) if !text.is_empty() => match parse_json(text) {
-            Ok(value @ Json::Obj(_)) => value,
-            _ => Json::Obj(Vec::new()),
-        },
-        _ => Json::Obj(Vec::new()),
-    };
-    let deps = match obj_get(&fields, "depends_on") {
-        Some(Json::Arr(items)) => items.clone(),
-        _ => {
-            return Err(SeamError::new(
-                ErrorCode::Internal,
-                "depends_on is not a list",
-            ))
-        }
-    };
-    Ok(Task {
-        task_id,
-        state,
-        fields,
-        notes,
-        deps,
-    })
-}
-
 async fn fetch_task(pool: &SqlitePool, task_id: &str) -> Result<Option<Task>, SeamError> {
     let rows = sqlx::query("SELECT * FROM tasks WHERE task_id=?")
         .bind(task_id)
@@ -1312,7 +678,7 @@ async fn fetch_task(pool: &SqlitePool, task_id: &str) -> Result<Option<Task>, Se
         .await
         .map_err(store_err)?;
     match rows.first() {
-        Some(row) => Ok(Some(task_from_fields(row_fields(row)?)?)),
+        Some(row) => Ok(Some(Task::from_row(row_fields(row)?)?)),
         None => Ok(None),
     }
 }
@@ -1338,70 +704,14 @@ async fn fetch_tasks(
     .map_err(store_err)?;
     let mut tasks = Vec::with_capacity(rows.len());
     for row in &rows {
-        tasks.push(task_from_fields(row_fields(row)?)?);
+        tasks.push(Task::from_row(row_fields(row)?)?);
     }
     Ok(tasks)
 }
 
-/// Python `float(value or 0)` for a stored `verdicts_since` note.
-fn float_or_zero(value: &Json) -> Result<f64, SeamError> {
-    match value {
-        Json::Null | Json::Bool(false) | Json::Int(0) => Ok(0.0),
-        Json::Float(number) if *number == 0.0 => Ok(0.0),
-        Json::Str(text) if text.is_empty() => Ok(0.0),
-        Json::Bool(true) => Ok(1.0),
-        Json::Int(number) => Ok(*number as f64),
-        Json::Float(number) => Ok(*number),
-        Json::Str(text) => text.trim().parse::<f64>().map_err(|_| {
-            SeamError::unprefixed(ErrorCode::Input, "could not convert string to float")
-        }),
-        _ => Err(SeamError::new(
-            ErrorCode::Internal,
-            "verdicts_since is not a number",
-        )),
-    }
-}
-
-/// `TaskStore._gates_of`: the `notes.gates` override, else the risk-class default.
-fn gates_of(task: &Task) -> Result<Vec<String>, SeamError> {
-    match task.note("gates") {
-        Json::Null => match task.field("risk_class") {
-            Json::Str(risk) => match risk.as_str() {
-                "low" => Ok(strings(&["review"])),
-                "medium" => Ok(strings(&["review", "quality"])),
-                "high" => Ok(strings(&["review", "quality", "security", "release"])),
-                _ => Err(SeamError::unprefixed(
-                    ErrorCode::Input,
-                    format!("KeyError: '{risk}'"),
-                )),
-            },
-            Json::Null => Err(SeamError::unprefixed(ErrorCode::Input, "KeyError: None")),
-            _ => Err(SeamError::new(
-                ErrorCode::Internal,
-                "risk_class is not text",
-            )),
-        },
-        Json::Arr(items) => items
-            .iter()
-            .map(|gate| match gate {
-                Json::Str(name) => Ok(name.clone()),
-                _ => Err(SeamError::new(ErrorCode::Internal, "gate name is not text")),
-            })
-            .collect(),
-        _ => Err(SeamError::new(
-            ErrorCode::Internal,
-            "unsupported notes.gates override",
-        )),
-    }
-}
-
-fn strings(items: &[&str]) -> Vec<String> {
-    items.iter().map(|item| item.to_string()).collect()
-}
-
 /// `TaskStore._latest_rows(task)`: highest-id verdict row per gate, at or after the last rework cut-off.
 async fn latest_rows(pool: &SqlitePool, task: &Task) -> Result<Vec<LatestRow>, SeamError> {
-    let since = float_or_zero(task.note("verdicts_since"))?;
+    let since = task.verdict_since()?;
     let rows = sqlx::query("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id")
         .bind(task.task_id.as_str())
         .bind(since)
@@ -1410,78 +720,9 @@ async fn latest_rows(pool: &SqlitePool, task: &Task) -> Result<Vec<LatestRow>, S
         .map_err(store_err)?;
     let mut latest: Vec<LatestRow> = Vec::new();
     for row in &rows {
-        let mut fields = row_fields(row)?;
-        let findings = match obj_get(&fields, "findings") {
-            Some(Json::Str(text)) => parse_json(text)?,
-            _ => {
-                return Err(SeamError::new(
-                    ErrorCode::Internal,
-                    "verdict row without findings",
-                ))
-            }
-        };
-        upsert(&mut fields, "findings".to_string(), findings);
-        let gate = match obj_get(&fields, "gate") {
-            Some(Json::Str(name)) => name.clone(),
-            _ => {
-                return Err(SeamError::new(
-                    ErrorCode::Internal,
-                    "verdict row without gate",
-                ))
-            }
-        };
-        upsert(&mut latest, gate, fields);
+        push_latest(&mut latest, row_fields(row)?)?;
     }
     Ok(latest)
-}
-
-/// `TaskStore.missing_gate_reasons` for the rows already loaded.
-///
-/// A row carrying a signed envelope needs `verify_envelope`, which this engine does not implement,
-/// so it refuses with `E-DEP` instead of guessing.
-fn missing_reasons(
-    gates: &[String],
-    latest: &[LatestRow],
-) -> Result<Vec<(String, String)>, SeamError> {
-    let mut reasons: Vec<(String, String)> = Vec::new();
-    for gate in gates {
-        let reason = match latest.iter().find(|(name, _)| name == gate) {
-            None => "absent",
-            Some((_, fields)) => match obj_get(fields, "envelope_json") {
-                None | Some(Json::Null) => "unsigned",
-                Some(Json::Str(envelope)) if envelope.is_empty() => "unsigned",
-                Some(_) => {
-                    return Err(SeamError::new(
-                        ErrorCode::Dep,
-                        format!(
-                            "gate {gate}: envelope signature verification is not implemented in the rust engine; use GSD_ENGINE=python"
-                        ),
-                    ))
-                }
-            },
-        };
-        upsert(&mut reasons, gate.clone(), reason.to_string());
-    }
-    Ok(reasons)
-}
-
-fn int_field(task: &Task, key: &str) -> Result<i64, SeamError> {
-    match task.field(key) {
-        Json::Int(number) => Ok(*number),
-        _ => Err(SeamError::new(
-            ErrorCode::Internal,
-            format!("{key} is not an integer"),
-        )),
-    }
-}
-
-fn outputs_len(task: &Task) -> Result<i64, SeamError> {
-    match task.field("outputs") {
-        Json::Arr(items) => Ok(items.len() as i64),
-        Json::Obj(fields) => Ok(fields.len() as i64),
-        Json::Str(text) => Ok(text.chars().count() as i64),
-        _ => Err(SeamError::new(ErrorCode::Internal, "outputs has no length")),
-    }
 }
 
 /// Counts run-log records for `correlation_id` in `events.jsonl` (`runlog.read_events`).
@@ -1497,20 +738,9 @@ fn count_events(swarm: &Path, correlation_id: Option<&str>) -> Result<i64, SeamE
         if line.trim().is_empty() {
             continue;
         }
-        let record = parse_json(line)?;
-        let Json::Obj(fields) = &record else {
-            return Err(SeamError::new(
-                ErrorCode::Internal,
-                "run log record is not an object",
-            ));
-        };
-        if let Some(wanted) = wanted {
-            if !matches!(obj_get(fields, "correlation_id"), Some(Json::Str(found)) if found.as_str() == wanted)
-            {
-                continue;
-            }
+        if run_log_counts(line, wanted)? {
+            count += 1;
         }
-        count += 1;
     }
     Ok(count)
 }
@@ -1523,131 +753,6 @@ fn latest_correlation(swarm: &Path) -> Result<Option<String>, SeamError> {
     }
     let text = fs::read_to_string(&path).map_err(io_error)?;
     Ok(Some(text.trim().to_string()))
-}
-
-/// One row of the `orch_status` task table, in the Python output order.
-struct StatusRow {
-    task_id: String,
-    agent: Json,
-    state: String,
-    depth: Json,
-    attempt: i64,
-    rework: i64,
-    ready: bool,
-    gates: Vec<String>,
-    verdicts: Fields,
-    missing: Vec<String>,
-    depends_on: Json,
-    outputs: i64,
-}
-
-impl StatusRow {
-    fn to_json(&self) -> Json {
-        Json::Obj(vec![
-            ("task_id".to_string(), jstr(&self.task_id)),
-            ("agent".to_string(), self.agent.clone()),
-            ("state".to_string(), jstr(&self.state)),
-            ("depth".to_string(), self.depth.clone()),
-            ("attempt".to_string(), Json::Int(self.attempt)),
-            ("rework".to_string(), Json::Int(self.rework)),
-            ("ready".to_string(), Json::Bool(self.ready)),
-            (
-                "gates_required".to_string(),
-                Json::Arr(self.gates.iter().map(|g| jstr(g)).collect()),
-            ),
-            ("verdicts".to_string(), Json::Obj(self.verdicts.clone())),
-            (
-                "missing_gates".to_string(),
-                Json::Arr(self.missing.iter().map(|g| jstr(g)).collect()),
-            ),
-            ("depends_on".to_string(), self.depends_on.clone()),
-            ("outputs".to_string(), Json::Int(self.outputs)),
-        ])
-    }
-
-    fn verdict_text(&self, gate: &str) -> String {
-        match obj_get(&self.verdicts, gate) {
-            Some(Json::Str(verdict)) => verdict.clone(),
-            Some(Json::Null) => "None".to_string(),
-            Some(other) => to_python_json(other),
-            None => "·".to_string(),
-        }
-    }
-}
-
-fn pad(text: &str, width: usize) -> String {
-    let length = text.chars().count();
-    if length >= width {
-        text.to_string()
-    } else {
-        format!("{}{}", text, " ".repeat(width - length))
-    }
-}
-
-/// Builds the human `summary` text exactly as `orch_status.run` does.
-fn status_summary(
-    rows: &[StatusRow],
-    counts: &[(String, i64)],
-    escalated: &[String],
-    complete: bool,
-) -> String {
-    let mut lines = vec![format!(
-        "{}{}{}{}{}{}{}",
-        pad("TASK", 14),
-        pad("AGENT", 7),
-        pad("STATE", 19),
-        pad("ATT", 4),
-        pad("RW", 3),
-        pad("READY", 6),
-        "GATES"
-    )];
-    for row in rows {
-        let gates = if row.gates.is_empty() {
-            "-".to_string()
-        } else {
-            row.gates
-                .iter()
-                .map(|gate| format!("{}={}", gate, row.verdict_text(gate)))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let agent = match &row.agent {
-            Json::Str(name) if !name.is_empty() => name.clone(),
-            _ => "?".to_string(),
-        };
-        lines.push(format!(
-            "{}{}{}{}{}{}{}",
-            pad(&row.task_id, 14),
-            pad(&agent, 7),
-            pad(&row.state, 19),
-            pad(&row.attempt.to_string(), 4),
-            pad(&row.rework.to_string(), 3),
-            pad(if row.ready { "yes" } else { "" }, 6),
-            gates
-        ));
-    }
-    let counts_repr = counts
-        .iter()
-        .map(|(state, count)| format!("'{state}': {count}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let escalated_repr = if escalated.is_empty() {
-        "none".to_string()
-    } else {
-        format!(
-            "[{}]",
-            escalated
-                .iter()
-                .map(|id| format!("'{id}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    lines.push(format!(
-        "\ncounts: {{{counts_repr}}}   escalated: {escalated_repr}   complete: {}",
-        if complete { "True" } else { "False" }
-    ));
-    lines.join("\n")
 }
 
 /// The `orch_status` read path: task list (no `--history`) or one task's history.
@@ -1698,36 +803,8 @@ async fn read_history(
         history.push(Json::Obj(row_fields(row)?));
     }
     let latest = latest_rows(pool, &task).await?;
-    let gates = gates_of(&task)?;
-    let missing = missing_reasons(&gates, &latest)?;
-    let fields = vec![
-        ("status".to_string(), jstr("ok")),
-        ("task_id".to_string(), jstr(task_id)),
-        ("history".to_string(), Json::Arr(history)),
-        (
-            "verdicts".to_string(),
-            Json::Obj(
-                latest
-                    .into_iter()
-                    .map(|(gate, row)| (gate, Json::Obj(row)))
-                    .collect(),
-            ),
-        ),
-        (
-            "missing_gate_reasons".to_string(),
-            Json::Obj(
-                missing
-                    .into_iter()
-                    .map(|(gate, reason)| (gate, jstr(&reason)))
-                    .collect(),
-            ),
-        ),
-        (
-            "summary".to_string(),
-            jstr(&format!("history for {task_id}")),
-        ),
-    ];
-    Ok(finish(fields, call))
+    let fields = history_fields(task_id, history, latest, &task)?;
+    Ok(finish(fields, &call.agent, &call.script))
 }
 
 /// `orch_status` with no transition or ingest: the task table for one correlation, or all tasks.
@@ -1738,128 +815,37 @@ async fn list_status(
     correlation: Option<String>,
 ) -> Result<Reply, SeamError> {
     let tasks = fetch_tasks(pool, correlation.as_deref()).await?;
-    let correlation_json = match &correlation {
-        Some(value) => jstr(value),
-        None => Json::Null,
-    };
     let db_path = swarm.join("tasks.db").display().to_string();
     let swarm_text = swarm.display().to_string();
     if tasks.is_empty() {
-        let fields = vec![
-            ("status".to_string(), jstr("ok")),
-            ("correlation_id".to_string(), correlation_json),
-            ("tasks".to_string(), Json::Arr(Vec::new())),
-            ("db".to_string(), jstr(&db_path)),
-            ("swarm_dir".to_string(), jstr(&swarm_text)),
-            (
-                "summary".to_string(),
-                jstr("no tasks (run orch_plan.py first)"),
-            ),
-        ];
-        return Ok(finish(fields, call));
+        let fields = empty_status(correlation.as_deref(), &db_path, &swarm_text);
+        return Ok(finish(fields, &call.agent, &call.script));
     }
 
-    let satisfied: Vec<String> = tasks
-        .iter()
-        .filter(|t| matches!(t.state.as_str(), "IN_REVIEW" | "APPROVED" | "DONE"))
-        .map(|t| t.task_id.clone())
-        .collect();
-    let is_ready = |task: &Task| {
-        matches!(
-            task.state.as_str(),
-            "PLANNED" | "RETRY" | "CREATED" | "VALIDATED"
-        ) && task.deps.iter().all(|dep| match dep {
-            Json::Str(id) => satisfied.iter().any(|ok| ok == id),
-            _ => false,
-        })
-    };
-
+    let satisfied = satisfied_ids(&tasks);
     let mut counts: Vec<(String, i64)> = Vec::new();
     let mut rows: Vec<StatusRow> = Vec::with_capacity(tasks.len());
     for task in &tasks {
-        let seen = counts
-            .iter()
-            .find(|(state, _)| *state == task.state)
-            .map(|(_, count)| *count)
-            .unwrap_or(0);
-        upsert(&mut counts, task.state.clone(), seen + 1);
+        count_state(&mut counts, &task.state);
         let latest = latest_rows(pool, task).await?;
-        let gates = gates_of(task)?;
-        let missing: Vec<String> = if task.state == "IN_REVIEW" {
-            missing_reasons(&gates, &latest)?
-                .into_iter()
-                .map(|(gate, _)| gate)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let verdicts: Fields = latest
-            .iter()
-            .map(|(gate, row)| {
-                (
-                    gate.clone(),
-                    obj_get(row, "verdict").cloned().unwrap_or(Json::Null),
-                )
-            })
-            .collect();
-        rows.push(StatusRow {
-            task_id: task.task_id.clone(),
-            agent: task.field("agent_id").clone(),
-            state: task.state.clone(),
-            depth: task.field("dag_depth").clone(),
-            attempt: int_field(task, "attempt")?,
-            rework: int_field(task, "rework_loops")?,
-            ready: is_ready(task),
-            gates,
-            verdicts,
-            missing,
-            depends_on: task.field("depends_on").clone(),
-            outputs: outputs_len(task)?,
-        });
+        rows.push(status_row(task, &latest, &satisfied)?);
     }
-
-    let escalated: Vec<String> = rows
-        .iter()
-        .filter(|r| r.state == "ESCALATED")
-        .map(|r| r.task_id.clone())
-        .collect();
-    let complete = rows
-        .iter()
-        .all(|r| r.state == "DONE" || r.state == "CANCELLED");
     let events = count_events(swarm, correlation.as_deref())?;
-    let summary = status_summary(&rows, &counts, &escalated, complete);
-    let fields = vec![
-        ("status".to_string(), jstr("ok")),
-        ("correlation_id".to_string(), correlation_json),
-        (
-            "tasks".to_string(),
-            Json::Arr(rows.iter().map(StatusRow::to_json).collect()),
-        ),
-        (
-            "counts".to_string(),
-            Json::Obj(
-                counts
-                    .iter()
-                    .map(|(state, count)| (state.clone(), Json::Int(*count)))
-                    .collect(),
-            ),
-        ),
-        (
-            "escalated".to_string(),
-            Json::Arr(escalated.iter().map(|id| jstr(id)).collect()),
-        ),
-        ("complete".to_string(), Json::Bool(complete)),
-        ("events".to_string(), Json::Int(events)),
-        ("db".to_string(), jstr(&db_path)),
-        ("swarm_dir".to_string(), jstr(&swarm_text)),
-        ("summary".to_string(), jstr(&summary)),
-    ];
-    Ok(finish(fields, call))
+    let fields = status_list(
+        correlation.as_deref(),
+        &rows,
+        &counts,
+        events,
+        &db_path,
+        &swarm_text,
+    );
+    Ok(finish(fields, &call.agent, &call.script))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gsd_route::py_float;
     use std::future::Future;
 
     type TestResult = Result<(), String>;

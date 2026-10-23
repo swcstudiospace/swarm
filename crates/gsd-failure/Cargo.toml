@@ -9,6 +9,7 @@ categories = ["error-handling", "resilience", "fault-tolerance", "development-to
 keywords = ["circuit-breaker", "retry", "dead-letter", "graceful-degradation", "resilience"]
 
 [dependencies]
+gsd-codes = { path = "../gsd-codes" }
 tokio = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

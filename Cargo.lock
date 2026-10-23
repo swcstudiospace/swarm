@@ -1453,6 +1453,7 @@ dependencies = [
  "gsd-governor",
  "gsd-pool",
  "gsd-proto",
+ "gsd-route",
  "gsd-runtime",
  "gsd-scheduler",
  "gsd-serde",
@@ -1467,6 +1468,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gsd-codes"
+version = "0.1.0"
+
+[[package]]
 name = "gsd-failure"
 version = "0.1.0"
 dependencies = [
@@ -1476,6 +1481,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "futures",
+ "gsd-codes",
  "parking_lot",
  "proptest",
  "serde",
@@ -1626,6 +1632,13 @@ dependencies = [
  "time",
  "ulid",
  "uuid",
+]
+
+[[package]]
+name = "gsd-route"
+version = "0.1.0"
+dependencies = [
+ "gsd-codes",
 ]
 
 [[package]]

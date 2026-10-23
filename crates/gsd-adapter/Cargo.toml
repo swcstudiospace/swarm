@@ -17,6 +17,7 @@ gsd-scheduler = { path = "../gsd-scheduler" }
 gsd-state = { path = "../gsd-state" }
 gsd-pool = { path = "../gsd-pool" }
 gsd-governor = { path = "../gsd-governor" }
+gsd-route = { path = "../gsd-route" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

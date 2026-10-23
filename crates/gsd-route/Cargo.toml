@@ -1,0 +1,12 @@
+[package]
+name = "gsd-route"
+version = "0.1.0"
+edition = "2021"
+description = "Pure route logic for the GSD-Core Rust engine: Python-shaped JSON and Task Store row shaping, with no database access"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["development-tools"]
+keywords = ["adapter", "json", "route", "migration"]
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
