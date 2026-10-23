@@ -12,6 +12,7 @@ keywords = ["security", "sandbox", "audit", "pii", "capability", "isolation"]
 tokio = { workspace = true }
 gsd-runtime = { path = "../gsd-runtime" }
 gsd-proto = { path = "../gsd-proto" }
+gsd-failure = { path = "../gsd-failure" }
 gsd-serde = { path = "../gsd-serde" }
 regex = { workspace = true }
 blake3 = { workspace = true }
