@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Lock-free MPSC queue for high-throughput message passing
 pub struct LockFreeQueue<T> {
@@ -88,88 +88,184 @@ impl<T> LockFreeChannel<T> {
     }
 }
 
-/// Priority-aware semaphore that supports priority-based acquisition
+/// Priority-aware semaphore that supports priority-based acquisition.
+///
+/// All permit accounting happens under one mutex: the available count and the
+/// ordered waiter queue. A release hands the permit directly to the highest
+/// priority live waiter (FIFO among equal priorities), so `available` only grows
+/// when no queued waiter can take the permit.
 #[derive(Debug)]
 pub struct PrioritySemaphore {
-    semaphore: Arc<Semaphore>,
-    waiters: Arc<parking_lot::Mutex<Vec<(i32, tokio::sync::oneshot::Sender<()>)>>>,
+    shared: Arc<Shared>,
+}
+
+#[derive(Debug)]
+struct Shared {
     max_permits: usize,
-    current_permits: Arc<AtomicUsize>,
+    state: parking_lot::Mutex<SemState>,
+}
+
+#[derive(Debug)]
+struct SemState {
+    available: usize,
+    waiters: VecDeque<Waiter>,
+    next_seq: u64,
+}
+
+#[derive(Debug)]
+struct Waiter {
+    priority: i32,
+    seq: u64,
+    tx: oneshot::Sender<()>,
 }
 
 impl PrioritySemaphore {
+    /// Creates a semaphore with `permits` permits.
     pub fn new(permits: usize) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(permits)),
-            waiters: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            max_permits: permits,
-            current_permits: Arc::new(AtomicUsize::new(permits)),
+            shared: Arc::new(Shared {
+                max_permits: permits,
+                state: parking_lot::Mutex::new(SemState {
+                    available: permits,
+                    waiters: VecDeque::new(),
+                    next_seq: 0,
+                }),
+            }),
         }
     }
 
+    /// Acquires a permit, queuing behind higher-priority waiters when none is free.
+    ///
+    /// The `Err` path is unreachable in this design. The oneshot sender lives only in
+    /// the waiter queue. It is either consumed by a hand-off, which sends a value, or
+    /// removed by the waiter's drop guard, which runs only after this future is gone.
+    /// So the receiver always observes a value.
     pub async fn acquire_with_priority(
         &self,
         priority: i32,
-    ) -> Result<PriorityPermit, tokio::sync::oneshot::error::RecvError> {
-        // Fast path: permits available
-        if self.current_permits.fetch_sub(1, Ordering::AcqRel) > 0 {
-            return Ok(PriorityPermit {
-                semaphore: self.semaphore.clone(),
-                current_permits: self.current_permits.clone(),
-            });
-        }
+    ) -> Result<PriorityPermit, oneshot::error::RecvError> {
+        let (seq, rx) = {
+            let mut state = self.shared.state.lock();
+            // Invariant: `available > 0` implies the queue is empty, so this never
+            // barges ahead of queued waiters.
+            if state.available > 0 {
+                state.available -= 1;
+                return Ok(PriorityPermit {
+                    shared: self.shared.clone(),
+                });
+            }
+            let (tx, rx) = oneshot::channel();
+            let seq = state.next_seq;
+            state.next_seq = state.next_seq.wrapping_add(1);
+            state.waiters.push_back(Waiter { priority, seq, tx });
+            (seq, rx)
+        };
 
-        // Need to wait - register with priority
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut waiters = self.waiters.lock();
-            waiters.push((priority, tx));
-            waiters.sort_by_key(|(p, _)| -p); // Higher priority first
-        }
-
-        rx.await?;
-
-        // We got the permit
+        let mut guard = WaitGuard {
+            shared: self.shared.clone(),
+            seq,
+            rx,
+            armed: true,
+        };
+        (&mut guard.rx).await?;
+        guard.armed = false;
         Ok(PriorityPermit {
-            semaphore: self.semaphore.clone(),
-            current_permits: self.current_permits.clone(),
+            shared: self.shared.clone(),
         })
     }
 
+    /// Acquires a permit without waiting. Returns `None` when none is free.
     pub fn try_acquire(&self) -> Option<PriorityPermit> {
-        if self.current_permits.fetch_sub(1, Ordering::AcqRel) > 0 {
-            Some(PriorityPermit {
-                semaphore: self.semaphore.clone(),
-                current_permits: self.current_permits.clone(),
-            })
-        } else {
-            self.current_permits.fetch_add(1, Ordering::Release);
-            None
+        let mut state = self.shared.state.lock();
+        if state.available == 0 {
+            return None;
         }
+        state.available -= 1;
+        Some(PriorityPermit {
+            shared: self.shared.clone(),
+        })
     }
 
+    /// Returns the number of currently free permits.
     pub fn available_permits(&self) -> usize {
-        self.current_permits.load(Ordering::Acquire)
+        self.shared.state.lock().available
     }
 
+    /// Returns the total number of permits this semaphore was created with.
     pub fn max_permits(&self) -> usize {
-        self.max_permits
+        self.shared.max_permits
+    }
+
+    /// Returns the number of live waiters currently queued.
+    #[cfg(test)]
+    fn queued_waiters(&self) -> usize {
+        self.shared.state.lock().waiters.len()
     }
 }
 
+/// A permit from [`PrioritySemaphore`]; dropping it releases the permit.
 #[derive(Debug)]
 pub struct PriorityPermit {
-    semaphore: Arc<Semaphore>,
-    current_permits: Arc<AtomicUsize>,
+    shared: Arc<Shared>,
 }
 
 impl Drop for PriorityPermit {
     fn drop(&mut self) {
-        self.current_permits.fetch_add(1, Ordering::Release);
-
-        // Notify next waiter if any
-        // (In a real implementation, we'd notify the highest priority waiter)
+        release(&self.shared);
     }
+}
+
+/// Drop guard for a queued waiter. Removes its queue entry on cancellation, or
+/// returns a permit that was handed over before the future was dropped.
+struct WaitGuard {
+    shared: Arc<Shared>,
+    seq: u64,
+    rx: oneshot::Receiver<()>,
+    armed: bool,
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The lock is released before `release` is called below.
+        let still_queued = {
+            let mut state = self.shared.state.lock();
+            match state.waiters.iter().position(|w| w.seq == self.seq) {
+                Some(idx) => state.waiters.remove(idx).is_some(),
+                None => false,
+            }
+        };
+        if !still_queued && self.rx.try_recv().is_ok() {
+            release(&self.shared);
+        }
+    }
+}
+
+/// Returns one permit: hands it to the best live waiter, or increments `available`.
+fn release(shared: &Shared) {
+    let mut state = shared.state.lock();
+    while let Some(idx) = next_waiter_index(&state.waiters) {
+        if let Some(waiter) = state.waiters.remove(idx) {
+            if waiter.tx.send(()).is_ok() {
+                return;
+            }
+        }
+    }
+    state.available += 1;
+}
+
+/// Index of the highest-priority waiter; ties keep the earliest queued entry.
+fn next_waiter_index(waiters: &VecDeque<Waiter>) -> Option<usize> {
+    let mut best: Option<(usize, i32)> = None;
+    for (idx, waiter) in waiters.iter().enumerate() {
+        match best {
+            Some((_, priority)) if waiter.priority <= priority => {}
+            _ => best = Some((idx, waiter.priority)),
+        }
+    }
+    best.map(|(idx, _)| idx)
 }
 
 /// Async barrier with timeout support
@@ -530,5 +626,143 @@ mod tests {
         assert!(bucket.take(5).await);
         assert!(bucket.take(5).await);
         assert!(!bucket.take(1).await);
+    }
+
+    async fn wait_for_queued(sem: &PrioritySemaphore, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sem.queued_waiters() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiters were not queued in time");
+    }
+
+    #[tokio::test]
+    async fn priority_semaphore_wakes_waiter_on_release() {
+        let sem = Arc::new(PrioritySemaphore::new(1));
+        let holder = sem.acquire_with_priority(0).await.unwrap();
+        let waiter = {
+            let sem = sem.clone();
+            tokio::spawn(async move { sem.acquire_with_priority(0).await.map(|_| ()) })
+        };
+        wait_for_queued(&sem, 1).await;
+
+        drop(holder);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter hung after release")
+            .expect("waiter task panicked");
+        assert!(result.is_ok());
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_semaphore_serves_highest_priority_first() {
+        let sem = Arc::new(PrioritySemaphore::new(1));
+        let holder = sem.acquire_with_priority(0).await.unwrap();
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+
+        let mut handles = Vec::new();
+        for (label, priority) in [("low", 0), ("high", 5)] {
+            let waiter_sem = sem.clone();
+            let order_tx = order_tx.clone();
+            handles.push(tokio::spawn(async move {
+                let permit = waiter_sem.acquire_with_priority(priority).await.unwrap();
+                let _ = order_tx.send(label);
+                drop(permit);
+            }));
+            wait_for_queued(&sem, handles.len()).await;
+        }
+        drop(order_tx);
+
+        drop(holder);
+        let first = tokio::time::timeout(Duration::from_secs(2), order_rx.recv())
+            .await
+            .expect("first waiter hung");
+        let second = tokio::time::timeout(Duration::from_secs(2), order_rx.recv())
+            .await
+            .expect("second waiter hung");
+        assert_eq!(first, Some("high"));
+        assert_eq!(second, Some("low"));
+
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("waiter task hung")
+                .expect("waiter task panicked");
+        }
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_semaphore_never_exceeds_max_permits() {
+        let sem = PrioritySemaphore::new(2);
+        let p1 = sem.try_acquire().expect("first permit");
+        let p2 = sem.try_acquire().expect("second permit");
+        assert!(sem.try_acquire().is_none());
+        assert_eq!(sem.available_permits(), 0);
+
+        drop(p1);
+        drop(p2);
+        assert_eq!(sem.available_permits(), 2);
+        assert_eq!(sem.max_permits(), 2);
+
+        let p3 = sem.try_acquire().expect("permit after release");
+        let p4 = sem.try_acquire().expect("second permit after release");
+        assert!(sem.try_acquire().is_none());
+        drop(p3);
+        drop(p4);
+        assert_eq!(sem.available_permits(), 2);
+
+        // A waiter queued while full must not let try_acquire admit a second holder:
+        // the wrapped counter of the old slow path did exactly that.
+        let limited = Arc::new(PrioritySemaphore::new(1));
+        let holder = limited.acquire_with_priority(0).await.expect("holder");
+        let queued = {
+            let limited = limited.clone();
+            tokio::spawn(async move { limited.acquire_with_priority(0).await.map(|_| ()) })
+        };
+        wait_for_queued(&limited, 1).await;
+        assert!(
+            limited.try_acquire().is_none(),
+            "try_acquire admitted a second holder"
+        );
+        assert_eq!(limited.available_permits(), 0);
+        drop(holder);
+        let admitted = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("queued waiter hung")
+            .expect("queued waiter panicked");
+        assert!(admitted.is_ok());
+        assert_eq!(limited.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_semaphore_cancelled_waiter_does_not_leak_permit() {
+        let sem = Arc::new(PrioritySemaphore::new(1));
+        let holder = sem.acquire_with_priority(0).await.unwrap();
+        let waiter = {
+            let sem = sem.clone();
+            tokio::spawn(async move { sem.acquire_with_priority(0).await.map(|_| ()) })
+        };
+        wait_for_queued(&sem, 1).await;
+
+        waiter.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("aborted waiter did not finish");
+        assert_eq!(sem.queued_waiters(), 0);
+
+        drop(holder);
+        assert_eq!(sem.available_permits(), 1);
+
+        let permit = tokio::time::timeout(Duration::from_secs(2), sem.acquire_with_priority(0))
+            .await
+            .expect("acquire hung after cancelled waiter")
+            .unwrap();
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
     }
 }
