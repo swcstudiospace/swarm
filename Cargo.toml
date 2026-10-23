@@ -150,12 +150,12 @@ thunderdome = "0.6"
 # yrs for CRDT
 yrs = "0.23"
 automerge = "0.11"
-# WASM runtime: exact pin; first used in P3
-wasmer = "=7.5.0"
+# WASM runtime: exact pin; first used in P5 (wasmtime per D-P3-5; wasm32-wasip2 component target)
+wasmtime = { version = "=50.0.0", features = ["component-model"] }
 
 [workspace.metadata.gsd-pins]
 rustc = "1.98.1"
-wasmer = "7.5.0"
+wasmtime = "50.0.0"
 wasm_target = "wasm32-wasip2"
 
 [profile.release]
