@@ -13,6 +13,7 @@ members = [
     "crates/gsd-failure",
     "crates/gsd-state",
     "crates/gsd-adapter",
+    "crates/gsd-sandbox",
 ]
 # ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli and sdk have invalid or nested manifests.
 exclude = ["crates/gsd-ipc", "crates/gsd-cli", "crates/gsd-sdk"]
