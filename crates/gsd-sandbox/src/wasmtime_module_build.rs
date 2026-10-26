@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 /// Module name the manifest must carry.
 pub const MODULE_NAME: &str = "gsd-core";
 /// Component target the manifest must carry.
-pub const MODULE_TARGET: &str = "wasm32-wasip2";
+pub const MODULE_TARGET: &str = "wasm32-unknown-unknown";
 
 /// Manifest describing one guest module artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +82,21 @@ pub fn describe(bytes: &[u8], name: &str, semver: &str) -> ModuleManifest {
     }
 }
 
+/// Refuses a manifest whose name or target is not the guest module's.
+fn check_name_and_target(name: &str, target: &str) -> Result<(), SandboxError> {
+    if name != MODULE_NAME {
+        return Err(SandboxError::InvalidManifest(format!(
+            "name must be {MODULE_NAME}"
+        )));
+    }
+    if target != MODULE_TARGET {
+        return Err(SandboxError::InvalidManifest(format!(
+            "target must be {MODULE_TARGET}"
+        )));
+    }
+    Ok(())
+}
+
 /// Parses and validates a manifest from JSON bytes.
 pub fn parse_manifest(json: &[u8]) -> Result<ModuleManifest, SandboxError> {
     let text = std::str::from_utf8(json)
@@ -90,16 +105,7 @@ pub fn parse_manifest(json: &[u8]) -> Result<ModuleManifest, SandboxError> {
         SandboxError::InvalidManifest("manifest is not valid JSON for the schema".to_owned())
     })?;
 
-    if manifest.name != MODULE_NAME {
-        return Err(SandboxError::InvalidManifest(format!(
-            "name must be {MODULE_NAME}"
-        )));
-    }
-    if manifest.target != MODULE_TARGET {
-        return Err(SandboxError::InvalidManifest(format!(
-            "target must be {MODULE_TARGET}"
-        )));
-    }
+    check_name_and_target(&manifest.name, &manifest.target)?;
     if !is_semver(&manifest.semver) {
         return Err(SandboxError::InvalidManifest(
             "semver must be MAJOR.MINOR.PATCH with decimal parts".to_owned(),
@@ -115,7 +121,7 @@ pub fn parse_manifest(json: &[u8]) -> Result<ModuleManifest, SandboxError> {
 
 /// Verifies module bytes against a manifest and the host's expected semver.
 ///
-/// Checks run in order: empty bytes, semver, then digest.
+/// Checks run in order: empty bytes, name, target, semver, then digest.
 pub fn verify_module(
     bytes: &[u8],
     manifest: &ModuleManifest,
@@ -124,6 +130,7 @@ pub fn verify_module(
     if bytes.is_empty() {
         return Err(SandboxError::EmptyModule);
     }
+    check_name_and_target(&manifest.name, &manifest.target)?;
     if manifest.semver != expected_semver {
         return Err(SandboxError::VersionMismatch {
             expected: expected_semver.to_owned(),
@@ -211,6 +218,16 @@ mod tests {
     }
 
     #[test]
+    fn verify_refuses_a_foreign_target_in_a_built_manifest() {
+        let mut manifest = describe(WASM, MODULE_NAME, "0.1.0");
+        manifest.target = "wasm32-wasip1".to_owned();
+        assert!(matches!(
+            verify_module(WASM, &manifest, "0.1.0"),
+            Err(SandboxError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
     fn verify_refuses_an_empty_module() {
         let manifest = describe(WASM, MODULE_NAME, "0.1.0");
         assert_eq!(
@@ -221,7 +238,7 @@ mod tests {
 
     #[test]
     fn parse_manifest_rejects_unknown_fields() {
-        let json = br#"{"name":"gsd-core","semver":"0.1.0","target":"wasm32-wasip2",
+        let json = br#"{"name":"gsd-core","semver":"0.1.0","target":"wasm32-unknown-unknown",
             "sha256":"0000000000000000000000000000000000000000000000000000000000000000",
             "extra":true}"#;
         assert!(matches!(
@@ -233,11 +250,11 @@ mod tests {
     #[test]
     fn parse_manifest_rejects_a_malformed_digest() {
         let short = format!(
-            r#"{{"name":"gsd-core","semver":"0.1.0","target":"wasm32-wasip2","sha256":"{}"}}"#,
+            r#"{{"name":"gsd-core","semver":"0.1.0","target":"wasm32-unknown-unknown","sha256":"{}"}}"#,
             "a".repeat(63)
         );
         let upper = format!(
-            r#"{{"name":"gsd-core","semver":"0.1.0","target":"wasm32-wasip2","sha256":"{}"}}"#,
+            r#"{{"name":"gsd-core","semver":"0.1.0","target":"wasm32-unknown-unknown","sha256":"{}"}}"#,
             "A".repeat(64)
         );
         assert!(matches!(
@@ -254,7 +271,7 @@ mod tests {
     fn parse_manifest_rejects_a_foreign_name_or_target() {
         let digest = "a".repeat(64);
         let foreign_name = format!(
-            r#"{{"name":"other","semver":"0.1.0","target":"wasm32-wasip2","sha256":"{digest}"}}"#
+            r#"{{"name":"other","semver":"0.1.0","target":"wasm32-unknown-unknown","sha256":"{digest}"}}"#
         );
         let foreign_target = format!(
             r#"{{"name":"gsd-core","semver":"0.1.0","target":"wasm32-wasip1","sha256":"{digest}"}}"#

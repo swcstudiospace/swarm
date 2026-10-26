@@ -102,6 +102,7 @@ def _env(tmp_path, monkeypatch):
     for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
         monkeypatch.delenv(k)  # an ambient HTTP_PROXY/NO_PROXY never leaks into a transport test
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.setenv("SWARM_PURE_PYTHON", "1")  # the oracle switch survives the scrub: child scripts import the pure modules
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))  # a tmp dir is never mistaken for a checkout's subdir
     substrate_client.reset()
     tee_mod.reset()

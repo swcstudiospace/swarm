@@ -16,11 +16,15 @@ members = [
     "crates/gsd-sandbox",
     "crates/gsd-route",
     "crates/gsd-codes",
+    "crates/gsd-guest",
+    "crates/gsd-sdk",
+    "crates/gsd-python",
 ]
-# ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli and sdk have invalid or nested manifests.
-exclude = ["crates/gsd-ipc", "crates/gsd-cli", "crates/gsd-sdk"]
+# ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli has an invalid manifest.
+exclude = ["crates/gsd-ipc", "crates/gsd-cli"]
 
 [workspace.dependencies]
+pyo3 = { version = "0.30.1", default-features = false, features = ["abi3-py312", "macros"] }
 tokio = { version = "1.40", features = ["full", "rt-multi-thread", "macros", "io-util", "net", "time", "sync", "fs", "process", "signal"] }
 tokio-uring = "0.5"
 tonic = { version = "0.12", features = ["tls", "transport", "codegen"] }
@@ -153,13 +157,14 @@ thunderdome = "0.6"
 # yrs for CRDT
 yrs = "0.23"
 automerge = "0.11"
-# WASM runtime: exact pin; first used in P5 (wasmtime per D-P3-5; wasm32-wasip2 component target)
+# WASM runtime: exact pin; first used in P5 (wasmtime per D-P3-5; the guest is a wasm32-unknown-unknown core module wrapped as a component, D-P5-13)
 wasmtime = { version = "=50.0.0", features = ["component-model"] }
 
 [workspace.metadata.gsd-pins]
 rustc = "1.98.1"
 wasmtime = "50.0.0"
-wasm_target = "wasm32-wasip2"
+wit-bindgen = "0.57.1"
+wasm_target = "wasm32-unknown-unknown"
 
 [profile.release]
 opt-level = 3

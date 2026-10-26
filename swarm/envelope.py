@@ -26,6 +26,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Protocol, cast
 
 from .errors import SwarmError, ErrorCode
 from .state_store import get_swarm_state_store
@@ -41,6 +42,20 @@ REQUIRED_FIELDS = ("msg_id", "correlation_id", "trace_id", "source", "target", "
 
 
 
+class _Ed25519Verifier(Protocol):
+    """Public half of an Ed25519 key, structurally matching the `cryptography` type."""
+
+    def verify(self, signature: bytes, data: bytes) -> None: ...
+
+
+class _Ed25519Signer(Protocol):
+    """Private half of an Ed25519 key, structurally matching the `cryptography` type."""
+
+    def sign(self, data: bytes) -> bytes: ...
+
+    def public_key(self) -> _Ed25519Verifier: ...
+
+
 def _uuid7() -> str:
     """UUIDv7-style id (time-ordered) without external deps."""
     ms = int(time.time() * 1000)
@@ -53,11 +68,11 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z"
 
 
-def build_envelope(*, source: str, target: str, msg_type: str, payload: dict,
+def build_envelope(*, source: str, target: str, msg_type: str, payload: dict[str, object],
                    correlation_id: str | None = None, causation_id: str | None = None,
                    trace_id: str | None = None, ttl_s: int = 300, priority: str = "P2",
-                   risk_class: str = "low") -> dict:
-    env = {
+                   risk_class: str = "low") -> dict[str, object]:
+    env: dict[str, object] = {
         "msg_id": _uuid7(),
         "correlation_id": correlation_id or str(uuid.uuid4()),
         "trace_id": trace_id or uuid.uuid4().hex,
@@ -77,7 +92,7 @@ def build_envelope(*, source: str, target: str, msg_type: str, payload: dict,
     return env
 
 
-def validate_envelope(env: dict, *, require_sig: bool = True) -> None:
+def validate_envelope(env: dict[str, object], *, require_sig: bool = True) -> None:
     if not isinstance(env, dict):
         raise SwarmError(ErrorCode.E_CONTRACT, "envelope must be an object")
     missing = [f for f in REQUIRED_FIELDS if f not in env]
@@ -90,9 +105,12 @@ def validate_envelope(env: dict, *, require_sig: bool = True) -> None:
         raise SwarmError(ErrorCode.E_CONTRACT, f"bad priority {env['priority']!r}")
     if env["risk_class"] not in RISK_CLASSES:
         raise SwarmError(ErrorCode.E_CONTRACT, f"bad risk_class {env['risk_class']!r}")
-    if not env["schema"].startswith(SCHEMA_PREFIX) or env["schema"] != SCHEMA_PREFIX + env["type"]:
+    # not_str above guarantees these are strings; the casts only narrow them for mypy.
+    schema = cast(str, env["schema"])
+    msg_type = cast(str, env["type"])
+    if not schema.startswith(SCHEMA_PREFIX) or schema != SCHEMA_PREFIX + msg_type:
         raise SwarmError(ErrorCode.E_CONTRACT, "schema must equal swarm.v1.<type>")
-    if "." not in env["type"]:
+    if "." not in msg_type:
         raise SwarmError(ErrorCode.E_CONTRACT, "type must be namespaced <domain>.<name>")
     if not isinstance(env["payload"], dict):
         raise SwarmError(ErrorCode.E_CONTRACT, "payload must be an object")
@@ -100,7 +118,7 @@ def validate_envelope(env: dict, *, require_sig: bool = True) -> None:
         raise SwarmError(ErrorCode.E_POLICY, f"{env['type']} requires a signature")
 
 
-def _canonical(env: dict) -> bytes:
+def _canonical(env: dict[str, object]) -> bytes:
     body = {k: v for k, v in env.items() if k != "sig"}
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
@@ -165,9 +183,15 @@ def _conventional_reference() -> Path | None:
     home = os.environ.get("HOME")
     if not config and not home:
         return None
-    return (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
+    if config:
+        base = Path(config)
+    elif home:
+        base = Path(home) / ".config"
+    else:
+        return None
+    return base / "agent-swarm" / "signing-key.hex"
 
-def _ed25519_material() -> tuple[object | None, str | None]:
+def _ed25519_material() -> tuple[_Ed25519Signer | None, str | None]:
     raw = os.environ.get("SWARM_ED25519_KEY")
     if raw:
         try:
@@ -189,9 +213,10 @@ def _ed25519_material() -> tuple[object | None, str | None]:
                 raise ValueError("empty reference")
             path = Path(reference)
         else:
-            path = _conventional_reference()
-            if path is None:
+            conventional = _conventional_reference()
+            if conventional is None:
                 return None, None
+            path = conventional
         if not path.is_absolute():
             # A relative reference would name a different file for each caller's working directory.
             return None, "fail-closed: private Ed25519 signing reference must be an absolute path"
@@ -204,7 +229,7 @@ def _ed25519_material() -> tuple[object | None, str | None]:
         return None, "fail-closed: private Ed25519 signing reference cannot be loaded safely"
 
 
-def _ed25519_key():
+def _ed25519_key() -> _Ed25519Signer | None:
     return _ed25519_material()[0]
 
 
@@ -287,7 +312,7 @@ def _signing_key_supplied() -> bool:
     conventional = _conventional_reference()
     e = conventional is not None and os.path.lexists(conventional)
     return (a + b + c + d + e) > 0
-def perform_signing_key_lifecycle(*, root=None) -> dict:
+def perform_signing_key_lifecycle(*, root: str | Path | None = None) -> dict[str, str]:
     """Signing key lifecycle as FIRST step in swarm coordinator init.
 
     Uses existing _ed25519_material/_signing_key_supplied/validate_signing_key/
@@ -340,16 +365,17 @@ def validate_signing_key() -> str | None:
     Acceptance: const time branch decision when present; clear msgs; used by init/preflight.
     """
     return signing_config_error()
-def _warn_dev_key(env: dict, root: str | Path | None) -> None:
+def _warn_dev_key(env: dict[str, object], root: str | Path | None) -> None:
     try:
         from .runlog import emit
+        # build_envelope always sets correlation_id to a str; hand-built envelopes may omit it, and emit takes str | None.
         emit("security.dev_key", {"msg_type": env["type"], "source": env["source"]},
-             source="swarm.envelope", correlation_id=env.get("correlation_id"), root=root)
+source="swarm.envelope", correlation_id=cast(str | None, env.get("correlation_id")), root=root)
     except Exception:  # signing never fails on logging
         pass
 
 
-def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = True) -> dict:
+def sign_envelope(env: dict[str, object], *, root: str | Path | None = None, audit: bool = True) -> dict[str, object]:
     """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10).
     audit=False skips that event for a key-less agent-session preview that can never record (WR-15)."""
     err = signing_config_error()
@@ -380,7 +406,7 @@ def _b64(data: str) -> bytes | None:
         return None
 
 
-def verify_envelope(env: dict) -> bool:
+def verify_envelope(env: dict[str, object]) -> bool:
     sig = env.get("sig") if isinstance(env, dict) else None
     if not isinstance(sig, str):
         return False

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -56,7 +57,7 @@ _DIRECTIVES = ("#include", "#define", "#if", "#elif", "#else", "#endif", "#pragm
                "#import", "#!")
 
 
-def _bad(field: str, message: str) -> dict:
+def _bad(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
@@ -65,8 +66,8 @@ def _categories(path: str) -> set[str]:
     return {name for name, words in _CATEGORY_WORDS.items() if tokens & words}
 
 
-def sensitive_paths(payload: dict) -> dict:
-    def work() -> dict:
+def sensitive_paths(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         flagged: list[str] = []
         categories: set[str] = set()
         for path in dict.fromkeys(payload["paths"]):
@@ -85,8 +86,8 @@ def sensitive_paths(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def auto_approve_check(payload: dict) -> dict:
-    def work() -> dict:
+def auto_approve_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         diff_lines = payload["added"] + payload["deleted"]
         failed: list[str] = []
         if diff_lines >= 100:
@@ -112,8 +113,8 @@ def auto_approve_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def review_latency_p95(payload: dict) -> dict:
-    def work() -> dict:
+def review_latency_p95(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         ordered = sorted(payload["durations_min"])
         rank = (95 * len(ordered) + 99) // 100  # nearest-rank: ceil(0.95 * n), 1-based
         p95 = float(ordered[rank - 1])
@@ -127,8 +128,8 @@ def review_latency_p95(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def severity_histogram(payload: dict) -> dict:
-    def work() -> dict:
+def severity_histogram(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         counts = {name: 0 for name in _SEVERITIES}
         for severity in payload["severities"]:
             counts[severity] += 1
@@ -144,8 +145,8 @@ def severity_histogram(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def false_approve_rate(payload: dict) -> dict:
-    def work() -> dict:
+def false_approve_rate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         approved = payload["approved_count"]
         defects = payload["defects_found_later"]
         if defects > approved:
@@ -166,8 +167,8 @@ def _is_comment(line: str) -> bool:
     return line.startswith(_COMMENT_PREFIXES) or line == "*"
 
 
-def comment_density(payload: dict) -> dict:
-    def work() -> dict:
+def comment_density(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         nonblank = 0
         comments = 0
         for raw in payload["added_lines"]:
@@ -214,8 +215,8 @@ def _test_base(dirs: list[str], stem: str) -> str | None:
     return None
 
 
-def test_pairing(payload: dict) -> dict:
-    def work() -> dict:
+def test_pairing(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         sources: list[tuple[str, str]] = []
         covered: set[str] = set()
         test_count = 0
@@ -243,8 +244,8 @@ def test_pairing(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def unresolved_threads(payload: dict) -> dict:
-    def work() -> dict:
+def unresolved_threads(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         threads = payload["threads"]
         ids = [thread["id"] for thread in threads]
         if len(set(ids)) != len(ids):
@@ -277,7 +278,7 @@ _MAX_BLOCK_ITEMS = 2000
 _DEFAULT_DISPUTE_THRESHOLD = 2
 
 
-def risk_tier(payload: dict) -> dict:
+def risk_tier(payload: dict[str, Any]) -> dict[str, Any]:
     """Map restricted categories, diff size and top severity to risk_tier low/medium/high.
 
     high   co_sign_required, or max_severity critical or blocker
@@ -285,7 +286,7 @@ def risk_tier(payload: dict) -> dict:
     low    none of the above
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         categories = list(dict.fromkeys(payload["categories"]))
         unknown = [name for name in categories if name not in _CATEGORY_WORDS]
         if unknown:
@@ -325,9 +326,9 @@ def _line_ok(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def _verdict_block_errors(block: dict) -> tuple[list[dict], str]:
+def _verdict_block_errors(block: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
     """(errors, normalized verdict or "none") for the final review json block (prompt output_format)."""
-    errors: list[dict] = []
+    errors: list[dict[str, Any]] = []
 
     def err(field: str, reason: str) -> None:
         errors.append({"field": field, "reason": reason})
@@ -394,8 +395,8 @@ def _verdict_block_errors(block: dict) -> tuple[list[dict], str]:
     return errors, normalized
 
 
-def verdict_shape(payload: dict) -> dict:
-    def work() -> dict:
+def verdict_shape(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         block = payload["block"]
         for key in ("blocking", "non_blocking"):
             if isinstance(block.get(key), list) and len(block[key]) > _MAX_BLOCK_ITEMS:
@@ -406,14 +407,14 @@ def verdict_shape(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def rule_dispute_flag(payload: dict) -> dict:
+def rule_dispute_flag(payload: dict[str, Any]) -> dict[str, Any]:
     """Flag rules that one producer disputed on at least `threshold` distinct pull requests (default 2).
 
     Counts are per (rule, producer): a rule disputed once each by two producers is not merged into one count, and a
     repeated (rule, pr, producer) dispute is counted once.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         threshold = payload.get("threshold", _DEFAULT_DISPUTE_THRESHOLD)
         seen: set[tuple[str, str, str]] = set()
         for index, item in enumerate(payload["disputes"]):

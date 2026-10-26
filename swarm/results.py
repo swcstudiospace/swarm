@@ -31,23 +31,29 @@ from __future__ import annotations
 import json
 import re
 from contextlib import nullcontext
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .errors import SwarmError, ErrorCode
 from .gates import BLOCKING_SEVERITY, SEVERITIES
 from .schema import load_schema, validate
 from .taskstore import TaskStore, TaskState as S
 
+if TYPE_CHECKING:
+    from .substrate_handoff import HandoffBridge
+    from .substrate_lease import LeaseBridge
+
 JSON_BLOCK = re.compile(r"```json\s*(\{.*?\})\s*```", re.S)
 SCHEMA_NAME = "task.result.v1"
-Emit = Callable[[str, dict], object]
+# Emitter callers differ: Ctx.emit takes `task_id=`; the batch reconcile emitter does not (reachable only with approve=False).
+Emit = Callable[..., object]
 
 
-def parse_result(text: str) -> dict | None:
+def parse_result(text: str) -> dict[str, Any] | None:
     """Last parseable fenced ```json block, else the whole text as a bare JSON object."""
     for raw in reversed(JSON_BLOCK.findall(text or "")):
         try:
-            return json.loads(raw)
+            parsed: dict[str, Any] = json.loads(raw)  # JSON_BLOCK captures one `{...}` object, so the parse is an object
+            return parsed
         except json.JSONDecodeError:
             continue
     try:
@@ -57,7 +63,7 @@ def parse_result(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-def validate_result(result, *, task_id: str) -> dict:
+def validate_result(result: dict[str, Any] | None, *, task_id: str) -> dict[str, Any]:
     """Schema-check `result` and bind it to the assigned task; raise E-CONTRACT otherwise."""
     if result is None:
         raise SwarmError(ErrorCode.E_CONTRACT, "no JSON result block from agent", task_id=task_id)
@@ -85,8 +91,10 @@ def reject(store: TaskStore, task_id: str, *, attempt: int, reason: str, mode: s
             if current["state"] == S.IN_PROGRESS.value and current["attempt"] == attempt:
                 store.transition(task_id, S.FAILED, reason=reason[:500])
                 return S.FAILED.value
-            return current["state"]
-    return store.get(task_id)["state"]
+            state: str = current["state"]
+            return state
+    new_state: str = store.get(task_id)["state"]
+    return new_state
 
 
 def check_manual_transition(store: TaskStore, task_id: str, to_state: str) -> None:
@@ -109,7 +117,7 @@ def _lease_start(store: TaskStore, task_id: str) -> float | None:
     return claims[-1] if claims else None
 
 
-def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
+def _gate_script_missing(store: TaskStore, task: dict[str, Any]) -> list[str]:
     """gate_for targets of a gate task lacking a verifying row that its gate script issued during the current lease
     (since the latest CLAIMED). With no CLAIMED row the lease start is unknown, so every target counts as missing.
     A PLANNED or RETRY gate task holds no lease at all (T-05-30): "the latest CLAIMED" would be its PREVIOUS lease, and an
@@ -130,19 +138,19 @@ def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
 PASS_VERDICTS = frozenset({"pass", "approve"})
 
 
-def agent_verdict(entry: dict) -> str:
+def agent_verdict(entry: dict[str, Any]) -> str:
     """A gate agent's verdicts{} entry's verdict string, normalized (stripped, lower-case; "" when missing).
     validate_result guarantees the entry is an object and its verdict a string."""
     return str(entry.get("verdict") or "").strip().lower()
 
 
-def agent_failed(entry: dict) -> bool:
+def agent_failed(entry: dict[str, Any]) -> bool:
     """Fail closed: an entry fails its target unless its verdict is in PASS_VERDICTS. Only for entries present in
     verdicts{}."""
     return agent_verdict(entry) not in PASS_VERDICTS
 
 
-def _review_verdict_mismatch(store: TaskStore, task: dict, result: dict) -> list[str]:
+def _review_verdict_mismatch(store: TaskStore, task: dict[str, Any], result: dict[str, Any]) -> list[str]:
     """Sorted gate_for targets of a review gate task whose agent verdicts{} entry fails (agent_failed) while the review
     row its script issued during the current lease is not `fail`. A failing entry under a key that is not a gate_for
     id applies to every target. Targets without such a row are _gate_script_missing's concern."""
@@ -166,7 +174,7 @@ def _review_verdict_mismatch(store: TaskStore, task: dict, result: dict) -> list
 BLOCKING_SEVERITIES = frozenset(SEVERITIES[SEVERITIES.index(BLOCKING_SEVERITY):])
 
 
-def _counts_major(finding) -> bool:
+def _counts_major(finding: object) -> bool:
     """A finding under a failing entry counts as major or worse unless its severity is a known one below major
     (case-insensitive); non-object findings and missing/unknown severities count as major, as swarm_run normalizes."""
     if not isinstance(finding, dict):
@@ -177,7 +185,7 @@ def _counts_major(finding) -> bool:
     return True
 
 
-def agent_findings(entry: dict) -> tuple[list, bool]:
+def agent_findings(entry: dict[str, Any]) -> tuple[list[object], bool]:
     """(findings, synthesized) of a verdicts{} entry. A failing entry without a finding of major or worse gets one
     synthesized major `agent-verdict` finding appended (IN-15), so an agent's failure always fails its target instead of
     reducing to an empty list or to minor findings that rev_gate passes. Passing entries are returned unchanged."""
@@ -189,7 +197,7 @@ def agent_findings(entry: dict) -> tuple[list, bool]:
     return items + [{"severity": "major", "kind": "agent-verdict", "summary": f"gate agent reported {verdict!r} {why}"}], True
 
 
-def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
+def _agent_verdict_feedback(store: TaskStore, task: dict[str, Any], result: dict[str, Any]) -> None:
     """A gate agent's verdicts{} is advisory text only (D-12): failing entries (agent_failed) become feedback on the
     gate task's own gate_for targets. Verdict rows are written solely by the gate scripts (swarm.verdicts)."""
     notes = task["notes_json"]
@@ -208,7 +216,7 @@ class _GateRefused(SwarmError):
     transition, is not one of these and must keep propagating."""
 
 
-def _gate_result_error(store: TaskStore, task: dict, result: dict) -> _GateRefused | None:
+def _gate_result_error(store: TaskStore, task: dict[str, Any], result: dict[str, Any]) -> _GateRefused | None:
     """Why this gate task's IN_REVIEW result must be refused, or None when the script's rows from this lease agree.
 
     Measured on `task` as it stands now, including lease history read from the store. A caller holding the write lock
@@ -240,7 +248,8 @@ def _refuse_gate(store: TaskStore, tid: str, err: SwarmError, mode: str, emit: E
     raise err
 
 
-def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, meta: dict, emit: Emit, mode: str) -> str:
+def apply_result(store: TaskStore, task: dict[str, Any], *, agent_id: str, result: dict[str, Any], meta: dict[str, Any],
+                 emit: Emit, mode: str) -> str:
     """Apply a validated result to the assigned task only; returns the task's new state."""
     tid = task["task_id"]
     state = result["state"]
@@ -310,10 +319,11 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
                 store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
                                    version=str(o.get("version", "1")),
                                    digest=o.get("digest", ""), producer=agent_id)
-    return store.get(tid)["state"]
+    new_state: str = store.get(tid)["state"]
+    return new_state
 
 
-def _stalled_gates(store: TaskStore, task: dict, reasons: dict[str, str], corr: str) -> list[str]:
+def _stalled_gates(store: TaskStore, task: dict[str, Any], reasons: dict[str, str], corr: str) -> list[str]:
     """Sorted "gate:reason" for required gates missing for a reason other than fail that no live gate task (state
     outside DONE/CANCELLED/ESCALATED) of that gate covers: nothing is left to issue them, so the task would stall."""
     tid = task["task_id"]
@@ -326,13 +336,13 @@ def _stalled_gates(store: TaskStore, task: dict, reasons: dict[str, str], corr: 
 RERUN_SUFFIX = re.compile(r"(\.r\d+)+$")
 
 
-def _rerun_index(task: dict) -> int:
+def _rerun_index(task: dict[str, Any]) -> int:
     """Rerun sequence of a gate task within its lineage: N for "<base>.rN", 0 for the original gate task."""
     m = re.search(r"\.r(\d+)$", task["task_id"])
     return int(m.group(1)) if m else 0
 
 
-def _ancestors(task: dict, rows: list[dict]) -> set[str]:
+def _ancestors(task: dict[str, Any], rows: list[dict[str, Any]]) -> set[str]:
     """Every task id that `task` depends on, directly or through other tasks of `rows`."""
     by_id = {row["task_id"]: row for row in rows}
     seen: set[str] = set()
@@ -346,7 +356,8 @@ def _ancestors(task: dict, rows: list[dict]) -> set[str]:
     return seen
 
 
-def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None, *, approve: bool = True) -> list[str]:
+def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | None = None,
+              handoffs: HandoffBridge | None = None, *, approve: bool = True) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates.
 
     `leases` is the runner's substrate_lease.LeaseBridge, or None (ingest, dry runs, substrate off). It is told about
@@ -388,7 +399,7 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                 # not started (PLANNED/RETRY) or is left to A01 (FAILED/BLOCKED/ESCALATED/CANCELLED) gets none
                 # a completed scan (a non-gate task that depends on the target: netchk, polchk, res) holds a result from the
                 # pre-rework artifact too, so it joins its lineage; the consumers that have not finished wait for its rerun
-                lineages: dict[str, list[dict]] = {}
+                lineages: dict[str, list[dict[str, Any]]] = {}
                 for g in store.list(correlation_id=corr):
                     if tid in g["notes_json"].get("gate_for", []) or (not g["notes_json"].get("gate") and tid in g["depends_on"]
                                                                       and not store.required_gates(g["task_id"])):

@@ -9,19 +9,20 @@
 //! (`swarm/taskstore.py`). Every other entrypoint refuses with `E-DEP` until its route flips.
 
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::future::{pending, Future};
+use std::io::{ErrorKind, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use gsd_failure::{error_code_from_python, ErrorCode};
 use gsd_route::{
-    check_safe_id, count_state, empty_status, finish, history_fields, jstr, obj_get, parse_json,
-    push_latest, run_log_counts, satisfied_ids, status_list, status_row, to_python_json, Fields,
-    Json, LatestRow, ReadArgs, StatusRow, Task,
+    check_safe_id, jstr, obj_get, orch_status_reply, parse_json, run_log_counts, to_python_json,
+    Fields, Json, ReadArgs, Task,
 };
 use gsd_route::{parse_orch_status_read, Reply, SeamError};
+use gsd_sdk::omp_bridge_pins::{AbortKind, BridgeError, StopReason};
+use gsd_sdk::omp_bridge_runner::{InvokeRequest, OmpBridge};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
@@ -270,9 +271,44 @@ fn invoke_checked<B: CoreBackend + ?Sized>(
     enforce_exit_contract(reply.exit_code, &reply.stdout, "")
 }
 
-/// Canonicalises `path`, falling back to the path as given when it does not exist.
+/// Canonicalises `path`. When it does not exist, the longest existing ancestor is canonicalised
+/// and the missing tail is appended after `.` and `..` are removed lexically, as
+/// `Path(base, value).resolve()` does in `swarm/paths.py`.
 fn canonical_or(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(done) = fs::canonicalize(path) {
+        return done;
+    }
+    let normal = lexical_normal(path);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut head = normal.clone();
+    loop {
+        if let Ok(done) = fs::canonicalize(&head) {
+            return tail.iter().rev().fold(done, |acc, part| acc.join(part));
+        }
+        let Some(name) = head.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return normal;
+        };
+        let Some(parent) = head.parent().map(Path::to_path_buf) else {
+            return normal;
+        };
+        tail.push(name);
+        head = parent;
+    }
+}
+
+/// Removes `.` components and resolves each `..` against the components before it.
+fn lexical_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Returns the value of `key` in `env` when it is set and non-empty.
@@ -315,20 +351,29 @@ fn git_toplevel(base: &Path) -> Option<String> {
 }
 
 /// Lane-verb and gate passthrough to the Python scripts, with the frozen argv and env contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Each call runs through the sdk runner, which owns the child's process group and its deadline.
+/// This seam classifies the outcome with [`enforce_exit_contract`].
+#[derive(Debug)]
 pub struct PythonEngine {
     python: String,
+    runtime: Result<tokio::runtime::Runtime, String>,
 }
 
 impl PythonEngine {
     /// Uses the given interpreter (normally `python3`).
     pub fn new(python: impl Into<String>) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string());
         Self {
             python: python.into(),
+            runtime,
         }
     }
 
-    fn run_script(&self, call: &Invocation) -> Result<Reply, SeamError> {
+    fn run_through_sdk(&self, call: &Invocation) -> Result<Reply, SeamError> {
         let script_path = call
             .root
             .join("scripts")
@@ -339,118 +384,97 @@ impl PythonEngine {
                 format!("script not found: {}", call.script),
             ));
         }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .map_err(|e| SeamError::new(ErrorCode::Internal, format!("tokio runtime: {e}")))?;
         let swarm_dir = resolve_swarm_dir(&call.root, env_value(&call.env, "SWARM_DIR"));
-        let mut command = Command::new(&self.python);
-        command
-            .arg(&script_path)
-            .args(&call.argv)
-            .arg("--json")
-            .current_dir(&call.root)
-            .envs(
-                call.env
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
-            )
-            .env("SWARM_DIR", swarm_dir.as_os_str())
-            .env_remove("SWARM_TASK_ID")
-            .env_remove("SWARM_CORRELATION_ID")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|e| {
-            SeamError::new(ErrorCode::Dep, format!("cannot start {}: {e}", self.python))
-        })?;
-        let stdout_reader = child.stdout.take().map(read_all);
-        let stderr_reader = child.stderr.take().map(read_all);
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if started.elapsed() >= call.deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(SeamError::new(
-                            ErrorCode::Timeout,
-                            format!("{} exceeded {} s", call.script, call.deadline.as_secs()),
-                        ));
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => {
-                    return Err(SeamError::new(
-                        ErrorCode::Internal,
-                        format!("wait failed: {e}"),
-                    ))
-                }
-            }
+        let bridge = OmpBridge::for_root(call.root.clone()).with_interpreter(self.python.as_str());
+        let req = InvokeRequest {
+            script: &call.script,
+            args: &call.argv,
+            cwd: &call.root,
+            swarm_dir: &swarm_dir,
+            env: &call.env,
+            timeout_ms: u64::try_from(call.deadline.as_millis()).unwrap_or(u64::MAX),
         };
-        let Some(exit_code) = status.code() else {
+        // The seam has no abort source, so only the deadline stops the call.
+        let run = runtime
+            .block_on(bridge.invoke_raw(req, pending::<AbortKind>()))
+            .map_err(bridge_error)?;
+        match run.stopped {
+            Some(StopReason::Timeout) => {
+                return Err(SeamError::new(
+                    ErrorCode::Timeout,
+                    format!("{} exceeded {} s", call.script, call.deadline.as_secs()),
+                ));
+            }
+            Some(StopReason::Abort) => {
+                return Err(SeamError::new(
+                    ErrorCode::Internal,
+                    format!("{} cancelled", call.script),
+                ));
+            }
+            None => {}
+        }
+        let Some(exit_code) = run.exit_code else {
             return Err(SeamError::new(
                 ErrorCode::Internal,
                 "script terminated by a signal",
             ));
         };
-        let stdout = String::from_utf8(join_bytes(stdout_reader))
+        let stdout = String::from_utf8(run.stdout)
             .map_err(|_| SeamError::new(ErrorCode::Internal, "stdout is not UTF-8"))?;
-        let stderr = String::from_utf8_lossy(&join_bytes(stderr_reader)).into_owned();
+        let stderr = String::from_utf8_lossy(&run.stderr);
         enforce_exit_contract(exit_code, &stdout, &stderr)
     }
 }
 
-fn read_all<R: Read + Send + 'static>(mut source: R) -> JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = source.read_to_end(&mut buffer);
-        buffer
-    })
-}
-
-fn join_bytes(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
+/// Carries a runner error into the seam with its wire code. The runner message already starts
+/// with `CODE: `, so it is not prefixed a second time.
+fn bridge_error(error: BridgeError) -> SeamError {
+    SeamError::unprefixed(error.code, error.message)
 }
 
 impl CoreBackend for PythonEngine {
     fn swarm_run(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn orch_plan(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn orch_assign(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn qa_gate(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn rev_gate(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn sec_gate(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn rel_plan(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn swarm_tool(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 
     fn lane_verb(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.run_script(call)
+        self.run_through_sdk(call)
     }
 }
 
@@ -462,36 +486,64 @@ pub struct RustEngine {
 impl RustEngine {
     /// Builds the engine's single-threaded tokio runtime.
     pub fn new() -> Result<Self, SeamError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| SeamError::new(ErrorCode::Internal, format!("tokio runtime: {e}")))?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime: single_thread_runtime()?,
+        })
     }
 
     fn orch_status_read(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        let args = match parse_orch_status_read(&call.argv) {
-            Some(args) if args.json => args,
-            _ => return Err(no_route(&call.script)),
-        };
-        let deadline = call.deadline;
-        self.runtime.block_on(async {
-            match tokio::time::timeout(deadline, read_orch_status(&args, call)).await {
-                Ok(result) => result,
-                Err(_) => Err(SeamError::new(
-                    ErrorCode::Timeout,
-                    format!("orch_status exceeded {} s", deadline.as_secs()),
-                )),
-            }
-        })
+        let args = read_args(call)?;
+        self.runtime.block_on(within_deadline(
+            call.deadline,
+            &call.script,
+            host_orch_status(&args, call),
+        ))
     }
 }
 
-fn no_route(script: &str) -> SeamError {
+/// The `E-DEP` refusal for a script or argv this engine does not serve.
+pub(crate) fn no_route(script: &str) -> SeamError {
     SeamError::new(
         ErrorCode::Dep,
         format!("the rust engine has no route for {script}; use GSD_ENGINE=python"),
     )
+}
+
+/// Builds the single-threaded tokio runtime the engines block on.
+pub(crate) fn single_thread_runtime() -> Result<tokio::runtime::Runtime, SeamError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SeamError::new(ErrorCode::Internal, format!("tokio runtime: {e}")))
+}
+
+/// Reads the `orch_status --json` flags of `call`; any other argv is refused with `E-DEP`.
+pub(crate) fn read_args(call: &Invocation) -> Result<ReadArgs, SeamError> {
+    match parse_orch_status_read(&call.argv) {
+        Some(args) if args.json => Ok(args),
+        _ => Err(no_route(&call.script)),
+    }
+}
+
+/// Runs `future` under the call deadline; expiry is `E-TIMEOUT`.
+pub(crate) async fn within_deadline<T>(
+    deadline: Duration,
+    script: &str,
+    future: impl Future<Output = Result<T, SeamError>>,
+) -> Result<T, SeamError> {
+    match tokio::time::timeout(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => Err(SeamError::new(
+            ErrorCode::Timeout,
+            format!("{script} exceeded {} s", deadline.as_secs()),
+        )),
+    }
+}
+
+/// The host Rust answer to a read: the snapshot shaped by the pure route logic.
+async fn host_orch_status(args: &ReadArgs, call: &Invocation) -> Result<Reply, SeamError> {
+    let request = read_snapshot(args, call).await?;
+    orch_status_reply(&request)
 }
 
 impl CoreBackend for RustEngine {
@@ -589,7 +641,7 @@ const SCHEMA_STATEMENTS: [&str; 4] = [
 ];
 
 /// Creates the Swarm state directory, then opens `tasks.db` under it with the schema and the verdict envelope columns, like `TaskStore.__init__`.
-async fn open_store(swarm: &Path) -> Result<SqlitePool, SeamError> {
+pub(crate) async fn open_store(swarm: &Path) -> Result<SqlitePool, SeamError> {
     ensure_store_dir(swarm)?;
     let options = SqliteConnectOptions::new()
         .filename(swarm.join("tasks.db"))
@@ -671,23 +723,24 @@ fn row_fields(row: &SqliteRow) -> Result<Fields, SeamError> {
     Ok(fields)
 }
 
-async fn fetch_task(pool: &SqlitePool, task_id: &str) -> Result<Option<Task>, SeamError> {
+/// `TaskStore._fetch(task_id)`: the task row in column order, or none.
+async fn fetch_task(pool: &SqlitePool, task_id: &str) -> Result<Option<Fields>, SeamError> {
     let rows = sqlx::query("SELECT * FROM tasks WHERE task_id=?")
         .bind(task_id)
         .fetch_all(pool)
         .await
         .map_err(store_err)?;
     match rows.first() {
-        Some(row) => Ok(Some(Task::from_row(row_fields(row)?)?)),
+        Some(row) => Ok(Some(row_fields(row)?)),
         None => Ok(None),
     }
 }
 
-/// `TaskStore.list(correlation_id=…)`: an empty or absent id lists every task.
+/// `TaskStore.list(correlation_id=…)`: an empty or absent id lists every task, in SQL order.
 async fn fetch_tasks(
     pool: &SqlitePool,
     correlation_id: Option<&str>,
-) -> Result<Vec<Task>, SeamError> {
+) -> Result<Vec<Fields>, SeamError> {
     let rows = match correlation_id.filter(|c| !c.is_empty()) {
         Some(correlation) => {
             sqlx::query("SELECT * FROM tasks WHERE correlation_id=? ORDER BY dag_depth, created_at")
@@ -704,13 +757,14 @@ async fn fetch_tasks(
     .map_err(store_err)?;
     let mut tasks = Vec::with_capacity(rows.len());
     for row in &rows {
-        tasks.push(Task::from_row(row_fields(row)?)?);
+        tasks.push(row_fields(row)?);
     }
     Ok(tasks)
 }
 
-/// `TaskStore._latest_rows(task)`: highest-id verdict row per gate, at or after the last rework cut-off.
-async fn latest_rows(pool: &SqlitePool, task: &Task) -> Result<Vec<LatestRow>, SeamError> {
+/// One `verdicts` entry of the request: the verdict rows `TaskStore._latest_rows(task)` reads, at or
+/// after the last rework cut-off and in id order. The latest row per gate is chosen by the route.
+async fn verdict_entry(pool: &SqlitePool, task: &Task) -> Result<Json, SeamError> {
     let since = task.verdict_since()?;
     let rows = sqlx::query("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id")
         .bind(task.task_id.as_str())
@@ -718,11 +772,14 @@ async fn latest_rows(pool: &SqlitePool, task: &Task) -> Result<Vec<LatestRow>, S
         .fetch_all(pool)
         .await
         .map_err(store_err)?;
-    let mut latest: Vec<LatestRow> = Vec::new();
+    let mut verdict_rows: Vec<Json> = Vec::with_capacity(rows.len());
     for row in &rows {
-        push_latest(&mut latest, row_fields(row)?)?;
+        verdict_rows.push(Json::Obj(row_fields(row)?));
     }
-    Ok(latest)
+    Ok(Json::Obj(vec![
+        ("task_id".to_string(), jstr(&task.task_id)),
+        ("rows".to_string(), Json::Arr(verdict_rows)),
+    ]))
 }
 
 /// Counts run-log records for `correlation_id` in `events.jsonl` (`runlog.read_events`).
@@ -755,14 +812,18 @@ fn latest_correlation(swarm: &Path) -> Result<Option<String>, SeamError> {
     Ok(Some(text.trim().to_string()))
 }
 
-/// The `orch_status` read path: task list (no `--history`) or one task's history.
-async fn read_orch_status(args: &ReadArgs, call: &Invocation) -> Result<Reply, SeamError> {
+/// The `orch_status` snapshot: the task rows of the task list (no `--history`) or of one task's
+/// history, as the request object `request_json` builds. Host Rust and the sandbox answer from it.
+pub(crate) async fn read_snapshot(args: &ReadArgs, call: &Invocation) -> Result<Json, SeamError> {
     let task_id = match &args.task_id {
         Some(value) => Some(value.clone()),
         None => env_value(&call.env, "SWARM_TASK_ID").map(str::to_string),
     };
     if let Some(id) = &task_id {
         check_safe_id(id, "task id")?;
+    }
+    if let Some(history) = args.history.as_deref().filter(|h| !h.is_empty()) {
+        check_safe_id(history, "task id")?;
     }
     let correlation_flag = match &args.correlation_id {
         Some(value) => Some(value.clone()),
@@ -779,67 +840,141 @@ async fn read_orch_status(args: &ReadArgs, call: &Invocation) -> Result<Reply, S
         None => latest_correlation(&swarm)?,
     };
     match args.history.as_deref().filter(|h| !h.is_empty()) {
-        Some(history) => read_history(&pool, call, history).await,
-        None => list_status(&pool, call, &swarm, correlation).await,
+        Some(history) => history_snapshot(&pool, call, &swarm, history).await,
+        None => list_snapshot(&pool, call, &swarm, correlation).await,
     }
 }
 
-/// `orch_status --history TASK`: transitions, latest verdicts and missing gate reasons of one task.
-async fn read_history(
+/// The `orch_status` request fields that differ by mode; everything else comes from the invocation.
+struct OrchStatusRequest {
+    mode: &'static str,
+    correlation: Option<String>,
+    events: i64,
+    tasks: Vec<Json>,
+    verdicts: Vec<Json>,
+    history: Json,
+}
+
+/// Builds the `orch_status` request object in the key order of the wire contract.
+fn request_json(agent: &str, script: &str, swarm: &Path, request: OrchStatusRequest) -> Json {
+    Json::Obj(vec![
+        ("mode".to_string(), jstr(request.mode)),
+        ("agent".to_string(), jstr(agent)),
+        ("script".to_string(), jstr(script)),
+        (
+            "correlation".to_string(),
+            request.correlation.as_deref().map_or(Json::Null, jstr),
+        ),
+        (
+            "db_path".to_string(),
+            jstr(&swarm.join("tasks.db").display().to_string()),
+        ),
+        ("swarm_dir".to_string(), jstr(&swarm.display().to_string())),
+        ("events".to_string(), Json::Int(request.events)),
+        ("tasks".to_string(), Json::Arr(request.tasks)),
+        ("verdicts".to_string(), Json::Arr(request.verdicts)),
+        ("history".to_string(), request.history),
+    ])
+}
+
+/// `orch_status --history TASK`: the task row, its transitions and latest verdicts are read here,
+/// into the request object `request_json` builds.
+async fn history_snapshot(
     pool: &SqlitePool,
     call: &Invocation,
+    swarm: &Path,
     task_id: &str,
-) -> Result<Reply, SeamError> {
-    let task = fetch_task(pool, task_id)
-        .await?
-        .ok_or_else(|| SeamError::new(ErrorCode::Input, format!("unknown task {task_id}")))?;
-    let transitions = sqlx::query("SELECT * FROM transitions WHERE task_id=? ORDER BY id")
-        .bind(task_id)
-        .fetch_all(pool)
-        .await
-        .map_err(store_err)?;
-    let mut history: Vec<Json> = Vec::with_capacity(transitions.len());
-    for row in &transitions {
-        history.push(Json::Obj(row_fields(row)?));
-    }
-    let latest = latest_rows(pool, &task).await?;
-    let fields = history_fields(task_id, history, latest, &task)?;
-    Ok(finish(fields, &call.agent, &call.script))
+) -> Result<Json, SeamError> {
+    let task = fetch_task(pool, task_id).await?;
+    let (task_json, transitions, verdicts) = match task {
+        Some(row) => {
+            let parsed = Task::from_row(row.clone())?;
+            let rows = sqlx::query("SELECT * FROM transitions WHERE task_id=? ORDER BY id")
+                .bind(task_id)
+                .fetch_all(pool)
+                .await
+                .map_err(store_err)?;
+            let mut transitions: Vec<Json> = Vec::with_capacity(rows.len());
+            for transition in &rows {
+                transitions.push(Json::Obj(row_fields(transition)?));
+            }
+            let verdict = verdict_entry(pool, &parsed).await?;
+            (Json::Obj(row), transitions, vec![verdict])
+        }
+        None => (Json::Null, Vec::new(), Vec::new()),
+    };
+    let history = Json::Obj(vec![
+        ("task_id".to_string(), jstr(task_id)),
+        ("task".to_string(), task_json),
+        ("transitions".to_string(), Json::Arr(transitions)),
+    ]);
+    let request = request_json(
+        &call.agent,
+        &call.script,
+        swarm,
+        OrchStatusRequest {
+            mode: "history",
+            correlation: None,
+            events: 0,
+            tasks: Vec::new(),
+            verdicts,
+            history,
+        },
+    );
+    Ok(request)
 }
 
-/// `orch_status` with no transition or ingest: the task table for one correlation, or all tasks.
-async fn list_status(
+/// `orch_status` with no `--history`: the task rows for one correlation, or all tasks, with their
+/// verdicts, into the request object `request_json` builds.
+async fn list_snapshot(
     pool: &SqlitePool,
     call: &Invocation,
     swarm: &Path,
     correlation: Option<String>,
-) -> Result<Reply, SeamError> {
-    let tasks = fetch_tasks(pool, correlation.as_deref()).await?;
-    let db_path = swarm.join("tasks.db").display().to_string();
-    let swarm_text = swarm.display().to_string();
-    if tasks.is_empty() {
-        let fields = empty_status(correlation.as_deref(), &db_path, &swarm_text);
-        return Ok(finish(fields, &call.agent, &call.script));
+) -> Result<Json, SeamError> {
+    let rows = fetch_tasks(pool, correlation.as_deref()).await?;
+    let mut verdicts: Vec<Json> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let task = Task::from_row(row.clone())?;
+        verdicts.push(verdict_entry(pool, &task).await?);
     }
-
-    let satisfied = satisfied_ids(&tasks);
-    let mut counts: Vec<(String, i64)> = Vec::new();
-    let mut rows: Vec<StatusRow> = Vec::with_capacity(tasks.len());
-    for task in &tasks {
-        count_state(&mut counts, &task.state);
-        let latest = latest_rows(pool, task).await?;
-        rows.push(status_row(task, &latest, &satisfied)?);
-    }
-    let events = count_events(swarm, correlation.as_deref())?;
-    let fields = status_list(
-        correlation.as_deref(),
-        &rows,
-        &counts,
-        events,
-        &db_path,
-        &swarm_text,
+    // An empty table never reads the run log, so a malformed log cannot fail an empty answer.
+    let events = if rows.is_empty() {
+        0
+    } else {
+        count_events(swarm, correlation.as_deref())?
+    };
+    let request = request_json(
+        &call.agent,
+        &call.script,
+        swarm,
+        OrchStatusRequest {
+            mode: "list",
+            correlation,
+            events,
+            tasks: rows.into_iter().map(Json::Obj).collect(),
+            verdicts,
+            history: Json::Null,
+        },
     );
-    Ok(finish(fields, &call.agent, &call.script))
+    Ok(request)
+}
+
+/// The snapshot of an empty Task Store in list mode: the input of the sandbox health probe.
+pub(crate) fn empty_snapshot() -> Json {
+    request_json(
+        "A01",
+        "orch_status",
+        Path::new(".swarm"),
+        OrchStatusRequest {
+            mode: "list",
+            correlation: None,
+            events: 0,
+            tasks: Vec::new(),
+            verdicts: Vec::new(),
+            history: Json::Null,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1257,7 +1392,7 @@ mod tests {
         assert_eq!(value["error"]["code"].as_str(), Some("E-INPUT"));
         assert_eq!(
             value["error"]["message"].as_str(),
-            Some("E-INPUT: unknown task nope")
+            Some("E-INPUT: unknown task for history.task_id")
         );
         assert_eq!(value["status"].as_str(), Some("error"));
         Ok(())
@@ -1344,6 +1479,240 @@ mod tests {
             .err();
         assert_eq!(error.as_ref().map(|e| e.code()), Some(ErrorCode::Input));
         assert!(!swarm.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_history_id_fails_before_any_store_access() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let swarm = dir.path().join(".swarm");
+        let engine = RustEngine::new().map_err(message)?;
+        let error = engine
+            .orch_status(&call(dir.path(), &swarm, &["--history", "../x", "--json"]))
+            .err();
+        assert_eq!(error.as_ref().map(|e| e.code()), Some(ErrorCode::Input));
+        assert!(!swarm.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_relative_swarm_dir_with_dotdot_is_normalised() -> TestResult {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let base = fs::canonicalize(&cwd).map_err(|e| e.to_string())?;
+        let resolved = resolve_swarm_dir(&cwd, Some("f32-no-such-dir/../f32-state"));
+        assert_eq!(resolved, base.join("f32-state"));
+        Ok(())
+    }
+
+    /// Writes `scripts/<name>.py` under `root`.
+    fn write_script(root: &Path, name: &str, body: &str) -> TestResult {
+        let dir = root.join("scripts");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::write(dir.join(format!("{name}.py")), body).map_err(|e| e.to_string())
+    }
+
+    fn python_call(
+        root: &Path,
+        script: &str,
+        argv: &[&str],
+        env: Vec<(String, String)>,
+        deadline: Duration,
+    ) -> Invocation {
+        Invocation {
+            agent: "A01".to_string(),
+            script: script.to_string(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            root: root.to_path_buf(),
+            env,
+            deadline,
+        }
+    }
+
+    /// Exit 0, 1 and 2 replies pass through the seam with their stdout bytes unchanged.
+    #[test]
+    fn python_engine_keeps_the_exit_0_1_2_reply_bytes() -> TestResult {
+        const EXIT_ZERO: &str = r#"import sys
+sys.stdout.write('{"status": "ok", "n": 1}\n')
+"#;
+        const EXIT_ONE: &str = r#"import sys
+sys.stdout.write('{"status": "fail", "summary": "gate red"}\n')
+sys.exit(1)
+"#;
+        const EXIT_TWO: &str = r#"import sys
+sys.stdout.write('{"error": {"code": "E-CONTRACT", "message": "schema rejected"}}\n')
+sys.exit(2)
+"#;
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let engine = PythonEngine::new("python3");
+        let cases = [
+            (
+                "exit_zero",
+                EXIT_ZERO,
+                0,
+                r#"{"status": "ok", "n": 1}
+"#,
+            ),
+            (
+                "exit_one",
+                EXIT_ONE,
+                1,
+                r#"{"status": "fail", "summary": "gate red"}
+"#,
+            ),
+            (
+                "exit_two",
+                EXIT_TWO,
+                2,
+                r#"{"error": {"code": "E-CONTRACT", "message": "schema rejected"}}
+"#,
+            ),
+        ];
+        for (script, body, exit_code, stdout) in cases {
+            write_script(dir.path(), script, body)?;
+            let call = python_call(dir.path(), script, &[], Vec::new(), Duration::from_secs(30));
+            let reply = invoke(&engine, &call);
+            if reply.exit_code != exit_code || reply.stdout != stdout {
+                return Err(format!(
+                    "{script}: exit {} stdout {:?}",
+                    reply.exit_code, reply.stdout
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A usage error (exit 2, empty stdout) is an `E-INPUT` failure at the seam.
+    #[test]
+    fn python_engine_usage_error_is_e_input() -> TestResult {
+        const USAGE: &str = r#"import sys
+sys.stderr.write("usage: probe --task-id\n")
+sys.exit(2)
+"#;
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        write_script(dir.path(), "usage", USAGE)?;
+        let engine = PythonEngine::new("python3");
+        let call = python_call(
+            dir.path(),
+            "usage",
+            &[],
+            Vec::new(),
+            Duration::from_secs(30),
+        );
+        let err = engine.lane_verb(&call).err().ok_or("usage must fail")?;
+        if err.code() != ErrorCode::Input {
+            return Err(err.message().to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether `pid` has exited or is a zombie, which is also dead. Polls for up to `limit`.
+    #[cfg(target_os = "linux")]
+    fn gone_within(pid: u32, limit: Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            if process_gone(pid) {
+                return true;
+            }
+            if started.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_gone(pid: u32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    == Some("Z")
+            }
+        }
+    }
+
+    /// Starts a grandchild in the same process group, records its pid in `argv[1]`, then sleeps.
+    #[cfg(target_os = "linux")]
+    const GRANDCHILD: &str = r#"import subprocess, sys, time
+child = subprocess.Popen(["sleep", "60"])
+with open(sys.argv[1], "w") as handle:
+    handle.write(str(child.pid))
+time.sleep(60)
+"#;
+
+    /// The deadline kills the whole process group, not only the python leader.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_engine_timeout_stops_the_whole_process_group() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        write_script(dir.path(), "grandchild", GRANDCHILD)?;
+        let pid_file = dir.path().join("grandchild.pid");
+        let pid_arg = pid_file.display().to_string();
+        let engine = PythonEngine::new("python3");
+        let call = python_call(
+            dir.path(),
+            "grandchild",
+            &[pid_arg.as_str()],
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+        let err = engine
+            .lane_verb(&call)
+            .err()
+            .ok_or("the deadline must stop the call")?;
+        if err.code() != ErrorCode::Timeout {
+            return Err(err.message().to_string());
+        }
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .map_err(|e| e.to_string())?
+            .trim()
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
+        if !gone_within(pid, Duration::from_secs(3)) {
+            return Err(format!("grandchild {pid} survived the group stop"));
+        }
+        Ok(())
+    }
+
+    /// The child inherits the parent's PATH and SWARM_DIR, and never sees the task identity.
+    #[test]
+    fn python_engine_child_inherits_path_and_loses_task_identity() -> TestResult {
+        const ENV_PROBE: &str = r#"import json, os
+print(json.dumps({
+    "path": os.environ.get("PATH"),
+    "swarm_dir": os.environ.get("SWARM_DIR"),
+    "task_id_set": "SWARM_TASK_ID" in os.environ,
+    "correlation_set": "SWARM_CORRELATION_ID" in os.environ,
+}))
+"#;
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        write_script(dir.path(), "env_probe", ENV_PROBE)?;
+        let swarm_arg = dir.path().join(".swarm").display().to_string();
+        let env = vec![
+            ("SWARM_DIR".to_string(), swarm_arg.clone()),
+            ("SWARM_TASK_ID".to_string(), "T-1".to_string()),
+            ("SWARM_CORRELATION_ID".to_string(), "C-1".to_string()),
+        ];
+        let engine = PythonEngine::new("python3");
+        let call = python_call(dir.path(), "env_probe", &[], env, Duration::from_secs(30));
+        let reply = engine.lane_verb(&call).map_err(message)?;
+        let seen: serde_json::Value =
+            serde_json::from_str(&reply.stdout).map_err(|e| e.to_string())?;
+
+        let inherited_path = std::env::var("PATH").ok();
+        if seen["path"].as_str() != inherited_path.as_deref() {
+            return Err(format!("child PATH {} is not inherited", seen["path"]));
+        }
+        let expected_swarm = resolve_swarm_dir(dir.path(), Some(swarm_arg.as_str()));
+        if seen["swarm_dir"].as_str() != expected_swarm.to_str() {
+            return Err(format!("child SWARM_DIR {} is wrong", seen["swarm_dir"]));
+        }
+        if seen["task_id_set"].as_bool() != Some(false)
+            || seen["correlation_set"].as_bool() != Some(false)
+        {
+            return Err("the child still sees the task identity".to_string());
+        }
         Ok(())
     }
 }

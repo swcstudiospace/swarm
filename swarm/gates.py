@@ -2,6 +2,7 @@
 from __future__ import annotations
 import time
 from pathlib import Path
+from typing import Any
 from .errors import SwarmError, ErrorCode
 from .envelope import build_envelope, sign_envelope, signing_config_error
 
@@ -13,7 +14,7 @@ BLOCKING_SEVERITY = "major"   # any finding at or above this ⇒ fail
 
 def make_finding(fid: str, severity: str, kind: str, summary: str, *, evidence: str = "",
                  ac_ref: str | None = None, owner_suggestion: str | None = None,
-                 location: str | None = None) -> dict:
+                 location: str | None = None) -> dict[str, Any]:
     if severity not in SEVERITIES:
         raise SwarmError(ErrorCode.E_CONTRACT, f"bad severity {severity}")
     return {"id": fid, "severity": severity, "kind": kind, "summary": summary,
@@ -21,16 +22,16 @@ def make_finding(fid: str, severity: str, kind: str, summary: str, *, evidence: 
             "location": location}
 
 
-def derive_verdict(findings: list[dict]) -> str:
+def derive_verdict(findings: list[dict[str, Any]]) -> str:
     """fail on any finding ≥ BLOCKING_SEVERITY, otherwise pass."""
     idx = SEVERITIES.index(BLOCKING_SEVERITY)
     return "fail" if any(SEVERITIES.index(f["severity"]) >= idx for f in findings) else "pass"
 
 
-def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict] | None = None,
-                 verdict: str | None = None, runs: dict | None = None, expires_s: int = 86400,
-                 correlation_id: str | None = None, extra: dict | None = None,
-                 root: str | Path | None = None, audit: bool = True) -> dict:
+def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict[str, Any]] | None = None,
+                 verdict: str | None = None, runs: dict[str, Any] | None = None, expires_s: int = 86400,
+                 correlation_id: str | None = None, extra: dict[str, Any] | None = None,
+                 root: str | Path | None = None, audit: bool = True) -> dict[str, Any]:
     """Return a signed envelope carrying a gate verdict. Waive requires explicit verdict.
     `root` routes the dev-key audit event to the caller's state dir; audit=False skips it (agent-session preview)."""
     if gate not in GATES:
@@ -51,14 +52,14 @@ def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict]
     return sign_envelope(env, root=root, audit=audit)
 
 
-def validate_verdict(env: dict) -> dict:
+def validate_verdict(env: dict[str, Any]) -> dict[str, Any]:
     from .envelope import validate_envelope, verify_envelope
     validate_envelope(env)
     if env["type"] != "gate.verdict":
         raise SwarmError(ErrorCode.E_CONTRACT, "not a gate.verdict")
     if not verify_envelope(env):
         raise SwarmError(ErrorCode.E_POLICY, "verdict signature invalid")
-    p = env["payload"]
+    p: dict[str, Any] = env["payload"]
     for k in ("gate", "task_id", "verdict", "findings", "expires_s"):
         if k not in p:
             raise SwarmError(ErrorCode.E_CONTRACT, f"verdict missing {k}")

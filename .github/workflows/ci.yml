@@ -11,6 +11,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Tooling and the omp suite import swarm; wheel.yml builds and gates the native extension.
+    env:
+      SWARM_PURE_PYTHON: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,6 +28,8 @@ jobs:
         run: python3 -m pytest
       - name: build_agents check
         run: python3 scripts/build_agents.py --check
+      - name: pin hash
+        run: python3 scripts/_check_pins.py
       - name: tool registry
         run: python3 -m swarm.tool_registry check
       - name: tool docs drift

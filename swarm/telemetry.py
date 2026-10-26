@@ -28,12 +28,12 @@ import uuid
 import weakref
 from collections import deque
 from pathlib import Path
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 try:  # POSIX advisory locks serialise the live.json read-derive-write cycle across processes
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX: derived writers fall back to the producer-freshness check alone
-    fcntl = None  # type: ignore[assignment]
+    fcntl = None  # type: ignore[assignment]  # fcntl is absent off POSIX; the None fallback is the intended non-POSIX path
 
 from .clock import SYSTEM_CLOCK, Clock
 from .errors import ErrorCode, SwarmError
@@ -90,14 +90,14 @@ _STALLED_RANK = 2
 
 
 # ---- small helpers ---------------------------------------------------------------------------------------------
-def clip(value, limit: int = CLIP) -> str | None:
+def clip(value: object, limit: int = CLIP) -> str | None:
     """Redact and clip free text for live.json; None stays None, non-strings are rendered with `str`."""
     if value is None:
         return None
     return _clip_text(value if isinstance(value, str) else str(value), limit)
 
 
-def clip_id(value, limit: int = 64) -> str | None:
+def clip_id(value: object, limit: int = 64) -> str | None:
     """Clip an identifier (task, run, handover id) for live.json WITHOUT redaction: validated ids are not free text, and a token-shaped
     one (`sk-onboarding-flow-v2`) must stay readable and comparable. Anything that is not id-shaped is treated as free text (`clip`)."""
     if isinstance(value, str) and runlog.ID_RE.fullmatch(value):
@@ -111,7 +111,7 @@ def _clip_text(raw: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def status_label(kind: str, step: str, percent=None) -> str:
+def status_label(kind: str, step: str, percent: object = None) -> str:
     """The one-line form of a `shared_status_report` for the bar: `progress: build (40%)`."""
     pct = f" ({percent:g}%)" if isinstance(percent, (int, float)) and not isinstance(percent, bool) else ""
     return f"{kind}: {step}{pct}"
@@ -153,14 +153,14 @@ def heartbeat_default() -> float:
     return _env_float("SWARM_HEARTBEAT_S", DEFAULT_HEARTBEAT_S)
 
 
-def _state_dir(root, db_path) -> Path:
+def _state_dir(root: str | Path | None, db_path: str | Path | None) -> Path:
     return Path(db_path).resolve().parent if db_path is not None else swarm_dir(root)
 
 
 _HANDOVER_FILE = re.compile(r"^(?P<task>.+)\.(?P<seq>\d+)\.json$")
 
 
-def _handovers_in(sdir: Path, corr: str | None, tasks: list[dict], side: str = "to_agent") -> dict[str, str]:
+def _handovers_in(sdir: Path, corr: str | None, tasks: list[dict[str, Any]], side: str = "to_agent") -> dict[str, str]:
     """`{task_id: handover_id}` for each task whose newest handover is addressed to the agent the task runs on
     (`side="to_agent"`, the in marker) or was written by that agent (`side="from_agent"`, the out marker).
 
@@ -212,7 +212,7 @@ def live_path(root: str | Path | None = None) -> Path:
     return swarm_dir(root) / LIVE_FILE
 
 
-def _write_atomic(path: Path, doc: dict) -> None:
+def _write_atomic(path: Path, doc: dict[str, Any]) -> None:
     """Write `doc` as JSON to a unique sibling temp file, then `os.replace`: readers never see a partial file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
@@ -237,14 +237,14 @@ def _remember_valid(path: Path) -> None:
         _LIVE_VALID[str(path)] = (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def _read_live_at(path: Path) -> dict | None:
+def _read_live_at(path: Path) -> dict[str, Any] | None:
     try:
         st = path.stat()
         sig = (st.st_ino, st.st_size, st.st_mtime_ns)
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc: object = json.loads(path.read_text(encoding="utf-8"))
         if _LIVE_VALID.get(str(path)) == sig and isinstance(doc, dict) and doc.get("schema") == LIVE_SCHEMA:
             return doc
-        if not _valid_live(doc):
+        if not isinstance(doc, dict) or not _valid_live(doc):
             return None
         _LIVE_VALID[str(path)] = sig
         return doc
@@ -252,7 +252,7 @@ def _read_live_at(path: Path) -> dict | None:
         return None
 
 
-def _valid_live(doc) -> bool:
+def _valid_live(doc: object) -> bool:
     return isinstance(doc, dict) and doc.get("schema") == LIVE_SCHEMA and not validate(doc, load_schema(LIVE_SCHEMA))
 
 
@@ -289,7 +289,7 @@ def _live_lock(target: Path, timeout: float = 2.0) -> Iterator[bool]:
         fh.close()
 
 
-def _pid_alive(pid) -> bool:
+def _pid_alive(pid: object) -> bool:
     if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
         return False
     try:
@@ -303,7 +303,7 @@ def _pid_alive(pid) -> bool:
     return True
 
 
-def _producer_fresh(doc: dict | None, now_wall: float, *, owned_here: bool) -> bool:
+def _producer_fresh(doc: dict[str, Any] | None, now_wall: float, *, owned_here: bool) -> bool:
     """True while `doc` was written by a scheduler `Telemetry` that is still alive: `producer == "scheduler"`, its
     `producer_updated` is within 3 heartbeats of `now_wall`, and its pid is a live process. A document stamped with this
     process's pid is only fresh while a `Telemetry` here still owns the file (`owned_here`)."""
@@ -325,13 +325,13 @@ def _producer_fresh(doc: dict | None, now_wall: float, *, owned_here: bool) -> b
 
 
 # ---- snapshot assembly (shared by the producer and the stateless path) -----------------------------------------
-def _sort_key(row: dict, order: int) -> tuple[int, int]:
+def _sort_key(row: dict[str, Any], order: int) -> tuple[int, int]:
     rank = _STALLED_RANK if row["stalled"] and row["state"] == RunState.RUNNING.value else _RANK[RunState(row["state"])]
     return rank, order
 
 
-def build_snapshot(rows: list[dict], *, correlation_id: str | None, seq: int, updated_wall: float, elapsed_s: float,
-                   max_parallel: int, effective_parallel: int, degraded: dict | None) -> dict:
+def build_snapshot(rows: list[dict[str, Any]], *, correlation_id: str | None, seq: int, updated_wall: float, elapsed_s: float,
+                   max_parallel: int, effective_parallel: int, degraded: dict[str, Any] | None) -> dict[str, Any]:
     """Assemble a `swarm.live.v1` document from complete run rows (counts cover every row, the list is capped)."""
     counts = {s: 0 for s in ("running", "queued", "waiting", "completed", "failed", "cancelled", "timed_out")}
     stalled = 0
@@ -412,15 +412,15 @@ class Telemetry:
         self._live = live
         self._lock = threading.RLock()
         self._runs: dict[str, _Run] = {}
-        self._history: deque[dict] = deque(maxlen=history_max)
-        self._subscribers: list[Callable[[dict], None]] = []
+        self._history: deque[dict[str, Any]] = deque(maxlen=history_max)
+        self._subscribers: list[Callable[[dict[str, Any]], None]] = []
         self._seq = 0
         self._t0: float | None = None
         self._t_end: float | None = None
         self._last_flush: float | None = None
-        self._tick: dict = {}
-        self._degraded: dict | None = None
-        self._handover_key: tuple | None = None  # (folder listing, live runs) the handover marks below were scanned for
+        self._tick: dict[str, Any] = {}
+        self._degraded: dict[str, Any] | None = None
+        self._handover_key: tuple[object, ...] | None = None  # (folder listing, live runs) the handover marks below were scanned for
         self._handover_marks: tuple[dict[str, str], dict[str, str]] = ({}, {})
         if live:
             _ACTIVE[str(self._live_target())] = weakref.ref(self)
@@ -435,7 +435,7 @@ class Telemetry:
             raise SwarmError(ErrorCode.E_INPUT, f"unknown run_id {run_id!r}", run_id=run_id)
         return run
 
-    def emit(self, event_type: str, payload: dict, *, task_id: str | None = None, local_only: bool = False) -> dict:
+    def emit(self, event_type: str, payload: dict[str, Any], *, task_id: str | None = None, local_only: bool = False) -> dict[str, Any]:
         """Write one record through `runlog.emit` (redacted there), keep it in the ring buffer and notify subscribers.
         Internal: every call site passes a literal `swarm.*` type so tests/test_substrate_tee.py can scan them. High-
         frequency types (`local_only`) never go to the substrate tee, whatever `tee` says."""
@@ -449,7 +449,7 @@ class Telemetry:
                 log.warning("telemetry subscriber %r raised; ignored", cb, exc_info=True)
         return record
 
-    def subscribe(self, cb: Callable[[dict], None]) -> Callable[[], None]:
+    def subscribe(self, cb: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
         """Call `cb(record)` for every emitted event; returns an `unsubscribe()` callable. Exceptions are logged only."""
         with self._lock:
             self._subscribers.append(cb)
@@ -461,7 +461,7 @@ class Telemetry:
 
         return unsubscribe
 
-    def recent_events(self) -> list[dict]:
+    def recent_events(self) -> list[dict[str, Any]]:
         """The last `history_max` emitted records, oldest first (a copy)."""
         with self._lock:
             return list(self._history)
@@ -667,7 +667,7 @@ class Telemetry:
             run.handover_in = marks_in.get(run.task_id, run.handover_in)
             run.handover_out = marks_out.get(run.task_id, run.handover_out)
 
-    def _row(self, run: _Run, now: float) -> dict:
+    def _row(self, run: _Run, now: float) -> dict[str, Any]:
         end = run.end_mono if run.end_mono is not None else now
         active = run.end_mono is None
         return {
@@ -680,7 +680,7 @@ class Telemetry:
             "handover_in": run.handover_in, "handover_out": run.handover_out, "error": run.error,
         }
 
-    def heartbeat(self, run_id: str | None = None) -> list[dict]:
+    def heartbeat(self, run_id: str | None = None) -> list[dict[str, Any]]:
         """Emit `swarm.run.heartbeat` for one run (or every unsettled run) and return the payloads. Runs the stall check
         first, so a heartbeat is also what notices a silent run."""
         with self._lock:
@@ -729,8 +729,8 @@ class Telemetry:
             return run.state
 
     def scheduler_tick(self, *, round: int, ready: int, running: int, queued: int, waiting: int, free_slots: int,
-                       max_parallel: int, effective_parallel: int, per_agent: dict | None = None,
-                       skipped: dict | None = None) -> None:
+                       max_parallel: int, effective_parallel: int, per_agent: dict[str, Any] | None = None,
+                       skipped: dict[str, Any] | None = None) -> None:
         """Emit one scheduler round and remember its parallelism for the snapshot."""
         with self._lock:
             self._tick = {"max_parallel": int(max_parallel), "effective_parallel": int(effective_parallel)}
@@ -771,7 +771,7 @@ class Telemetry:
             self.flush_live()
 
     # -- snapshot / live.json --
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         """Current `swarm.live.v1` document (runs capped at 64, strings redacted and clipped)."""
         with self._lock:
             self.stalled_runs()
@@ -808,7 +808,7 @@ class Telemetry:
 
 
 # ---- readers and the stateless path -----------------------------------------------------------------------------
-def read_live(root: str | Path | None = None) -> dict | None:
+def read_live(root: str | Path | None = None) -> dict[str, Any] | None:
     """The parsed `live.json`, or None when it is absent, unreadable, malformed or off-schema. Never raises."""
     try:
         return _read_live_at(live_path(root))
@@ -819,7 +819,7 @@ def read_live(root: str | Path | None = None) -> dict | None:
 _TS_RE = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z")
 
 
-def _parse_ts(ts) -> float | None:
+def _parse_ts(ts: object) -> float | None:
     """Epoch seconds of a `%Y-%m-%dT%H:%M:%SZ` UTC stamp; None for anything else."""
     return _parse_ts_str(ts) if isinstance(ts, str) else None
 
@@ -831,7 +831,8 @@ def _parse_ts_str(ts: str) -> float | None:
     if m is None:
         return None
     try:
-        return float(calendar.timegm(_dt.datetime(*map(int, m.groups())).timetuple()))
+        year, month, day, hour, minute, second = map(int, m.groups())
+        return float(calendar.timegm(_dt.datetime(year, month, day, hour, minute, second).timetuple()))
     except ValueError:
         return None
 
@@ -841,13 +842,13 @@ class _Tail:
 
     def __init__(self, ino: int, start: int):
         self.ino, self.start, self.end = ino, start, start
-        self.records: list[dict] = []
+        self.records: list[dict[str, Any]] = []
 
 
 _TAIL_CACHE: dict[str, _Tail] = {}
 
 
-def _parse_events(data: bytes, out: list[dict]) -> None:
+def _parse_events(data: bytes, out: list[dict[str, Any]]) -> None:
     for line in data.decode("utf-8", errors="replace").splitlines():
         if '"swarm.' not in line:
             continue
@@ -860,7 +861,7 @@ def _parse_events(data: bytes, out: list[dict]) -> None:
             out.append(rec)
 
 
-def _read_tail(path: Path, max_bytes: int = TAIL_BYTES) -> list[dict]:
+def _read_tail(path: Path, max_bytes: int = TAIL_BYTES) -> list[dict[str, Any]]:
     """Parsed `swarm.*` records from (about) the last `max_bytes` of events.jsonl; malformed lines (a torn tail) are
     skipped. Per process the parse is incremental: an unchanged file costs one `stat`, an appended file only its new
     bytes (a window past 2x `max_bytes`, a replaced inode or a shrunk file is re-read from scratch). An unterminated
@@ -870,7 +871,7 @@ def _read_tail(path: Path, max_bytes: int = TAIL_BYTES) -> list[dict]:
         st = path.stat()
         tail = _TAIL_CACHE.get(key)
         fresh = tail is None or tail.ino != st.st_ino or st.st_size < tail.end or tail.end - tail.start > 2 * max_bytes
-        if fresh:
+        if tail is None or fresh:
             tail = _Tail(st.st_ino, max(0, st.st_size - max_bytes))
         elif st.st_size == tail.end:
             return tail.records
@@ -888,7 +889,7 @@ def _read_tail(path: Path, max_bytes: int = TAIL_BYTES) -> list[dict]:
     records = tail.records if fresh else list(tail.records)  # lists handed out earlier stay unchanged
     _parse_events(complete, records)
     if rest.strip():
-        extra: list[dict] = []
+        extra: list[dict[str, Any]] = []
         _parse_events(rest, extra)
         if extra:  # unterminated, but already a whole record
             records += extra
@@ -899,7 +900,7 @@ def _read_tail(path: Path, max_bytes: int = TAIL_BYTES) -> list[dict]:
     return records
 
 
-def _load_tasks(db: Path, correlation_id: str | None, state_dir: Path) -> tuple[str | None, list[dict], dict[str, list]]:
+def _load_tasks(db: Path, correlation_id: str | None, state_dir: Path) -> tuple[str | None, list[dict[str, Any]], dict[str, list[tuple[Any, ...]]]]:
     """(correlation, task rows, transitions by task) from a read-only connection; nothing when there is no store."""
     if not db.exists():
         return correlation_id, [], {}
@@ -926,7 +927,7 @@ def _load_tasks(db: Path, correlation_id: str | None, state_dir: Path) -> tuple[
                                 (correlation_id,)).fetchall()
         ids = [r["task_id"] for r in rows]
         marks = ",".join("?" * len(ids))
-        trans: dict[str, list] = {tid: [] for tid in ids}
+        trans: dict[str, list[tuple[Any, ...]]] = {tid: [] for tid in ids}
         for t in conn.execute(f"SELECT task_id, to_state, reason, ts FROM transitions WHERE task_id IN ({marks}) "
                               "ORDER BY id", ids):
             trans[t["task_id"]].append((t["to_state"], t["reason"], t["ts"]))
@@ -935,7 +936,10 @@ def _load_tasks(db: Path, correlation_id: str | None, state_dir: Path) -> tuple[
         conn.close()
 
 
-def _loads(text, default):
+_T = TypeVar("_T")
+
+
+def _loads(text: str | None, default: _T) -> _T:
     try:
         val = json.loads(text) if text else default
     except ValueError:
@@ -944,7 +948,7 @@ def _loads(text, default):
 
 
 def derive_snapshot(root: str | Path | None = None, *, clock: Clock = SYSTEM_CLOCK, db_path: str | Path | None = None,
-                    correlation_id: str | None = None, stall_after_s: float | None = None) -> dict:
+                    correlation_id: str | None = None, stall_after_s: float | None = None) -> dict[str, Any]:
     """A `swarm.live.v1` document rebuilt, statelessly, from Task Store rows (mapped with `lifecycle.from_task_state`)
     and the `events.jsonl` tail (activity and heartbeat). Runs without a scheduler process show up too.
 
@@ -959,9 +963,9 @@ def derive_snapshot(root: str | Path | None = None, *, clock: Clock = SYSTEM_CLO
     now_wall = clock.wall()
 
     events = _read_tail(sdir / "events.jsonl")
-    last_by_run: dict[str, dict[str, dict]] = {}  # key -> {"activity": rec, "heartbeat": rec, "handover": rec}
-    tick: dict | None = None
-    degraded: dict | None = None
+    last_by_run: dict[str, dict[str, dict[str, Any]]] = {}  # key -> {"activity": rec, "heartbeat": rec, "handover": rec}
+    tick: dict[str, Any] | None = None
+    degraded: dict[str, Any] | None = None
     finished: dict[str, str] = {}
     for rec in events:
         if corr is not None and rec.get("correlation_id") not in (None, corr):
@@ -984,11 +988,11 @@ def derive_snapshot(root: str | Path | None = None, *, clock: Clock = SYSTEM_CLO
 
     by_id = {t["task_id"]: t for t in tasks}
     handover_in = _handovers_in(sdir, corr, tasks)
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     starts: list[float] = []
     ends: list[float] = []
     for t in tasks:
-        deps = _loads(t.get("depends_on"), [])
+        deps: list[str] = _loads(t.get("depends_on"), [])
         deps_met = all((by_id.get(d) or {}).get("state") in SATISFIED_STATES for d in deps)
         state = from_task_state(t["state"], deps_met=deps_met)
         attempt = max(int(t.get("attempt") or 0), 1)
@@ -1006,11 +1010,12 @@ def derive_snapshot(root: str | Path | None = None, *, clock: Clock = SYSTEM_CLO
         activity = last_by_run.get(run_id) or last_by_run.get(t["task_id"]) or {}
         act, hb = activity.get(EV_ACTIVITY), activity.get(EV_HEARTBEAT)
         latest = max((r for r in (act, hb) if r), key=lambda r: r.get("ts") or "", default=None)
-        last_act_wall = None
+        last_act_wall: float | None = None
         if act and _parse_ts(act.get("ts")) is not None:
             last_act_wall = _parse_ts(act["ts"])
-        if hb and _parse_ts(hb.get("ts")) is not None and isinstance(hb["payload"].get("since_activity_s"), (int, float)):
-            cand = _parse_ts(hb["ts"]) - float(hb["payload"]["since_activity_s"])
+        hb_wall = _parse_ts(hb.get("ts")) if hb else None
+        if hb and hb_wall is not None and isinstance(hb["payload"].get("since_activity_s"), (int, float)):
+            cand = hb_wall - float(hb["payload"]["since_activity_s"])
             last_act_wall = cand if last_act_wall is None else max(last_act_wall, cand)
         if last_act_wall is None or last_act_wall < start_ts:
             last_act_wall = last_ts if state is RunState.RUNNING else None

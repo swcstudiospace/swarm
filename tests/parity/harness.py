@@ -10,10 +10,24 @@ written under the repository's .swarm/. Standard library only.
 
   python3 tests/parity/harness.py          text table; exit 0 only when all eleven cases pass
   python3 tests/parity/harness.py --json   the case table as JSON
+
+The Rust leg is an explicit mode, never detected from the environment (U12.9):
+  GSD_ENGINE_BIN=<built gsd_engine> python3 tests/parity/harness.py --rust
+Under --rust each orch_status leg (happy_path, transition, gate_pass_fail_major --history, validation_error, empty,
+large) runs the Python truth, then the same argv on the gsd_engine binary from the same restored state. Exit 0 or 1 from
+the binary must print Python's stdout bytes with Python's exit code. An exit 2 whose code is a fallback code (E-INTERNAL,
+E-DEP, E-CAPACITY, E-CONTRACT, E-INPUT) is a recorded refusal, and the script run with GSD_ENGINE=rust must then print
+Python's bytes; any other answer must match Python's bytes too. The legal transition is the one call that mutates
+state: the wall-clock updated_at it reports is masked on both sides, and nothing else is. A byte mismatch writes
+tests/parity/fixtures/<case>-<digest>.json (case, argv, every leg's exit code and stdout) and fails the case.
+Without --rust, GSD_ENGINE_BIN is ignored. --rust with GSD_ENGINE_BIN unset, not a file, or not executable, or a binary
+that cannot be started, exits 1 with a message. Nothing is skipped silently.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -34,6 +48,18 @@ SCRIPTS = REPO / "scripts"
 PROCESS_TIMEOUT_S = 60.0
 HOST_ENV_KEYS = ("PATH", "TMPDIR", "LANG")
 LARGE_TASKS = 200
+
+# The selector's fallback codes as literals. scripts/orch_status.py RUST_FALLBACK_CODES must equal this set; the
+# classifier case checks that it does, so changing either side fails a check instead of moving the leg's answer.
+SELECTOR_FALLBACK_CODES = frozenset({"E-INTERNAL", "E-DEP", "E-CAPACITY", "E-CONTRACT", "E-INPUT"})
+
+FIXTURES = REPO / "tests" / "parity" / "fixtures"
+STATE_DIRS = ("state", "workspace", "home")
+WALL_CLOCK_FIELD = re.compile(rb'("updated_at": )[^,\n]+')
+
+
+class RustLegUnavailable(RuntimeError):
+    """The --rust leg cannot run: its binary is missing or does not start. The run exits 1; it never skips."""
 
 sys.path.insert(0, str(REPO))  # in-process setup imports the swarm package of this checkout
 
@@ -84,8 +110,11 @@ class CaseResult:
 class Sandbox:
     """Per-case temporary state: a workspace, SWARM_DIR, HOME and a fresh signing key (never a host key)."""
 
-    def __init__(self, base: Path) -> None:
+    def __init__(self, base: Path, case_name: str, rust_bin: Optional[str] = None) -> None:
         self.base = base
+        self.case_name = case_name
+        self.rust_bin = rust_bin  # the gsd_engine binary under --rust; None leaves the Rust leg off
+        self.parity: list[Check] = []  # Rust-leg checks, appended by orch_status_leg
         self.workspace = base / "workspace"
         self.swarm_dir = base / "state" / ".swarm"
         self.home = base / "home"
@@ -99,6 +128,7 @@ class Sandbox:
         env.update(
             HOME=str(self.home),
             SWARM_DIR=str(self.swarm_dir),
+            SWARM_PURE_PYTHON="1",
             SWARM_SIGNING_KEY=self.signing_key,
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONHASHSEED="0",
@@ -107,6 +137,20 @@ class Sandbox:
         )
         env.update(overrides or {})
         return env
+
+    def snapshot(self, name: str) -> Path:
+        """Copies the state directories aside, so a later restore() puts them back to this exact point."""
+        dest = self.base / "snapshots" / name
+        shutil.rmtree(dest, ignore_errors=True)
+        for part in STATE_DIRS:
+            shutil.copytree(self.base / part, dest / part)
+        return dest
+
+    def restore(self, snap: Path) -> None:
+        """Puts the state directories back as snapshot() saw them."""
+        for part in STATE_DIRS:
+            shutil.rmtree(self.base / part)
+            shutil.copytree(snap / part, self.base / part)
 
 
 @contextmanager
@@ -151,19 +195,139 @@ def _parse_object(raw: bytes) -> Optional[dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
-def invoke(sandbox: Sandbox, script: str, args: list[str], *, env: Optional[dict[str, str]] = None) -> Probe:
-    """Run scripts/<script>.py in the sandbox with --root <workspace> and --json appended to `args`."""
-    argv = [*args, "--root", str(sandbox.workspace), "--json"]
+def invoke(sandbox: Sandbox, script: str, args: list[str], *, engine: str = "python",
+           env: Optional[dict[str, str]] = None) -> Probe:
+    """Runs one invocation with --root <workspace> appended to `args`.
+
+    engine "python": scripts/<script>.py with GSD_ENGINE unset and --json appended. This is the truth.
+    engine "selector": the same script with GSD_ENGINE=rust and GSD_ENGINE_BIN, so its Python fallback can answer.
+    engine "rust": the gsd_engine binary with the same argv; the binary appends --json itself, as the SDK bridge does.
+    """
+    argv = [*args, "--root", str(sandbox.workspace)]
+    if engine == "rust":
+        return _invoke_binary(sandbox, script, argv)
+    if engine not in ("python", "selector"):
+        raise ValueError(f"unknown engine {engine!r}")
+    overrides = dict(env or {})
+    if engine == "selector":
+        if sandbox.rust_bin is None:
+            raise RuntimeError("the Rust leg is off: no gsd_engine binary was named")
+        overrides.update(GSD_ENGINE="rust", GSD_ENGINE_BIN=sandbox.rust_bin)
     proc = subprocess.run(
-        [sys.executable, str(SCRIPTS / f"{script}.py"), *argv],
+        [sys.executable, str(SCRIPTS / f"{script}.py"), *argv, "--json"],
         cwd=sandbox.workspace,
-        env=sandbox.env(env),
+        env=sandbox.env(overrides),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=PROCESS_TIMEOUT_S,
         check=False,
     )
     return Probe(proc.returncode, proc.stdout, proc.stderr, _parse_object(proc.stdout))
+
+
+def _invoke_binary(sandbox: Sandbox, script: str, argv: list[str]) -> Probe:
+    """Runs the gsd_engine binary directly with the stdin object that scripts/orch_status.py builds for it."""
+    if sandbox.rust_bin is None:
+        raise RuntimeError("the Rust leg is off: no gsd_engine binary was named")
+    env = sandbox.env()
+    keys = _selector(sandbox).RUST_ENV_KEYS
+    request = {"agent": "A01", "script": script, "argv": argv, "root": str(sandbox.workspace),
+               "env": {key: env[key] for key in keys if env.get(key)}}
+    payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    try:
+        proc = subprocess.run([sandbox.rust_bin], input=payload, capture_output=True, cwd=sandbox.workspace,
+                              env=env, timeout=PROCESS_TIMEOUT_S, check=False)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise RustLegUnavailable(f"the gsd_engine binary could not be started ({reason})") from exc
+    return Probe(proc.returncode, proc.stdout, proc.stderr, _parse_object(proc.stdout))
+
+
+def _selector(sandbox: Sandbox) -> Any:
+    """scripts/orch_status.py loaded as a module, so the env keys come from the selector itself."""
+    spec = importlib.util.spec_from_file_location("parity_orch_status", SCRIPTS / "orch_status.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("scripts/orch_status.py cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    with in_process(sandbox):
+        spec.loader.exec_module(module)
+    return module
+
+
+def _error_code(probe: Probe) -> Optional[str]:
+    """The taxonomy code of an exit-2 error reply, else None."""
+    if probe.exit_code != 2 or probe.payload is None:
+        return None
+    error = probe.payload.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _masked(probe: Probe, mutating: bool) -> bytes:
+    """The stdout that is compared. A mutating call's wall-clock updated_at is masked; nothing else is."""
+    return WALL_CLOCK_FIELD.sub(rb"\g<1><clock>", probe.stdout) if mutating else probe.stdout
+
+
+def _same(left: Probe, right: Probe, mutating: bool) -> bool:
+    return left.exit_code == right.exit_code and _masked(left, mutating) == _masked(right, mutating)
+
+
+def _leg(sandbox: Sandbox, probe: Probe) -> dict[str, Any]:
+    """One leg as a fixture records it. The sandbox's signing key is redacted from the text."""
+    def text(raw: bytes) -> str:
+        return raw.decode("utf-8", "backslashreplace").replace(sandbox.signing_key, "<redacted>")
+
+    return {"exit_code": probe.exit_code, "stdout": text(probe.stdout),
+            "stdout_base64": base64.b64encode(probe.stdout).decode("ascii"), "stderr": text(probe.stderr)}
+
+
+def _record_mismatch(sandbox: Sandbox, args: list[str], legs: dict[str, Probe], mutating: bool) -> str:
+    """Writes the fixture for one byte mismatch and returns its path relative to the repository."""
+    FIXTURES.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(json.dumps([sandbox.case_name, args]).encode("utf-8")).hexdigest()[:12]
+    path = FIXTURES / f"{sandbox.case_name}-{digest}.json"
+    body = {"case": sandbox.case_name, "script": "orch_status", "argv": args, "mutating": mutating,
+            "legs": {name: _leg(sandbox, probe) for name, probe in legs.items()}}
+    path.write_text(json.dumps(body, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return str(path.relative_to(REPO))
+
+
+def _rust_checks(sandbox: Sandbox, before: Path, args: list[str], truth: Probe, mutating: bool) -> list[Check]:
+    """The binary's answer to one call, or the selector's fallback where the binary refuses, against Python."""
+    label = f"orch_status {' '.join(args)}"
+    fallback_codes = SELECTOR_FALLBACK_CODES
+    sandbox.restore(before)
+    rust = invoke(sandbox, "orch_status", args, engine="rust")
+    refusal = _error_code(rust)
+    legs: dict[str, Probe] = {"python": truth, "rust": rust}
+    if refusal in fallback_codes:
+        sandbox.restore(before)
+        legs["selector"] = invoke(sandbox, "orch_status", args, engine="selector")
+        answer = legs["selector"]
+        name = f"{label}: rust refuses {refusal}, the script fallback prints Python's bytes"
+    else:
+        answer = rust
+        suffix = f", refused {refusal}" if refusal else ""
+        name = f"{label}: rust answers exit {rust.exit_code}{suffix} with Python's bytes"
+    if _same(answer, truth, mutating):
+        return [Check(name, True, f"exit {truth.exit_code}")]
+    where = _record_mismatch(sandbox, args, legs, mutating)
+    return [Check(name, False, f"exit {answer.exit_code} vs Python exit {truth.exit_code}; fixture {where}")]
+
+
+def orch_status_leg(sandbox: Sandbox, args: list[str], *, mutating: bool = False) -> Probe:
+    """The Python truth for one orch_status call. Under --rust it is also answered by the binary and by the
+    selector's fallback, each from the state Python saw; the comparison goes to sandbox.parity."""
+    if sandbox.rust_bin is None:
+        return invoke(sandbox, "orch_status", args)
+    before = sandbox.snapshot("before")
+    truth = invoke(sandbox, "orch_status", args)
+    after = sandbox.snapshot("after")
+    try:
+        sandbox.parity.extend(_rust_checks(sandbox, before, args, truth, mutating))
+    finally:
+        sandbox.restore(after)
+    return truth
 
 
 _MISSING = object()
@@ -308,7 +472,7 @@ def _swarm_tool_limit(sandbox: Sandbox) -> int:
 
 def case_happy_path(sandbox: Sandbox) -> list[Check]:
     seed_tasks(sandbox, "T-happy-1", correlation_id="C-happy")
-    status = invoke(sandbox, "orch_status", ["--correlation-id", "C-happy"])
+    status = orch_status_leg(sandbox, ["--correlation-id", "C-happy"])
     catalog = invoke(sandbox, "swarm_tool", ["catalog", "--caller", "A05", "--kind", "tools"])
     call = invoke(sandbox, "swarm_tool", ["call", "--caller", "a05-backend", "--name", "be_route_norm",
                                           "--input", '{"path": "/users/:id/"}'])
@@ -327,8 +491,9 @@ def case_happy_path(sandbox: Sandbox) -> list[Check]:
 
 def case_transition(sandbox: Sandbox) -> list[Check]:
     seed_tasks(sandbox, "T-legal-1", "T-illegal-1")
-    legal = invoke(sandbox, "orch_status", ["--transition", "T-legal-1", "CANCELLED", "--reason", "parity legal"])
-    illegal = invoke(sandbox, "orch_status", ["--transition", "T-illegal-1", "DONE", "--reason", "parity illegal"])
+    legal = orch_status_leg(sandbox, ["--transition", "T-legal-1", "CANCELLED", "--reason", "parity legal"],
+                            mutating=True)
+    illegal = orch_status_leg(sandbox, ["--transition", "T-illegal-1", "DONE", "--reason", "parity illegal"])
     return [
         expect("legal transition CREATED -> CANCELLED", legal, exit_code=0,
                keys=("status", "task", "summary"), predicate=equals(("task", "state"), "CANCELLED")),
@@ -351,8 +516,8 @@ def case_gate_pass_fail_major(sandbox: Sandbox) -> list[Check]:
             gate="review", task_id="T-gate-fail", agent_id="A09", findings=[major], correlation_id="C-gate",
             root=sandbox.workspace, audit=False))
     history_keys = ("status", "task_id", "history", "verdicts", "missing_gate_reasons", "summary")
-    passed = invoke(sandbox, "orch_status", ["--history", "T-gate-pass"])
-    failed = invoke(sandbox, "orch_status", ["--history", "T-gate-fail"])
+    passed = orch_status_leg(sandbox, ["--history", "T-gate-pass"])
+    failed = orch_status_leg(sandbox, ["--history", "T-gate-fail"])
     return [
         expect("gate pass verdict reads back as pass", passed, exit_code=0, keys=history_keys,
                predicate=equals(("verdicts", "review", "verdict"), "pass")),
@@ -386,8 +551,8 @@ def case_boundary_100kb(sandbox: Sandbox) -> list[Check]:
 
 
 def case_validation_error(sandbox: Sandbox) -> list[Check]:
-    bad_id = invoke(sandbox, "orch_status", ["--task-id", "bad..id"])
-    unknown = invoke(sandbox, "orch_status", ["--history", "T-parity-missing"])
+    bad_id = orch_status_leg(sandbox, ["--task-id", "bad..id"])
+    unknown = orch_status_leg(sandbox, ["--history", "T-parity-missing"])
     caller = invoke(sandbox, "swarm_tool", ["catalog", "--caller", "nobody-here"])
     return [
         expect("task id containing '..' is refused before any work", bad_id, exit_code=2,
@@ -400,7 +565,7 @@ def case_validation_error(sandbox: Sandbox) -> list[Check]:
 
 
 def case_empty(sandbox: Sandbox) -> list[Check]:
-    store_run = invoke(sandbox, "orch_status", [])
+    store_run = orch_status_leg(sandbox, [])
     query = invoke(sandbox, "swarm_tool", ["catalog", "--caller", "A05", "--kind", "tools",
                                            "--query", "zz-no-such-tool"])
     return [
@@ -413,7 +578,7 @@ def case_empty(sandbox: Sandbox) -> list[Check]:
 
 def case_large(sandbox: Sandbox) -> list[Check]:
     seed_tasks(sandbox, *(f"T-large-{i:03d}" for i in range(LARGE_TASKS)), correlation_id="C-large")
-    status = invoke(sandbox, "orch_status", ["--correlation-id", "C-large"])
+    status = orch_status_leg(sandbox, ["--correlation-id", "C-large"])
     catalog = invoke(sandbox, "swarm_tool", ["catalog", "--caller", "A01", "--kind", "all"])
     return [
         expect(f"orch_status reads {LARGE_TASKS} tasks in one correlation", status, exit_code=0,
@@ -487,7 +652,10 @@ def _diff(got: set[str], want: set[str]) -> str:
 
 
 def case_classifier(sandbox: Sandbox) -> list[Check]:
-    """Static mirror check: ErrorCode, the retry partitions, omp/src/bridge.ts and classify() must agree."""
+    """Static mirror check: ErrorCode, the retry partitions, omp/src/bridge.ts and classify() must agree.
+
+    scripts/orch_status.py RUST_FALLBACK_CODES must equal SELECTOR_FALLBACK_CODES (checked below).
+    """
     with in_process(sandbox):
         from swarm.errors import ErrorCode, SwarmError, classify
         from swarm.retry import PERMANENT_CODES, TRANSIENT_CODES
@@ -521,6 +689,12 @@ def case_classifier(sandbox: Sandbox) -> list[Check]:
     for exc_type, code in expected_map.items():
         got = classify(exc_type("parity probe")).value
         checks.append(Check(f"classify({exc_type.__name__}) is {code}", got == code, f"got {got}"))
+    selector_codes = set(_selector(sandbox).RUST_FALLBACK_CODES)
+    checks.append(Check(
+        "scripts/orch_status.py RUST_FALLBACK_CODES equals the harness copy",
+        selector_codes == SELECTOR_FALLBACK_CODES,
+        _diff(selector_codes, SELECTOR_FALLBACK_CODES),
+    ))
     return checks
 
 
@@ -548,23 +722,29 @@ CASES: tuple[Case, ...] = (
          "Plan mode refuses a WRITE tool; a hand move of a gate task is refused; both as E-POLICY with no paths leaked.",
          case_policy),
     Case("classifier_quadruple_mirror", "errors + retry + omp bridge",
-         "ErrorCode, the retry partitions, bridge.ts (object and union) and classify() agree on the taxonomy.",
+         "ErrorCode, retry partitions, bridge.ts, classify() and the selector's fallback set agree.",
          case_classifier),
 )
 
 
-def run_case(case: Case) -> CaseResult:
-    """Run one case in a fresh temporary directory, removed afterwards."""
+def run_case(case: Case, rust_bin: Optional[str] = None) -> CaseResult:
+    """Run one case in a fresh temporary directory, removed afterwards; rust_bin is set under --rust."""
     base = Path(tempfile.mkdtemp(prefix=f"parity-{case.name}-"))
+    sandbox: Optional[Sandbox] = None
     try:
         resolved = base.resolve()
         if resolved == REPO or REPO in resolved.parents:
             raise RuntimeError(f"temporary state {resolved} lies inside the repository")
-        checks = case.run(Sandbox(base))
+        sandbox = Sandbox(base, case.name, rust_bin)
+        checks = case.run(sandbox)
+    except RustLegUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001 - one broken case must not hide the rest of the table
         checks = [Check("case ran to completion", False, f"{type(exc).__name__}: {exc}")]
     finally:
         shutil.rmtree(base, ignore_errors=True)
+    if sandbox is not None:
+        checks = [*checks, *sandbox.parity]
     status = "pass" if checks and all(check.ok for check in checks) else "fail"
     return CaseResult(case.name, case.route, case.description, status, checks)
 
@@ -579,11 +759,29 @@ def render_table(results: list[CaseResult]) -> str:
     return "\n".join(lines)
 
 
+def _rust_binary() -> str:
+    """The gsd_engine binary named by GSD_ENGINE_BIN, resolved. Unset or not executable is RustLegUnavailable."""
+    value = os.environ.get("GSD_ENGINE_BIN", "")
+    if not value:
+        raise RustLegUnavailable("GSD_ENGINE_BIN is not set; name the built gsd_engine binary")
+    path = Path(value).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RustLegUnavailable(f"GSD_ENGINE_BIN is not an executable file: {path}")
+    return str(path)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="A1 parity runner: 11 cases for the read-only route, Python as truth.")
     parser.add_argument("--json", action="store_true", help="print the case table as JSON")
+    parser.add_argument("--rust", action="store_true",
+                        help="also compare each orch_status leg with the gsd_engine binary at GSD_ENGINE_BIN")
     args = parser.parse_args(argv)
-    results = [run_case(case) for case in CASES]
+    try:
+        rust_bin = _rust_binary() if args.rust else None
+        results = [run_case(case, rust_bin) for case in CASES]
+    except RustLegUnavailable as exc:
+        print(f"parity: the --rust leg cannot run: {exc}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps([asdict(result) for result in results], indent=2))
     else:

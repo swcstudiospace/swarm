@@ -39,9 +39,11 @@ Reference constants (public sources, checked 2026-10-20) and what is house polic
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
+from typing import Any, NoReturn, SupportsFloat
 
 from swarm.tools.support import respond
 
@@ -74,19 +76,19 @@ class _Bad(Exception):
         self.message = message
 
 
-def _bad(field: str, message: str):
+def _bad(field: str, message: str) -> NoReturn:
     raise _Bad(field, message)
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _guard(work):
+def _guard(work: Callable[[], dict[str, Any]]) -> Callable[[], dict[str, Any]]:
     """Turn a `_bad` raised anywhere inside `work` into the INVALID_INPUT shape. A result too large for a float (a
     volume of 1e-300, say) is also an input problem, not a dependency failure."""
 
-    def run() -> dict:
+    def run() -> dict[str, Any]:
         try:
             return work()
         except _Bad as exc:
@@ -97,16 +99,16 @@ def _guard(work):
     return run
 
 
-def _fr(value) -> Fraction:
+def _fr(value: object) -> Fraction:
     """Exact value of the number as written: 0.1 is 1/10, not its binary neighbour."""
     return Fraction(Decimal(repr(value)))
 
 
-def _r(value, digits: int = 4) -> float:
+def _r(value: SupportsFloat, digits: int = 4) -> float:
     return round(float(value), digits)
 
 
-def _num(value) -> str:
+def _num(value: SupportsFloat) -> str:
     """Six significant figures, never exponent form: a money amount above 1e6 prints as digits, not 1e+06."""
     number = float(value)
     text = f"{number:.6g}"
@@ -117,14 +119,14 @@ def _num(value) -> str:
     return format(Decimal(text), "f")
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, Any]:
     return {"id": fid, "severity": severity, "summary": summary}
 
 
 _SEVERITY_ORDER = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
 
 
-def _cap(findings: list[dict]) -> list[dict]:
+def _cap(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """At most MAX_FINDINGS findings, most severe first (stable within a severity). When some are dropped the last slot
     says how many, so a truncated list is never mistaken for a complete one."""
     ordered = sorted(findings, key=lambda item: _SEVERITY_ORDER[item["severity"]])
@@ -192,14 +194,14 @@ def _unique(field: str, names: list[str], what: str) -> None:
 # --- unit economics --------------------------------------------------------------------------------------------
 
 
-def unit_cost(payload: dict) -> dict:
+def unit_cost(payload: dict[str, Any]) -> dict[str, Any]:
     """Total cost over volume: unit cost, cost per 1000 units, dominant category and margin against revenue per unit.
 
     Verdict: loss_making (unit cost > revenue per unit), else over_target (unit cost > target), within_target
     (unit cost <= target) or no_target; the verdict uses the exact quotient, while `unit_cost` is printed rounded to
     8 decimals and `cost_per_1000_units` to 6. A target overshoot above 25 % is major, otherwise minor (house policy)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         totals: dict[str, Fraction] = {}
         for index, item in enumerate(payload["costs"]):
             category = item["category"].strip()
@@ -213,7 +215,7 @@ def unit_cost(payload: dict) -> dict:
         if total > 0:
             top_category = min(totals, key=lambda name: (-totals[name], name))
             top_share = totals[top_category] / total
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         verdict = "no_target"
         margin_known, margin = False, Fraction(0)
         if "revenue_per_unit" in payload:
@@ -261,7 +263,7 @@ def _resize_action(request: Fraction, recommended: Fraction, tolerance: Fraction
     return "keep"
 
 
-def rightsize(payload: dict) -> dict:
+def rightsize(payload: dict[str, Any]) -> dict[str, Any]:
     """Recommend per-replica CPU and memory requests from observed usage.
 
     CPU = ceil(p95 or p99 x (1 + headroom)); memory = ceil(p99 x (1 + headroom)) because memory is not compressible
@@ -273,7 +275,7 @@ def rightsize(payload: dict) -> dict:
     callers apply their own platform minimums. Saving = replicas x hours x unit price x delta; positive for
     downsizing, negative for upsizing. Nothing is applied: A11/A21 apply the recommendation at L3."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         cpu_basis = payload["cpu_basis"]
         cpu_headroom = 1 + _fr(payload.get("cpu_headroom_pct", DEFAULT_HEADROOM_PCT)) / 100
         mem_headroom = 1 + _fr(payload.get("mem_headroom_pct", DEFAULT_HEADROOM_PCT)) / 100
@@ -357,7 +359,7 @@ def rightsize(payload: dict) -> dict:
 # --- commitments -----------------------------------------------------------------------------------------------
 
 
-def commitment_coverage(payload: dict) -> dict:
+def commitment_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Savings-plan style commitment of `commitment` discounted spend per period at `discount_pct` off on-demand.
 
     A commitment covers up to cap = commitment / (1 - discount) of on-demand-equivalent usage per period.
@@ -369,7 +371,7 @@ def commitment_coverage(payload: dict) -> dict:
     10th percentile of usage x (1 - discount). A20 proposes;
     the purchase is an L4 human decision."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         usage = [_fr(u) for u in payload["usage"]]
         commitment = _fr(payload["commitment"])
         retained = 1 - _fr(payload["discount_pct"]) / 100
@@ -385,7 +387,7 @@ def commitment_coverage(payload: dict) -> dict:
         net = covered - paid
         unused = paid - covered * retained
         baseline = sorted(usage)[math.ceil(Fraction(periods, 10)) - 1] * retained
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         breakeven_pct = retained * 100
         if utilization < min_util:
             verdict = "under_utilized"
@@ -419,7 +421,7 @@ def commitment_coverage(payload: dict) -> dict:
 # --- budget ----------------------------------------------------------------------------------------------------
 
 
-def budget_burn(payload: dict) -> dict:
+def budget_burn(payload: dict[str, Any]) -> dict[str, Any]:
     """Spend-to-date against a budget for the period [period_start, period_end].
 
     Run rate per day = mean of `recent_daily_spend` when supplied, else spend_to_date / elapsed days. Projected total
@@ -428,7 +430,7 @@ def budget_burn(payload: dict) -> dict:
     the budget at the run rate ("" when no overrun is projected or the budget is already spent);
     `days_until_overrun` is -1 when no overrun is projected and 0 when already over."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         start = _instant("period_start", payload["period_start"])
         end = _instant("period_end", payload["period_end"])
         as_of = _instant("as_of", payload["as_of"])
@@ -450,7 +452,7 @@ def budget_burn(payload: dict) -> dict:
         used_pct, elapsed_pct = spend / budget * 100, elapsed_s / total_s * 100
         overrun_amount = max(Fraction(0), projected - budget)
         overrun_at, days_until = "", Fraction(-1)
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         if spend >= budget:
             verdict, days_until = "over_budget", Fraction(0)
             findings.append(_finding("BB-OVER", "major", f"spend {_num(spend)} has reached or exceeded the budget {_num(budget)}"))
@@ -485,7 +487,7 @@ def budget_burn(payload: dict) -> dict:
 # --- anomalies -------------------------------------------------------------------------------------------------
 
 
-def spend_anomaly(payload: dict) -> dict:
+def spend_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
     """Modified z-score anomalies over a daily series: M = 0.6745 (x - median) / MAD, flagged when |M| > threshold
     (default 3.5, Iglewicz and Hoaglin). When the MAD is 0 (more than half the days are identical) the mean absolute
     deviation about the median is used instead, M = (x - median) / (1.253314 x meanAD): IBM's convention, `scale_method`
@@ -494,7 +496,7 @@ def spend_anomaly(payload: dict) -> dict:
     inside the threshold and downward days add nothing. Upward anomalies at
     |M| >= 2 x threshold are major, other upward ones minor and downward ones info."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         start = _day("start_date", payload["start_date"])
         try:
             (start + timedelta(days=len(payload["daily_spend"]) - 1)).isoformat()
@@ -549,7 +551,7 @@ PROBLEM_TYPES = ("case_mismatch", "duplicate_key", "empty_value", "invalid_value
 BLOCKING_PROBLEMS = ("case_mismatch", "empty_value", "missing")
 
 
-def _tag_problems(tags: list[dict], required: list[str], allowed: dict[str, list[str]]) -> list[tuple[str, str]]:
+def _tag_problems(tags: list[dict[str, Any]], required: list[str], allowed: dict[str, list[str]]) -> list[tuple[str, str]]:
     """(problem, key) pairs for one resource. Tag keys are compared case-sensitively (the AWS rule; Azure tag names and
     GCP labels follow other rules, so a caller on those clouds must normalise first): `Owner` does not satisfy a
     required `owner` and is reported as case_mismatch. Only required keys are judged; a repeated key is judged on
@@ -573,7 +575,7 @@ def _tag_problems(tags: list[dict], required: list[str], allowed: dict[str, list
     return problems
 
 
-def tag_coverage(payload: dict) -> dict:
+def tag_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Share of resources (and of their cost) carrying every required allocation tag with a valid value.
 
     A resource is compliant when each required key is present with that exact spelling, has a non-blank value and,
@@ -583,7 +585,7 @@ def tag_coverage(payload: dict) -> dict:
     impossible (missing, case_mismatch, empty_value), else minor. A finding lists at most 5 problems (the
     `problem_counts` cover all of them). Tag values are never echoed."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         resources = payload["resources"]
         _unique("resources", [r["id"] for r in resources], "resource id")
         required = payload["required_keys"]
@@ -640,13 +642,13 @@ def tag_coverage(payload: dict) -> dict:
 # --- idle resources --------------------------------------------------------------------------------------------
 
 
-def idle_resources(payload: dict) -> dict:
+def idle_resources(payload: dict[str, Any]) -> dict[str, Any]:
     """Resources whose utilization has been strictly below `threshold_pct` for at least `min_idle_days` consecutive
     days ending with the most recent sample (one sample per day, oldest first). A series shorter than min_idle_days is
     reported as insufficient data, never as idle. The recommendation is owner review: A20 does not delete. Severity is
     major when every sample is idle, else minor."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         threshold = _fr(payload["threshold_pct"])
         min_days = payload["min_idle_days"]
         _unique("resources", [r["id"] for r in payload["resources"]], "resource id")
@@ -692,7 +694,7 @@ def idle_resources(payload: dict) -> dict:
 # --- storage tiering -------------------------------------------------------------------------------------------
 
 
-def storage_tiering(payload: dict) -> dict:
+def storage_tiering(payload: dict[str, Any]) -> dict[str, Any]:
     """Cheapest storage tier per dataset over its remaining retention, net of the one-off transition cost.
 
     Monthly cost of a tier = size x storage price + monthly reads x retrieval price. A tier is eligible only when the
@@ -703,7 +705,7 @@ def storage_tiering(payload: dict) -> dict:
     leaving the current tier (the dataset's age in it is not an input), object-size minimums and retrieval latency;
     a billing month is 30 days."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         tiers = {t["name"]: t for t in payload["tiers"]}
         if len(tiers) != len(payload["tiers"]):
             _bad("tiers", "tier names must be unique")
@@ -712,7 +714,7 @@ def storage_tiering(payload: dict) -> dict:
         saving_total = transition_total = Fraction(0)
         moves = 0
 
-        def monthly(tier: dict, size: Fraction, reads: Fraction) -> Fraction:
+        def monthly(tier: dict[str, Any], size: Fraction, reads: Fraction) -> Fraction:
             return size * _fr(tier["storage_per_gb_month"]) + reads * _fr(tier["retrieval_per_gb"])
 
         for dataset_index, dataset in enumerate(payload["datasets"]):
@@ -775,7 +777,7 @@ EGRESS_ADVICE = {
 }
 
 
-def egress_cost(payload: dict) -> dict:
+def egress_cost(payload: dict[str, Any]) -> dict[str, Any]:
     """Monthly data-transfer cost from flows and a rate card.
 
     cross_az and cross_region flows are billed at their per-GB rate (state the effective rate: where a provider bills
@@ -785,7 +787,7 @@ def egress_cost(payload: dict) -> dict:
     processing rate per GB on top. A flow's cost is its own rate; internet flows share the blended internet rate. A
     category at >= 50 % of the total cost yields a finding and is reported as dominant_category."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         rates = payload["rates"]
         tiers = payload["internet_tiers"]
         previous = None
@@ -844,7 +846,7 @@ def egress_cost(payload: dict) -> dict:
 # --- spot / preemptible ----------------------------------------------------------------------------------------
 
 
-def spot_suitability(payload: dict) -> dict:
+def spot_suitability(payload: dict[str, Any]) -> dict[str, Any]:
     """Spot/preemptible fit per workload: interruption overhead versus price savings.
 
     Each instance is interrupted interruption_pct_month / 100 times a month (the provider advisor's monthly
@@ -857,7 +859,7 @@ def spot_suitability(payload: dict) -> dict:
     ceil(replicas x on_demand_floor_pct / 100) (default 20 %, at least 1) replicas on demand; the rest may run on
     spot. The 30 / 20 / 20 defaults are house policy. Recommendation only: A11 applies node-pool changes (L3)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         max_interrupt = _fr(payload.get("max_interruption_pct", 20))
         min_savings = _fr(payload.get("min_savings_pct", 30))
         floor_pct = _fr(payload.get("on_demand_floor_pct", 20))
@@ -919,7 +921,7 @@ def spot_suitability(payload: dict) -> dict:
 # --- carbon ----------------------------------------------------------------------------------------------------
 
 
-def carbon_estimate(payload: dict) -> dict:
+def carbon_estimate(payload: dict[str, Any]) -> dict[str, Any]:
     """Operational emissions: kWh = average power W x hours / 1000 x PUE; kgCO2e = kWh x grid intensity (g/kWh) / 1000.
 
     Location-based method (the intensity of the grid where the workload runs). Every workload region must have a
@@ -928,7 +930,7 @@ def carbon_estimate(payload: dict) -> dict:
     Verdict relocation_candidates when the total potential saving is >= min_saving_pct (default 10) of the total
     emissions, else no_action. Embodied emissions and network energy are out of scope."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         grid = {}
         for grid_index, row in enumerate(payload["grid_intensity"]):
             if row["region"] in grid:
@@ -977,7 +979,7 @@ def carbon_estimate(payload: dict) -> dict:
 # --- showback --------------------------------------------------------------------------------------------------
 
 
-def showback(payload: dict) -> dict:
+def showback(payload: dict[str, Any]) -> dict[str, Any]:
     """Allocate a shared cost to consumers: proportional (by direct cost), even, or usage (by the usage metric).
 
     The shared cost must be a whole number of cents. Shares are exact fractions; each consumer gets the floor in
@@ -986,7 +988,7 @@ def showback(payload: dict) -> dict:
     (else INVALID_INPUT on consumers). A consumer at >= 50 % of the allocation (with more than one consumer) is an
     info finding."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         consumers = payload["consumers"]
         _unique("consumers", [c["team"] for c in consumers], "team")
         shared = Decimal(repr(payload["shared_cost"])) * 100

@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 registry/intake/.lock
 target/
+
+# PyO3 extension copied into the tree by an editable or in-place build (maturin develop, pip install -e .)
+swarm/_native*.so

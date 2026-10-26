@@ -1,0 +1,8 @@
+{
+  "description": "Isolation headers for the browser build. COOP and COEP make the top-level document cross-origin isolated, which SharedArrayBuffer requires. CORP keeps same-origin resources usable under COEP.",
+  "headers": {
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cross-Origin-Resource-Policy": "same-origin"
+  }
+}

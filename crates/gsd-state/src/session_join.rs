@@ -2,9 +2,9 @@
 //! join, applies each outcome to its thread's phase, and runs the cancel window.
 //!
 //! The barrier, merge and dispatch mechanics stay in `gsd-scheduler`; this module adds none of them.
-//! Each run's stage log is emitted to a [`CompletionLedger`] under [`JoinKey`] `(stage, join seq,
-//! attempt)`. An emission under a key already collected is dropped, and a run under such a key is not
-//! repeated, so a re-emitted completion never applies twice.
+//! Each run's stage log is emitted to a [`CompletionLedger`] under [`JoinKey`]
+//! `(task id, stage, join seq, attempt)`. An emission under a key already collected is dropped,
+//! and a run under such a key is not repeated, so a re-emitted completion never applies twice.
 //!
 //! Cancel follows the runner's flag rule. A [`CancelMarker`] is written at `cancel/<corr>` with the
 //! sanitized correlation id. Each running task then has [`CancelTiming::cooperative`] (3 s) to stop, walked
@@ -72,6 +72,9 @@ pub enum JoinError {
     /// The nexus plan has more stages than a [`JoinKey`] stage index can hold.
     #[error("nexus plan has {0} stages, more than a u32 stage index holds")]
     TooManyStages(usize),
+    /// A merged stage index is not a stage of the nexus plan.
+    #[error("merged stage {0} is not a stage of the nexus plan")]
+    UnknownStage(u32),
     /// A thread lookup, thread-phase change or start refused. See [`DispatchError`].
     #[error("dispatch: {0}")]
     Dispatch(#[from] DispatchError),
@@ -80,9 +83,12 @@ pub enum JoinError {
     Scheduler(#[from] SchedulerError),
 }
 
-/// Idempotency key of one emitted stage completion: `(stage id, join seq, attempt)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Idempotency key of one emitted stage completion: `(task id, stage id, join seq, attempt)`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JoinKey {
+    /// Task the completion belongs to. A matrix stage keys each task. A nexus stage keys its
+    /// participants by their sorted task ids, length-prefixed; see `participant_key`.
+    pub task_id: String,
     /// Stage the completion belongs to.
     pub stage: u32,
     /// Join sequence number within the session, supplied by the caller.
@@ -101,7 +107,7 @@ pub enum Emit {
 }
 
 /// The emission of one stage, with its key and outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageEmit {
     /// Key the stage was emitted under.
     pub key: JoinKey,
@@ -293,8 +299,9 @@ impl JoinContext {
         Ok(())
     }
 
-    fn key(&self, stage: u32) -> JoinKey {
+    fn key(&self, task_id: &str, stage: u32) -> JoinKey {
         JoinKey {
+            task_id: task_id.to_string(),
             stage,
             join_seq: self.join_seq,
             attempt: self.attempt,
@@ -305,7 +312,9 @@ impl JoinContext {
 /// Result of one join run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct JoinCompletion {
-    /// Emission of each stage. Empty when the run was cancelled before any stage merged.
+    /// Emission of each stage that was collected or deduplicated. Empty when the run was cancelled
+    /// before any stage merged. A task that did not run, or did not reach a terminal phase, has no
+    /// entry.
     pub stages: Vec<StageEmit>,
     /// Tasks stopped when the cooperative window closed. Each ends `CANCELLED_TIMED_OUT` (`timed_out`).
     pub forced: Vec<String>,
@@ -314,21 +323,28 @@ pub struct JoinCompletion {
     pub cancelled: Vec<String>,
     /// Tasks not started because the marker was already set. Their threads stay as they were.
     pub not_started: Vec<String>,
-    /// Tasks whose outcome was rate-limited. Their threads stay `RUNNING`; retry belongs to the caller.
+    /// Tasks whose outcome was rate-limited. Their threads stay `RUNNING` and their keys are not
+    /// collected; retry belongs to the caller.
     pub rate_limited: Vec<String>,
     /// Tasks the matrix join never dispatched, for example behind a failed dependency.
     pub undispatched: Vec<String>,
+    /// Tasks whose thread could not be admitted to `RUNNING`, so they did not run. Their keys are
+    /// not collected, so a retry can run them.
+    pub start_failed: Vec<String>,
     /// Whether the cancel marker was set during the run.
     pub cancel_requested: bool,
 }
 
 impl JoinCompletion {
-    fn deduplicated(key: JoinKey) -> Self {
+    fn deduplicated(keys: &[JoinKey]) -> Self {
         Self {
-            stages: vec![StageEmit {
-                key,
-                emit: Emit::Deduplicated,
-            }],
+            stages: keys
+                .iter()
+                .map(|key| StageEmit {
+                    key: key.clone(),
+                    emit: Emit::Deduplicated,
+                })
+                .collect(),
             ..Self::default()
         }
     }
@@ -345,19 +361,24 @@ pub(crate) enum Terminal {
 /// Per-run sets the matrix wrapper fills in as tasks run.
 #[derive(Default)]
 struct RunState {
+    /// Tasks whose key was already collected when the run began. They are not run.
+    replayed: HashSet<String>,
     started: Mutex<HashSet<String>>,
     skipped: Mutex<HashSet<String>>,
     forced: Mutex<HashSet<String>>,
     cooperative: Mutex<HashSet<String>>,
 }
 
-/// Runs `batch` through the B5 flat matrix join and collects its completion once per key.
+/// Runs `batch` through the B5 flat matrix join and collects each task that settled.
 ///
-/// Every batch task must be bound to an IDLE thread. A task that starts is admitted and handed off to
-/// `RUNNING` through the B7 helpers, and its end is written as its thread's terminal phase. If the cancel
-/// marker is set before a task starts, that task is not run and is listed in `not_started`. A task still
-/// running when the cooperative window closes is dropped and ends `CANCELLED_TIMED_OUT` (`timed_out`).
-/// If the key is already in `ledger`, nothing runs and the call returns [`Emit::Deduplicated`].
+/// A task whose key is already in `ledger` is not run: its worker is not called, and it reports
+/// [`Emit::Deduplicated`] while the rest of the batch runs. Every other task must be bound to an IDLE
+/// thread. A task that starts is admitted and handed off to `RUNNING` through the B7 helpers, and its
+/// end is written as its thread's terminal phase. If the cancel marker is set before a task starts,
+/// that task is not run and is listed in `not_started`. A task still running when the cooperative
+/// window closes is dropped and ends `CANCELLED_TIMED_OUT` (`timed_out`). A task that did not run,
+/// whether cancelled before its start or refused at start (listed in `start_failed`), or whose
+/// outcome is rate-limited, is not collected and has no entry in `stages`.
 pub async fn collect_matrix_completions<W, Fut>(
     ctx: &JoinContext,
     ledger: &mut CompletionLedger,
@@ -371,18 +392,29 @@ where
     Fut: Future<Output = Result<(), TaskFailure>> + Send + 'static,
 {
     ctx.check()?;
-    let key = ctx.key(batch.stage);
-    if ledger.contains(&key) {
-        return Ok(JoinCompletion::deduplicated(key));
-    }
     let ids: Vec<String> = batch
         .tasks
         .iter()
         .map(|task| task_id_of(task).to_string())
         .collect();
-    prepare_fresh(&ctx.session, &ids)?;
+    let keys: Vec<JoinKey> = ids.iter().map(|id| ctx.key(id, batch.stage)).collect();
+    let replayed: HashSet<String> = ids
+        .iter()
+        .zip(&keys)
+        .filter(|(_, key)| ledger.contains(key))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let fresh: Vec<String> = ids
+        .iter()
+        .filter(|id| !replayed.contains(*id))
+        .cloned()
+        .collect();
+    prepare_fresh(&ctx.session, &fresh)?;
 
-    let run = Arc::new(RunState::default());
+    let run = Arc::new(RunState {
+        replayed,
+        ..RunState::default()
+    });
     let worker = Arc::new(worker);
     let session = Arc::clone(&ctx.session);
     let cancel = ctx.cancel.clone();
@@ -404,35 +436,56 @@ where
     let started = take(&run.started);
     let forced = take(&run.forced);
     let cooperative = take(&run.cooperative);
-    let mut records: Vec<CompletionRecord> = Vec::new();
+    let mut by_task: BTreeMap<String, Vec<CompletionRecord>> = BTreeMap::new();
     let mut rate_limited = Vec::new();
+    let mut start_failed = BTreeSet::new();
     {
         let mut guard = ctx.session.lock();
         for record in report.log.records() {
             let id = record.key.task_id.as_str();
-            if skipped.contains(id) {
+            if run.replayed.contains(id) || skipped.contains(id) {
                 continue;
             }
-            records.push(record.clone());
             if !started.contains(id) {
+                // `run_task` records a start failure without admitting the thread, so the task
+                // did not run. Report it; its key stays uncollected so a retry can run it.
+                start_failed.insert(id.to_string());
                 continue;
             }
             let is_forced = forced.contains(id);
             let is_cooperative = cooperative.contains(id);
             match terminal_for(&record.outcome, is_forced, is_cooperative) {
-                Some(terminal) => apply_terminal_to_task(&mut guard, id, terminal)?,
+                Some(terminal) => {
+                    apply_terminal_to_task(&mut guard, id, terminal)?;
+                    by_task
+                        .entry(id.to_string())
+                        .or_default()
+                        .push(record.clone());
+                }
                 None => rate_limited.push(id.to_string()),
             }
         }
     }
 
-    let emit = ledger.emit(key, CompletionLog::from_records(records));
+    let mut stages = Vec::with_capacity(keys.len());
+    for (id, key) in ids.iter().zip(keys) {
+        if run.replayed.contains(id) {
+            stages.push(StageEmit {
+                key,
+                emit: Emit::Deduplicated,
+            });
+        } else if let Some(records) = by_task.remove(id) {
+            let emit = ledger.emit(key.clone(), CompletionLog::from_records(records));
+            stages.push(StageEmit { key, emit });
+        }
+    }
     Ok(JoinCompletion {
-        stages: vec![StageEmit { key, emit }],
+        stages,
         forced: sorted(forced),
         cancelled: sorted(cooperative),
         not_started: sorted(skipped),
         rate_limited,
+        start_failed: start_failed.into_iter().collect(),
         undispatched: report.undispatched,
         cancel_requested: ctx.cancel.is_cancelled(),
     })
@@ -444,7 +497,9 @@ where
 /// caller's transport. This keeps the Nexus endpoints out of `gsd-state`. Every thread of `plan` must be
 /// bound and IDLE. All of them are started before `run` is awaited. If the cancel window closes first,
 /// `run` is dropped and each started thread ends `CANCELLED_TIMED_OUT` (`timed_out`). If any stage key is
-/// already in `ledger`, the whole run is deduplicated and `run` is not called.
+/// already in `ledger`, the whole run is deduplicated and `run` is not called. A task named in two
+/// stages is refused before any thread is written. An error after the threads start ends each thread
+/// still `RUNNING` as `FAILED`, and nothing is collected.
 pub async fn collect_nexus_completions<F, Fut>(
     ctx: &JoinContext,
     ledger: &mut CompletionLedger,
@@ -456,20 +511,15 @@ where
     Fut: Future<Output = SchedulerResult<NexusJoinReport>>,
 {
     ctx.check()?;
+    reject_repeated_across_stages(plan)?;
     let stage_count = u32::try_from(plan.stages.len())
         .map_err(|_| JoinError::TooManyStages(plan.stages.len()))?;
-    let keys: Vec<JoinKey> = (0..stage_count).map(|stage| ctx.key(stage)).collect();
-    if keys.iter().any(|key| ledger.contains(key)) {
-        return Ok(JoinCompletion {
-            stages: keys
-                .iter()
-                .map(|key| StageEmit {
-                    key: *key,
-                    emit: Emit::Deduplicated,
-                })
-                .collect(),
-            ..JoinCompletion::default()
-        });
+    let stage_keys: Vec<JoinKey> = (0..stage_count)
+        .zip(&plan.stages)
+        .map(|(stage, tasks)| ctx.key(&participant_key(tasks), stage))
+        .collect();
+    if stage_keys.iter().any(|key| ledger.contains(key)) {
+        return Ok(JoinCompletion::deduplicated(&stage_keys));
     }
 
     let ids: Vec<String> = plan
@@ -482,7 +532,10 @@ where
         .collect();
     prepare_fresh(&ctx.session, &ids)?;
     for id in &ids {
-        start_task(&ctx.session, id)?;
+        if let Err(error) = start_task(&ctx.session, id) {
+            fail_running_threads(&ctx.session, &ids);
+            return Err(error);
+        }
     }
 
     let window = forced_after(ctx.cancel.clone(), ctx.timing.cooperative);
@@ -491,47 +544,96 @@ where
         result = run() => Some(result),
         () = window => None,
     };
+    let (merges, forced) = match settle_nexus(&ctx.session, &stage_keys, &ids, joined) {
+        Ok(settled) => settled,
+        Err(error) => {
+            fail_running_threads(&ctx.session, &ids);
+            return Err(error);
+        }
+    };
 
-    let mut stages = Vec::new();
-    let mut forced = Vec::new();
-    match joined {
-        Some(result) => {
-            let report = result?;
-            for merge in &report.stages {
-                let key = ctx.key(merge.stage);
-                {
-                    let mut guard = ctx.session.lock();
-                    for record in merge.log.records() {
-                        if let Some(terminal) = nexus_terminal_for(&record.outcome) {
-                            apply_terminal_to_task(&mut guard, &record.key.task_id, terminal)?;
-                        }
-                    }
-                }
-                let emit = ledger.emit(key, merge.log.clone());
-                stages.push(StageEmit { key, emit });
-            }
-        }
-        None => {
-            {
-                let mut guard = ctx.session.lock();
-                for id in &ids {
-                    apply_terminal_to_task(
-                        &mut guard,
-                        id,
-                        Terminal::Cancelled(TerminalReason::TimedOut),
-                    )?;
-                }
-            }
-            forced = ids;
-        }
+    let mut stages = Vec::with_capacity(merges.len());
+    for (key, log) in merges {
+        let emit = ledger.emit(key.clone(), log);
+        stages.push(StageEmit { key, emit });
     }
-
     Ok(JoinCompletion {
         stages,
         forced,
         cancel_requested: ctx.cancel.is_cancelled(),
         ..JoinCompletion::default()
     })
+}
+
+/// Refuses a plan that names one task id in two stages. The first stage would end the thread, and the
+/// second stage's terminal write would then fail after the first had already been written.
+fn reject_repeated_across_stages(plan: &NexusPlan) -> JoinResult<()> {
+    let mut first_stage: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, tasks) in plan.stages.iter().enumerate() {
+        for task in tasks {
+            let first = *first_stage.entry(task_id_of(task)).or_insert(index);
+            if first != index {
+                return Err(JoinError::Scheduler(SchedulerError::Other(format!(
+                    "a task id appears in stage {first} and again in stage {index}"
+                ))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves every stage key and writes the terminal phase of each thread of a nexus run. Returns the
+/// stage logs to collect and the tasks forced at the window. Stage keys are resolved before the first
+/// thread is written.
+fn settle_nexus(
+    session: &Mutex<SessionState>,
+    stage_keys: &[JoinKey],
+    ids: &[String],
+    joined: Option<SchedulerResult<NexusJoinReport>>,
+) -> JoinResult<(Vec<(JoinKey, CompletionLog)>, Vec<String>)> {
+    let Some(result) = joined else {
+        let mut guard = session.lock();
+        for id in ids {
+            apply_terminal_to_task(
+                &mut guard,
+                id,
+                Terminal::Cancelled(TerminalReason::TimedOut),
+            )?;
+        }
+        return Ok((Vec::new(), ids.to_vec()));
+    };
+    let report = result?;
+    let mut merges = Vec::with_capacity(report.stages.len());
+    for merge in report.stages {
+        merges.push((stage_key(stage_keys, merge.stage)?, merge.log));
+    }
+    let mut guard = session.lock();
+    for (_, log) in &merges {
+        for record in log.records() {
+            if let Some(terminal) = nexus_terminal_for(&record.outcome) {
+                apply_terminal_to_task(&mut guard, &record.key.task_id, terminal)?;
+            }
+        }
+    }
+    Ok((merges, Vec::new()))
+}
+
+/// Ends each thread of `ids` that is still RUNNING as FAILED. Threads in any other phase are left as
+/// they are, so a run that errors after its threads start leaves none of them RUNNING.
+fn fail_running_threads(session: &Mutex<SessionState>, ids: &[String]) {
+    let mut guard = session.lock();
+    for id in ids {
+        let Some(thread_id) = thread_for_task(&guard, id) else {
+            continue;
+        };
+        let running = guard
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread| matches!(phase_of(thread, &thread_id), Ok(ThreadPhase::Running)));
+        if running {
+            let _ = apply_terminal(&mut guard, &thread_id, Terminal::Failed);
+        }
+    }
 }
 
 /// Runs one matrix task under the cancel window and returns its result to the matrix join.
@@ -548,6 +650,9 @@ where
     Fut: Future<Output = Result<(), TaskFailure>> + Send,
 {
     let id = task_id_of(&task).to_string();
+    if run.replayed.contains(&id) {
+        return Ok(());
+    }
     if cancel.is_cancelled() {
         run.skipped.lock().insert(id);
         return Ok(());
@@ -710,6 +815,28 @@ fn nexus_terminal_for(outcome: &TaskOutcome) -> Option<Terminal> {
 
 fn task_id_of(task: &Task) -> &str {
     task.id.as_ref().map_or("", |id| id.value.as_str())
+}
+
+/// Identity of a nexus stage's participants: their task ids, sorted and length-prefixed, so two
+/// stages share a key only when they hold the same ids.
+fn participant_key(tasks: &[Task]) -> String {
+    let ids: BTreeSet<&str> = tasks.iter().map(task_id_of).collect();
+    let mut key = String::new();
+    for id in ids {
+        key.push_str(&id.len().to_string());
+        key.push(':');
+        key.push_str(id);
+    }
+    key
+}
+
+/// Returns the key of `stage` from `stage_keys`, which holds one key per plan stage in stage order.
+fn stage_key(stage_keys: &[JoinKey], stage: u32) -> JoinResult<JoinKey> {
+    usize::try_from(stage)
+        .ok()
+        .and_then(|index| stage_keys.get(index))
+        .cloned()
+        .ok_or(JoinError::UnknownStage(stage))
 }
 
 fn take(set: &Mutex<HashSet<String>>) -> HashSet<String> {
@@ -938,12 +1065,13 @@ mod tests {
     fn ledger_drops_a_second_emission_under_the_same_key() {
         let mut ledger = CompletionLedger::default();
         let key = JoinKey {
+            task_id: "t1".to_string(),
             stage: 0,
             join_seq: 1,
             attempt: 1,
         };
         let first = CompletionLog::from_records(Vec::new());
-        assert_eq!(ledger.emit(key, first.clone()), Emit::Collected);
+        assert_eq!(ledger.emit(key.clone(), first.clone()), Emit::Collected);
         let late = CompletionRecord {
             key: CompletionKey {
                 stage: 0,
@@ -959,15 +1087,34 @@ mod tests {
             outcome: TaskOutcome::Completed,
         };
         assert_eq!(
-            ledger.emit(key, CompletionLog::from_records(vec![late])),
+            ledger.emit(key.clone(), CompletionLog::from_records(vec![late])),
             Emit::Deduplicated
         );
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.log(&key), Some(&first));
+        // Another task at the same stage and join seq is a different key and is collected.
+        let other_task = JoinKey {
+            task_id: "t2".to_string(),
+            ..key.clone()
+        };
+        assert_eq!(ledger.emit(other_task, first.clone()), Emit::Collected);
         // A different attempt is a different key and is collected.
         let retry = JoinKey { attempt: 2, ..key };
         assert_eq!(ledger.emit(retry, first), Emit::Collected);
-        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.len(), 3);
+    }
+
+    #[test]
+    fn participant_key_is_order_free_and_unambiguous() {
+        let ids = |names: &[&str]| names.iter().map(|name| task(name)).collect::<Vec<Task>>();
+        assert_eq!(
+            participant_key(&ids(&["t2", "t1"])),
+            participant_key(&ids(&["t1", "t2"]))
+        );
+        assert_ne!(
+            participant_key(&ids(&["ab", "c"])),
+            participant_key(&ids(&["a", "bc"]))
+        );
     }
 
     #[tokio::test]
@@ -989,20 +1136,32 @@ mod tests {
         .await?;
         assert_eq!(
             first.stages,
-            vec![StageEmit {
-                key: JoinKey {
-                    stage: 0,
-                    join_seq: 1,
-                    attempt: 1,
+            vec![
+                StageEmit {
+                    key: JoinKey {
+                        task_id: "t1".to_string(),
+                        stage: 0,
+                        join_seq: 1,
+                        attempt: 1,
+                    },
+                    emit: Emit::Collected,
                 },
-                emit: Emit::Collected,
-            }]
+                StageEmit {
+                    key: JoinKey {
+                        task_id: "t2".to_string(),
+                        stage: 0,
+                        join_seq: 1,
+                        attempt: 1,
+                    },
+                    emit: Emit::Collected,
+                },
+            ]
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
         assert_eq!(phase(&session, "th2")?, ThreadPhase::Succeeded);
 
-        // Re-emitting the same (stage, join seq, attempt) key neither reruns nor reapplies.
+        // Re-emitting the same (task, stage, join seq, attempt) keys neither reruns nor reapplies.
         let second = collect_matrix_completions(
             &ctx,
             &mut ledger,
@@ -1012,9 +1171,12 @@ mod tests {
             counting(Arc::clone(&calls)),
         )
         .await?;
-        assert_eq!(second.stages[0].emit, Emit::Deduplicated);
+        assert_eq!(second.stages.len(), 2);
+        for stage in &second.stages {
+            assert_eq!(stage.emit, Emit::Deduplicated);
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.len(), 2);
         Ok(())
     }
 
@@ -1129,6 +1291,8 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(completion.not_started, vec!["t1".to_string()]);
+        assert!(completion.stages.is_empty());
+        assert!(ledger.is_empty());
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
         Ok(())
     }
@@ -1226,6 +1390,175 @@ mod tests {
                 Some("timed_out")
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn not_run_task_is_not_collected_so_a_replay_runs_it() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (control, signal) = cancel_channel();
+        let timing = CancelTiming::default();
+        let _marker = control.request("corr-5", "test", 0.0, timing);
+        let ctx = context(&session, 9, timing, signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let cancelled = collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(cancelled.not_started, vec!["t1".to_string()]);
+        assert!(cancelled.stages.is_empty());
+        assert!(ledger.is_empty());
+
+        let (_fresh_control, fresh) = cancel_channel();
+        let replay_ctx = context(&session, 9, timing, fresh);
+        let replay = collect_matrix_completions(
+            &replay_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replay.stages[0].emit, Emit::Collected);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_task_is_not_rerun_while_a_new_task_runs() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1"), ("th2", "t2")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 8, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            batch(0, &["t1", "t2"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second.stages.len(), 2);
+        assert_eq!(second.stages[0].emit, Emit::Deduplicated);
+        assert_eq!(second.stages[1].emit, Emit::Collected);
+        assert_eq!(second.stages[1].key.task_id, "t2");
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(phase(&session, "th2")?, ThreadPhase::Succeeded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rate_limited_outcome_leaves_its_key_uncollected() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 10, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let limited = |_task: Task, _cancel: CancelSignal| {
+            std::future::ready(Err::<(), TaskFailure>(TaskFailure::RateLimited {
+                retry_after: None,
+            }))
+        };
+
+        let completion = collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            limited,
+        )
+        .await?;
+
+        assert_eq!(completion.rate_limited, vec!["t1".to_string()]);
+        assert!(completion.stages.is_empty());
+        assert!(ledger.is_empty());
+        // The thread keeps RUNNING, as the module contract states; see `rate_limited`.
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nexus_error_after_start_leaves_no_thread_running() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1"), ("th2", "t2")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 11, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let plan = NexusPlan {
+            join_id: String::new(),
+            stages: vec![vec![task("t1"), task("t2")]],
+        };
+
+        let refused = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
+            std::future::ready(Err::<NexusJoinReport, SchedulerError>(
+                SchedulerError::Other("nexus join id must be non-empty".to_string()),
+            ))
+        })
+        .await;
+
+        assert!(matches!(
+            refused,
+            Err(JoinError::Scheduler(SchedulerError::Other(_)))
+        ));
+        assert!(ledger.is_empty());
+        for thread in ["th1", "th2"] {
+            assert_ne!(phase(&session, thread)?, ThreadPhase::Running);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_repeated_across_nexus_stages_is_refused_before_any_write() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 12, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let plan = NexusPlan {
+            join_id: "j".to_string(),
+            stages: vec![vec![task("t1")], vec![task("t1")]],
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+
+        let refused = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok::<NexusJoinReport, SchedulerError>(stage_report(
+                0,
+                Vec::new(),
+            )))
+        })
+        .await;
+
+        assert!(matches!(
+            refused,
+            Err(JoinError::Scheduler(SchedulerError::Other(_)))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ledger.is_empty());
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
         Ok(())
     }
 

@@ -8,15 +8,21 @@ OMP session visibility, subagent IDs. SPE-13823 n6.
 
 from __future__ import annotations
 import json
+import logging
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .paths import swarm_dir
-from .runlog import emit, read_events
+from .runlog import emit
 from .state_store import claude_state_dir, get_swarm_state_store
 from .lifecycle import TRANSITIONS, RunState, from_task_state
+
+if TYPE_CHECKING:
+    from .taskstore import TaskStore
+
+log = logging.getLogger("swarm.observability")
 
 # a subagent id is `subagent-<task_id>-<12 hex>-<epoch ms>` (subagent_lifecycle.new_subagent_id)
 _SID_TASK = re.compile(r"^subagent-(.+)-[0-9a-f]{12}-\d+$")
@@ -32,63 +38,54 @@ def _task_of(subagent_id: str | None) -> str | None:
 # attributes a record by the `<AGENT>@<script>` prefix of its source, so these sources carry the controller's id.
 CONTROLLER_AGENT = "A01"
 
-def emit_hook_fired(hook: str, *, corr: str | None = None, deduped: bool = False, root: str | Path | None = None, **kw: Any) -> dict:
+def emit_hook_fired(hook: str, *, corr: str | None = None, deduped: bool = False, root: str | Path | None = None, **kw: Any) -> dict[str, Any]:
     return emit("hook-fired", {"hook": hook, "deduped": deduped, **kw}, source="hook_trigger", correlation_id=corr, root=root)
-def emit_per_unit(task_id: str, agent: str, phase: str, state: str, *, corr: str | None = None, root: str | Path | None = None) -> dict:
+def emit_per_unit(task_id: str, agent: str, phase: str, state: str, *, corr: str | None = None, root: str | Path | None = None) -> dict[str, Any]:
     return emit("per-unit", {"task_id": task_id, "agent": agent, "phase": phase, "state": state}, source="execution", correlation_id=corr, task_id=task_id, root=root)
 
 
-def emit_batch_end(round_n: int, dispatched: int, counts: dict, *, corr: str | None = None, root: str | Path | None = None) -> dict:
+def emit_batch_end(round_n: int, dispatched: int, counts: dict[str, Any], *, corr: str | None = None, root: str | Path | None = None) -> dict[str, Any]:
     return emit("batch-end", {"round": round_n, "dispatched": dispatched, "counts": counts}, source="swarm_run", correlation_id=corr, root=root)
 
 
-def emit_stale(kind: str, reason: str, *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None) -> dict:
+def emit_stale(kind: str, reason: str, *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None) -> dict[str, Any]:
     return emit("stale", {"kind": kind, "reason": reason}, source="watchdog", correlation_id=corr, task_id=task_id, root=root)
 
 
-def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None, slice_id: str | None = None, subagent_id: str | None = None) -> dict:
+def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None, slice_id: str | None = None, subagent_id: str | None = None) -> dict[str, Any]:
     """Build 6-state projection (n5). Extended for full states LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR, immediate transitions.
     Supports gsd-autonomous, wires OMP gsd command use, calls audit for lifecycle/ids.
     Add support perID partial on FAILED/ERROR states. Isolate errors with try.
+    States are counted from the Task Store rows only; a Task Store that cannot be read is ERROR, never derived from events.
     """
     store = get_swarm_state_store(root=root)
     done = 0
     total = 0
     active = 0
-    state = "IN_PROGRESS"
     try:
         from .taskstore import TaskStore
         ts = TaskStore(root=root)
-        tasks = ts.list_tasks(correlation_id=corr) if corr else ts.list_tasks()
+        tasks = ts.list(correlation_id=corr) if corr else ts.list()
+    except Exception:  # noqa: BLE001 - an unreadable Task Store is ERROR; the state is never derived from events
+        state = "ERROR"
+    else:
         total = len(tasks)
-        if total > 0:
-            done = sum(1 for t in tasks if t.get("state") in ("DONE", "APPROVED"))
-            failures = sum(1 for t in tasks if t.get("state") in ("FAILED", "ESCALATED"))
-            active = sum(1 for t in tasks if t.get("state") in ("PENDING", "RUNNING", "IN_PROGRESS"))
-            if done == total:
-                state = "COMPLETED"
-            elif failures > 0:
-                state = "PARTIAL_FAILURE" if done > 0 else "ERROR"
-            else:
-                state = "IN_PROGRESS"
-        else:
+        done = sum(1 for t in tasks if t.get("state") in ("DONE", "APPROVED"))
+        failures = sum(1 for t in tasks if t.get("state") in ("FAILED", "ESCALATED"))
+        active = sum(1 for t in tasks if t.get("state") in ("PENDING", "RUNNING", "IN_PROGRESS"))
+        if total == 0:
             state = "EMPTY"
-    except Exception:
-        try:
-            events = read_events(correlation_id=corr, root=root) if corr else []
-            done = sum(1 for e in events if isinstance(e, dict) and e.get("type") in ("task.done", "task.approved", "task_done"))
-            total = max(1, len(events))
-            state = "COMPLETED" if done >= total else "IN_PROGRESS"
-            if total == 0:
-                state = "EMPTY"
-        except Exception:
-            state = "ERROR"
-            # isolate
+        elif done == total:
+            state = "COMPLETED"
+        elif failures > 0:
+            state = "PARTIAL_FAILURE" if done > 0 else "ERROR"
+        else:
+            state = "IN_PROGRESS"
 
     progress = {"done": done, "total": total, "active": active}
     # support consolidated metrics
     consolidated = {"done": done, "total": total, "active": active, "completion": (done / total * 100) if total else 0}
-    extra = {"consolidated_metrics": consolidated, "slice_id": slice_id}
+    extra: dict[str, Any] = {"consolidated_metrics": consolidated, "slice_id": slice_id}
     if subagent_id and state in ("FAILED", "ERROR"):
         extra["per_id_partial"] = {"subagent_id": subagent_id, "state": state, "partial": True}
     try:
@@ -104,7 +101,7 @@ def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None
     return data
 
 
-def write_claude_state(data: dict, *, root: str | Path | None = None) -> Path:
+def write_claude_state(data: dict[str, Any], *, root: str | Path | None = None) -> Path:
     """Atomic write .claude/swarm-state.json (n5); SWARM_CLAUDE_STATE_DIR replaces the .claude directory."""
     cdir = claude_state_dir(Path(swarm_dir(root, create=True)).parent / ".claude")
     cdir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +112,7 @@ def write_claude_state(data: dict, *, root: str | Path | None = None) -> Path:
     return p
 
 
-def update_from_events(corr: str | None = None, *, root: str | Path | None = None, slice_id: str | None = None, subagent_id: str | None = None) -> dict:
+def update_from_events(corr: str | None = None, *, root: str | Path | None = None, slice_id: str | None = None, subagent_id: str | None = None) -> dict[str, Any]:
     """Update from events, wired to support slice, sub ID for gsd OMP visibility."""
     data = build_swarm_state(corr=corr, root=root, slice_id=slice_id)
     write_claude_state(data, root=root)
@@ -123,7 +120,7 @@ def update_from_events(corr: str | None = None, *, root: str | Path | None = Non
     if subagent_id or slice_id:
         emit_gsd_omp("updated", subagent_id=subagent_id, task_id=None, corr=corr, root=root, task_slice=slice_id, state=data.get("swarm_state"))
     return data
-def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, error_agg: dict | None = None, dry_run: bool = False, **kw: Any) -> dict:
+def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, error_agg: dict[str, Any] | None = None, dry_run: bool = False, **kw: Any) -> dict[str, Any]:
     """Integrate emit for OMP gsd-autonomous. Per-subagent status streaming for OMP session visibility in concurrent launches.
     Enhanced for real-time per-sub, spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR etc).
     Add support emit for error agg, perID partial on FAILED/ERROR. Isolate with try. Wire to gsd states.
@@ -152,7 +149,7 @@ def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, ta
     except Exception:
         pass
     return emit("gsd.autonomous.omp", payload, source=f"{CONTROLLER_AGENT}@omp_gsd", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
-def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None = None, phase: str = "exec", corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, consolidated: dict | None = None, error_agg: dict | None = None, dry_run: bool = False, **kw: Any) -> dict:
+def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None = None, phase: str = "exec", corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, consolidated: dict[str, Any] | None = None, error_agg: dict[str, Any] | None = None, dry_run: bool = False, **kw: Any) -> dict[str, Any]:
     """Stream per-subagent identifier + real-time status directly to OMP session.
     Enhanced for immediate spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR).
     Add support emit for error agg, perID partial on FAILED/ERROR. Isolate errors with try.
@@ -188,7 +185,7 @@ def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None
     except Exception:
         pass
     return emit("subagent.status.stream", payload, source=f"{CONTROLLER_AGENT}@subagent_lifecycle", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
-def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, state: str = "ERROR", dry_run: bool = False, **kw: Any) -> dict:
+def emit_error_agg(subagent_id: str, agg: dict[str, Any], *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, state: str = "ERROR", dry_run: bool = False, **kw: Any) -> dict[str, Any]:
     """Dedicated support emit for error agg from CentralErrorAggregator.
     Per sub ID details/partials/retry surfaced. Called on FAILED/ERROR.
     Wire to gsd states, isolate with try.
@@ -210,14 +207,15 @@ def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, c
             stream_subagent_status(subagent_id, "error", task_id=task_id, state=state, error_agg=agg, root=root, dry_run=dry_run)
         except Exception:
             pass
-        return emit("error.agg", payload, source=f"{CONTROLLER_AGENT}@error_aggregator", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
-    except Exception:
-        # isolate
-        return {"subagent_id": subagent_id, "error_agg": agg, "state": state}
+        record = emit("error.agg", payload, source=f"{CONTROLLER_AGENT}@error_aggregator", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
+        return {**record, "written": True}
+    except Exception:  # noqa: BLE001 - the aggregate is a side record; the caller learns that it was not written
+        log.warning("error aggregate record could not be written", exc_info=True)
+        return {"subagent_id": subagent_id, "error_agg": agg, "state": state, "written": False}
 
 
-def emit_inline_transition(store, task: dict, from_state: str, to_state: str, *, reason: str | None = None,
-                           root: str | Path | None = None) -> list[dict]:
+def emit_inline_transition(store: TaskStore, task: dict[str, Any], from_state: str, to_state: str, *, reason: str | None = None,
+                           root: str | Path | None = None) -> list[dict[str, Any]]:
     """Run records for one in-session task transition (no scheduler process: A01 drives `orch_status.py`).
 
     `task` is the Task Store row after the move. TaskStore's observer already refreshes live.json; this writes the events

@@ -17,6 +17,8 @@ Tools:
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -25,13 +27,13 @@ IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
 UNTYPED = frozenset({"", "any", "unknown"})
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _duplicate(values):
+def _duplicate(values: Iterable[object]) -> object:
     """Return the first value that appears twice, or None."""
-    seen = set()
+    seen: set[object] = set()
     for value in values:
         if value in seen:
             return value
@@ -39,10 +41,10 @@ def _duplicate(values):
     return None
 
 
-def fe_heading_sequence_check(payload: dict) -> dict:
+def fe_heading_sequence_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Heading levels must start at h1 and never descend more than one level at a time."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         levels = payload["levels"]
         first_ok = levels[0] == 1
         skips = [i for i in range(1, len(levels)) if levels[i] - levels[i - 1] > 1]
@@ -58,10 +60,10 @@ def fe_heading_sequence_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def fe_alt_text_check(payload: dict) -> dict:
+def fe_alt_text_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Non-decorative images need meaningful alt text; decorative images must not carry any."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         images = payload["images"]
         dup = _duplicate(image["id"] for image in images)
         if dup is not None:
@@ -100,10 +102,10 @@ def fe_alt_text_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def fe_form_label_check(payload: dict) -> dict:
+def fe_form_label_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Every control except type hidden needs a label, a non-blank aria-label, or an aria-labelledby reference."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         controls = payload["controls"]
         dup = _duplicate(control["id"] for control in controls)
         if dup is not None:
@@ -127,10 +129,10 @@ def fe_form_label_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def fe_tab_order_check(payload: dict) -> dict:
+def fe_tab_order_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Positive tabindex values override DOM order; count them and the resulting focus-order inversions."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         elements = payload["elements"]
         dup = _duplicate(element["id"] for element in elements)
         if dup is not None:
@@ -153,10 +155,10 @@ def fe_tab_order_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def fe_bundle_budget_check(payload: dict) -> dict:
+def fe_bundle_budget_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Total bundle bytes must fit the budget and must not grow past the regression limit over a baseline."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         chunks = payload["chunks"]
         dup = _duplicate(chunk["name"] for chunk in chunks)
         if dup is not None:
@@ -184,10 +186,10 @@ def fe_bundle_budget_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def fe_prop_type_coverage(payload: dict) -> dict:
+def fe_prop_type_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Each component's props need a concrete declared type; untyped means blank, any, or unknown."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         components = payload["components"]
         dup = _duplicate(component["name"] for component in components)
         if dup is not None:
@@ -219,10 +221,10 @@ def fe_prop_type_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def fe_target_size_check(payload: dict) -> dict:
+def fe_target_size_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Interactive targets must be at least min_px wide and tall (WCAG 2.2 SC 2.5.8 default 24 CSS px)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         targets = payload["targets"]
         dup = _duplicate(target["id"] for target in targets)
         if dup is not None:
@@ -286,7 +288,7 @@ def _strip_function_calls(value: str, prefix: str) -> str:
     return "".join(out)
 
 
-def _strip_token_refs(value: str, patterns) -> str:
+def _strip_token_refs(value: str, patterns: Iterable[str]) -> str:
     value = _QUOTED_RE.sub(" ", _strip_function_calls(value, "url("))
     for pattern in patterns:
         if pattern.endswith("("):
@@ -305,10 +307,10 @@ def _literals(prop: str, value: str) -> tuple[int, int]:
     return colors, spacing
 
 
-def fe_token_literal_scan(payload: dict) -> dict:
+def fe_token_literal_scan(payload: dict[str, Any]) -> dict[str, Any]:
     """Colour and spacing values must be design-token references; hex, rgb(), hsl(), and non-zero px/rem/em are literals."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         declarations = payload["declarations"]
         dup = _duplicate(item["id"] for item in declarations)
         if dup is not None:
@@ -343,10 +345,10 @@ def fe_token_literal_scan(payload: dict) -> dict:
 # ---------------------------------------------------------------- fe_state_parity_check
 
 
-def fe_state_parity_check(payload: dict) -> dict:
+def fe_state_parity_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Implemented states must equal ux.spec states exactly; dotted sub-states such as form.error are distinct states."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         screens = payload["screens"]
         dup = _duplicate(screen["id"] for screen in screens)
         if dup is not None:
@@ -383,10 +385,10 @@ CWV_LIMITS = {"lcp_s": 2.5, "inp_ms": 200, "cls": 0.1}
 LIGHTHOUSE_MINIMUMS = {"perf": 90, "a11y": 100}
 
 
-def fe_cwv_budget_check(payload: dict) -> dict:
+def fe_cwv_budget_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Core Web Vitals must be at or under their limits and Lighthouse scores at or over their minimums (limit-equal passes)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         cwv = payload["cwv"]
         lighthouse = payload["lighthouse"]
         overrides = payload.get("thresholds", {})
@@ -398,7 +400,7 @@ def fe_cwv_budget_check(payload: dict) -> dict:
         for key in ("bp", "seo"):
             if key in minimums and key not in lighthouse:
                 return _invalid("lighthouse", f"thresholds.{key}_min needs a lighthouse.{key} score")
-        breaches: list[dict] = []
+        breaches: list[dict[str, Any]] = []
         cwv_breaches = 0
         for metric in ("lcp_s", "inp_ms", "cls"):
             if cwv[metric] > limits[metric]:
@@ -492,10 +494,10 @@ def _scan_text(text: str, sanitizers: tuple[str, ...]) -> set[tuple[int, str]]:
     return hits
 
 
-def fe_client_security_scan(payload: dict) -> dict:
+def fe_client_security_scan(payload: dict[str, Any]) -> dict[str, Any]:
     """Flag XSS sinks, inline scripts and handlers, external assets without integrity, and PII keys in web storage."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         files = payload["files"]
         dup = _duplicate(item["id"] for item in files)
         if dup is not None:
@@ -503,7 +505,7 @@ def fe_client_security_scan(payload: dict) -> dict:
         names = tuple(payload.get("sanitizer_names", ()))
         if any(not name.strip() for name in names):
             return _invalid("sanitizer_names", "a sanitizer name must not be blank")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         by_kind: dict[str, int] = {}
         for item in files:
             for number, kind in sorted(_scan_text(item["text"], names)):

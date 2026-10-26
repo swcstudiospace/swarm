@@ -9,6 +9,9 @@
 """
 from __future__ import annotations
 import argparse
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -58,6 +61,11 @@ def run(args, ctx) -> dict:
     corr = ctx.correlation_id or latest_correlation(ctx.root)
 
     if args.history:
+        try:
+            store.get(args.history)
+        except SwarmError as exc:
+            # Named without the id, as the Rust wire answers (review F17): the caller has the id.
+            raise SwarmError(ErrorCode.E_INPUT, "unknown task for history.task_id") from exc
         return {"status": "ok", "task_id": args.history, "history": store.history(args.history),
                 "verdicts": store.latest_verdicts(args.history),
                 "missing_gate_reasons": store.missing_gate_reasons(args.history), "summary": f"history for {args.history}"}
@@ -122,5 +130,95 @@ def add_args(p):
     p.add_argument("--history", metavar="TASK_ID")
 
 
+# GSD_ENGINE selector (U12.6, OD-1). Unset, empty or `python` runs the body unchanged. `rust` asks the
+# gsd_engine binary at GSD_ENGINE_BIN first; the body answers when run_rust returns None (see its docstring).
+# E-TIMEOUT is never retried and never falls back (D-P5-21).
+# RUST_CALL_TIMEOUT_S bounds the whole call. The binary has its own 600 s deadline, which does not cover its
+# start-up or its stdin read, so this outer bound is 60 s larger. GSD_RUST_TIMEOUT_S, when set to a positive
+# integer (seconds), overrides it; tests use that to keep the timeout short.
+RUST_CALL_TIMEOUT_S = 660
+RUST_FALLBACK_CODES = frozenset({"E-INTERNAL", "E-DEP", "E-CAPACITY", "E-CONTRACT", "E-INPUT"})
+RUST_ENV_KEYS = ("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
+
+
+def _refuse(code: ErrorCode, message: str) -> int:
+    """Prints an error reply shaped like the Rust engine's and returns exit 2."""
+    body = {"agent": "A01", "script": "orch_status", "status": "error",
+            "error": {"code": code.value, "message": message, "details": {}, "handling": code.standard_handling}}
+    print(json.dumps(body, indent=2))
+    return AgentScript.EXIT_ERROR
+
+
+def _reply_object(stdout: bytes) -> dict | None:
+    try:
+        body = json.loads(stdout.decode("utf-8"))
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _error_code(reply: dict) -> str | None:
+    error = reply.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _rust_timeout_s() -> int:
+    """GSD_RUST_TIMEOUT_S when it is a positive integer, otherwise RUST_CALL_TIMEOUT_S."""
+    raw = os.environ.get("GSD_RUST_TIMEOUT_S", "")
+    if raw.isascii() and raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return RUST_CALL_TIMEOUT_S
+
+
+def run_rust(argv: list[str]) -> int | None:
+    """Answers the call on the Rust engine. None hands the call to the Python body.
+
+    None (fallback) is returned exactly for these triggers: a reply whose error.code is in RUST_FALLBACK_CODES;
+    an argument the binary cannot take (the request is not UTF-8 encodable); an exit-2 reply without a typed
+    error.code; a reply that is not a JSON object; an exit code other than 0, 1 or 2.
+    Refused with exit 2 and never a fallback: GSD_ENGINE_BIN unset or not startable (E-DEP), and a binary that
+    did not answer within the call deadline (E-TIMEOUT).
+    """
+    binary = os.environ.get("GSD_ENGINE_BIN", "")
+    if not binary:
+        return _refuse(ErrorCode.E_DEP, "GSD_ENGINE=rust needs GSD_ENGINE_BIN set to the gsd_engine binary")
+    request = {"agent": "A01", "script": "orch_status", "argv": argv, "root": os.getcwd(),
+               "env": {key: os.environ[key] for key in RUST_ENV_KEYS if os.environ.get(key)}}
+    try:
+        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return None  # fallback: an argument the binary cannot take
+    try:
+        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s())
+    except subprocess.TimeoutExpired:
+        return _refuse(ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
+    except OSError:
+        return _refuse(ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")
+    reply = _reply_object(done.stdout)
+    if reply is None:
+        return None
+    if done.returncode not in (AgentScript.EXIT_OK, AgentScript.EXIT_FAIL, AgentScript.EXIT_ERROR):
+        return None
+    if done.returncode == AgentScript.EXIT_ERROR:
+        code = _error_code(reply)
+        # fallback: an exit-2 reply without a typed error.code, or one whose code the Python body serves
+        if code is None or code in RUST_FALLBACK_CODES:
+            return None
+    sys.stdout.buffer.write(done.stdout)
+    sys.stdout.flush()
+    return done.returncode
+
+
 if __name__ == "__main__":
+    engine = os.environ.get("GSD_ENGINE", "")
+    if engine == "rust":
+        backend = os.environ.get("GSD_RUST_BACKEND", "")
+        if backend not in ("", "host", "sandbox"):
+            sys.exit(_refuse(ErrorCode.E_INPUT, "GSD_RUST_BACKEND must be 'host' or 'sandbox' when set"))
+        answer = run_rust(sys.argv[1:])
+        if answer is not None:
+            sys.exit(answer)
+    elif engine not in ("", "python"):
+        sys.exit(_refuse(ErrorCode.E_INPUT, "GSD_ENGINE must be 'python' or 'rust'"))
     sys.exit(AgentScript("A01", "orch_status", run, description=__doc__, add_args=add_args).main())

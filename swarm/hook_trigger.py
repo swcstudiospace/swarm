@@ -19,6 +19,7 @@ import os
 import subprocess
 import threading
 from pathlib import Path
+from typing import Any
 
 from .envelope import real_key_configured
 from .signal_detector import detect_completion
@@ -47,7 +48,7 @@ def _follow_on_env() -> dict[str, str]:
     return env
 
 
-def _release_when_ended(mgr: SubagentLifecycleManager, sid: str, proc: subprocess.Popen, *, root: str | Path | None) -> None:
+def _release_when_ended(mgr: SubagentLifecycleManager, sid: str, proc: subprocess.Popen[bytes], *, root: str | Path | None) -> None:
     """Free sid's lifecycle slot once the detached follow-on session exits. A daemon thread waits on proc."""
     def _watch() -> None:
         try:
@@ -85,7 +86,7 @@ def compute_trigger_id(session_id: str, corr: str | None, event_type: str) -> st
     return hashlib.sha256(key).hexdigest()[:16]
 
 
-def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str | None = None, root: str | Path | None = None) -> dict:
+def fire_if_ready(payload: str | dict[str, Any], *, session_id: str = "unknown", corr: str | None = None, root: str | Path | None = None) -> dict[str, Any]:
     """Idempotent fire. Returns {fired, deduped, id, event}."""
     if not is_opt_in():
         return {"fired": False, "reason": "opt-in-off"}
@@ -97,7 +98,7 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
     blocked = _spawn_refusal()
     if blocked is not None:
         reason, marker = blocked
-        fields: dict = {"reason": reason}
+        fields: dict[str, str] = {"reason": reason}
         if marker:
             fields["marker"] = marker
         emit_hook_fired("a01_complete", corr=corr, deduped=False, root=root, **fields)

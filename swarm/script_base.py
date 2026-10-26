@@ -20,9 +20,10 @@ import os
 import re
 import subprocess
 import traceback
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .errors import ErrorCode, SwarmError, classify
 from .runlog import emit
@@ -78,7 +79,7 @@ class Ctx:
     dry_run: bool
     root: Path = field(default_factory=lambda: Path.cwd())
 
-    def emit(self, event_type: str, payload: dict, *, task_id: str | None = None) -> dict:
+    def emit(self, event_type: str, payload: dict[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
         # a dry run (this record and the script's exit record, which AgentScript.main emits through here) stays local
         return emit(event_type, payload, source=f"{self.agent_id}@{self.script}", correlation_id=self.correlation_id,
                     task_id=task_id or self.task_id or payload.get("task_id"), root=self.root, tee=not self.dry_run)
@@ -87,7 +88,7 @@ class Ctx:
 class AgentScript:
     EXIT_OK, EXIT_FAIL, EXIT_ERROR = 0, 1, 2
 
-    def __init__(self, agent_id: str, name: str, run: Callable[[argparse.Namespace, Ctx], dict],
+    def __init__(self, agent_id: str, name: str, run: Callable[[argparse.Namespace, Ctx], dict[str, Any]],
                  *, description: str = "", add_args: Callable[[argparse.ArgumentParser], None] | None = None):
         self.agent_id, self.name, self.run, self.description, self.add_args = agent_id, name, run, description, add_args
 
@@ -139,7 +140,7 @@ class AgentScript:
             return self.EXIT_ERROR
 
     @staticmethod
-    def _print(obj: dict, as_json: bool) -> None:
+    def _print(obj: dict[str, Any], as_json: bool) -> None:
         if as_json:
             print(json.dumps(obj, indent=2, default=str))
             return
@@ -155,7 +156,7 @@ class AgentScript:
             print("  error:", json.dumps(obj["error"], indent=2, default=str))
 
 
-def sh(cmd: list[str] | str, *, cwd: Path | None = None, timeout: int = 600, check: bool = False) -> subprocess.CompletedProcess:
+def sh(cmd: list[str] | str, *, cwd: Path | None = None, timeout: int = 600, check: bool = False) -> subprocess.CompletedProcess[str]:
     """Run a command, capturing output; never raises unless check=True."""
     shell = isinstance(cmd, str)
     return subprocess.run(cmd, cwd=cwd, shell=shell, capture_output=True, text=True, timeout=timeout, check=check)
@@ -166,8 +167,8 @@ def which(binary: str) -> bool:
     return _w(binary) is not None
 
 
-def iter_files(root: Path, *, exts: tuple[str, ...] = (), skip_dirs=(".git", "node_modules", ".venv", "venv",
-                                                                     "dist", "build", "__pycache__", ".swarm")):
+def iter_files(root: Path, *, exts: tuple[str, ...] = (), skip_dirs: tuple[str, ...] = (".git", "node_modules", ".venv", "venv",
+                                                                                         "dist", "build", "__pycache__", ".swarm")) -> Iterator[Path]:
     for p in root.rglob("*"):
         if any(part in skip_dirs for part in p.parts):
             continue

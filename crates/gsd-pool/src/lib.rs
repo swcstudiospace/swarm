@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use gsd_codes::ErrorCode;
 use gsd_proto::gsd::v1::{ChatThreadId, SubagentType, ThreadStateKind};
 use parking_lot::RwLock;
 use uuid::Uuid;
@@ -39,8 +40,8 @@ pub enum PoolError {
     Exhausted(String),
     #[error("Invalid state transition: {0}")]
     InvalidState(String),
-    #[error("Sandbox error: {0}")]
-    Sandbox(String),
+    #[error("Sandbox error: {message}")]
+    Sandbox { code: ErrorCode, message: String },
     #[error("Capability mismatch: {0}")]
     CapabilityMismatch(String),
     #[error("Budget exhausted: {0}")]
@@ -231,5 +232,34 @@ impl PoolMetrics {
     }
     fn inc_failed(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod sandbox_error_tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_variant_carries_each_error_code() {
+        let codes = [
+            ErrorCode::Input,
+            ErrorCode::Timeout,
+            ErrorCode::Dep,
+            ErrorCode::Capacity,
+            ErrorCode::Contract,
+            ErrorCode::Policy,
+            ErrorCode::Internal,
+        ];
+        for code in codes {
+            let err = PoolError::Sandbox {
+                code,
+                message: "sandbox failure".to_string(),
+            };
+            match &err {
+                PoolError::Sandbox { code: got, .. } => assert_eq!(*got, code),
+                other => panic!("expected Sandbox variant, got {other:?}"),
+            }
+            assert!(err.to_string().starts_with("Sandbox error: "));
+        }
     }
 }

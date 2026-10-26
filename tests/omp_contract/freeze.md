@@ -453,8 +453,62 @@ const STRIPPED_ENV = ["SWARM_TASK_ID", "SWARM_CORRELATION_ID"]; // argparse defa
 
 ## 8. ExtensionAPI versioning
 
-Status: **OPEN. Decision pending with the omp host owners.**
+Status: **Default-frozen kept.** Decision recorded 2026-10-25 by the user, Wave A gate A3 (run ut-mvnofpc5-51f2ca97). The surface stays frozen without a version scheme, and the two options below are not chosen; the default holds until the omp host owners decide otherwise. Any later change to spawned-command bytes or to the stdout schema triggers an omp-mirror review before it lands (A3 done-criteria in `plan/execution-waves.md`).
 
 - The open question is how the omp ExtensionAPI version is pinned against this bridge contract. Two options are on the table with the omp host owners: **pin by commit** (the contract records the omp commit it was frozen against) or **omission** (the contract does not record an ExtensionAPI version at all).
 - **Default stays frozen.** Until the host owners decide, this document and `vectors.json` describe the current source as the contract. No version field is added and no version gate is added to the bridge or tools.
 - No change in this phase depends on the decision. The decision is pending; it is not resolved here.
+
+---
+
+## 9. Surface pins (U6.3)
+
+Each id below is a `vectors.json` record of kind `constant` (ids `S-*`). The Rust mirror is `crates/gsd-sdk/src/omp_surface_pins.rs`, and its tests replay every record. A string value is the literal the source spells, without the surrounding quotes. A number keeps its source underscores (`30_000`). A list is replayed element by element. The 30-slug array (`guard.ts:17-24`) and the four gate pairs are split into records that each cite a line whose four-line window holds their values.
+
+- `S-ORCHESTRATOR` (`omp/src/guard.ts:14`): orchestrator slug `a01-orchestrator`, named in the task-depth-cap reason.
+- `S-SWARM-STATE-REASON` (`omp/src/guard.ts:32`): refusal reason for swarm-state tools. Operators and the A01 dispatcher read it.
+- `S-SWARM-ASSIGNMENT-REASON` (`omp/src/guard.ts:33`): refusal reason for swarm-assignment. Operators and the A01 dispatcher read it.
+- `S-GUARD-ERROR-PREFIX` (`omp/src/guard.ts:35`): prefix of the refusal returned when the guard throws in a swarm session. index.ts appends the error message and `)`.
+- `S-SWARM-SLUGS-01` (`omp/src/guard.ts:18`): `SWARM_SLUGS` elements 1 to 20, `a01-orchestrator` through `a20-finops`.
+- `S-SWARM-SLUGS-02` (`omp/src/guard.ts:22`): `SWARM_SLUGS` elements 21 to 30, `a21-cluster-ops` through `a30-custody-compliance`.
+- `S-RULE-ID-01` (`omp/src/guard.ts:2930`): rule id `assignment-script-shell` of the `RULES` table.
+- `S-RULE-ID-02` (`omp/src/guard.ts:2943`): rule id `orch-state-shell`.
+- `S-RULE-ID-03` (`omp/src/guard.ts:2959`): rule id `signer-file-shell`.
+- `S-RULE-ID-04` (`omp/src/guard.ts:2981`): rule id `protected-path-shell`.
+- `S-RULE-ID-05` (`omp/src/guard.ts:3012`): rule id `gate-script-shell`.
+- `S-RULE-ID-06` (`omp/src/guard.ts:3062`): rule id `git-force-push`. Rule ids are read by the A01 dispatcher and kept stable.
+- `S-GATE-AGENTS-01` (`omp/src/context.ts:15`): `GATE_AGENTS` pair `["quality", "a08-qa"]`, the only agent that runs the quality gate.
+- `S-GATE-AGENTS-02` (`omp/src/context.ts:15`): `GATE_AGENTS` pair `["review", "a09-reviewer"]`.
+- `S-GATE-AGENTS-03` (`omp/src/context.ts:15`): `GATE_AGENTS` pair `["security", "a10-security"]`.
+- `S-GATE-AGENTS-04` (`omp/src/context.ts:15`): `GATE_AGENTS` pair `["release", "a12-release"]`.
+- `S-SWARM-AGENT-ENV` (`omp/src/context.ts:33`): env var that names the calling agent in a headless `-p` session.
+- `S-RUNTIME-HEADING` (`omp/src/hooks.ts:152`): heading of the runtime part. A prior part that starts with it means the runtime part is already present.
+- `S-RUNTIME-ROOT-LABEL` (`omp/src/hooks.ts:155`): label of the runtime root line that the omp preamble reads.
+- `S-HOOK01-HEADING` (`omp/src/hooks.ts:24`): heading of the HOOK-01 context part, the first line of `SWARM_CONTEXT`.
+- `S-DISPATCH-MARKER` (`omp/src/hooks.ts:17`): marker that tags the `/swarm` dispatch prompt so the HOOK-01 hook never re-steers it.
+- `S-SWARM-FLAG-PATTERN` (`omp/src/commands.ts:16`): the `--pattern=` flag of `/swarm`, from the usage line.
+- `S-SWARM-FLAG-RISK` (`omp/src/commands.ts:16`): the `--risk=` flag of `/swarm`, from the usage line.
+- `S-COMMAND-SWARM` (`omp/src/index.ts:39`): name the extension registers as a command, `swarm`.
+- `S-TOOL-NAME-01` (`omp/src/tools.ts:197`): tool `swarm_status`. `buildTools` builds it and `index.ts:37` registers it.
+- `S-TOOL-NAME-02` (`omp/src/tools.ts:220`): tool `swarm_assignment`.
+- `S-TOOL-NAME-03` (`omp/src/tools.ts:269`): tool `swarm_plan`.
+- `S-TOOL-NAME-04` (`omp/src/tools.ts:321`): tool `swarm_ingest`.
+- `S-TOOL-NAME-05` (`omp/src/tools.ts:347`): tool `swarm_transition`.
+- `S-TOOL-NAME-06` (`omp/src/tools.ts:374`): tool `swarm_gate`.
+- `S-TOOL-NAME-07` (`omp/src/tools.ts:444`): tool `swarm_catalog`.
+- `S-TOOL-NAME-08` (`omp/src/tools.ts:473`): tool `swarm_tool_call`.
+- `S-BAR-WIDGET-KEY` (`omp/src/swarm_bar.ts:31`): widget key `agent-swarm` that the status bar mounts under.
+- `S-BAR-ENV-SWITCH` (`omp/src/swarm_bar.ts:2567`): env var `SWARM_BAR`, the status bar switch.
+- `S-BAR-OFF-VALUE` (`omp/src/swarm_bar.ts:2567`): `SWARM_BAR` value `off`, which disables the bar.
+- `S-BAR-LINGER-S-ENV` (`omp/src/swarm_bar.ts:2839`): env var `SWARM_BAR_LINGER_S`, the linger time after a settled row in seconds.
+- `S-BAR-LINGER-S-DEFAULT` (`omp/src/swarm_bar.ts:2839`): default linger of 20 s, used when the env value is not a positive number.
+- `S-BAR-FAIL-LINGER-S-ENV` (`omp/src/swarm_bar.ts:2840`): env var `SWARM_BAR_FAIL_LINGER_S`, the linger time after a failed row in seconds.
+- `S-BAR-FAIL-LINGER-S-DEFAULT` (`omp/src/swarm_bar.ts:2840`): default failed-row linger of 600 s.
+- `S-BAR-REDUCED-MOTION-ENV` (`omp/src/swarm_bar.ts:2842`): env var `SWARM_BAR_REDUCED_MOTION`.
+- `S-BAR-REDUCED-MOTION-ON` (`omp/src/swarm_bar.ts:2842`): `SWARM_BAR_REDUCED_MOTION` value `1`, which turns reduced motion on.
+- `S-BAR-IDLE-POLL-ENV` (`omp/src/swarm_bar.ts:2845`): env var `SWARM_BAR_IDLE_POLL_MS`, the idle poll interval in ms.
+- `S-BAR-IDLE-POLL-DEFAULT` (`omp/src/swarm_bar.ts:2508`): default idle poll interval of 2000 ms.
+- `S-BAR-IDLE-POLL-MIN` (`omp/src/swarm_bar.ts:2509`): lower clamp of the idle poll interval, 500 ms.
+- `S-BAR-IDLE-POLL-MAX` (`omp/src/swarm_bar.ts:2510`): upper clamp of the idle poll interval, 30_000 ms.
+
+Not pinned here: the multi-line `DEPTH_REASON` and the `/swarm` dispatch prompt bodies, which are large template literals with computed parts.

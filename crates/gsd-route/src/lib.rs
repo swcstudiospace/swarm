@@ -7,7 +7,13 @@
 //! order, and calls these functions in the order the Python scripts run them, so error precedence
 //! matches the Python engine.
 
+use std::collections::HashMap;
+
 use gsd_codes::ErrorCode;
+
+mod orch_status_wire;
+
+pub use orch_status_wire::{decode_reply_wire, orch_status_invoke, orch_status_reply};
 
 /// Ordered columns of one Task Store row, typed as SQLite stored them (Python `dict(row)`).
 pub type Fields = Vec<(String, Json)>;
@@ -240,6 +246,7 @@ impl Parser<'_> {
     fn object(&mut self, depth: usize) -> Option<Json> {
         self.eat(b'{')?;
         let mut fields: Vec<(String, Json)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         self.skip_ws();
         if self.eat(b'}').is_some() {
             return Some(Json::Obj(fields));
@@ -250,7 +257,13 @@ impl Parser<'_> {
             self.skip_ws();
             self.eat(b':')?;
             let value = self.value(depth + 1)?;
-            upsert(&mut fields, key, value);
+            match index.get(&key) {
+                Some(&at) => fields[at].1 = value,
+                None => {
+                    index.insert(key.clone(), fields.len());
+                    fields.push((key, value));
+                }
+            }
             self.skip_ws();
             if self.eat(b',').is_some() {
                 continue;
@@ -333,8 +346,9 @@ impl Parser<'_> {
 
     fn hex4(&mut self) -> Option<u32> {
         let slice = self.bytes.get(self.pos..self.pos + 4)?;
-        let text = std::str::from_utf8(slice).ok()?;
-        let value = u32::from_str_radix(text, 16).ok()?;
+        let value = slice.iter().try_fold(0u32, |acc, &byte| {
+            Some(acc * 16 + char::from(byte).to_digit(16)?)
+        })?;
         self.pos += 4;
         Some(value)
     }
@@ -344,15 +358,29 @@ impl Parser<'_> {
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
+        match self.peek()? {
+            b'0' => self.pos += 1,
+            b'1'..=b'9' => {
+                self.digits();
+            }
+            _ => return None,
+        }
         let mut is_float = false;
-        while let Some(byte) = self.peek() {
-            match byte {
-                b'0'..=b'9' => self.pos += 1,
-                b'.' | b'e' | b'E' | b'+' | b'-' => {
-                    is_float = true;
-                    self.pos += 1;
-                }
-                _ => break,
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            if !self.digits() {
+                return None;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !self.digits() {
+                return None;
             }
         }
         let text = std::str::from_utf8(self.bytes.get(start..self.pos)?).ok()?;
@@ -361,6 +389,15 @@ impl Parser<'_> {
         } else {
             text.parse::<i64>().ok().map(Json::Int)
         }
+    }
+
+    /// Consumes ASCII digits and returns whether at least one was consumed.
+    fn digits(&mut self) -> bool {
+        let start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        self.pos > start
     }
 }
 
@@ -687,7 +724,7 @@ fn gates_of(task: &Task) -> Result<Vec<String>, SeamError> {
                 "high" => Ok(strings(&["review", "quality", "security", "release"])),
                 _ => Err(SeamError::unprefixed(
                     ErrorCode::Input,
-                    format!("KeyError: '{risk}'"),
+                    "KeyError: risk_class has no default gates",
                 )),
             },
             Json::Null => Err(SeamError::unprefixed(ErrorCode::Input, "KeyError: None")),
@@ -1331,6 +1368,43 @@ mod tests {
         let fields = history_fields("T-A", history, latest, &task).map_err(message)?;
         let expected = "{\n  \"status\": \"ok\",\n  \"task_id\": \"T-A\",\n  \"history\": [\n    {\n      \"to_state\": \"CREATED\",\n      \"from_state\": null\n    }\n  ],\n  \"verdicts\": {\n    \"review\": {\n      \"task_id\": \"T-A\",\n      \"gate\": \"review\",\n      \"verdict\": \"pass\",\n      \"findings\": [],\n      \"envelope_json\": null,\n      \"ts\": 2.0\n    }\n  },\n  \"missing_gate_reasons\": {\n    \"review\": \"unsigned\"\n  },\n  \"summary\": \"history for T-A\"\n}";
         assert_eq!(to_python_json(&Json::Obj(fields)), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn number_and_escape_grammar_is_strict_json() -> TestResult {
+        for text in ["01", "1.", "-", "-01", "1e", "1e+", "1.e3", "+1"] {
+            assert!(parse_json(text).is_err(), "{text:?}");
+        }
+        for text in [r#""\u+041""#, r#""\u00G1""#] {
+            assert!(parse_json(text).is_err(), "{text:?}");
+        }
+        assert_eq!(parse_json("-0").map_err(message)?, Json::Int(0));
+        assert_eq!(parse_json("0.5").map_err(message)?, Json::Float(0.5));
+        assert_eq!(parse_json("1e3").map_err(message)?, Json::Float(1000.0));
+        assert_eq!(parse_json(r#""\u0041""#).map_err(message)?, jstr("A"));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_keys_keep_first_position_and_last_value() -> TestResult {
+        let parsed = parse_json("{\"a\": 1, \"b\": 2, \"a\": 3}").map_err(message)?;
+        let expected = Json::Obj(vec![
+            ("a".to_string(), Json::Int(3)),
+            ("b".to_string(), Json::Int(2)),
+        ]);
+        assert_eq!(parsed, expected);
+        let mut text = String::from("{");
+        for index in 0..2000 {
+            text.push_str(&format!("\"k{index}\": {index}, "));
+        }
+        text.push_str("\"k0\": -1}");
+        let Json::Obj(fields) = parse_json(&text).map_err(message)? else {
+            return Err("object expected".to_string());
+        };
+        assert_eq!(fields.len(), 2000);
+        assert_eq!(fields[0], ("k0".to_string(), Json::Int(-1)));
+        assert_eq!(fields[1999], ("k1999".to_string(), Json::Int(1999)));
         Ok(())
     }
 }

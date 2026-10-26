@@ -15,7 +15,7 @@ import sys
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping, TypeGuard
 
 from . import substrate_client, workspace
 from .paths import swarm_dir
@@ -166,7 +166,7 @@ def kind_for(swarm_type: str) -> str | None:
 _AGENT_RE = re.compile(r"^(A\d{2})(?:@|$)")
 
 
-def agent_of(record: Mapping) -> str | None:
+def agent_of(record: Mapping[str, Any]) -> str | None:
     """The emitting agent id (A01..A30) of a run-log record, or None when it names none.
 
     Ctx.emit stamps ``source = "<agent id>@<script>"``. The one non-agent source that still has an identity is
@@ -186,7 +186,7 @@ _GRAPH_ID_IN_TEXT = re.compile(r"(?<![0-9A-Za-z-])ut-[0-9a-z]+-[0-9a-f]{8}(?![0-
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
-def is_graph_id(value: object) -> bool:
+def is_graph_id(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and GRAPH_ID_RE.fullmatch(value) is not None
 
 
@@ -216,7 +216,7 @@ def resolve_graph_id(correlation_id: str | None = None, *, explicit: str | None 
     """
     e = os.environ if env is None else env
     if is_graph_id(explicit):
-        return explicit  # type: ignore[return-value]
+        return explicit
     if is_graph_id((e.get("SUBSTRATE_GRAPH_ID") or "").strip()):
         return e["SUBSTRATE_GRAPH_ID"].strip()
     return graph_id_in_text(brief_text) or mint_graph_id()
@@ -400,7 +400,8 @@ def repo_slug(root: str | Path) -> str:
 
 
 # --- the tee -----------------------------------------------------------------------------------------------
-def build_event(record: Mapping, graph_id: str, *, env: Mapping[str, str] | None = None, root: str | Path | None = None) -> dict | None:
+def build_event(record: Mapping[str, Any], graph_id: str, *, env: Mapping[str, str] | None = None,
+                root: str | Path | None = None) -> dict[str, Any] | None:
     """The /events body for a run-log record, or None when the record cannot be attributed or its type is unmapped."""
     e = os.environ if env is None else env
     swarm_type, agent = record.get("type"), agent_of(record)
@@ -432,7 +433,7 @@ def build_event(record: Mapping, graph_id: str, *, env: Mapping[str, str] | None
     return body
 
 
-def tee(record: Mapping, ctx_root: str | Path | None = None, *, env: Mapping[str, str] | None = None) -> bool:
+def tee(record: Mapping[str, Any], ctx_root: str | Path | None = None, *, env: Mapping[str, str] | None = None) -> bool:
     """Send one run-log record to substrate. True only when substrate accepted a new event. Never raises.
 
     The record goes out with the token of the agent it is attributed to, from `workspace.credential`: that agent's env

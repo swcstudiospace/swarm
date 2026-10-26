@@ -44,14 +44,14 @@ def test_backoff_attempt_below_one_and_huge_attempt_are_safe():
 def test_backoff_env_defaults(monkeypatch):
     monkeypatch.delenv("SWARM_RETRY_BASE_S", raising=False)
     monkeypatch.delenv("SWARM_RETRY_CAP_S", raising=False)
-    assert backoff_s(1, jitter=0) == 2
-    assert backoff_s(20, jitter=0) == 120
+    assert backoff_s(1, jitter=0) == 0.1
+    assert backoff_s(20, jitter=0) == 5
     monkeypatch.setenv("SWARM_RETRY_BASE_S", "5")
     monkeypatch.setenv("SWARM_RETRY_CAP_S", "30")
     assert backoff_s(1, jitter=0) == 5
     assert backoff_s(5, jitter=0) == 30
     monkeypatch.setenv("SWARM_RETRY_BASE_S", "junk")
-    assert backoff_s(1, jitter=0) == 2
+    assert backoff_s(1, jitter=0) == 0.1
 
 
 def test_backoff_rejects_bad_args():
@@ -66,7 +66,7 @@ def test_transient_codes(code):
     assert is_transient(code, "")
 
 
-@pytest.mark.parametrize("code", ["E-INPUT", "E-POLICY", "E-CONTRACT", ErrorCode.E_POLICY])
+@pytest.mark.parametrize("code", ["E-INPUT", "E-POLICY", ErrorCode.E_POLICY])
 def test_permanent_codes_never_transient_even_with_markers(code):
     assert not is_transient(code, "429 rate limit overloaded retry after 5 s")
 
@@ -214,3 +214,10 @@ def test_retry_after_clamp_follows_the_env_cap_and_never_shortens_the_cooldown(m
     clock.advance(99)
     lim.on_success()
     assert lim.current() == 2
+
+
+def test_transient_classification_follows_the_rust_contract():
+    assert is_transient("E-CONTRACT")
+    assert is_transient("E-TIMEOUT") and is_transient("E-DEP") and is_transient("E-CAPACITY")
+    assert not is_transient("E-INPUT")
+    assert not is_transient("E-POLICY")

@@ -59,8 +59,10 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from typing import Any, TypeGuard
 
 from swarm.tools.support import respond
 
@@ -88,17 +90,23 @@ _MAX_FINITE_S = Decimal("1e300")  # a duration beyond this cannot be reported as
 # --- shared helpers -----------------------------------------------------------------------------------------------
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, str]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _dec(value) -> Decimal:
+def _respond(payload: dict[str, Any], work: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """`support.respond` is untyped, so its result is Any; this restates it as the handler's result type."""
+    result: dict[str, Any] = respond(payload, work)
+    return result
+
+
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _r(value, digits: int = 4) -> float:
+def _r(value: Decimal | float | int, digits: int = 4) -> float:
     return round(float(value), digits)
 
 
@@ -110,7 +118,7 @@ def _floor(value: Decimal) -> int:
     return int(value.to_integral_value(rounding=ROUND_FLOOR))
 
 
-def _n(value) -> str:
+def _n(value: object) -> str:
     """Compact human number for finding text."""
     d = value if isinstance(value, Decimal) else _dec(value)
     if d == d.to_integral_value():
@@ -136,7 +144,7 @@ _LONG_RUN = re.compile(r"[A-Za-z0-9+/_=]{32,}")
 _SCAN_LIMIT = 512  # longer text is never an identifier worth echoing, and scanning it is quadratic in several shapes
 
 
-def _safe(value, limit: int = 80) -> str:
+def _safe(value: object, limit: int = 80) -> str:
     """`value` as text for a finding. Input echoed back into a finding or an output list can be a credential someone
     pasted into a name or value field: text with a secret shape (URL credentials, cloud/VCS tokens, long hex or random
     runs, key=value credentials, a mnemonic) or longer than 512 characters is replaced by a length-only marker, and text
@@ -149,7 +157,7 @@ def _safe(value, limit: int = 80) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _wrap(raw: list[tuple[str, str]], prefix: str, pinned=()) -> tuple[str, list[dict]]:
+def _wrap(raw: list[tuple[str, str]], prefix: str, pinned: Sequence[tuple[str, str]] = ()) -> tuple[str, list[dict[str, str]]]:
     """Sort and number raw (severity, text) findings; the verdict is derived before any truncation. `pinned` findings are kept
     whatever the truncation: they take room from the findings it keeps, so the output never exceeds _MAX_FINDINGS (300)."""
     ordered = sorted(set(raw), key=lambda item: (_SEVERITY_RANK[item[0]], item[1]))
@@ -165,7 +173,7 @@ def _wrap(raw: list[tuple[str, str]], prefix: str, pinned=()) -> tuple[str, list
     return verdict, items
 
 
-def _norm(value):
+def _norm(value: object) -> object:
     """JSON value normalised for equality: 1 equals 1.0, booleans stay distinct from numbers."""
     if isinstance(value, bool):
         return value
@@ -178,35 +186,35 @@ def _norm(value):
     return value
 
 
-def _canon(value) -> str:
+def _canon(value: object) -> str:
     return json.dumps(_norm(value), sort_keys=True, separators=(",", ":"))
 
 
-def _is_num(value) -> bool:
+def _is_num(value: object) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 class _Bad(Exception):
     """A semantic input problem: becomes INVALID_INPUT naming `field`."""
 
-    def __init__(self, field: str, message: str):
+    def __init__(self, field: str, message: str) -> None:
         super().__init__(message)
         self.field, self.message = field, message
 
 
-def _depth_exceeds(value, limit: int) -> bool:
+def _depth_exceeds(value: object, limit: int) -> bool:
     """True when `value` nests deeper than `limit` containers (iterative: no recursion on hostile input)."""
     stack = [(value, 1)]
     while stack:
         node, depth = stack.pop()
-        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()
+        children: Iterable[object] = node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()
         if children and depth > limit:
             return True
         stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
     return False
 
 
-def _load_json(text: str, field: str):
+def _load_json(text: str, field: str) -> Any:
     try:
         value = json.loads(text)
     except (ValueError, RecursionError) as exc:
@@ -226,7 +234,7 @@ def _unpercent(text: str) -> str:
         return text
 
 
-def _anchor(root, name: str):
+def _anchor(root: Any, name: str) -> Any:
     """The subschema that declares `$anchor`/`$dynamicAnchor` `name` or an `$id` of `#name`; None when there is none."""
     stack, seen = [root], 0
     while stack and seen < 200000:
@@ -244,7 +252,7 @@ def _anchor(root, name: str):
 _ARRAY_INDEX = re.compile(r"0|[1-9][0-9]{0,8}")  # RFC 6901 array index: ASCII digits, no leading zero
 
 
-def _pointer(root, ref: str):
+def _pointer(root: Any, ref: str) -> Any:
     """Resolve a local reference ("#", "#/a/b" as an RFC 6901 pointer in a percent-encoded fragment, or "#anchor");
     None when it does not resolve. An empty reference token is a real (empty) key, not a skipped segment."""
     if not ref.startswith("#"):
@@ -276,11 +284,11 @@ _ANNOTATIONS = ("title", "description", "examples", "$comment", "default", "depr
                 "$id", "$anchor", "$defs", "definitions")
 
 
-def _bound(node: dict, low: bool):
+def _bound(node: dict[str, Any], low: bool) -> tuple[Decimal, bool] | None:
     """Tightest numeric bound of a schema as (value, exclusive) or None. A Draft-4 `exclusiveMinimum: true` flag makes
     `minimum` exclusive (likewise for the maximum)."""
     inclusive, exclusive = ("minimum", "exclusiveMinimum") if low else ("maximum", "exclusiveMaximum")
-    candidates = []
+    candidates: list[tuple[Decimal, bool]] = []
     if _is_num(node.get(inclusive)):
         candidates.append((_dec(node[inclusive]), node.get(exclusive) is True))
     if _is_num(node.get(exclusive)):
@@ -290,7 +298,7 @@ def _bound(node: dict, low: bool):
     return max(candidates, key=lambda c: (c[0], c[1])) if low else min(candidates, key=lambda c: (c[0], not c[1]))
 
 
-def _value_fits(value, types: set) -> bool:
+def _value_fits(value: Any, types: set[str]) -> bool:
     """Can the JSON `value` be valid under a schema whose declared type set is `types`?"""
     if value is None:
         return "null" in types
@@ -305,7 +313,7 @@ def _value_fits(value, types: set) -> bool:
     return "array" in types if isinstance(value, list) else "object" in types
 
 
-def _position(items, extra, index: int):
+def _position(items: Any, extra: Any, index: int) -> Any:
     """The schema of array position `index`: a tuple entry, the schema past the tuple, or the one `items` schema."""
     if not isinstance(items, list):
         return items
@@ -315,7 +323,7 @@ def _position(items, extra, index: int):
 _DRAFT_URI = re.compile(r"https?://json-schema\.org/(draft-0[3467]|draft/(?:2019-09|2020-12))/schema#?\Z")
 
 
-def _draft_identity(declared):
+def _draft_identity(declared: Any) -> Any:
     """The draft a `$schema` value names. Spellings of one draft (with or without the trailing `#`, http or https) give the same
     identity; any other value is its own identity, so unrecognised or different drafts stay apart."""
     match = _DRAFT_URI.match(declared) if isinstance(declared, str) else None
@@ -328,18 +336,18 @@ class _JsonCompare:
     pattern) it reports a major finding rather than a pass. Keywords of `sub` that are ignored only make it stricter.
     Siblings of a `$ref` apply in addition to its target on both sides in Draft 2019-09 and later; drafts 3 to 7 ignore them (see _draft)."""
 
-    def __init__(self, base, head):
+    def __init__(self, base: Any, head: Any) -> None:
         self.roots = {"base": base, "head": head}
         self.nodes = 0
-        self.stack: set = set()
-        self.unanalysed: set = set()
-        self.cache: dict = {}  # derived schemas keep one identity, so the cycle check recognises them
+        self.stack: set[tuple[int, int]] = set()
+        self.unanalysed: set[tuple[str, str]] = set()
+        self.cache: dict[tuple[object, ...], Any] = {}  # derived schemas keep one identity, so the cycle check recognises them
 
     @staticmethod
     def _field(side: str) -> str:
         return f"{side}_schema"
 
-    def _conjuncts(self, schema, side: str, depth: int = 0) -> list:
+    def _conjuncts(self, schema: Any, side: str, depth: int = 0) -> list[Any]:
         """The schemas whose conjunction `schema` denotes. A `$ref` contributes its target, and its sibling keywords apply
         in addition (Draft 2019-09 and later; drafts 3 to 7 ignore them, and an unrecognised draft refuses them). Booleans may appear in the list."""
         if depth > _MAX_REF_HOPS:
@@ -359,12 +367,13 @@ class _JsonCompare:
             raise _Bad(self._field(side), "every schema must be an object or a boolean")
         return [schema]
 
-    def _siblings(self, schema: dict) -> dict:
+    def _siblings(self, schema: dict[str, Any]) -> dict[str, Any]:
         """The non-annotation keywords beside a `$ref`, cached per node so that the cycle check sees a stable identity."""
         key = ("siblings", id(schema))
         if key not in self.cache:
             self.cache[key] = ({k: v for k, v in schema.items() if k != "$ref" and k not in _ANNOTATIONS}, schema)
-        return self.cache[key][0]
+        siblings: dict[str, Any] = self.cache[key][0]
+        return siblings
 
     def _draft(self, side: str) -> str:
         """The draft the root `$schema` declares: "legacy" (draft 3 to 7, where a $ref ignores its siblings), "modern" (2019-09 or
@@ -380,7 +389,7 @@ class _JsonCompare:
             return "legacy"
         return "modern" if "draft/2019-09" in declared or "draft/2020-12" in declared else "unknown"
 
-    def _merged(self, parts: list):
+    def _merged(self, parts: list[Any]) -> Any:
         """A schema at least as weak as the conjunction of `parts`, so a proof for it proves the conjunction. None when
         if/then/else come from two parts, which cannot be merged keyword by keyword. Cached per list of parts."""
         key = ("merged", tuple(id(part) for part in parts))
@@ -389,10 +398,10 @@ class _JsonCompare:
         return self.cache[key][0]
 
     @staticmethod
-    def _merge(parts: list):
+    def _merge(parts: list[Any]) -> dict[str, Any] | None:
         if sum(1 for part in parts if isinstance(part, dict) and {"if", "then", "else"} & part.keys()) > 1:
             return None
-        merged: dict = {}
+        merged: dict[str, Any] = {}
         for part in parts:
             for key, value in part.items():
                 if key not in merged:
@@ -407,7 +416,7 @@ class _JsonCompare:
                     merged[key] = value  # a keyword alone is implied by the conjunction it came from
         return merged
 
-    def _flat(self, schema, side: str):
+    def _flat(self, schema: Any, side: str) -> Any:
         """A schema at least as weak as `schema`, for the disjointness test; True when no proof is possible."""
         parts = [part for part in self._conjuncts(schema, side) if part is not True]
         if any(part is False for part in parts):
@@ -419,7 +428,7 @@ class _JsonCompare:
         merged = self._merged(parts)
         return True if merged is None else merged
 
-    def _types(self, node: dict, side: str):
+    def _types(self, node: dict[str, Any], side: str) -> set[str] | None:
         declared = node.get("type")
         if declared is None:
             return None
@@ -428,19 +437,19 @@ class _JsonCompare:
             raise _Bad(self._field(side), f"unsupported JSON Schema type {_safe(declared, 40)!r}")
         return set(names)
 
-    def _declared(self, side: str):
+    def _declared(self, side: str) -> object:
         """The draft identity of the root `$schema` of `side` (see _draft_identity), or None when it declares none."""
         root = self.roots[side]
         return _draft_identity(root.get("$schema")) if isinstance(root, dict) else None
 
-    def _same(self, sub: dict, ss: str, sup: dict, ps: str) -> bool:
+    def _same(self, sub: dict[str, Any], ss: str, sup: dict[str, Any], ps: str) -> bool:
         """Both subtrees are textually identical, carry no `$ref` (which may resolve differently on each side), and are read under
         the same declared draft: identical text means different things under draft 4 and draft 7 (`const`, a boolean
         `exclusiveMinimum`), so the shortcut is taken only when both roots declare the same `$schema`."""
         text = _canon(sub)
         return text == _canon(sup) and "$ref" not in text and self._declared(ss) == self._declared(ps)
 
-    def compare(self, sub, sub_side: str, sup, sup_side: str, path: str, out: list) -> None:
+    def compare(self, sub: Any, sub_side: str, sup: Any, sup_side: str, path: str, out: list[tuple[str, str]]) -> None:
         """Every instance valid under `sub` is valid under `sup`; findings cover the parts that are not provably valid. Both
         sides are conjunctions (see _conjuncts). The source is accepted against one target part when one of its conjuncts
         alone is, or when their merged superset is; otherwise the findings of the merged superset are reported."""
@@ -457,7 +466,8 @@ class _JsonCompare:
             if part is False:
                 out.append(("blocker", f"{path}: no longer accepted (the target schema is `false`)"))
                 return
-            merged = None
+            merged: dict[str, Any] | None = None
+            candidates: list[Any]
             if not sub_parts:
                 candidates = [{}]
             elif len(sub_parts) == 1:
@@ -465,9 +475,10 @@ class _JsonCompare:
             else:
                 merged = self._merged(sub_parts)
                 candidates = sub_parts if merged is None else [*sub_parts, merged]
-            trials, accepted = [], False
+            trials: list[list[tuple[str, str]]] = []
+            accepted = False
             for candidate in candidates:
-                trial: list = []
+                trial: list[tuple[str, str]] = []
                 key = (id(candidate), id(part))
                 if key not in self.stack:  # a pair met again is a $ref cycle, already being decided further up
                     self.stack.add(key)
@@ -489,7 +500,7 @@ class _JsonCompare:
             else:
                 out.extend(trials[-1])
 
-    def _body(self, sub: dict, ss: str, sup: dict, ps: str, path: str, out: list) -> None:
+    def _body(self, sub: dict[str, Any], ss: str, sup: dict[str, Any], ps: str, path: str, out: list[tuple[str, str]]) -> None:
         for keyword in _UNANALYSED:
             if keyword in sup:
                 text = _canon(sup[keyword])
@@ -521,7 +532,7 @@ class _JsonCompare:
                 out.append(("blocker", f"{path}: source accepts any type but target requires {sorted(pt)}"))
             elif not st <= widened:
                 out.append(("blocker", f"{path}: type {sorted(st)} is not accepted by target type {sorted(pt)}"))
-        can = (lambda *names: st is None or bool(st & set(names)))  # noqa: E731 - tiny local predicate
+        can: Callable[..., bool] = lambda *names: st is None or bool(st & set(names))  # noqa: E731 - tiny local predicate
         self._enum(sub, ss, sup, ps, path, out)
         if can("number", "integer"):
             self._range(sub, sup, path, out)
@@ -538,14 +549,15 @@ class _JsonCompare:
         if can("object"):
             self._object(sub, ss, sup, ps, path, out)
 
-    def _beside(self, node: dict) -> dict:
+    def _beside(self, node: dict[str, Any]) -> dict[str, Any]:
         """The keywords of `node` other than its anyOf/oneOf, cached per node so that the cycle check sees a stable identity."""
         key = ("beside", id(node))
         if key not in self.cache:
             self.cache[key] = ({k: v for k, v in node.items() if k not in ("anyOf", "oneOf")}, node)
-        return self.cache[key][0]
+        beside_cached: dict[str, Any] = self.cache[key][0]
+        return beside_cached
 
-    def _with_siblings(self, beside: dict, alt, side: str, path: str, out: list):
+    def _with_siblings(self, beside: dict[str, Any], alt: Any, side: str, path: str, out: list[tuple[str, str]]) -> Any:
         """The source alternative `alt` with the source keywords beside its anyOf/oneOf: one schema at least as weak as their
         conjunction, so a proof for it proves the source alternative. None when the alternative accepts nothing, or when the
         conjunction cannot be merged (the finding then says so)."""
@@ -565,11 +577,11 @@ class _JsonCompare:
                                  "merged: compatibility is not proven"))
         return merged
 
-    def _alternatives(self, sub: dict, ss: str, alts: list, ps: str, key: str, path: str, out: list) -> None:
+    def _alternatives(self, sub: Any, ss: str, alts: list[Any], ps: str, key: str, path: str, out: list[tuple[str, str]]) -> None:
         """`sub` against the anyOf/oneOf of the target: some alternative must accept it, and for oneOf exactly one."""
-        covering = []
+        covering: list[int] = []
         for index, alt in enumerate(alts):
-            trial: list = []
+            trial: list[tuple[str, str]] = []
             self.compare(sub, ss, alt, ps, path, trial)
             if not trial:
                 covering.append(index)
@@ -588,7 +600,7 @@ class _JsonCompare:
                                      "valid before can match two of them"))
                 return
 
-    def _disjoint(self, first, fs: str, second, ss: str, depth: int = 0) -> bool:
+    def _disjoint(self, first: Any, fs: str, second: Any, ss: str, depth: int = 0) -> bool:
         """True only when no instance can satisfy both schemas: disjoint type sets, disjoint enum/const values, a value
         set that fits no type of the other, or a required property whose two schemas are disjoint (a discriminator)."""
         if depth > 6:
@@ -600,7 +612,7 @@ class _JsonCompare:
             return False
         ta, tb = self._types(first, fs), self._types(second, ss)
         if ta is not None and tb is not None:
-            widen = lambda t: t | ({"integer"} if "number" in t else set())  # noqa: E731
+            widen: Callable[[set[str]], set[str]] = lambda t: t | ({"integer"} if "number" in t else set())  # noqa: E731
             if not widen(ta) & widen(tb):
                 return True
         va, vb = self._values(first, fs), self._values(second, ss)
@@ -625,7 +637,7 @@ class _JsonCompare:
         declared = root.get("$schema") if isinstance(root, dict) else None
         return not (isinstance(declared, str) and any(f"draft-0{number}" in declared for number in "34"))
 
-    def _values(self, node: dict, side: str):
+    def _values(self, node: dict[str, Any], side: str) -> list[Any] | None:
         """The finite value set of a schema (`enum` and `const` intersected when both are present), or None. A `const` counts
         only under a draft that has the keyword."""
         enum = node.get("enum") if isinstance(node.get("enum"), list) else None
@@ -635,7 +647,7 @@ class _JsonCompare:
             return [node["const"]] if _canon(node["const"]) in {_canon(v) for v in enum} else []
         return enum
 
-    def _enum(self, sub: dict, ss: str, sup: dict, ps: str, path: str, out: list) -> None:
+    def _enum(self, sub: dict[str, Any], ss: str, sup: dict[str, Any], ps: str, path: str, out: list[tuple[str, str]]) -> None:
         target = self._values(sup, ps)
         if target is None:
             return
@@ -649,7 +661,7 @@ class _JsonCompare:
             shown = ", ".join(_safe(v, 30) for v in missing[:3])
             out.append(("major", f"{path}: value(s) {shown} accepted by the source are not in the target enum"))
 
-    def _range(self, sub: dict, sup: dict, path: str, out: list) -> None:
+    def _range(self, sub: dict[str, Any], sup: dict[str, Any], path: str, out: list[tuple[str, str]]) -> None:
         for low, label in ((True, "lower"), (False, "upper")):
             wanted = _bound(sup, low)
             if wanted is None:
@@ -666,7 +678,7 @@ class _JsonCompare:
                                      f"(target {'>' if low and wanted[1] else '>=' if low else '<' if wanted[1] else '<='} {_n(wanted[0])})"))
 
     @staticmethod
-    def _multiple(sub: dict, sup: dict, st, path: str, out: list) -> None:
+    def _multiple(sub: dict[str, Any], sup: dict[str, Any], st: set[str] | None, path: str, out: list[tuple[str, str]]) -> None:
         """`multipleOf`: every multiple of the source step must be a multiple of the target step."""
         wanted = sup.get("multipleOf")
         if not _is_num(wanted) or wanted <= 0:
@@ -680,13 +692,13 @@ class _JsonCompare:
         if not proven:
             out.append(("major", f"{path}: multipleOf {_n(wanted)} is not guaranteed by the source"))
 
-    def _length(self, sub: dict, sup: dict, low_key: str, high_key: str, label: str, path: str, out: list) -> None:
+    def _length(self, sub: dict[str, Any], sup: dict[str, Any], low_key: str, high_key: str, label: str, path: str, out: list[tuple[str, str]]) -> None:
         if _is_num(sup.get(low_key)) and sup[low_key] > 0 and not (_is_num(sub.get(low_key)) and sub[low_key] >= sup[low_key]):
             out.append(("major", f"{path}: {low_key} is below the target minimum {_n(sup[low_key])} ({label})"))
         if _is_num(sup.get(high_key)) and not (_is_num(sub.get(high_key)) and sub[high_key] <= sup[high_key]):
             out.append(("major", f"{path}: {high_key} is above the target maximum {_n(sup[high_key])} ({label})"))
 
-    def _array(self, sub: dict, ss: str, sup: dict, ps: str, path: str, out: list) -> None:
+    def _array(self, sub: dict[str, Any], ss: str, sup: dict[str, Any], ps: str, path: str, out: list[tuple[str, str]]) -> None:
         self._length(sub, sup, "minItems", "maxItems", "array length", path, out)
         if sup.get("uniqueItems") is True and sub.get("uniqueItems") is not True:
             out.append(("major", f"{path}: target requires uniqueItems but the source does not"))
@@ -707,9 +719,9 @@ class _JsonCompare:
             return
         self.compare(sub_items, ss, sup_items, ps, f"{path}[]", out)
 
-    def _object(self, sub: dict, ss: str, sup: dict, ps: str, path: str, out: list) -> None:
-        sub_props = sub.get("properties") if isinstance(sub.get("properties"), dict) else {}
-        sup_props = sup.get("properties") if isinstance(sup.get("properties"), dict) else {}
+    def _object(self, sub: dict[str, Any], ss: str, sup: dict[str, Any], ps: str, path: str, out: list[tuple[str, str]]) -> None:
+        sub_props: dict[str, Any] = sub["properties"] if isinstance(sub.get("properties"), dict) else {}
+        sup_props: dict[str, Any] = sup["properties"] if isinstance(sup.get("properties"), dict) else {}
         sub_ap, sup_ap = sub.get("additionalProperties", True), sup.get("additionalProperties", True)
         sub_req = {r for r in sub.get("required", []) if isinstance(r, str)} if isinstance(sub.get("required"), list) else set()
         sup_req = {r for r in sup.get("required", []) if isinstance(r, str)} if isinstance(sup.get("required"), list) else set()
@@ -743,15 +755,15 @@ class _JsonCompare:
             out.append(("major", f"{path}: the source accepts properties by pattern that the closed or constrained target does not "
                                  "provably accept"))
 
-    def _constrains(self, schema, side: str) -> bool:
+    def _constrains(self, schema: Any, side: str) -> bool:
         return any(part is False or (isinstance(part, dict) and any(k not in _ANNOTATIONS for k in part))
                    for part in self._conjuncts(schema, side))
 
 
-def _json_schema_compat(base, head) -> tuple[list, list, list]:
+def _json_schema_compat(base: Any, head: Any) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
     compare = _JsonCompare(base, head)
-    backward: list = []
-    forward: list = []
+    backward: list[tuple[str, str]] = []
+    forward: list[tuple[str, str]] = []
     compare.compare(base, "base", head, "head", "$", backward)  # data written with base must pass head
     compare.compare(head, "head", base, "base", "$", forward)  # data written with head must pass base
     extra = [("minor", f"{path}: keyword {keyword!r} is not analysed; verify this part manually")
@@ -770,7 +782,7 @@ def _avro_qualify(name: str, namespace: str) -> str:
     return name if "." in name or not namespace else f"{namespace}.{name}"
 
 
-def _avro_logical(schema: dict):
+def _avro_logical(schema: dict[str, Any]) -> tuple[str, tuple[Any, Any] | None]:
     """(logicalType, decimal parameters or None) of a primitive or fixed schema; a decimal's scale defaults to 0."""
     logical = schema.get("logicalType")
     if not isinstance(logical, str):
@@ -778,7 +790,7 @@ def _avro_logical(schema: dict):
     return (logical, (schema.get("precision"), schema.get("scale", 0))) if logical == "decimal" else (logical, None)
 
 
-def _avro_aliases(node: dict, field: str, label: str) -> list[str]:
+def _avro_aliases(node: dict[str, Any], field: str, label: str) -> list[str]:
     """The string aliases of a record, enum, fixed or field; a non-list value is INVALID_INPUT, never silently dropped."""
     raw = node.get("aliases", [])
     if not isinstance(raw, list) or not all(isinstance(a, str) for a in raw):
@@ -786,7 +798,7 @@ def _avro_aliases(node: dict, field: str, label: str) -> list[str]:
     return raw
 
 
-def _avro_normalize(schema, namespace: str, names: dict, field: str) -> dict:
+def _avro_normalize(schema: Any, namespace: str, names: dict[str, dict[str, Any]], field: str) -> dict[str, Any]:
     """Schema JSON -> graph of nodes {k: kind, ...}; named types are shared objects, so recursion is a real cycle."""
     if isinstance(schema, str):
         if schema in _AVRO_PRIMITIVES:
@@ -809,7 +821,7 @@ def _avro_normalize(schema, namespace: str, names: dict, field: str) -> dict:
         full = raw if "." in raw else _avro_qualify(raw, schema["namespace"] if isinstance(schema.get("namespace"), str) else namespace)
         own_ns = full.rpartition(".")[0]
         aliases = [_avro_qualify(a, own_ns) for a in _avro_aliases(schema, field, _safe(full, 60))]
-        node: dict = {"k": "record" if kind in ("record", "error") else kind, "n": full, "aliases": aliases, "lt": "", "dec": None}
+        node: dict[str, Any] = {"k": "record" if kind in ("record", "error") else kind, "n": full, "aliases": aliases, "lt": "", "dec": None}
         names[full] = node
         if node["k"] == "record":
             fields = schema.get("fields")
@@ -848,11 +860,11 @@ def _avro_normalize(schema, namespace: str, names: dict, field: str) -> dict:
 class _AvroCompare:
     """Can data written with `writer` be read with `reader` (Avro schema resolution)?"""
 
-    def __init__(self):
-        self.stack: set = set()
+    def __init__(self) -> None:
+        self.stack: set[tuple[int, int]] = set()
         self.nodes = 0
 
-    def match(self, w: dict, r: dict, path: str, out: list) -> None:
+    def match(self, w: dict[str, Any], r: dict[str, Any], path: str, out: list[tuple[str, str]]) -> None:
         self.nodes += 1
         if self.nodes > _NODE_BUDGET:
             raise _Bad("base_schema", "schema comparison exceeds the node budget; split the schema")
@@ -868,17 +880,17 @@ class _AvroCompare:
             self.stack.discard(key)
 
     @staticmethod
-    def _label(node: dict) -> str:
+    def _label(node: dict[str, Any]) -> str:
         return _safe(node.get("n") or node["k"], 60)
 
-    def _match(self, w: dict, r: dict, path: str, out: list) -> None:
+    def _match(self, w: dict[str, Any], r: dict[str, Any], path: str, out: list[tuple[str, str]]) -> None:
         if w["k"] == "union":
             for index, branch in enumerate(w["b"]):
                 self.match(branch, r, f"{path}<{index}:{self._label(branch)}>", out)
             return
         if r["k"] == "union":
             for branch in r["b"]:
-                trial: list = []
+                trial: list[tuple[str, str]] = []
                 self.match(w, branch, path, trial)
                 if not trial:
                     return
@@ -895,7 +907,7 @@ class _AvroCompare:
             out.append(("blocker", f"{path}: {self._label(w)} ({wk}) cannot be read as {self._label(r)} ({rk})"))
             return
         if wk in ("record", "enum", "fixed"):
-            short = lambda n: n.rpartition(".")[2]  # noqa: E731
+            short: Callable[[str], str] = lambda n: n.rpartition(".")[2]  # noqa: E731
             if short(w["n"]) != short(r["n"]) and w["n"] not in r["aliases"] and short(w["n"]) not in [short(a) for a in r["aliases"]]:
                 out.append(("blocker", f"{path}: {wk} name {_safe(w['n'], 60)} does not match reader name {_safe(r['n'], 60)}"))
                 return
@@ -925,30 +937,30 @@ class _AvroCompare:
             self.match(w["v"], r["v"], f"{path}{{}}", out)
 
     @staticmethod
-    def _logical(w: dict, r: dict, path: str, out: list) -> None:
+    def _logical(w: dict[str, Any], r: dict[str, Any], path: str, out: list[tuple[str, str]]) -> None:
         """A changed logical type, or a changed decimal precision or scale, reinterprets the same bytes."""
         if w["lt"] != r["lt"]:
             out.append(("major", f"{path}: logicalType changed from {_safe(w['lt'], 30) or 'none'} to {_safe(r['lt'], 30) or 'none'}"))
         elif w["dec"] != r["dec"]:
-            shown = lambda d: f"({_safe(d[0], 12)},{_safe(d[1], 12)})"  # noqa: E731
+            shown: Callable[[Any], str] = lambda d: f"({_safe(d[0], 12)},{_safe(d[1], 12)})"  # noqa: E731
             out.append(("major", f"{path}: decimal precision/scale changed from {shown(w['dec'])} to {shown(r['dec'])}"))
 
 
-def _avro_schema_compat(base, head) -> tuple[list, list, list]:
+def _avro_schema_compat(base: Any, head: Any) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
     base_node = _avro_normalize(base, "", {}, "base_schema")
     head_node = _avro_normalize(head, "", {}, "head_schema")
-    backward: list = []
-    forward: list = []
+    backward: list[tuple[str, str]] = []
+    forward: list[tuple[str, str]] = []
     _AvroCompare().match(base_node, head_node, "$", backward)  # writer base, reader head
     _AvroCompare().match(head_node, base_node, "$", forward)  # writer head, reader base
     return backward, forward, []
 
 
-def schema_compat(payload: dict) -> dict:
+def schema_compat(payload: dict[str, Any]) -> dict[str, Any]:
     """Compatibility of two event schemas. backward: consumers on `head` read data written with `base`; forward:
     consumers still on `base` read data written with `head`; full: both. Verdict covers the requested mode only."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         fmt, mode = payload["format"], payload["mode"]
         try:
             base = _load_json(payload["base_schema"], "base_schema")
@@ -967,7 +979,7 @@ def schema_compat(payload: dict) -> dict:
             raw += [(sev, f"[backward] {text}") for sev, text in backward]
         if mode in ("forward", "full"):
             raw += [(sev, f"[forward] {text}") for sev, text in forward]
-        breaking = lambda items: not any(s in ("blocker", "major") for s, _ in items)  # noqa: E731
+        breaking: Callable[[list[tuple[str, str]]], bool] = lambda items: not any(s in ("blocker", "major") for s, _ in items)  # noqa: E731
         backward_ok, forward_ok = breaking(backward), breaking(forward)
         compatible = {"backward": backward_ok, "forward": forward_ok, "full": backward_ok and forward_ok}[mode]
         verdict, findings = _wrap(raw, "SC")
@@ -976,7 +988,7 @@ def schema_compat(payload: dict) -> dict:
                 "breaking_changes": min(1000, sum(1 for s, _ in raw if s in ("blocker", "major"))),
                 "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- CloudEvents 1.0 ----------------------------------------------------------------------------------------------
@@ -1006,10 +1018,10 @@ def _rfc3339(text: str) -> bool:
     return True
 
 
-def cloudevents_check(payload: dict) -> dict:
+def cloudevents_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate the context attributes of one CloudEvent against the 1.0 specification (names, required set, value forms)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         attributes, has_data = payload["attributes"], payload["has_data"]
         values: dict[str, str] = {}
         label: dict[str, str] = {}
@@ -1060,7 +1072,7 @@ def cloudevents_check(payload: dict) -> dict:
                 "optional_present": sum(1 for n in _CE_OPTIONAL if n in values),
                 "extension_attributes": extensions, "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- AsyncAPI lint ------------------------------------------------------------------------------------------------
@@ -1068,7 +1080,7 @@ def cloudevents_check(payload: dict) -> dict:
 _ASYNCAPI_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.\-]+)?\Z", re.ASCII)
 
 
-def _asyncapi_refs(document, raw: list) -> None:
+def _asyncapi_refs(document: Any, raw: list[tuple[str, str]]) -> None:
     """Report every local $ref that does not resolve and every external $ref (not followed)."""
     stack = [("#", document)]
     seen = 0
@@ -1121,10 +1133,11 @@ class _AsyncApiWalk:
 
     __slots__ = ("document", "default_ct", "origin", "raw", "keys", "reach", "entries", "steps", "emitted", "exhausted", "reason")
 
-    def __init__(self, document, default_ct: bool, raw: list, keys: set) -> None:
+    def __init__(self, document: Any, default_ct: bool, raw: list[tuple[str, str]], keys: set[tuple[str, str]]) -> None:
         self.document, self.default_ct, self.origin = document, default_ct, ""
-        self.raw, self.keys, self.reach = raw, keys, set()
-        self.entries: dict[int, list] = {}
+        self.raw, self.keys = raw, keys
+        self.reach: set[int] = set()
+        self.entries: dict[int, list[tuple[Any, ...]]] = {}
         self.steps = self.emitted = 0
         self.exhausted, self.reason = False, ""
 
@@ -1145,7 +1158,7 @@ class _AsyncApiWalk:
 _SELF = ("self", "")  # the message a $ref reached: counted under the $ref string of whichever walk reaches it
 
 
-def _asyncapi_message(message, where: str, chain: tuple, walk: _AsyncApiWalk) -> None:
+def _asyncapi_message(message: Any, where: str, chain: tuple[int, ...], walk: _AsyncApiWalk) -> None:
     """A message, a $ref to one, or a oneOf of messages, walked from `where`; findings carry `where` as their path prefix. Each
     distinct message is one counted key: a $ref is ("ref", its absolute $ref string), an inline message is ("path", its path).
     `chain` holds the ids of the $ref targets on the current walk: meeting one again is a cycle, reported at its own path and not
@@ -1153,7 +1166,8 @@ def _asyncapi_message(message, where: str, chain: tuple, walk: _AsyncApiWalk) ->
     inline, so one $ref level costs one Python frame."""
     if walk.exhausted or not walk.charge(1):
         return
-    fresh, own = None, None
+    fresh: tuple[Any, ...] | None = None
+    own: tuple[str, str] | None = None
     if isinstance(message, dict) and isinstance(message.get("$ref"), str):
         ref = message["$ref"]
         target = _pointer(walk.document, ref)
@@ -1198,7 +1212,7 @@ def _asyncapi_message(message, where: str, chain: tuple, walk: _AsyncApiWalk) ->
         _replay(walk, entry, outer_where, ref)
 
 
-def _memo_entry(walk: _AsyncApiWalk, target_id: int, chain: tuple):
+def _memo_entry(walk: _AsyncApiWalk, target_id: int, chain: tuple[int, ...]) -> tuple[Any, ...] | None:
     """The memoised walk of the target valid under this chain, or None. A walk is valid when the chain holds exactly the targets it
     walked under, among the targets that walk reached."""
     chain_set = set(chain)
@@ -1210,7 +1224,7 @@ def _memo_entry(walk: _AsyncApiWalk, target_id: int, chain: tuple):
     return None
 
 
-def _replay(walk: _AsyncApiWalk, entry, where: str, ref: str) -> None:
+def _replay(walk: _AsyncApiWalk, entry: tuple[Any, ...], where: str, ref: str) -> None:
     """Replay a memoised walk under `where`: its findings, its counted keys and its reached targets, as they are found there. A
     stopped walk copies no more findings, but the messages a replay reaches are still counted, so the message count stays the count
     analysed up to the stop."""
@@ -1232,7 +1246,7 @@ def _replay(walk: _AsyncApiWalk, entry, where: str, ref: str) -> None:
             walk.keys.add((kind, value))
 
 
-def _walk_top(walk: _AsyncApiWalk, message, where: str) -> None:
+def _walk_top(walk: _AsyncApiWalk, message: Any, where: str) -> None:
     """One top-level message of the document. The interpreter's recursion limit ends the walk as a stop, never as an exception."""
     walk.origin = where
     try:
@@ -1242,10 +1256,10 @@ def _walk_top(walk: _AsyncApiWalk, message, where: str) -> None:
                   "the document is not fully analysed")
 
 
-def asyncapi_lint(payload: dict) -> dict:
+def asyncapi_lint(payload: dict[str, Any]) -> dict[str, Any]:
     """Structural lint of an AsyncAPI 2.x or 3.x document given as JSON text: required fields, operations, messages, refs."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             document = _load_json(payload["document"], "document")
         except _Bad as exc:
@@ -1264,7 +1278,8 @@ def asyncapi_lint(payload: dict) -> dict:
                 raw.append(("blocker", f"info.{key} is required"))
         channels = document.get("channels")
         default_ct = isinstance(document.get("defaultContentType"), str) and bool(document["defaultContentType"])
-        operations_seen, messages = 0, set()
+        operations_seen = 0
+        messages: set[tuple[str, str]] = set()
         walk = _AsyncApiWalk(document, default_ct, raw, messages)
         if major not in (2, 3):
             raw.append(("blocker", f"AsyncAPI {_safe(version, 40)} is not supported by this lint (2.x and 3.x)"))
@@ -1307,7 +1322,7 @@ def asyncapi_lint(payload: dict) -> dict:
                                              "but consumers get no contract)"))
                     else:
                         _walk_top(walk, operation["message"], f"{where}/message")
-            servers = document.get("servers")
+            servers: Any = document.get("servers")
             for name in sorted(servers) if isinstance(servers, dict) else []:
                 server = servers[name]
                 for key in ("url", "protocol"):
@@ -1326,7 +1341,7 @@ def asyncapi_lint(payload: dict) -> dict:
                     continue
                 for msg_name in sorted(msgs):
                     _walk_top(walk, msgs[msg_name], f"channels/{cn}/messages/{_safe(msg_name, 60)}")
-            operations = document.get("operations")
+            operations: Any = document.get("operations")
             for name in sorted(operations) if isinstance(operations, dict) else []:
                 operations_seen += 1
                 operation, where = operations[name], f"operations/{_safe(name, 60)}"
@@ -1357,7 +1372,7 @@ def asyncapi_lint(payload: dict) -> dict:
                 "channels": len(channels) if isinstance(channels, dict) else 0,
                 "operations": operations_seen, "messages": len(messages), "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- partition plan -----------------------------------------------------------------------------------------------
@@ -1365,11 +1380,11 @@ def asyncapi_lint(payload: dict) -> dict:
 _MAX_PARTITIONS = 10**12  # the output schema maximum for every partition count
 
 
-def partition_plan(payload: dict) -> dict:
+def partition_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """Partitions needed for a peak rate: the largest of the throughput bound, the consumer-capacity bound and the bound
     that keeps the hottest key's partition within one partition's capacity (min of consumer rate and write budget)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         peak, size = _dec(payload["peak_msgs_per_s"]), _dec(payload["avg_msg_bytes"])
         cap, consumer = _dec(payload["partition_max_mib_per_s"]), _dec(payload["consumer_max_msgs_per_s"])
         target = peak * (1 + _dec(payload["headroom_pct"]) / 100)
@@ -1416,16 +1431,16 @@ def partition_plan(payload: dict) -> dict:
                 "hot_partition_msgs_per_s": _r(hot_rate, 2), "skew_ratio": _r(skew),
                 "max_consumer_parallelism": evaluated, "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- consumer lag -------------------------------------------------------------------------------------------------
 
 
-def lag_assessment(payload: dict) -> dict:
+def lag_assessment(payload: dict[str, Any]) -> dict[str, Any]:
     """Drain time, trend and SLO breach of a consumer group backlog; consumers needed to clear it within the SLO."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         lag, arrival, slo = _dec(payload["lag_msgs"]), _dec(payload["arrival_msgs_per_s"]), _dec(payload["slo_s"])
         per, count = _dec(payload["per_consumer_msgs_per_s"]), payload["consumer_count"]
         partitions = payload.get("partition_count")
@@ -1469,22 +1484,24 @@ def lag_assessment(payload: dict) -> dict:
                 "recovery_time_s": _r(recovery, 2), "trend": trend, "slo_breach": breach, "consumers_needed": needed,
                 "needs_more_partitions": needs_partitions, "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- retry schedule -----------------------------------------------------------------------------------------------
 
 
-def retry_schedule(payload: dict) -> dict:
+def retry_schedule(payload: dict[str, Any]) -> dict[str, Any]:
     """Exponential backoff schedule (none/full/equal jitter) checked against the visibility timeout and the retry budget."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         base, mult, cap = _dec(payload["base_delay_s"]), _dec(payload["multiplier"]), _dec(payload["max_delay_s"])
         if cap < base:
             return _invalid("max_delay_s", "max_delay_s must be at least base_delay_s")
         attempts, jitter, mode = payload["max_attempts"], payload["jitter"], payload["retry_mode"]
         processing, visibility, budget = _dec(payload["processing_timeout_s"]), _dec(payload["visibility_timeout_s"]), _dec(payload["budget_s"])
-        schedule, bounds, delay = [], [], base
+        schedule: list[dict[str, Any]] = []
+        bounds: list[tuple[Decimal, Decimal]] = []
+        delay = base
         for retry in range(1, attempts):
             high = min(delay, cap)
             low = {"none": high, "full": Decimal(0), "equal": high / 2}[jitter]
@@ -1527,16 +1544,16 @@ def retry_schedule(payload: dict) -> dict:
                 "worst_case_total_s": _r(worst, 3), "fits_visibility": fits_visibility, "fits_budget": fits_budget,
                 "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- DLQ coverage -------------------------------------------------------------------------------------------------
 
 
-def dlq_coverage(payload: dict) -> dict:
+def dlq_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Every consumer needs a distinct DLQ, a max receive count, a redrive path, an alarm and longer DLQ retention."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         consumers = payload["consumers"]
         names = [c["name"] for c in consumers]
         if len(set(names)) != len(names):
@@ -1588,16 +1605,16 @@ def dlq_coverage(payload: dict) -> dict:
         return {"state": "SUCCESS", "consumers": len(consumers), "covered": len(consumers) - len(uncovered),
                 "uncovered_consumers": sorted(uncovered), "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- idempotency --------------------------------------------------------------------------------------------------
 
 
-def idempotency_window(payload: dict) -> dict:
+def idempotency_window(payload: dict[str, Any]) -> dict[str, Any]:
     """Does the dedup window outlive the longest time a duplicate can still arrive, and is the key strategy sound?"""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         window = _dec(payload["dedup_window_s"])
         required = max(_dec(payload["retry_window_s"]), _dec(payload["redelivery_window_s"]), _dec(payload["replay_window_s"]))
         natural, key = payload["naturally_idempotent"], payload["key_source"]
@@ -1622,7 +1639,7 @@ def idempotency_window(payload: dict) -> dict:
         return {"state": "SUCCESS", "required_window_s": _r(required, 3), "headroom_s": _r(headroom, 3),
                 "covered": covered, "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- ordering -----------------------------------------------------------------------------------------------------
@@ -1635,10 +1652,10 @@ _ORDERING = {
 }
 
 
-def ordering_check(payload: dict) -> dict:
+def ordering_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Does the broker's ordering unit, the routing key and the consumer/retry behaviour preserve per-entity order?"""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         broker = payload["broker"]
         unit, keyed = _ORDERING[broker]
         entity, route = set(payload["entity_key_fields"]), payload["partition_key_fields"]
@@ -1692,16 +1709,16 @@ def ordering_check(payload: dict) -> dict:
         ordered = bool(unit) and not entity_unknown and not any(sev in ("blocker", "major") for sev, _ in breaks)
         return {"state": "SUCCESS", "ordering_unit": unit, "ordered": ordered, "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- function sizing ----------------------------------------------------------------------------------------------
 
 
-def function_sizing(payload: dict) -> dict:
+def function_sizing(payload: dict[str, Any]) -> dict[str, Any]:
     """Concurrency (Little's law on p95), timeout margin, downstream connection limit, cold start and queue trigger fit."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         platform, memory, timeout = payload["platform"], payload["memory_mb"], payload["timeout_s"]
         if platform == "aws-lambda":
             if not LAMBDA_MEMORY_MB[0] <= memory <= LAMBDA_MEMORY_MB[1]:
@@ -1716,7 +1733,7 @@ def function_sizing(payload: dict) -> dict:
             return _invalid("connections_per_instance", "downstream_max_connections and connections_per_instance go together")
         invocations = _dec(payload["peak_events_per_s"]) / payload["batch_size"]
         needed = max(1, _ceil(invocations * (1 + _dec(payload["headroom_pct"]) / 100) * p95 / 1000))
-        safe = max(0, _floor(Decimal(limit) / Decimal(per_instance))) if limit is not None else -1
+        safe = max(0, _floor(Decimal(limit) / Decimal(per_instance))) if limit is not None and per_instance is not None else -1
         reserved = payload.get("reserved_concurrency")
         raw: list[tuple[str, str]] = []
         timeout_ms = Decimal(timeout) * 1000
@@ -1751,18 +1768,18 @@ def function_sizing(payload: dict) -> dict:
                 "provisioned_concurrency_suggested": provisioned, "vcpu_equivalent": _r(vcpu, 2),
                 "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- autoscaler ---------------------------------------------------------------------------------------------------
 
 
-def scaler_sanity(payload: dict) -> dict:
+def scaler_sanity(payload: dict[str, Any]) -> dict[str, Any]:
     """Bounds, partitions, reaction time, cooldown and shutdown grace of a KEDA/HPA-style event-driven scaler. Reaction
     time is the house approximation polling interval + replica startup; KEDA's `cooldownPeriod` only delays the scale to
     zero (from the last active trigger), so it is judged only when min_replicas is 0."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         low, high = payload["min_replicas"], payload["max_replicas"]
         polling, startup = _dec(payload["polling_interval_s"]), _dec(payload["replica_startup_s"])
         partitions = payload.get("partitions")
@@ -1793,16 +1810,16 @@ def scaler_sanity(payload: dict) -> dict:
         return {"state": "SUCCESS", "needed_replicas": needed, "effective_max_replicas": effective,
                 "reaction_time_s": _r(reaction, 3), "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- saga ---------------------------------------------------------------------------------------------------------
 
 
-def saga_coverage(payload: dict) -> dict:
+def saga_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Compensable steps need idempotent compensations, one pivot, retriable steps after it, and an outbox for events."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         steps = payload["steps"]
         names = [s["name"] for s in steps]
         if len(set(names)) != len(names):
@@ -1814,7 +1831,7 @@ def saga_coverage(payload: dict) -> dict:
             raw.append(("major", f"{len(pivots)} pivot steps ({', '.join(_safe(steps[i]['name'], 40) for i in pivots)}): "
                                  "a saga has one commit point"))
         first_pivot = pivots[0] if pivots else len(steps)
-        compensation = lambda step: step["compensation"].strip()  # noqa: E731 - blank text is no compensating action
+        compensation: Callable[[Any], str] = lambda step: step["compensation"].strip()  # noqa: E731 - blank text is no compensating action
         for index, step in enumerate(steps):
             name, kind = _safe(step["name"], 60), step["kind"]
             if kind == "compensable":
@@ -1846,16 +1863,16 @@ def saga_coverage(payload: dict) -> dict:
                 "uncompensated_steps": sorted(uncompensated), "pivot": _safe(steps[pivots[0]]["name"], 80) if pivots else "",
                 "compensation_order": order, "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- retention and replay -----------------------------------------------------------------------------------------
 
 
-def retention_replay(payload: dict) -> dict:
+def retention_replay(payload: dict[str, Any]) -> dict[str, Any]:
     """Can the retained log be replayed from `replay_from_age_s`, how long does catch-up take, and is it restartable?"""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         retention, age = _dec(payload["retention_s"]), _dec(payload["replay_from_age_s"])
         events, rate, live = _dec(payload["replay_events"]), _dec(payload["replay_rate_per_s"]), _dec(payload["live_rate_per_s"])
         compacted, prod = payload["compacted"], payload["environment"] == "prod"
@@ -1890,4 +1907,4 @@ def retention_replay(payload: dict) -> dict:
                 "retention_headroom_s": _r(headroom, 2), "requires_l3_approval": prod,
                 "verdict": verdict, "findings": findings}
 
-    return respond(payload, work)
+    return _respond(payload, work)

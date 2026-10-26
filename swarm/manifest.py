@@ -8,6 +8,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_FILE = Path(os.environ.get("SWARM_AGENTS_FILE", ROOT / "agents.json"))
@@ -130,25 +131,26 @@ def _describe(value: object) -> str:
     return "an empty list" if value == [] else type(value).__name__
 
 
-def load_manifest(path: Path | None = None) -> list[dict]:
+def load_manifest(path: Path | None = None) -> list[dict[str, Any]]:
     source = Path(path or AGENTS_FILE)
     try:
-        data = json.loads(source.read_text(encoding="utf-8"))
+        data: object = json.loads(source.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"{source.name}: invalid JSON: {exc}") from exc
     if isinstance(data, dict):
         if "agents" not in data:
             raise ValueError(f"{source.name}: document has no 'agents' key")
-        agents = data["agents"]
+        agents: object = data["agents"]
     else:
         agents = data
     problems = validate_agents(agents)
     if problems:
         raise ValueError("\n".join(f"{source.name}: {p}" for p in problems))
-    return agents
+    # validate_agents() accepted this value, so it is a non-empty list of agent objects.
+    return cast(list[dict[str, Any]], agents)
 
 
-def get_agent(ident: str, path: Path | None = None) -> dict:
+def get_agent(ident: str, path: Path | None = None) -> dict[str, Any]:
     ident_l = ident.lower()
     for a in load_manifest(path):
         if ident_l in (a["id"].lower(), a["code"].lower(), a["slug"].lower()):
@@ -156,5 +158,5 @@ def get_agent(ident: str, path: Path | None = None) -> dict:
     raise KeyError(f"no agent matches {ident!r}")
 
 
-def by_capability(capability: str, path: Path | None = None) -> list[dict]:
+def by_capability(capability: str, path: Path | None = None) -> list[dict[str, Any]]:
     return [a for a in load_manifest(path) if capability in a["capabilities"]]

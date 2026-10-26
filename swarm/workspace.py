@@ -29,11 +29,12 @@ import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from types import TracebackType
+from typing import Any, Mapping
 
 from .manifest import get_agent
 
-SPEC = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
+SPEC: dict[str, Any] = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
 SERVER: str = SPEC["server"]
 # Claude Code's name for every tool of the server; it goes in an agent's `tools:` and in `--allowedTools`.
 CLAUDE_TOOLS = f"mcp__{SERVER}"
@@ -57,7 +58,8 @@ def server_var(surface: str) -> str:
 
 def mcp_config(workspace: str | Path, runtime: str) -> Path:
     """The project file `runtime` reads the substrate entry from."""
-    return Path(workspace) / SPEC["runtimes"][runtime]["path"]
+    path: str = SPEC["runtimes"][runtime]["path"]
+    return Path(workspace) / path
 
 
 def projected_mcp(workspace: str | Path, runtime: str) -> bool:
@@ -106,7 +108,7 @@ def _private_directory(path: Path, st: os.stat_result) -> None:
 
 
 def _open_directory(path: Path, *, create: bool = False, private: bool = False,
-                    created: list | None = None) -> int:
+                    created: list[tuple[int, str, os.stat_result]] | None = None) -> int:
     """Walk from the root with pinned, no-follow directory descriptors, never through an ancestor symlink."""
     path = path.absolute()
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
@@ -290,7 +292,8 @@ class FileTransaction:
             item.committed = True
         self.complete = True
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
+                 tb: TracebackType | None) -> None:
         problems = []
         try:
             if not self.complete:

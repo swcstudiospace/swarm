@@ -1,13 +1,17 @@
 //! Verified loading and instantiation of the GSD-Core guest component under wasmtime.
 //!
-//! Identity is checked before any compilation. Instantiation links no WASI and no host imports,
-//! so a component with any import fails with `E-DEP`.
+//! Identity is checked before any compilation. `instantiate` links no imports, so a component with
+//! any import fails with `E-DEP`. The host bridge links its imports through `instantiate_with`.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 use gsd_failure::ErrorCode;
 use wasmtime::component::{Component, Instance, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits};
+use wasmtime::{Config, Engine, Store};
 
-use crate::wasmtime_limits::{apply, Limits, LimitsError};
+use crate::wasmtime_limits::{apply, GuestLimiter, Limits, LimitsError, EPOCH_SLICE};
 use crate::wasmtime_module_build::{verify_module, ModuleIdentity, ModuleManifest, SandboxError};
 
 /// Refusals raised while loading or instantiating a guest component.
@@ -52,20 +56,48 @@ impl From<LimitsError> for LoadError {
     }
 }
 
+/// Advances the engine's epoch once per [`EPOCH_SLICE`] until the last holder drops. An epoch
+/// deadline of `n` ticks therefore stops a running call within about `n` slices.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                thread::sleep(EPOCH_SLICE);
+                engine.increment_epoch();
+            }
+        });
+        Self { stop }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 /// Wasmtime engine configured for the component model.
 pub struct GuestLoader {
     engine: Engine,
+    ticker: Arc<EpochTicker>,
 }
 
 impl GuestLoader {
-    /// Builds a loader with the component model, fuel and epoch interruption enabled.
+    /// Builds a loader with fuel and epoch interruption enabled, and starts the epoch ticker.
     pub fn new() -> Result<Self, LoadError> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.consume_fuel(true);
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|_| LoadError::Compile)?;
-        Ok(Self { engine })
+        let ticker = Arc::new(EpochTicker::start(engine.clone()));
+        Ok(Self { engine, ticker })
     }
 
     /// Verifies `bytes` against `manifest` and `expected_semver`, then compiles them.
@@ -92,19 +124,43 @@ impl GuestLoader {
         guest: &LoadedGuest,
         limits: &Limits,
     ) -> Result<GuestInstance, LoadError> {
+        self.instantiate_with(guest, limits, |_| Ok(()))
+    }
+
+    /// Instantiates a verified guest under `limits`, letting `link` add host imports to the linker
+    /// first. An import that `link` does not add stays unresolved, so instantiation fails with
+    /// `E-DEP`.
+    pub(crate) fn instantiate_with(
+        &self,
+        guest: &LoadedGuest,
+        limits: &Limits,
+        link: impl FnOnce(&mut Linker<GuestState>) -> Result<(), LoadError>,
+    ) -> Result<GuestInstance, LoadError> {
         limits.validate()?;
-        let linker: Linker<GuestState> = Linker::new(&self.engine);
+        let mut linker: Linker<GuestState> = Linker::new(&self.engine);
+        link(&mut linker)?;
         let mut store = Store::new(
             &self.engine,
             GuestState {
-                limits: StoreLimits::default(),
+                limits: GuestLimiter::default(),
             },
         );
         apply(&mut store, limits).map_err(|_| LoadError::Instantiate)?;
         let instance = linker
             .instantiate(&mut store, &guest.component)
             .map_err(|_| LoadError::Instantiate)?;
-        Ok(GuestInstance { store, instance })
+        Ok(GuestInstance {
+            store,
+            instance,
+            limits: *limits,
+            _ticker: Arc::clone(&self.ticker),
+        })
+    }
+
+    /// The engine this loader compiles with, for crate tests that introspect component types.
+    #[cfg(test)]
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 }
 
@@ -119,17 +175,26 @@ impl LoadedGuest {
     pub fn identity(&self) -> &ModuleIdentity {
         &self.identity
     }
+
+    /// The compiled component, for crate tests that introspect its types.
+    #[cfg(test)]
+    pub(crate) fn component(&self) -> &Component {
+        &self.component
+    }
 }
 
 /// A live guest instance and the store that owns it.
 pub struct GuestInstance {
     store: Store<GuestState>,
     instance: Instance,
+    limits: Limits,
+    /// Keeps the epoch ticker alive while this instance can run a guest.
+    _ticker: Arc<EpochTicker>,
 }
 
 /// Per-store state: the resource limiter installed by `wasmtime_limits::apply`.
 pub(crate) struct GuestState {
-    pub(crate) limits: StoreLimits,
+    pub(crate) limits: GuestLimiter,
 }
 
 impl GuestInstance {
@@ -140,10 +205,19 @@ impl GuestInstance {
             .is_some()
     }
 
-    /// The store and the instance, for crate tests that call exports.
-    #[cfg(test)]
+    /// The store and the instance, for the typed guest boundary and crate tests.
     pub(crate) fn parts(&mut self) -> (&mut Store<GuestState>, Instance) {
         (&mut self.store, self.instance)
+    }
+
+    /// The limits this instance was started with; every call re-arms its fuel and deadline from them.
+    pub(crate) fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// True when the limits this instance was started with set an epoch deadline.
+    pub(crate) fn deadline_configured(&self) -> bool {
+        self.limits.deadline_ticks.is_some()
     }
 }
 

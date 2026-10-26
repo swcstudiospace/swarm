@@ -107,7 +107,7 @@ authorized = (
 print(json.dumps({"verified": verify_envelope(envelope), "authorized": authorized}))
 `, correlationId], {
     cwd: REPO_ROOT,
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", SWARM_SIGNING_KEY: fixtureSigningKey, SWARM_REQUIRE_KEY: "1" },
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", SWARM_SIGNING_KEY: fixtureSigningKey, SWARM_REQUIRE_KEY: "1", SWARM_PURE_PYTHON: "1" },
     stdin: Buffer.from(JSON.stringify(envelope)),
     stdout: "pipe",
     stderr: "pipe",

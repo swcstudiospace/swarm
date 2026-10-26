@@ -235,6 +235,7 @@ def _env(tmp_path, monkeypatch):
     for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
         monkeypatch.delenv(k)
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.setenv("SWARM_PURE_PYTHON", "1")  # the oracle switch survives the scrub: child scripts import the pure modules
     monkeypatch.setenv("SWARM_SIGNING_KEY", "runner-secret")
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     substrate_client.reset()

@@ -16,6 +16,7 @@ Tools:
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -30,24 +31,24 @@ _ADR_NEXT = {
 }
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, str]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _core(value) -> tuple[int, int, int] | None:
+def _core(value: object) -> tuple[int, int, int] | None:
     """MAJOR.MINOR.PATCH as integers; None for prerelease, build metadata or malformed text."""
     match = _CORE_VERSION.fullmatch(value) if isinstance(value, str) else None
-    return tuple(int(part) for part in match.groups()) if match else None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else None
 
 
-def semver_bump(payload: dict) -> dict:
+def semver_bump(payload: dict[str, Any]) -> dict[str, Any]:
     """Bump between two release versions, and whether it satisfies the change's required bump.
 
     A breaking change requires a major bump and an additive change a minor bump, regardless of
     the 0.x major, matching the prompt's rule that breaking contract changes need a major version.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         base = _core(payload["base_version"])
         head = _core(payload["head_version"])
         if base is None:
@@ -76,8 +77,8 @@ def semver_bump(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _index(fields: list, label: str) -> tuple[dict | None, str | None]:
-    index: dict = {}
+def _index(fields: list[dict[str, Any]], label: str) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
+    index: dict[str, dict[str, Any]] = {}
     for field in fields:
         if field["name"] in index:
             return None, f"duplicate field name {field['name']} in {label}"
@@ -85,7 +86,7 @@ def _index(fields: list, label: str) -> tuple[dict | None, str | None]:
     return index, None
 
 
-def field_breaks(payload: dict) -> dict:
+def field_breaks(payload: dict[str, Any]) -> dict[str, Any]:
     """Compare two field sets of one contract side.
 
     Removed fields and type changes are breaking on both sides. On the request side a new required
@@ -93,14 +94,14 @@ def field_breaks(payload: dict) -> dict:
     change is breaking. Every other change is additive.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         side = payload["side"]
         base, problem = _index(payload["base_fields"], "base_fields")
-        if problem:
-            return _invalid("base_fields", problem)
+        if base is None:
+            return _invalid("base_fields", problem or "")
         head, problem = _index(payload["head_fields"], "head_fields")
-        if problem:
-            return _invalid("head_fields", problem)
+        if head is None:
+            return _invalid("head_fields", problem or "")
         breaking: list[str] = []
         additive: list[str] = []
         for name in sorted(base):
@@ -126,14 +127,14 @@ def field_breaks(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def layer_violations(payload: dict) -> dict:
+def layer_violations(payload: dict[str, Any]) -> dict[str, Any]:
     """Edges whose target sits in a layer above the source layer.
 
     layer_order runs from the outermost layer (index 0) to the innermost. A module may depend on its
     own layer or any later one. Edges touching an unassigned module are reported, not judged.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         order = payload["layer_order"]
         if len(set(order)) != len(order):
             return _invalid("layer_order", "layer names must be unique")
@@ -207,10 +208,10 @@ def _strongly_connected(adj: dict[str, set[str]], radj: dict[str, set[str]]) -> 
     return groups
 
 
-def cycle_check(payload: dict) -> dict:
+def cycle_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Cyclic components of a dependency graph. A self-edge counts as a cycle of one node."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         adj: dict[str, set[str]] = {}
         radj: dict[str, set[str]] = {}
         for edge in payload["edges"]:
@@ -236,14 +237,14 @@ def cycle_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def c4_fanout(payload: dict) -> dict:
+def c4_fanout(payload: dict[str, Any]) -> dict[str, Any]:
     """Container count, distinct relation count and per-container fan-out against a budget.
 
     Fan-out is the number of distinct containers a container relates to. Isolated containers have
     neither outgoing nor incoming relations.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         containers = payload["containers"]
         known = set(containers)
         if len(known) != len(containers):
@@ -275,14 +276,14 @@ def c4_fanout(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def adr_transition(payload: dict) -> dict:
+def adr_transition(payload: dict[str, Any]) -> dict[str, Any]:
     """Whether an ADR may move between statuses. Statuses match scripts/arch_adr.py.
 
     proposed -> accepted | rejected; accepted -> deprecated | superseded; deprecated -> superseded.
     rejected and superseded are terminal. Moving to superseded needs superseded_by.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         src, dst = payload["from_status"], payload["to_status"]
         superseded_by = payload.get("superseded_by")
         if src == dst:
@@ -303,14 +304,14 @@ def adr_transition(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def nfr_budget(payload: dict) -> dict:
+def nfr_budget(payload: dict[str, Any]) -> dict[str, Any]:
     """Measured NFR values checked against their budgets.
 
     max budgets breach when the value exceeds the limit; min budgets breach when it falls below.
     A budget with no measurement is unmeasured and keeps within_budget false (fail closed).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         budgets = payload["budgets"]
         names = [item["metric"] for item in budgets]
         if len(set(names)) != len(names):
@@ -345,7 +346,7 @@ def nfr_budget(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def nfr_allocation(payload: dict) -> dict:
+def nfr_allocation(payload: dict[str, Any]) -> dict[str, Any]:
     """Whether every NFR is bound to a contract clause or component budget that can be measured.
 
     A quantitative NFR counts as allocated only when at least one of its bindings carries a numeric
@@ -354,7 +355,7 @@ def nfr_allocation(payload: dict) -> dict:
     ids that are not in `nfrs` are listed as unknown and keep fully_allocated false (fail closed).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         nfrs = payload["nfrs"]
         ids = [item["id"] for item in nfrs]
         if any(not item.strip() for item in ids):
@@ -362,7 +363,7 @@ def nfr_allocation(payload: dict) -> dict:
         if len(set(ids)) != len(ids):
             return _invalid("nfrs", "NFR ids must be unique")
         kind_of = {item["id"]: item["kind"] for item in nfrs}
-        bound: dict[str, list[dict]] = {}
+        bound: dict[str, list[dict[str, Any]]] = {}
         unknown: set[str] = set()
         seen: set[tuple[str, str, str]] = set()
         for binding in payload["bindings"]:
@@ -401,7 +402,7 @@ def nfr_allocation(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def breaking_readiness(payload: dict) -> dict:
+def breaking_readiness(payload: dict[str, Any]) -> dict[str, Any]:
     """Autonomy level and outstanding requirements before a contract change may be published.
 
     Breaking or external-facing changes are L3 and always need human approval (breaking_contract). A
@@ -410,7 +411,7 @@ def breaking_readiness(payload: dict) -> dict:
     is true only when nothing is outstanding and no human approval is required.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         head = payload["head_version"]
         if _core(head) is None:
             return _invalid("head_version", "head_version must be MAJOR.MINOR.PATCH")
@@ -445,7 +446,7 @@ def breaking_readiness(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def adr_supersession(payload: dict) -> dict:
+def adr_supersession(payload: dict[str, Any]) -> dict[str, Any]:
     """Integrity of an ADR set's supersession links (each ADR names at most one it supersedes).
 
     dangling: X -> Y where Y is not in the set. cycles: ADRs that supersede each other through a loop
@@ -455,7 +456,7 @@ def adr_supersession(payload: dict) -> dict:
     rejected ADR. heads: ADRs nothing supersedes; chains: each head with two or more links, newest first.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         adrs = payload["adrs"]
         ids = [item["adr_id"] for item in adrs]
         if any(not item.strip() for item in ids):

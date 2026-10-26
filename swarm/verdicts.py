@@ -9,11 +9,16 @@ the gate script with its keys after the session (WR-12).
 """
 from __future__ import annotations
 import os
-from typing import Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 from .errors import SwarmError, ErrorCode
 from .envelope import insecure_dev_key, real_key_configured, signing_config_error
 from .gates import SEVERITIES, derive_verdict, make_finding, make_verdict
+
+if TYPE_CHECKING:
+    from .script_base import Ctx
+    from .taskstore import TaskStore
 
 # Names the missing key. Advisory envelopes carry this; it is not a verifying signature.
 MISSING_KEY_REASON = (
@@ -35,12 +40,12 @@ def keyless_advisory() -> bool:
     return not real_key_configured() and insecure_dev_key() is None
 
 
-def advisory_envelope(*, gate: str, task_id: str, agent_id: str, findings: list[dict], runs: dict,
-                      expires_s: int, correlation_id: str | None, extra: dict | None, reason: str) -> dict:
+def advisory_envelope(*, gate: str, task_id: str, agent_id: str, findings: list[dict[str, Any]], runs: dict[str, Any],
+                      expires_s: int, correlation_id: str | None, extra: dict[str, Any] | None, reason: str) -> dict[str, Any]:
     """Unsigned gate envelope marked advisory. It does not verify and is not a verdict row."""
     import time
     from .envelope import build_envelope
-    payload = {"gate": gate, "task_id": task_id, "verdict": derive_verdict(findings or []),
+    payload: dict[str, Any] = {"gate": gate, "task_id": task_id, "verdict": derive_verdict(findings or []),
                "findings": findings or [], "runs": runs or {}, "expires_s": expires_s,
                "issued_at": time.time(), "advisory": True, "advisory_reason": reason, **(extra or {})}
     return build_envelope(source=agent_id, target="A01", msg_type="gate.verdict", payload=payload,
@@ -52,7 +57,7 @@ SIM_FINDING = {"id": "SIM-1", "severity": "major", "kind": "functional", "summar
                "evidence": "", "ac_ref": None, "owner_suggestion": None, "location": None}
 
 
-def agent_finding(f, i: int, path: str, *, prefix: str = "RF", owner: str = "A05") -> dict:
+def agent_finding(f: object, i: int, path: str, *, prefix: str = "RF", owner: str = "A05") -> dict[str, Any]:
     """One agent-reported finding from a findings file, validated: an object with a severity in SEVERITIES
     (default minor); a missing id becomes <prefix>-<i>."""
     if not isinstance(f, dict):
@@ -65,7 +70,7 @@ def agent_finding(f, i: int, path: str, *, prefix: str = "RF", owner: str = "A05
                         owner_suggestion=f.get("owner_suggestion", owner), location=f.get("location"))
 
 
-def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner: str = "A05") -> dict[str, list[dict]]:
+def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner: str = "A05") -> dict[str, list[dict[str, Any]]]:
     """--per-target-findings {target task id: [findings]} (D-13): the agent's findings for each gate target; a gate
     gives each listed target a verdict derived from the script's own findings plus only that target's list."""
     import json
@@ -75,14 +80,14 @@ def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner:
     raw = json.loads(Path(path).read_text())
     if not isinstance(raw, dict) or not all(isinstance(v, list) for v in raw.values()):
         raise SwarmError(ErrorCode.E_INPUT, f"{path}: expected an object {{target task id: [findings]}}")
-    out: dict[str, list[dict]] = {}
+    out: dict[str, list[dict[str, Any]]] = {}
     for target, items in raw.items():
         out[target] = [agent_finding(f, i, path, prefix=prefix, owner=owner) for i, f in enumerate(items, offset + 1)]
         offset += len(items)
     return out
 
 
-def check_per_target_keys(own: dict[str, list[dict]], task_id: str | None, root=None) -> None:
+def check_per_target_keys(own: dict[str, list[dict[str, Any]]], task_id: str | None, root: str | Path | None = None) -> None:
     """E-INPUT when --per-target-findings names a target that is not in the gate task's gate_for: a finding under a
     mistyped or stale id could otherwise never reach a verdict. Nothing to check without a gate task."""
     from .taskstore import TaskStore
@@ -104,7 +109,7 @@ def check_per_target_keys(own: dict[str, list[dict]], task_id: str | None, root=
 RISK_ORDER = ("low", "medium", "high")
 
 
-def gate_risk_class(task_id: str | None, root=None) -> str | None:
+def gate_risk_class(task_id: str | None, root: str | Path | None = None) -> str | None:
     """The highest risk class of a gate task and its gate_for targets (the quality gate's tier selection);
     None when task_id is not a known gate task. A target missing from the Task Store is skipped."""
     from .taskstore import TaskStore
@@ -128,16 +133,16 @@ def gate_risk_class(task_id: str | None, root=None) -> str | None:
     return max(known, key=RISK_ORDER.index) if known else None
 
 
-def _per_target_blocks(per_target: dict[str, list[dict]] | None) -> bool:
+def _per_target_blocks(per_target: dict[str, list[dict[str, Any]]] | None) -> bool:
     """True when any target's own findings would fail its verdict."""
     return any(derive_verdict(items) == "fail" for items in (per_target or {}).values())
 
 
-def _advisory_per_target(per_target: dict[str, list[dict]] | None, *, gate: str, agent_id: str, runs: dict,
-                         expires_s: int, correlation_id: str | None, extra: dict | None, reason: str,
-                         store) -> dict[str, dict]:
+def _advisory_per_target(per_target: dict[str, list[dict[str, Any]]] | None, *, gate: str, agent_id: str, runs: dict[str, Any],
+                         expires_s: int, correlation_id: str | None, extra: dict[str, Any] | None, reason: str,
+                         store: TaskStore | None) -> dict[str, dict[str, Any]]:
     """Unsigned per-target envelopes. Nothing here is written to the Task Store."""
-    out: dict[str, dict] = {}
+    out: dict[str, dict[str, Any]] = {}
     for target, items in (per_target or {}).items():
         corr = correlation_id
         if store is not None:
@@ -150,7 +155,7 @@ def _advisory_per_target(per_target: dict[str, list[dict]] | None, *, gate: str,
     return out
 
 
-def gate_verdict(env: dict, recorded: dict[str, dict]) -> str:
+def gate_verdict(env: dict[str, Any], recorded: dict[str, dict[str, Any]]) -> str:
     """A gate script's overall verdict: fail when its envelope or any recorded per-target verdict fails."""
     verdicts = [env["payload"]["verdict"], *(e["payload"]["verdict"] for e in recorded.values())]
     return "fail" if "fail" in verdicts else "pass"
@@ -161,13 +166,13 @@ def simulated_failures() -> set[str]:
     return {x.strip() for x in os.environ.get("SWARM_DRYRUN_FAIL", "").split(",") if x.strip()}
 
 
-def simulated_per_target(targets: list[str] | None, gate: str) -> dict[str, list[dict]]:
+def simulated_per_target(targets: list[str] | None, gate: str) -> dict[str, list[dict[str, Any]]]:
     """Dry-run findings per target: SIM-1 (major) for targets named in SWARM_DRYRUN_FAIL, else none."""
     fails = simulated_failures()
     return {t: ([dict(SIM_FINDING)] if f"{t}:{gate}" in fails else []) for t in targets or []}
 
 
-def resolve_targets(store, task_id: str | None, *, gate: str, correlation_id: str | None = None) -> list[str] | None:
+def resolve_targets(store: TaskStore, task_id: str | None, *, gate: str, correlation_id: str | None = None) -> list[str] | None:
     """gate_for of a gate task; None when task_id is not a gate task. E-POLICY when its gate differs, when
     correlation_id is given and is not the gate task's own correlation, or when a gate task with targets is
     not leased (IN_PROGRESS) — only a running gate task records verdicts."""
@@ -198,10 +203,10 @@ def resolve_targets(store, task_id: str | None, *, gate: str, correlation_id: st
     return targets
 
 
-def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id: str, findings: list[dict],
-                         runs: dict, correlation_id: str | None, expires_s: int, extra: dict | None = None,
-                         verdict: str | None = None, per_target: dict[str, list[dict]] | None = None,
-                         emit: Callable[..., object], root=None) -> dict[str, dict]:
+def record_gate_verdicts(store: TaskStore, *, gate_task_id: str | None, gate: str, agent_id: str, findings: list[dict[str, Any]],
+                         runs: dict[str, Any], correlation_id: str | None, expires_s: int, extra: dict[str, Any] | None = None,
+                         verdict: str | None = None, per_target: dict[str, list[dict[str, Any]]] | None = None,
+                         emit: Callable[..., object], root: str | Path | None = None) -> dict[str, dict[str, Any]]:
     """Record one signed verdict row per gate_for target of `gate_task_id`; return {target: envelope}.
     Each target verdict is signed with the target's own correlation; a given `correlation_id` must be the
     gate task's (E-POLICY otherwise). All rows (and fail feedback) of one run commit together or not at all (D-13).
@@ -214,7 +219,7 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
     if keyless_advisory():
         emit("gate.verdict.unrecorded", {"task_id": gate_task_id, "gate": gate, "reason": MISSING_KEY_REASON})
         return {}
-    out = {}
+    out: dict[str, dict[str, Any]] = {}
     with store.transaction():
         for target in targets:
             tf = (per_target or {}).get(target, findings)
@@ -230,9 +235,9 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
 
 
 
-def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dict, expires_s: int = 86400,
-               extra: dict | None = None, simulate: bool = False,
-               per_target: dict[str, list[dict]] | None = None) -> tuple[dict, dict[str, dict]]:
+def issue_gate(ctx: Ctx, *, gate: str, agent_id: str, findings: list[dict[str, Any]], runs: dict[str, Any], expires_s: int = 86400,
+               extra: dict[str, Any] | None = None, simulate: bool = False,
+               per_target: dict[str, list[dict[str, Any]]] | None = None) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Gate-script tail: sign the verdict for ctx.task_id, write verdicts/<id>.<gate>.json, and record rows on
     the gate task's targets. per_target ({target: findings}) gives each target a verdict derived from its own
     findings (D-13); targets it omits get `findings`. The file envelope always carries `findings`.
@@ -245,7 +250,7 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     store = TaskStore(root=ctx.root) if ctx.task_id else None
     targets = (resolve_targets(store, ctx.task_id, gate=gate, correlation_id=ctx.correlation_id)
                if store else None)  # E-POLICY before any write
-    gate_task = store.get(ctx.task_id) if store and targets is not None else None
+    gate_task = store.get(ctx.task_id) if store and ctx.task_id and targets is not None else None
     # file envelope: the caller's correlation, else the gate task's; a non-gate/unknown id keeps a minted one
     corr = ctx.correlation_id or (gate_task["correlation_id"] if gate_task else None)
     if simulate:

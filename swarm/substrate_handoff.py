@@ -28,7 +28,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import substrate_lease, substrate_tee
 from .errors import SwarmError
@@ -71,7 +71,7 @@ def trust_of(verdict: object) -> str:
     return REJECTED
 
 
-def boundary_key(packet: Mapping) -> str | None:
+def boundary_key(packet: Mapping[str, Any]) -> str | None:
     notes = packet.get("notes")
     if not isinstance(notes, str) or not notes.startswith(BOUNDARY_PREFIX):
         return None
@@ -97,7 +97,7 @@ def _valid_packet(packet: object, graph: str) -> bool:
                and isinstance(packet[name].get("surface"), str) and packet[name]["surface"] for name in ("from", "to"))
 
 
-def _boundary_time(packet: Mapping) -> float:
+def _boundary_time(packet: Mapping[str, Any]) -> float:
     """Signed logical boundary time, unchanged by delivery; older packets use their signed storage time."""
     notes = packet.get("notes")
     lines = notes.splitlines() if isinstance(notes, str) else []
@@ -118,7 +118,7 @@ def _text(item: object) -> str:
     return item if isinstance(item, str) else json.dumps(item, sort_keys=True, default=str)
 
 
-def _lines(items, limit: int = MAX_LINE) -> list[str]:
+def _lines(items: Iterable[object] | None, limit: int = MAX_LINE) -> list[str]:
     out: list[str] = []
     for item in items or []:
         if item is None:
@@ -133,12 +133,12 @@ def _merge(*lists: list[str]) -> list[str]:
     return _lines([i for lst in lists for i in lst])
 
 
-def dod_of(task: Mapping) -> list[str]:
+def dod_of(task: Mapping[str, Any]) -> list[str]:
     """The Definition of Done is the task's own `acceptance[]` (HAND-01), one line per criterion."""
     return _lines(task.get("acceptance"))
 
 
-def files_of(task: Mapping) -> list[str]:
+def files_of(task: Mapping[str, Any]) -> list[str]:
     """The artifacts the task registered (`outputs[].uri`)."""
     return _lines([o.get("uri") for o in task.get("outputs") or [] if isinstance(o, dict)])
 
@@ -153,7 +153,7 @@ def _finding_line(gate: str, finding: object) -> str:
     return f"{gate} [{finding.get('severity') or '?'}] {what}" + (f" ({where})" if where else "")
 
 
-def _finding_files(findings) -> list[str]:
+def _finding_files(findings: Iterable[object] | None) -> list[str]:
     return _lines([f.get("file") or f.get("path") for f in findings or [] if isinstance(f, dict)])
 
 
@@ -193,7 +193,7 @@ def boundary(*, round_: str, part: str, sender: str, receiver: str, node_id: str
                     to_session, lease)
 
 
-def _fit_packet(args: dict) -> bool:
+def _fit_packet(args: dict[str, Any]) -> bool:
     """Fit payload below the signed-packet budget without truncating the key or transition time."""
     header, _, body = args["notes"].partition("\n\n")
     trimmed: dict[str, int] = {}
@@ -229,7 +229,7 @@ def _fit_packet(args: dict) -> bool:
     return size() <= PACKET_BUDGET
 
 
-def escalation_owner(store: TaskStore, task: Mapping) -> str:
+def escalation_owner(store: TaskStore, task: Mapping[str, Any]) -> str:
     """Who becomes accountable when the swarm gives up on `task`: A14 when a direct upstream task is A14's (the work
     order this task carries out), else A01."""
     for dep_id in task.get("depends_on") or []:
@@ -250,8 +250,9 @@ class HandoffBridge:
     into the runner: a handoff never changes a transition's outcome.
     """
 
-    def __init__(self, store_path: str | Path, correlation_id: str, *, emit: Callable[[str, dict], object],
-                 root: str | Path | None = None, env: Mapping[str, str] | None = None, leases=None):
+    def __init__(self, store_path: str | Path, correlation_id: str, *, emit: Callable[[str, dict[str, Any]], object],
+                 root: str | Path | None = None, env: Mapping[str, str] | None = None,
+                 leases: substrate_lease.LeaseBridge | None = None):
         self.env = os.environ if env is None else env
         self.store_path, self.correlation_id, self.root, self.emit = Path(store_path), correlation_id, root, emit
         self.leases = leases  # substrate_lease.LeaseBridge, for the lease an escalation hands over
@@ -294,7 +295,7 @@ class HandoffBridge:
             if not isinstance(entry, dict) or trust_of(entry.get("verdict")) == REJECTED:
                 continue
             packet = entry.get("packet")
-            if not _valid_packet(packet, graph):
+            if not isinstance(packet, dict) or not _valid_packet(packet, graph):
                 continue
             node = packet["node_id"]
             key, sender = boundary_key(packet), packet["from"]["surface"]
@@ -369,7 +370,7 @@ class HandoffBridge:
 
     def _write(self, b: Boundary, graph: str, sender_surface: str, receiver_surface: str,
                mark: tuple[str, str, str]) -> str:
-        args = {"to": receiver_surface, "goal": b.goal, "files": b.files, "dod": b.dod, "blockers": b.blockers,
+        args: dict[str, Any] = {"to": receiver_surface, "goal": b.goal, "files": b.files, "dod": b.dod, "blockers": b.blockers,
                 "graph_id": graph, "node_id": b.node_id, "notes": b.notes,
                 "session_id": substrate_tee.session_id(b.sender, graph, self.env)}
         if b.to_session:
@@ -419,7 +420,7 @@ class HandoffBridge:
         return sum(self.send(b) == "sent" for b in pending)
 
     # -- the boundaries
-    def dispatched(self, task: dict, agent_id: str) -> list[str]:
+    def dispatched(self, task: dict[str, Any], agent_id: str) -> list[str]:
         """Dependency boundaries of a task about to be dispatched to `agent_id`: one packet per upstream task owned by
         another agent, from that agent, carrying this task's goal and Definition of Done and the upstream's artifacts.
         Written once per edge: a rework or retry of the task finds them in the ledger."""
@@ -446,7 +447,7 @@ class HandoffBridge:
                                          "reason": f"internal: {exc}"[:300]})
             return ["unsent"]
 
-    def gate_failed(self, task_id: str, failing: list[str], verdicts: Mapping[str, dict], rework: int) -> list[str]:
+    def gate_failed(self, task_id: str, failing: list[str], verdicts: Mapping[str, dict[str, Any]], rework: int) -> list[str]:
         """CHANGES_REQUESTED → rework: one packet per failing gate, from the agent that issued the failing verdict to
         the producer, with the findings as blockers. `verdicts` are the rows `reconcile` acted on, read before the
         transition made them stale."""
@@ -472,8 +473,8 @@ class HandoffBridge:
             self.emit("handoff.unsent", {"task_id": task_id, "boundary": "rework", "reason": f"internal: {exc}"[:300]})
             return ["unsent"]
 
-    def escalated(self, task_id: str, *, reason: str, failing: list[str] = (),
-                  verdicts: Mapping[str, dict] | None = None) -> str:
+    def escalated(self, task_id: str, *, reason: str, failing: Sequence[str] = (),
+                  verdicts: Mapping[str, dict[str, Any]] | None = None) -> str:
         """ESCALATED: the producer hands the task to A14 (an A14 work order) or A01. A lease it still holds (the rework
         cap is reached in review, where the producer holds the node) goes with the packet: the server releases it once
         the packet is durable, so the node never reads free without an account of why."""
@@ -529,8 +530,8 @@ class Context:
     sender: str | None = None
     lease_handover: bool = False
     signed: bool = False  # every packet of the newest round verified
-    packets: list[dict] = field(default_factory=list)
-    events: list[dict] = field(default_factory=list)
+    packets: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
     detail: str = ""
 
 

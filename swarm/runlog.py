@@ -11,7 +11,9 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 from .paths import swarm_dir
 from .redact import redact
@@ -21,7 +23,7 @@ def _log_file(root: str | Path | None, *, create: bool) -> Path:
     return swarm_dir(root, create=create) / "events.jsonl"
 
 
-def redact_leases(value):
+def redact_leases(value: object) -> object:
     """A copy of `value` without substrate lease ids. A lease id is the holder's fencing token (LEASE-02): the Task Store
     mirrors it in notes.lease for A01's own release, and no run-log record, nor its tee, carries it. A task row carries it
     twice, in `notes_json` and in the raw `notes` JSON text."""
@@ -44,9 +46,13 @@ _ID_KEYS = ("run_id", "handover_id", "task_id", "parent_id", "correlation_id")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-def _redact_payload(payload):
+# swarm.redact.redact is untyped (returns Any); the Callable annotation keeps its call site typed.
+_redact: Callable[..., object] = redact
+
+
+def _redact_payload(payload: Mapping[str, object]) -> object:
     plain = redact_leases(payload)
-    clean = redact(plain)
+    clean = _redact(plain)
     if isinstance(plain, dict) and isinstance(clean, dict):
         for key in _ID_KEYS:
             value = plain.get(key)
@@ -55,13 +61,13 @@ def _redact_payload(payload):
     return clean
 
 
-def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | None = None,
-         task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
+def emit(event_type: str, payload: Mapping[str, object], *, source: str, correlation_id: str | None = None,
+         task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict[str, Any]:
     """Append one record to the run log; `tee=False` (dry runs) keeps it local and never sends it to substrate. Lease ids
     are dropped from the payload (`redact_leases`), then secrets are replaced (`redact.redact`) in everything but the identifier
     fields `_ID_KEYS`; the caller's own payload object is left as it is."""
     log_file = _log_file(root, create=True)
-    record = {
+    record: dict[str, Any] = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "type": event_type,
         "source": source,
@@ -83,11 +89,11 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
 
 
 def read_events(*, correlation_id: str | None = None, task_id: str | None = None,
-                event_type: str | None = None, root: str | Path | None = None) -> list[dict]:
+                event_type: str | None = None, root: str | Path | None = None) -> list[dict[str, Any]]:
     log_file = _log_file(root, create=False)
     if not log_file.exists():
         return []
-    out = []
+    out: list[dict[str, Any]] = []
     for line in log_file.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -102,8 +108,8 @@ def read_events(*, correlation_id: str | None = None, task_id: str | None = None
     return out
 
 
-def log_phase(phase: str, payload: dict, *, source: str = "swarm", correlation_id: str | None = None,
-              task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
+def log_phase(phase: str, payload: Mapping[str, object], *, source: str = "swarm", correlation_id: str | None = None,
+              task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict[str, Any]:
     """Logger unit: emit structured log at a run phase (e.g. 'init', 'reconcile', 'dispatch', 'execute', 'summary').
     Every phase of init/lifecycle/run gets a typed event in events.jsonl.
     """
@@ -111,8 +117,8 @@ def log_phase(phase: str, payload: dict, *, source: str = "swarm", correlation_i
     return emit(f"phase.{phase}", p, source=source, correlation_id=correlation_id, task_id=task_id, root=root, tee=tee)
 
 
-def log_summary(report: dict, *, source: str = "swarm_run", correlation_id: str | None = None,
-                root: str | Path | None = None, tee: bool = True) -> dict:
+def log_summary(report: Mapping[str, object], *, source: str = "swarm_run", correlation_id: str | None = None,
+                root: str | Path | None = None, tee: bool = True) -> dict[str, Any]:
     """Logger unit: emit end-of-run summary report (counts, complete, escalated, timings, log excerpts).
     Called at lifecycle end.
     """

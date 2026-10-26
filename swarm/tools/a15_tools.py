@@ -14,8 +14,10 @@ from __future__ import annotations
 import posixpath
 import re
 from collections import Counter
+from collections.abc import Hashable, Iterable
 from datetime import date
 from urllib.parse import unquote
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -32,19 +34,19 @@ _SENTENCE_END = re.compile(r"[.!?]+")
 _VOWEL_RUN = re.compile(r"[aeiouy]+")
 
 
-def _unique(items) -> list:
+def _unique[T: Hashable](items: Iterable[T]) -> list[T]:
     return list(dict.fromkeys(items))
 
 
-def _duplicates(items) -> list:
+def _duplicates[T: Hashable](items: Iterable[T]) -> list[T]:
     return [item for item, count in Counter(items).items() if count > 1]
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, str]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _parse_date(value) -> date | None:
+def _parse_date(value: object) -> date | None:
     if not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-":
         return None
     try:
@@ -82,8 +84,8 @@ def _link_path(source: str, target: str) -> str | None:
     return posixpath.normpath(posixpath.join(posixpath.dirname(source), path))
 
 
-def _with_parents(files: set) -> set:
-    dirs: set = set()
+def _with_parents(files: set[str]) -> set[str]:
+    dirs: set[str] = set()
     for path in files:
         parent = posixpath.dirname(path)
         while parent and parent not in dirs:
@@ -92,8 +94,8 @@ def _with_parents(files: set) -> set:
     return dirs
 
 
-def docs_link_targets(payload: dict) -> dict:
-    def work() -> dict:
+def docs_link_targets(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         files = {posixpath.normpath(path) for path in payload["files"]}
         known = files | _with_parents(files) | {"."}
         checked = external = 0
@@ -124,10 +126,10 @@ def _slug(text: str) -> str:
     )
 
 
-def _heading_anchors(headings: list) -> set:
+def _heading_anchors(headings: list[str]) -> set[str]:
     """Anchors for ordered headings; repeated slugs get -1, -2 suffixes as GitHub does."""
     occurrences: dict[str, int] = {}
-    anchors: set = set()
+    anchors: set[str] = set()
     for text in headings:
         base = _slug(text)
         seen = occurrences.get(base, 0)
@@ -136,8 +138,8 @@ def _heading_anchors(headings: list) -> set:
     return anchors
 
 
-def docs_anchor_check(payload: dict) -> dict:
-    def work() -> dict:
+def docs_anchor_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         anchors = _heading_anchors(payload["headings"])
         broken = [ref for ref in payload["references"] if ref.lstrip("#") and ref.lstrip("#") not in anchors]
         return {
@@ -152,8 +154,8 @@ def docs_anchor_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def docs_changelog_section_order(payload: dict) -> dict:
-    def work() -> dict:
+def docs_changelog_section_order(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         sections = payload["sections"]
         rank = {name: index for index, name in enumerate(CHANGELOG_ORDER)}
         known = [name for name in sections if name in rank]
@@ -178,8 +180,8 @@ def docs_changelog_section_order(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def docs_conventional_groups(payload: dict) -> dict:
-    def work() -> dict:
+def docs_conventional_groups(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         counts = {"added": 0, "changed": 0, "fixed": 0, "other": 0}
         breaking = 0
         unparsed: list[str] = []
@@ -214,7 +216,7 @@ def _endpoint_key(text: str) -> tuple[str, str] | None:
     return f"{parts[0].upper()} {path}", text.strip()
 
 
-def _endpoint_map(entries: list) -> dict[str, str] | None:
+def _endpoint_map(entries: list[str]) -> dict[str, str] | None:
     """Normalized key mapped to first original text; None when an entry is malformed."""
     mapping: dict[str, str] = {}
     for text in entries:
@@ -225,8 +227,8 @@ def _endpoint_map(entries: list) -> dict[str, str] | None:
     return mapping
 
 
-def docs_api_endpoint_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def docs_api_endpoint_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         total = _endpoint_map(payload["total_endpoints"])
         if total is None:
             return _invalid("total_endpoints", "each entry must be 'METHOD /path' with a known HTTP method")
@@ -256,8 +258,8 @@ def _syllables(word: str) -> int:
     return max(1, count)
 
 
-def docs_flesch_grade(payload: dict) -> dict:
-    def work() -> dict:
+def docs_flesch_grade(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         text = payload["text"]
         words = _WORD.findall(text)
         if not words:
@@ -281,8 +283,8 @@ def docs_flesch_grade(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def docs_stale_doc_age(payload: dict) -> dict:
-    def work() -> dict:
+def docs_stale_doc_age(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         as_of = _parse_date(payload["as_of"])
         if as_of is None:
             return _invalid("as_of", "as_of must be a YYYY-MM-DD date")
@@ -314,8 +316,8 @@ def docs_stale_doc_age(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def docs_runbook_verified_ratio(payload: dict) -> dict:
-    def work() -> dict:
+def docs_runbook_verified_ratio(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         as_of = _parse_date(payload["as_of"])
         if as_of is None:
             return _invalid("as_of", "as_of must be a YYYY-MM-DD date")
@@ -347,8 +349,8 @@ def docs_runbook_verified_ratio(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def docs_adr_render_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def docs_adr_render_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         ids = [adr["id"] for adr in payload["adrs"]]
         duplicates = _duplicates(ids)
         if duplicates:
@@ -384,20 +386,20 @@ _INLINE_CODE = re.compile(r"`[^`\n]*`")
 _QUOTE_PREFIX = re.compile(r"(?: {0,3}>[ \t]?)+")  # blockquote markers: `>`, `> `, `> >`, ...
 
 
-def _blank(value) -> bool:
+def _blank(value: object) -> bool:
     return not isinstance(value, str) or not value.strip()
 
 
-def docs_runbook_schema_check(payload: dict) -> dict:
+def docs_runbook_schema_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate runbook fragments against the executable schema A13 consumes (agents/A15-docs.md section 3)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         known = payload.get("known_actions")
         known_set = set(known) if known is not None else None
-        seen_ids: set = set()
-        invalid: list[dict] = []
-        flagged: list[dict] = []
-        bad_ids: set = set()
+        seen_ids: set[str] = set()
+        invalid: list[dict[str, str]] = []
+        flagged: list[dict[str, str]] = []
+        bad_ids: set[str] = set()
 
         def problem(runbook_id: str, field: str, reason: str) -> None:
             invalid.append({"runbook_id": runbook_id, "field": field, "reason": reason})
@@ -452,10 +454,10 @@ def docs_runbook_schema_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def docs_digest_staleness(payload: dict) -> dict:
+def docs_digest_staleness(payload: dict[str, Any]) -> dict[str, Any]:
     """Staleness law (agents/A15-docs.md section 4.2): a doc is stale when its bound artifact digest differs from the current one."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         current: dict[str, str] = {}
         for index, entry in enumerate(payload["current"]):
             artifact, digest = entry["artifact"], entry["digest"]
@@ -469,9 +471,9 @@ def docs_digest_staleness(payload: dict) -> dict:
         duplicate = _duplicates(paths)
         if duplicate:
             return _invalid("docs", f"duplicate path {duplicate[0]}")
-        stale: list[dict] = []
+        stale: list[dict[str, str]] = []
         unbound: list[str] = []
-        scopes: set = set()
+        scopes: set[str] = set()
         for doc in payload["docs"]:
             artifact, bound = doc.get("bound_artifact"), doc.get("bound_digest")
             if _blank(artifact):
@@ -534,12 +536,12 @@ def _prose_lines(text: str) -> list[tuple[int, str]]:
 MAX_REPORTED_VIOLATIONS = 500  # the list is a sample; violation_count and by_term stay exact (the registry also bounds output bytes)
 
 
-def docs_terminology_drift(payload: dict) -> dict:
+def docs_terminology_drift(payload: dict[str, Any]) -> dict[str, Any]:
     """Glossary lint (agents/A15-docs.md sections 5 and 6): deprecated or variant terms per file and line."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         owner: dict[str, str] = {}
-        preferred_seen: set = set()
+        preferred_seen: set[str] = set()
         for index, entry in enumerate(payload["glossary"]):
             preferred = entry["preferred"].strip()
             if not preferred:
@@ -587,7 +589,7 @@ def docs_terminology_drift(payload: dict) -> dict:
                 resolved[found] = cached
             return cached
 
-        violations: list[dict] = []
+        violations: list[dict[str, Any]] = []
         count = 0
         by_term: dict[str, int] = {}
         clean = 0

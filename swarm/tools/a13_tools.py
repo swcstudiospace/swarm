@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -21,7 +22,7 @@ TICKET_BURN_3D = Decimal("1")
 MAX_EVENT_COUNT = 10**15
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr), so 0.0144 is 0.0144 and not its binary neighbour."""
     return Decimal(repr(value))
 
@@ -34,10 +35,10 @@ def _ts(value: str) -> datetime:
     return parsed
 
 
-def multiwindow_alert(payload: dict) -> dict:
+def multiwindow_alert(payload: dict[str, Any]) -> dict[str, Any]:
     """Multi-window burn rate: page when 1h >= 14.4x and 6h >= 6x; ticket when 3d >= 1x."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         budget = Decimal(1) - _dec(payload["slo_target"])
         ratio_1h, ratio_6h, ratio_3d = (_dec(payload[key]) for key in ("error_ratio_1h", "error_ratio_6h", "error_ratio_3d"))
         burn_1h, burn_6h, burn_3d = float(ratio_1h / budget), float(ratio_6h / budget), float(ratio_3d / budget)
@@ -58,10 +59,10 @@ def multiwindow_alert(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def budget_remaining(payload: dict) -> dict:
+def budget_remaining(payload: dict[str, Any]) -> dict[str, Any]:
     """Error budget left in a window, from good and total event counts."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         good, total = payload["good"], payload["total"]
         if total > MAX_EVENT_COUNT:
             return {"state": "INVALID_INPUT", "field": "total", "message": f"total must be at most {MAX_EVENT_COUNT}"}
@@ -82,10 +83,10 @@ def budget_remaining(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def alert_fatigue(payload: dict) -> dict:
+def alert_fatigue(payload: dict[str, Any]) -> dict[str, Any]:
     """Share of pages that were not actionable, compared with the allowed noise ratio."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         pages, actionable = payload["pages"], payload["actionable"]
         if actionable > pages:
             return {"state": "INVALID_INPUT", "field": "actionable", "message": "actionable pages exceed pages"}
@@ -102,10 +103,10 @@ def alert_fatigue(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def incident_timing(payload: dict) -> dict:
+def incident_timing(payload: dict[str, Any]) -> dict[str, Any]:
     """MTTD = detected - started; MTTR = resolved - started (time to restore); both averaged in seconds."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         mttd: list[float] = []
         mttr: list[float] = []
         for index, item in enumerate(payload["incidents"]):
@@ -134,10 +135,10 @@ def incident_timing(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def ingestion_lag_p95(payload: dict) -> dict:
+def ingestion_lag_p95(payload: dict[str, Any]) -> dict[str, Any]:
     """Nearest-rank P95 of telemetry ingestion lag, compared with a target."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         lags = sorted(float(value) for value in payload["lags_seconds"])
         p95 = lags[math.ceil(0.95 * len(lags)) - 1]
         return {
@@ -151,10 +152,10 @@ def ingestion_lag_p95(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def dashboard_staleness(payload: dict) -> dict:
+def dashboard_staleness(payload: dict[str, Any]) -> dict[str, Any]:
     """Age in hours of a dashboard's last refresh at a supplied check time."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             updated = _ts(payload["last_updated_at"])
         except ValueError as exc:
@@ -179,10 +180,10 @@ def dashboard_staleness(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def runbook_link_coverage(payload: dict) -> dict:
+def runbook_link_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Share of alerts whose runbook reference resolves to a known runbook."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         known = set(payload["known_runbooks"])
         alerts = payload["alerts"]
         unlinked = [alert["name"] for alert in alerts if alert["runbook"] not in known]
@@ -199,10 +200,10 @@ def runbook_link_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def cardinality_estimate(payload: dict) -> dict:
+def cardinality_estimate(payload: dict[str, Any]) -> dict[str, Any]:
     """Worst-case series count: product of distinct values per label."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         labels = payload["labels"]
         names = [label["label"] for label in labels]
         if len(set(names)) != len(names):
@@ -219,10 +220,10 @@ def cardinality_estimate(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def probe_availability(payload: dict) -> dict:
+def probe_availability(payload: dict[str, Any]) -> dict[str, Any]:
     """Availability ratio of boolean probe results and the longest run of consecutive failures."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         results = payload["results"]
         up = sum(1 for ok in results if ok)
         longest = 0
@@ -248,10 +249,10 @@ ESCALATION_MINUTES = 10.0
 INCIDENT_SEV_MAX = 2
 
 
-def mitigation_gate(payload: dict) -> dict:
+def mitigation_gate(payload: dict[str, Any]) -> dict[str, Any]:
     """Allow an automatic mitigation only for a whitelisted playbook, below the per-incident cap, and not on full prod without A12."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         max_auto = payload.get("max_auto", MAX_AUTO_MITIGATIONS)
         remaining = max(0, max_auto - payload["auto_count"])
         if payload["playbook"] not in payload["whitelist"]:
@@ -267,10 +268,10 @@ def mitigation_gate(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def escalation_due(payload: dict) -> dict:
+def escalation_due(payload: dict[str, Any]) -> dict[str, Any]:
     """An incident at sev 1 or 2 escalates to humans once it has gone max_minutes (default 10) without stabilizing."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             declared = _ts(payload["declared_at"])
         except ValueError as exc:

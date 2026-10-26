@@ -1,0 +1,16 @@
+[package]
+name = "gsd-guest"
+version = "0.1.0"
+edition = "2021"
+description = "GSD-Core sandboxed guest: the gsd:core WIT world exporting invoke over the pure route logic"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
+gsd-route = { path = "../gsd-route" }
+wit-bindgen = "=0.57.1"

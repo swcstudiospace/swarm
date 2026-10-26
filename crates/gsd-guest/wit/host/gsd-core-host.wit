@@ -1,0 +1,35 @@
+package gsd:core-host@0.2.0;
+
+/// Diagnostics. The host bounds the events one call may emit.
+interface log {
+    /// Records one event. A call whose events exceed the host's batch cap fails with `E-CONTRACT`.
+    emit: func(message: string);
+}
+
+/// Monotonic host time. The guest has no wall clock.
+interface time {
+    /// Nanoseconds since the host's origin for the instance. Never decreases within a call.
+    now: func() -> u64;
+}
+
+/// Host-seeded deterministic bytes.
+interface rand {
+    /// The next eight bytes of the stream seeded by the call, as a `u64`.
+    next: func() -> u64;
+}
+
+/// Session-namespaced storage. The host links it only when it has a backend.
+interface storage {
+    /// Stores `value` under `key` in the calling thread's namespace. Requires `storage.write`.
+    put: func(key: string, value: string);
+    /// True when `key` holds a value in the calling thread's namespace. Requires `storage.read`.
+    contains: func(key: string) -> bool;
+}
+
+/// The host bridge world. It declares four imports and no `omp-callback`.
+world gsd-core-host {
+    import log;
+    import time;
+    import rand;
+    import storage;
+}

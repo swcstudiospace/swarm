@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+os.environ.setdefault("SWARM_PURE_PYTHON", "1")
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -140,6 +141,7 @@ _BASE_ENV_ALLOW = frozenset({
     "SWARM_DIR", "SWARM_GSD_STATE_FILE", "SWARM_CLAUDE_STATE_DIR",
     "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
     "SWARM_ALLOW_INSECURE_DEV_KEY",
+    "SWARM_PURE_PYTHON",
 })
 
 

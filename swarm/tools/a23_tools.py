@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Callable
 from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
+from typing import TypedDict, cast, overload
 
 from swarm.tools.support import respond
 
@@ -105,7 +107,15 @@ _SECRET_PATTERNS = (
 )
 
 
-def _scrub(value):
+@overload
+def _scrub(value: str) -> str: ...
+@overload
+def _scrub(value: dict[str, object]) -> dict[str, object]: ...
+@overload
+def _scrub(value: list[object]) -> list[object]: ...
+@overload
+def _scrub(value: object) -> object: ...
+def _scrub(value: object) -> object:
     """A copy of a result with credential-shaped substrings of every string masked and each string capped at MAX_VALUE
     characters; numbers, booleans and keys stay."""
     if isinstance(value, str):
@@ -127,15 +137,16 @@ class _Invalid(Exception):
         self.field = field
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, object]:
     """The one INVALID_INPUT shape: {state, field, message}."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _guarded(analyse, payload: dict):
+def _guarded(analyse: Callable[[dict[str, object]], dict[str, object]],
+             payload: dict[str, object]) -> Callable[[], dict[str, object]]:
     """Wrap an analysis as the `work` callable of `respond`, mapping _Invalid to INVALID_INPUT and masking secrets."""
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         try:
             return _scrub(analyse(payload))
         except _Invalid as exc:
@@ -144,7 +155,13 @@ def _guarded(analyse, payload: dict):
     return work
 
 
-def _dec(value) -> Decimal:
+def _respond(payload: dict[str, object], analyse: Callable[[dict[str, object]], dict[str, object]]) -> dict[str, object]:
+    """support.respond with its result typed: `respond` is untyped and returns the dict that the guarded analysis produces."""
+    result: dict[str, object] = respond(payload, _guarded(analyse, payload))
+    return result
+
+
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
@@ -153,12 +170,12 @@ def _clip(text: str) -> str:
     return text if len(text) <= MAX_SUMMARY else text[: MAX_SUMMARY - 3] + "..."
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, str]:
     """A raw finding; the summary is masked and clipped once, in `_report`, for the findings that are actually returned."""
     return {"id": fid, "severity": severity, "summary": summary}
 
 
-def _report(findings: list[dict]) -> dict:
+def _report(findings: list[dict[str, str]]) -> dict[str, object]:
     """verdict, finding_count and the sorted, capped findings list shared by every tool (summaries masked, then clipped)."""
     ordered = sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
     top = max((SEVERITY_RANK[f["severity"]] for f in findings), default=0)
@@ -170,13 +187,13 @@ def _report(findings: list[dict]) -> dict:
 # --- shared parsing helpers ----------------------------------------------------------------------------------------
 
 
-def _dict(value, field: str, what: str) -> dict:
+def _dict(value: object, field: str, what: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise _Invalid(field, f"{what} must be an object")
     return value
 
 
-def _list(value, field: str, what: str) -> list:
+def _list(value: object, field: str, what: str) -> list[object]:
     if value is None:
         return []
     if not isinstance(value, list):
@@ -184,7 +201,7 @@ def _list(value, field: str, what: str) -> list:
     return value
 
 
-def _str(value, field: str, what: str, *, empty: bool = False) -> str:
+def _str(value: object, field: str, what: str, *, empty: bool = False) -> str:
     if not isinstance(value, str) or (not empty and not value.strip()):
         raise _Invalid(field, f"{what} must be a non-empty string")
     if len(value) > 253:  # DNS subdomain length; keeps every name echoed in a result inside its output_schema maxLength
@@ -192,26 +209,26 @@ def _str(value, field: str, what: str, *, empty: bool = False) -> str:
     return value
 
 
-def _nonneg_int(value, field: str, what: str) -> int:
+def _nonneg_int(value: object, field: str, what: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise _Invalid(field, f"{what} must be a non-negative integer")
     return value
 
 
-def _meta(doc, field: str, index: int, kind: str) -> tuple[str, str]:
+def _meta(doc: object, field: str, index: int, kind: str) -> tuple[str, str]:
     """(namespace, name) of a manifest; namespace defaults to `default`."""
-    doc = _dict(doc, field, f"{field}[{index}]")
-    metadata = _dict(doc.get("metadata") or {}, field, f"{field}[{index}].metadata")
+    manifest = _dict(doc, field, f"{field}[{index}]")
+    metadata = _dict(manifest.get("metadata") or {}, field, f"{field}[{index}].metadata")
     name = _str(metadata.get("name"), field, f"{field}[{index}] ({kind}) metadata.name")
     namespace = metadata.get("namespace", DEFAULT_NAMESPACE)
     return _str(namespace, field, f"{field}[{index}] metadata.namespace"), name
 
 
-def _spec(doc: dict, field: str, index: int) -> dict:
-    return _dict(doc.get("spec") or {}, field, f"{field}[{index}].spec")
+def _spec(doc: object, field: str, index: int) -> dict[str, object]:
+    return _dict(_dict(doc, field, f"{field}[{index}]").get("spec") or {}, field, f"{field}[{index}].spec")
 
 
-def _labels(value, field: str, what: str) -> dict:
+def _labels(value: object, field: str, what: str) -> dict[str, object]:
     labels = _dict(value if value is not None else {}, field, what)
     for key, val in labels.items():
         if not isinstance(val, str):
@@ -219,7 +236,7 @@ def _labels(value, field: str, what: str) -> dict:
     return labels
 
 
-def _selector_matches(selector, labels: dict, field: str) -> bool:
+def _selector_matches(selector: object, labels: dict[str, object], field: str) -> bool:
     """Kubernetes LabelSelector semantics: an empty or absent selector matches everything; matchLabels and every
     matchExpressions requirement are ANDed."""
     if selector is None:
@@ -251,7 +268,7 @@ def _selector_matches(selector, labels: dict, field: str) -> bool:
     return True
 
 
-def _selector_empty(selector) -> bool:
+def _selector_empty(selector: dict[str, object] | None) -> bool:
     return not selector or (not (selector.get("matchLabels") or {}) and not (selector.get("matchExpressions") or []))
 
 
@@ -267,7 +284,7 @@ _DURATION_MS = {
 }
 
 
-def _duration_ms(value, field: str, what: str) -> Decimal:
+def _duration_ms(value: object, field: str, what: str) -> Decimal:
     """Go-style duration ("500ms", "1.5s", "1h30m") in milliseconds; "0" is zero. Negative or malformed -> INVALID_INPUT."""
     if not isinstance(value, str) or not value:
         raise _Invalid(field, f"{what} must be a duration string such as 500ms or 2s")
@@ -305,7 +322,7 @@ def _istio_duration_problem(milliseconds: Decimal) -> str | None:
     return None
 
 
-def _ts(value, field: str, what: str) -> datetime:
+def _ts(value: object, field: str, what: str) -> datetime:
     if not isinstance(value, str):
         raise _Invalid(field, f"{what} must be an ISO-8601 timestamp with an offset")
     text = value[:-1] + "+00:00" if value.endswith("Z") else value
@@ -321,7 +338,7 @@ def _ts(value, field: str, what: str) -> datetime:
 # --- mesh_authz_lint -----------------------------------------------------------------------------------------------
 
 
-def _has_wildcard(values: list) -> tuple[bool, bool]:
+def _has_wildcard(values: list[object]) -> tuple[bool, bool]:
     """(exact "*", prefix/suffix pattern) in an Istio string-match list; Istio only supports "*", "prefix*", "*suffix"."""
     exact = any(v == "*" for v in values if isinstance(v, str))
     pattern = any(isinstance(v, str) and v != "*" and (v.startswith("*") or v.endswith("*")) for v in values)
@@ -331,34 +348,58 @@ def _has_wildcard(values: list) -> tuple[bool, bool]:
 _IPV4_MAPPED_ALL = ipaddress.ip_network("::ffff:0.0.0.0/96")  # every IPv4 address written in IPv6 notation
 
 
-def _universal_block(value) -> bool:
+_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _ip_network(value: object, *, strict: bool) -> _Network:
+    """ipaddress.ip_network on a parsed JSON value. It takes an int or a str and raises ValueError or TypeError for anything
+    else, and every caller catches both."""
+    return ipaddress.ip_network(cast(str | int, value), strict=strict)  # the stub takes str or int; other values fail inside ip_network
+
+
+def _ip_address(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """ipaddress.ip_address on a parsed JSON value (see _ip_network); callers catch ValueError."""
+    return ipaddress.ip_address(cast(str | int, value))  # same cast as _ip_network
+
+
+def _subnet_of(inner: _Network, outer: _Network) -> bool:
+    """inner.subnet_of(outer); networks of different IP versions are never nested, so the answer is False for them."""
+    if isinstance(inner, ipaddress.IPv4Network) and isinstance(outer, ipaddress.IPv4Network):
+        return inner.subnet_of(outer)
+    if isinstance(inner, ipaddress.IPv6Network) and isinstance(outer, ipaddress.IPv6Network):
+        return inner.subnet_of(outer)
+    return False
+
+
+def _universal_block(value: object) -> bool:
     """Whether an ipBlock CIDR admits every address: 0.0.0.0/0, ::/0, or an IPv6 network that contains the whole IPv4-mapped range
     ::ffff:0.0.0.0/96 (::/64 and ::/80, and the shorter prefixes down to ::/0; not ::/81 or ::/96). The mapped range counts as universal
     on the inference [INFERENCE] that Istio matches IPv4 peers under that range, so a network containing all of it covers every IPv4
     peer written in IPv6 notation. A narrower mapped range (for example ::ffff:10.0.0.0/104) is not universal."""
     try:
-        network = ipaddress.ip_network(value, strict=False)
+        network = _ip_network(value, strict=False)
     except (TypeError, ValueError):
         return False
-    return network.prefixlen == 0 or (network.version == 6 and _IPV4_MAPPED_ALL.subnet_of(network))
+    return network.prefixlen == 0 or _subnet_of(_IPV4_MAPPED_ALL, network)
 
 
-def _no_universal(key: str, values: list) -> bool:
+def _no_universal(key: str, values: list[object]) -> bool:
     """No value of this key matches every value of it."""
     return False
 
 
-def _operation_wildcard(key: str, values: list) -> bool:
+def _operation_wildcard(key: str, values: list[object]) -> bool:
     """A to.operation list containing "*" matches every value of its field."""
     return "*" in values
 
 
-def _source_universal(key: str, values: list) -> bool:
+def _source_universal(key: str, values: list[object]) -> bool:
     """An ipBlocks or remoteIpBlocks list containing 0.0.0.0/0 or ::/0 matches every address."""
     return key in ("ipBlocks", "remoteIpBlocks") and any(_universal_block(value) for value in values)
 
 
-def _narrows(fields: dict, keys: tuple, field: str, where: str, *, universal) -> bool:
+def _narrows(fields: dict[str, object], keys: tuple[str, ...], field: str, where: str, *,
+             universal: Callable[[str, list[object]], bool]) -> bool:
     """Whether one group of recognised fields constrains a request: some key holds values that do not all match every value of it.
     `universal(key, values)` says when they do, and such a key does not narrow. Otherwise a value narrows, as Istio reads it: a source
     "*" means any authenticated request, a negated "*" means only requests without that value, and a when "*" means the attribute
@@ -370,7 +411,7 @@ def _narrows(fields: dict, keys: tuple, field: str, where: str, *, universal) ->
     return False
 
 
-def _matches_everything(rule: dict, field: str, where: str) -> bool:
+def _matches_everything(rule: dict[str, object], field: str, where: str) -> bool:
     """Whether an ALLOW rule matches every request: the literal `{}`, or one whose from, to and when all constrain nothing. Within one
     list the items are ORed, so one unconstrained item frees the list; an absent or empty list constrains nothing; the lists are ANDed,
     so the rule is open only when every one of them is free. A from source is unconstrained when none of its recognised fields narrows
@@ -378,45 +419,52 @@ def _matches_everything(rule: dict, field: str, where: str) -> bool:
     when its positive fields (hosts, ports, methods, paths) contain "*" or are empty, and its negated fields are empty. A when condition
     is unconstrained when its values and notValues are both empty."""
 
-    def free(key: str, item_free) -> bool:
+    def free(key: str, item_free: Callable[[dict[str, object]], bool]) -> bool:
         items = _list(rule.get(key), field, f"{where}.{key}")
         return not items or any(item_free(_dict(item, field, f"{where}.{key} item")) for item in items)
 
-    def source_free(item: dict) -> bool:
+    def source_free(item: dict[str, object]) -> bool:
         source = _dict(item.get("source") or {}, field, f"{where}.from.source")
         return not _narrows(source, AUTHZ_SOURCE_FIELDS, field, f"{where}.from.source", universal=_source_universal)
 
-    def operation_free(item: dict) -> bool:
+    def operation_free(item: dict[str, object]) -> bool:
         operation = _dict(item.get("operation") or {}, field, f"{where}.to.operation")
         positive = _narrows(operation, AUTHZ_OPERATION_FIELDS, field, f"{where}.to.operation", universal=_operation_wildcard)
         negated = _narrows(operation, AUTHZ_NEGATIVE_OPERATION, field, f"{where}.to.operation", universal=_no_universal)
         return not (positive or negated)
 
-    def condition_free(item: dict) -> bool:
+    def condition_free(item: dict[str, object]) -> bool:
         return not _narrows(item, AUTHZ_CONDITION_FIELDS, field, f"{where}.when", universal=_no_universal)
 
     return free("from", source_free) and free("to", operation_free) and free("when", condition_free)
 
 
-def _without_negations(rule: dict) -> dict:
+def _without_negations(rule: dict[str, object]) -> dict[str, object]:
     """The rule with its negative matches removed (source not*, to.operation not*, when notValues): what its positive matches still
     constrain. Its from, to and when items are validated objects by the time the caller uses it."""
     part = dict(rule)
-    if isinstance(rule.get("from"), list):
-        part["from"] = [{**item, "source": {k: v for k, v in (item.get("source") or {}).items() if k not in AUTHZ_NEGATIVE_SOURCE}}
-                        for item in rule["from"]]
-    if isinstance(rule.get("to"), list):
-        part["to"] = [{**item, "operation": {k: v for k, v in (item.get("operation") or {}).items() if k not in AUTHZ_NEGATIVE_OPERATION}}
-                      for item in rule["to"]]
-    if isinstance(rule.get("when"), list):
-        part["when"] = [{k: v for k, v in item.items() if k != "notValues"} for item in rule["when"]]
+    from_items = rule.get("from")
+    if isinstance(from_items, list):
+        part["from"] = [_without_part(item, "source", AUTHZ_NEGATIVE_SOURCE) for item in from_items]
+    to_items = rule.get("to")
+    if isinstance(to_items, list):
+        part["to"] = [_without_part(item, "operation", AUTHZ_NEGATIVE_OPERATION) for item in to_items]
+    when_items = rule.get("when")
+    if isinstance(when_items, list):
+        part["when"] = [{k: v for k, v in _dict(item, "policies", "when item").items() if k != "notValues"} for item in when_items]
     return part
 
 
-def _authz_lint(payload: dict) -> dict:
+def _without_part(item: object, part_name: str, keys: tuple[str, ...]) -> dict[str, object]:
+    """`item` with the listed keys removed from its `part_name` mapping (source or operation)."""
+    fields = _dict(item, "policies", "rule item")
+    return {**fields, part_name: {k: v for k, v in _dict(fields.get(part_name) or {}, "policies", part_name).items() if k not in keys}}
+
+
+def _authz_lint(payload: dict[str, object]) -> dict[str, object]:
     root = payload.get("root_namespace", DEFAULT_ROOT_NAMESPACE)
     policies = _list(payload["policies"], "policies", "policies")
-    findings: list[dict] = []
+    findings: list[dict[str, str]] = []
     deny_all: set[str] = set()  # namespaces where a request needs a matching ALLOW: allow-nothing policy or specific ALLOW rules
     block_all: set[str] = set()  # namespaces with a DENY policy whose empty rule matches every request
     allow_all: set[str] = set()  # namespaces where an ALLOW policy admits every request
@@ -542,7 +590,7 @@ def _authz_lint(payload: dict) -> dict:
     }
 
 
-def authz_lint(payload: dict) -> dict:
+def authz_lint(payload: dict[str, object]) -> dict[str, object]:
     """Lint Istio AuthorizationPolicies. Semantics (Istio authorization-policy reference): CUSTOM is evaluated first, then any
     matching DENY denies, then with no ALLOW policy in scope everything is allowed, otherwise a request needs a matching ALLOW.
     A namespace is default-deny when a namespace-wide (or root-namespace) ALLOW policy applies to it (empty `spec`, the
@@ -554,13 +602,28 @@ def authz_lint(payload: dict) -> dict:
     authenticated identity, issuer or namespace), prefix/suffix patterns, 0.0.0.0/0 ip blocks, and rules without `from` (admit
     unauthenticated plaintext clients). A selector key other than matchLabels is AUTHZ-SELECTOR-UNSUPPORTED and scopes the policy
     to workloads. Without `namespaces`, only namespaces that hold a policy are checked: list every namespace to catch one with none."""
-    return respond(payload, _guarded(_authz_lint, payload))
+    return _respond(payload, _authz_lint)
 
 
 # --- mesh_mtls_coverage --------------------------------------------------------------------------------------------
 
 
-def _contenders(candidates: list[dict]) -> tuple[dict, list[dict]]:
+class _PeerAuth(TypedDict):
+    namespace: str
+    name: str
+    mode: str
+    labels: dict[str, object]
+    ports: dict[int, str]
+    created: datetime | None
+
+
+class _Row(TypedDict):
+    namespace: str
+    workload_count: int
+    strict_count: int
+
+
+def _contenders(candidates: list[_PeerAuth]) -> tuple[_PeerAuth, list[_PeerAuth]]:
     """The oldest same-level candidate (dated ones first, ties by name) and every candidate that could be the effective one: those
     sharing its creationTimestamp, and every undated one, since an undated object cannot be ordered against the others."""
     ordered = sorted(candidates, key=lambda c: (c["created"] is None, c["created"].timestamp() if c["created"] else 0.0, c["name"]))
@@ -568,11 +631,11 @@ def _contenders(candidates: list[dict]) -> tuple[dict, list[dict]]:
     return top, [c for c in ordered if c["created"] is None or c["created"] == top["created"]]
 
 
-def _conflicting(contenders: list[dict], inherited: str | None) -> bool:
+def _conflicting(contenders: list[_PeerAuth], inherited: str | None) -> bool:
     """True when the contenders would give different effective postures (mode and per-port modes), so the outcome depends on which
     one Istio picks. An UNSET mode takes `inherited`, the mode the levels below decide; None (they conflict) leaves it unknown."""
     ports = sorted({port for c in contenders for port in c["ports"]})
-    postures = set()
+    postures: set[tuple[str, tuple[str, ...]]] = set()
     for c in contenders:
         mode = inherited if c["mode"] == "UNSET" else c["mode"]
         if mode is None:
@@ -582,7 +645,7 @@ def _conflicting(contenders: list[dict], inherited: str | None) -> bool:
     return len(postures) > 1
 
 
-def _decided(levels: tuple, start: int) -> str | None:
+def _decided(levels: tuple[tuple[str, list[_PeerAuth]], ...], start: int) -> str | None:
     """The mode the levels from `start` on decide for a workload (PERMISSIVE when none does), or None when a level is in conflict."""
     for index in range(start, len(levels)):
         candidates = levels[index][1]
@@ -596,12 +659,12 @@ def _decided(levels: tuple, start: int) -> str | None:
     return "PERMISSIVE"
 
 
-def _parse_peer_auth(doc, index: int) -> dict:
+def _parse_peer_auth(doc: object, index: int) -> _PeerAuth:
     namespace, name = _meta(doc, "peer_authentications", index, "PeerAuthentication")
     spec = _spec(doc, "peer_authentications", index)
     mtls = _dict(spec.get("mtls") or {}, "peer_authentications", "spec.mtls")
     mode = mtls.get("mode", "UNSET")
-    if mode not in MTLS_MODES:
+    if not isinstance(mode, str) or mode not in MTLS_MODES:
         raise _Invalid("peer_authentications", f"{namespace}/{name}: mtls.mode {mode!r} must be one of {', '.join(MTLS_MODES)}")
     selector = _dict(spec.get("selector") or {}, "peer_authentications", "spec.selector")
     if any(value for key, value in selector.items() if key != "matchLabels"):
@@ -616,24 +679,26 @@ def _parse_peer_auth(doc, index: int) -> dict:
         if not 1 <= port <= 65535:
             raise _Invalid("peer_authentications", f"{namespace}/{name}: portLevelMtls port {port} is outside 1..65535")
         port_mode = _dict(value, "peer_authentications", "portLevelMtls entry").get("mode", "UNSET")
-        if port_mode not in MTLS_MODES:
+        if not isinstance(port_mode, str) or port_mode not in MTLS_MODES:
             raise _Invalid("peer_authentications", f"{namespace}/{name}: portLevelMtls {port} mode {port_mode!r} is not a valid mode")
         ports[port] = port_mode
-    stamp = (doc.get("metadata") or {}).get("creationTimestamp")
+    metadata = _dict(_dict(doc, "peer_authentications", f"peer_authentications[{index}]").get("metadata") or {},
+                     "peer_authentications", f"peer_authentications[{index}].metadata")
+    stamp = metadata.get("creationTimestamp")
     created = _ts(stamp, "peer_authentications", f"{namespace}/{name} metadata.creationTimestamp") if stamp is not None else None
     return {"namespace": namespace, "name": name, "mode": mode, "labels": match_labels, "ports": ports, "created": created}
 
 
-def _mtls_coverage(payload: dict) -> dict:
+def _mtls_coverage(payload: dict[str, object]) -> dict[str, object]:
     root = payload.get("root_namespace", DEFAULT_ROOT_NAMESPACE)
     target = payload.get("min_strict_pct", 100)
     policies = [_parse_peer_auth(doc, i) for i, doc in enumerate(_list(payload["peer_authentications"], "peer_authentications", "list"))]
-    findings: list[dict] = []
+    findings: list[dict[str, str]] = []
     for pa in policies:
         if pa["ports"] and not pa["labels"]:
             findings.append(_finding("MTLS-PORT-NO-SELECTOR", "major",
                                      f"{pa['namespace']}/{pa['name']}: portLevelMtls requires a workload selector"))
-    rows: dict[str, dict] = {}
+    rows: dict[str, _Row] = {}
     groups: dict[tuple[str, str], list[str]] = {}
     non_strict: list[str] = []
     strict = permissive = disabled = port_exceptions = 0
@@ -650,7 +715,8 @@ def _mtls_coverage(payload: dict) -> dict:
             ("namespace policy", [p for p in in_ns if not p["labels"]]),
             ("mesh-wide policy", [p for p in policies if p["namespace"] == root and not p["labels"]]),
         )
-        mode, source, chosen = "PERMISSIVE", "default (no PeerAuthentication)", None
+        mode, source = "PERMISSIVE", "default (no PeerAuthentication)"
+        chosen: _PeerAuth | None = None
         for index, (level, candidates) in enumerate(levels):
             if not candidates:
                 continue
@@ -667,7 +733,7 @@ def _mtls_coverage(payload: dict) -> dict:
             if pick["mode"] != "UNSET":
                 mode, source = pick["mode"], f"{level} {pick['namespace']}/{pick['name']}"
                 break
-        weak_ports = []
+        weak_ports: list[tuple[int, str]] = []
         if chosen is not None:
             for port, port_mode in sorted(chosen["ports"].items()):
                 effective = mode if port_mode == "UNSET" else port_mode
@@ -707,10 +773,9 @@ def _mtls_coverage(payload: dict) -> dict:
         exact = share.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
         findings.append(_finding("MTLS-COVERAGE-BELOW-TARGET", "major",
                                  f"strict mTLS covers {strict} of {total} workloads ({exact}%), target {target}%"))
-    table = []
+    table: list[dict[str, object]] = []
     for row in sorted(rows.values(), key=lambda r: r["namespace"]):
-        row["strict_pct"] = round(row["strict_count"] * 100 / row["workload_count"], 2)
-        table.append(row)
+        table.append({**row, "strict_pct": round(row["strict_count"] * 100 / row["workload_count"], 2)})
     return {
         "state": "SUCCESS",
         "workload_count": total,
@@ -725,21 +790,32 @@ def _mtls_coverage(payload: dict) -> dict:
     }
 
 
-def mtls_coverage(payload: dict) -> dict:
+def mtls_coverage(payload: dict[str, object]) -> dict[str, object]:
     """Effective PeerAuthentication mode per workload. Istio precedence: the oldest workload-selector policy that matches
     the pod labels, else the oldest namespace-wide policy, else the mesh-wide policy in the root namespace, else PERMISSIVE;
     mode UNSET at a level defers to the parent. portLevelMtls (selector policies only) can weaken a STRICT workload on single
     ports. A workload counts as strict only when its mode is STRICT and no port is weaker. Same-level policies that tie on
     creationTimestamp (or are undated) whose effective postures differ, an UNSET mode taking the level below, are MTLS-CONFLICT (major) and the workload is not
     counted strict. `non_strict_workloads` lists the first 100 names; at most 200 namespaces are analysed."""
-    return respond(payload, _guarded(_mtls_coverage, payload))
+    return _respond(payload, _mtls_coverage)
 
 
 # --- mesh_traffic_split --------------------------------------------------------------------------------------------
 
 
-def _destinations(route_list, field: str, where: str) -> list[dict]:
-    out = []
+class _Entry(TypedDict):
+    host: str
+    subset: str | None
+    weight: int | None
+
+
+class _DestRule(TypedDict):
+    fqdn: str
+    subsets: set[str]
+
+
+def _destinations(route_list: list[object], field: str, where: str) -> list[_Entry]:
+    out: list[_Entry] = []
     for item in route_list:
         item = _dict(item, field, f"{where} route item")
         destination = _dict(item.get("destination") or {}, field, f"{where} destination")
@@ -750,25 +826,26 @@ def _destinations(route_list, field: str, where: str) -> list[dict]:
         subset = destination.get("subset")
         if subset is not None and not isinstance(subset, str):
             raise _Invalid(field, f"{where} destination.subset must be a string")
-        out.append({"host": host, "subset": subset, "weight": weight})
+        out.append({"host": host, "subset": subset if isinstance(subset, str) else None,
+                    "weight": weight if isinstance(weight, int) else None})
     return out
 
 
-def _dr_index(destination_rules: list, field: str) -> list[dict]:
-    index = []
+def _dr_index(destination_rules: list[object], field: str) -> list[_DestRule]:
+    index: list[_DestRule] = []
     for i, doc in enumerate(destination_rules):
         namespace, name = _meta(doc, field, i, "DestinationRule")
         spec = _spec(doc, field, i)
         host = _str(spec.get("host"), field, f"{namespace}/{name} spec.host")
-        subsets = set()
+        subsets: set[str] = set()
         for subset in _list(spec.get("subsets"), field, f"{namespace}/{name} spec.subsets"):
             subsets.add(_str(_dict(subset, field, "subset").get("name"), field, f"{namespace}/{name} subset name"))
         index.append({"fqdn": _fqdn(host, namespace), "subsets": subsets})
     return index
 
 
-def _traffic_split(payload: dict) -> dict:
-    findings: list[dict] = []
+def _traffic_split(payload: dict[str, object]) -> dict[str, object]:
+    findings: list[dict[str, str]] = []
     rules = _dr_index(_list(payload["destination_rules"], "destination_rules", "destination_rules"), "destination_rules")
     services = _list(payload["virtual_services"], "virtual_services", "virtual_services")
     route_count = destination_count = 0
@@ -814,7 +891,7 @@ def _traffic_split(payload: dict) -> dict:
                                                  f"{where}: subset {subset!r} is not defined by any DestinationRule for {fqdn} (requests fail 503)"))
                 if protocol != "http":
                     continue
-                timeout = None
+                timeout: Decimal | None = None
                 if "timeout" in route:
                     timeout = _duration_ms(route["timeout"], "virtual_services", f"{where} timeout")
                     problem = _istio_duration_problem(timeout)
@@ -826,7 +903,7 @@ def _traffic_split(payload: dict) -> dict:
                 if not retries:
                     continue
                 attempts = _nonneg_int(retries.get("attempts", 0), "virtual_services", f"{where} retries.attempts")
-                per_try = None
+                per_try: Decimal | None = None
                 if "perTryTimeout" in retries:
                     per_try = _duration_ms(retries["perTryTimeout"], "virtual_services", f"{where} perTryTimeout")
                     problem = _istio_duration_problem(per_try)
@@ -853,7 +930,7 @@ def _traffic_split(payload: dict) -> dict:
             "destination_count": destination_count, **_report(findings)}
 
 
-def traffic_split(payload: dict) -> dict:
+def traffic_split(payload: dict[str, object]) -> dict[str, object]:
     """Validate Istio VirtualService routing. Weights are relative shares (Istio reference: a destination gets weight / sum of the
     weights): a route with several destinations whose weights are all 0 or unset routes nothing (Istio rejects it: blocker); a
     sum other than 100 is valid and only reported as minor with the effective shares. Every `subset` must be defined by a
@@ -862,13 +939,13 @@ def traffic_split(payload: dict) -> dict:
     number of milliseconds (0s included: omit the field for no timeout) and perTryTimeout or retryOn next to attempts 0. Retries:
     perTryTimeout above the route timeout is dead, (attempts+1) x perTryTimeout above the timeout can never finish, no timeout
     means unbounded, and attempts above 5 is flagged (a house ceiling, Istio has none)."""
-    return respond(payload, _guarded(_traffic_split, payload))
+    return _respond(payload, _traffic_split)
 
 
 # --- mesh_destination_policy ---------------------------------------------------------------------------------------
 
 
-def _check_traffic_policy(policy, label: str, findings: list[dict]) -> bool:
+def _check_traffic_policy(policy: object, label: str, findings: list[dict[str, str]]) -> bool:
     """Check one trafficPolicy / portLevelSettings block; True when it carries outlierDetection."""
     policy = _dict(policy, "destination_rules", f"{label} trafficPolicy")
     outlier = policy.get("outlierDetection")
@@ -877,13 +954,13 @@ def _check_traffic_policy(policy, label: str, findings: list[dict]) -> bool:
         c5 = outlier.get("consecutive5xxErrors")
         cg = outlier.get("consecutiveGatewayErrors", 0)
         if c5 is not None:
-            _nonneg_int(c5, "destination_rules", f"{label} consecutive5xxErrors")
-        _nonneg_int(cg, "destination_rules", f"{label} consecutiveGatewayErrors")
+            c5 = _nonneg_int(c5, "destination_rules", f"{label} consecutive5xxErrors")
+        cg = _nonneg_int(cg, "destination_rules", f"{label} consecutiveGatewayErrors")
         split, local = outlier.get("splitExternalLocalOriginErrors"), outlier.get("consecutiveLocalOriginFailures")
         if split is not None and not isinstance(split, bool):
             raise _Invalid("destination_rules", f"{label}: splitExternalLocalOriginErrors must be a boolean")
         if local is not None:
-            _nonneg_int(local, "destination_rules", f"{label} consecutiveLocalOriginFailures")
+            local = _nonneg_int(local, "destination_rules", f"{label} consecutiveLocalOriginFailures")
         local_active = split is True and local != 0  # consecutiveLocalOriginFailures defaults to 5 once split is on
         if c5 == 0 and cg == 0 and not local_active:
             findings.append(_finding("DR-OUTLIER-INERT", "major", f"{label}: consecutive5xxErrors 0 and no consecutiveGatewayErrors "
@@ -943,10 +1020,10 @@ def _check_traffic_policy(policy, label: str, findings: list[dict]) -> bool:
     return outlier is not None
 
 
-def _destination_policy(payload: dict) -> dict:
-    findings: list[dict] = []
+def _destination_policy(payload: dict[str, object]) -> dict[str, object]:
+    findings: list[dict[str, str]] = []
     rules = _list(payload["destination_rules"], "destination_rules", "destination_rules")
-    endpoints: dict[str, list[dict]] = {}
+    endpoints: dict[str, list[dict[str, object]]] = {}
     for index, item in enumerate(_list(payload["workloads"], "workloads", "workloads")):
         item = _dict(item, "workloads", f"workloads[{index}]")
         namespace = _str(item.get("namespace"), "workloads", f"workloads[{index}].namespace")
@@ -993,7 +1070,7 @@ def _destination_policy(payload: dict) -> dict:
     return {"state": "SUCCESS", "rule_count": len(rules), "subset_count": subset_count, **_report(findings)}
 
 
-def destination_policy(payload: dict) -> dict:
+def destination_policy(payload: dict[str, object]) -> dict[str, object]:
     """Sanity-check Istio DestinationRules. Outlier detection: consecutive5xxErrors defaults to 5 and 0 disables it,
     consecutiveGatewayErrors defaults to 0 (disabled) and has no effect when not below consecutive5xxErrors, local-origin
     failures count only with splitExternalLocalOriginErrors true (default 5), interval and baseEjectionTime need a whole number
@@ -1001,7 +1078,7 @@ def destination_policy(payload: dict) -> dict:
     below 1ms or sub-ms, maxRequestsPerConnection 1 (no keep-alive), maxRetries left at its 2^32-1 default. Subsets: duplicate
     names, empty labels, labels matching no supplied endpoint of the host (`workloads` are the pods behind each service).
     tls.mode DISABLE conflicts with STRICT PeerAuthentication."""
-    return respond(payload, _guarded(_destination_policy, payload))
+    return _respond(payload, _destination_policy)
 
 
 # --- mesh_gateway_api_check ----------------------------------------------------------------------------------------
@@ -1032,17 +1109,28 @@ def _hosts_overlap(a: str, b: str) -> bool:
     return b.startswith("*.") and a.endswith(b[1:])
 
 
-def _api_group(value, default: str) -> str:
+def _api_group(value: object, default: str) -> object:
     return default if value is None else value
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     """A hashable stand-in for a manifest value: strings stay, anything else becomes its repr and so never matches a real name."""
     return value if isinstance(value, str) else repr(value)
 
 
-def _grant_allows(index: dict, used: set[int], *, from_kind: str, from_ns: str, to_group: str, to_kind: str,
-                  to_ns: str, to_name: str) -> bool:
+_Listener = TypedDict("_Listener", {"name": str, "port": int, "protocol": object, "hostname": str, "from": object,
+                                    "selector": object, "kinds": object})
+_Grant = TypedDict("_Grant", {"namespace": str, "name": str, "from": list[tuple[object, str, str]],
+                              "to": list[tuple[object, str, object]]})
+
+
+class _Gateway(TypedDict):
+    namespace: str
+    listeners: list[_Listener]
+
+
+def _grant_allows(index: dict[tuple[str, tuple[str, ...], tuple[str, ...]], int], used: set[int], *, from_kind: object,
+                  from_ns: object, to_group: object, to_kind: object, to_ns: object, to_name: object) -> bool:
     """Whether a ReferenceGrant in `to_ns` allows the sender to reference the target (an empty grant `to.name` allows every
     name). `index` maps (grant namespace, from tuple, to tuple) to the position of the first grant that holds the pair."""
     sender = (GATEWAY_GROUP, _text(from_kind), _text(from_ns))
@@ -1054,30 +1142,36 @@ def _grant_allows(index: dict, used: set[int], *, from_kind: str, from_ns: str, 
     return True
 
 
-def _gateway_api_check(payload: dict) -> dict:
-    findings: list[dict] = []
-    grants = []
+def _gateway_api_check(payload: dict[str, object]) -> dict[str, object]:
+    findings: list[dict[str, str]] = []
+    grants: list[_Grant] = []
     for i, doc in enumerate(_list(payload["reference_grants"], "reference_grants", "reference_grants")):
         namespace, name = _meta(doc, "reference_grants", i, "ReferenceGrant")
         spec = _spec(doc, "reference_grants", i)
-        senders = [(_api_group(_dict(f, "reference_grants", "from").get("group"), ""), _str(f.get("kind"), "reference_grants", "from.kind"),
-                    _str(f.get("namespace"), "reference_grants", "from.namespace")) for f in _list(spec.get("from"), "reference_grants", "from")]
-        receivers = [(_api_group(_dict(t, "reference_grants", "to").get("group"), ""), _str(t.get("kind"), "reference_grants", "to.kind"),
-                      t.get("name") or "") for t in _list(spec.get("to"), "reference_grants", "to")]
+        senders: list[tuple[object, str, str]] = []
+        for f in _list(spec.get("from"), "reference_grants", "from"):
+            source_ref = _dict(f, "reference_grants", "from")
+            senders.append((_api_group(source_ref.get("group"), ""), _str(source_ref.get("kind"), "reference_grants", "from.kind"),
+                            _str(source_ref.get("namespace"), "reference_grants", "from.namespace")))
+        receivers: list[tuple[object, str, object]] = []
+        for t in _list(spec.get("to"), "reference_grants", "to"):
+            target_ref = _dict(t, "reference_grants", "to")
+            receivers.append((_api_group(target_ref.get("group"), ""), _str(target_ref.get("kind"), "reference_grants", "to.kind"),
+                              target_ref.get("name") or ""))
         if not senders or not receivers:
             findings.append(_finding("GRANT-EMPTY", "major", f"{namespace}/{name}: ReferenceGrant needs at least one from and one to"))
         grants.append({"namespace": namespace, "name": name, "from": senders, "to": receivers})
-    grant_index: dict[tuple, int] = {}
+    grant_index: dict[tuple[str, tuple[str, ...], tuple[str, ...]], int] = {}
     for position, grant in enumerate(grants):
         for sender in grant["from"]:
             for receiver in grant["to"]:
                 grant_index.setdefault((_text(grant["namespace"]), tuple(map(_text, sender)), tuple(map(_text, receiver))), position)
     used: set[int] = set()
-    namespace_labels: dict[str, dict] = {}
+    namespace_labels: dict[str, dict[str, object]] = {}
     for i, item in enumerate(_list(payload.get("namespaces"), "namespaces", "namespaces")):
         item = _dict(item, "namespaces", f"namespaces[{i}]")
         namespace_labels[_str(item.get("name"), "namespaces", f"namespaces[{i}].name")] = _labels(item.get("labels"), "namespaces", "labels")
-    gateways: dict[tuple[str, str], dict] = {}
+    gateways: dict[tuple[str, str], _Gateway] = {}
     gateway_docs = _list(payload["gateways"], "gateways", "gateways")
     for i, doc in enumerate(gateway_docs):
         namespace, name = _meta(doc, "gateways", i, "Gateway")
@@ -1088,7 +1182,7 @@ def _gateway_api_check(payload: dict) -> dict:
         listeners = _list(spec.get("listeners"), "gateways", f"{subject} listeners")
         if not listeners:
             findings.append(_finding("GW-NO-LISTENERS", "major", f"{subject}: a Gateway needs at least one listener"))
-        parsed: list[dict] = []
+        parsed: list[_Listener] = []
         names: set[str] = set()
         for l_index, listener in enumerate(listeners):
             listener = _dict(listener, "gateways", f"{subject} listeners[{l_index}]")
@@ -1105,10 +1199,10 @@ def _gateway_api_check(payload: dict) -> dict:
             if not isinstance(protocol, str) or not (protocol in LISTENER_PROTOCOLS or "/" in protocol):
                 findings.append(_finding("GW-LISTENER-PROTOCOL", "major", f"{where}: protocol {protocol!r} is not one of "
                                          f"{', '.join(LISTENER_PROTOCOLS)} or a domain-prefixed custom protocol"))
-            hostname = listener.get("hostname")
-            if hostname is not None and not isinstance(hostname, str):
+            hostname_value = listener.get("hostname")
+            if hostname_value is not None and not isinstance(hostname_value, str):
                 raise _Invalid("gateways", f"{where}: hostname must be a string")
-            hostname = hostname or ""
+            hostname = hostname_value if isinstance(hostname_value, str) else ""
             if hostname and not _valid_hostname(hostname):
                 findings.append(_finding("GW-LISTENER-HOSTNAME", "major", f"{where}: hostname {hostname!r} is not a lowercase RFC 1123 name"))
             if hostname and protocol in ("TCP", "UDP"):
@@ -1142,7 +1236,7 @@ def _gateway_api_check(payload: dict) -> dict:
                 findings.append(_finding("GW-ROUTES-ALL-NAMESPACES", "info", f"{where}: routes from every namespace may attach"))
             parsed.append({"name": lname, "port": port, "protocol": protocol, "hostname": hostname, "from": origin,
                            "selector": scope.get("selector"), "kinds": allowed.get("kinds")})
-        by_port: dict[int, list[dict]] = {}
+        by_port: dict[int, list[_Listener]] = {}
         for entry in parsed:
             by_port.setdefault(entry["port"], []).append(entry)
         for port, group in sorted(by_port.items()):
@@ -1154,7 +1248,7 @@ def _gateway_api_check(payload: dict) -> dict:
                 findings.append(_finding("GW-LISTENER-PORT-CONFLICT", "major", f"{subject}: listeners {', '.join(sorted(e['name'] for e in group))} "
                                          f"share port {port} with incompatible protocols {', '.join(sorted(map(str, protocols)))}"))
                 continue
-            seen_keys: dict[tuple, str] = {}
+            seen_keys: dict[tuple[object, str], str] = {}
             for entry in group:
                 key = (entry["protocol"] if l4 else None, entry["hostname"])
                 if key in seen_keys:
@@ -1194,13 +1288,14 @@ def _gateway_api_check(payload: dict) -> dict:
                     continue
             if ref.get("port") is not None:
                 candidates = [c for c in candidates if c["port"] == ref["port"]]
-            reasons, accepted = [], False
+            reasons: list[str] = []
+            accepted = False
             for listener in candidates:
                 reason = None
                 kinds = listener["kinds"]
                 if listener["protocol"] not in HTTPROUTE_PROTOCOLS:
                     reason = f"protocol {listener['protocol']} cannot carry an HTTPRoute"
-                elif kinds is not None and not any(isinstance(k, dict) and k.get("kind") == "HTTPRoute" for k in kinds):
+                elif kinds is not None and not (isinstance(kinds, list) and any(isinstance(k, dict) and k.get("kind") == "HTTPRoute" for k in kinds)):
                     reason = "allowedRoutes.kinds excludes HTTPRoute"
                 elif listener["from"] == "None":
                     reason = "allowedRoutes.namespaces.from is None, so no route may attach"
@@ -1232,15 +1327,15 @@ def _gateway_api_check(payload: dict) -> dict:
             total_weight = 0
             for ref in backends:
                 ref = _dict(ref, "routes", f"{subject} backendRef")
-                kind, group = ref.get("kind") or "Service", _api_group(ref.get("group"), "")
+                kind, backend_group = ref.get("kind") or "Service", _api_group(ref.get("group"), "")
                 backend_ns, backend_name = ref.get("namespace") or namespace, _str(ref.get("name"), "routes", f"{subject} backendRef.name")
                 weight = ref.get("weight", 1)
                 if isinstance(weight, bool) or not isinstance(weight, int) or weight < 0:
                     raise _Invalid("routes", f"{subject}: backendRef weight {weight!r} must be a non-negative integer")
                 total_weight += weight
-                if kind == "Service" and group == "" and ref.get("port") is None:
+                if kind == "Service" and backend_group == "" and ref.get("port") is None:
                     findings.append(_finding("ROUTE-BACKEND-NO-PORT", "major", f"{subject}: Service backendRef {backend_name} needs a port"))
-                if backend_ns != namespace and not _grant_allows(grant_index, used, from_kind="HTTPRoute", from_ns=namespace, to_group=group,
+                if backend_ns != namespace and not _grant_allows(grant_index, used, from_kind="HTTPRoute", from_ns=namespace, to_group=backend_group,
                                                                   to_kind=kind, to_ns=backend_ns, to_name=backend_name):
                     findings.append(_finding("ROUTE-BACKEND-NO-GRANT", "major", f"{subject}: backend {backend_ns}/{backend_name} needs a "
                                              f"ReferenceGrant in {backend_ns} allowing HTTPRoutes from {namespace}"))
@@ -1254,7 +1349,7 @@ def _gateway_api_check(payload: dict) -> dict:
             "unattached_routes": sorted(unattached)[:MAX_LISTED], **_report(findings)}
 
 
-def gateway_api_check(payload: dict) -> dict:
+def gateway_api_check(payload: dict[str, object]) -> dict[str, object]:
     """Validate Gateway API (gateway.networking.k8s.io) Gateways, HTTPRoutes and ReferenceGrants together. Listeners: unique
     names, valid ports/protocols/hostnames, tls required for HTTPS/TLS and rejected on HTTP/TCP/UDP, HTTPS terminating with
     certificateRefs, allowedRoutes scope (All, Selector, Same, None). Same-port listeners: the spec only requires them to be
@@ -1265,14 +1360,30 @@ def gateway_api_check(payload: dict) -> dict:
     intersection), Service backendRefs have a port, zero total weight drops traffic. A certificateRef or backendRef in another
     namespace needs a ReferenceGrant in the target namespace naming the sender kind and namespace and the target group/kind
     (and name when given). `unattached_routes` lists at most 100 names."""
-    return respond(payload, _guarded(_gateway_api_check, payload))
+    return _respond(payload, _gateway_api_check)
 
 
 # --- NetworkPolicy shared helpers ----------------------------------------------------------------------------------
 
 
-def _parse_netpols(items: list, field: str) -> list[dict]:
-    policies = []
+class _NetPol(TypedDict):
+    namespace: str
+    name: str
+    selector: dict[str, object]
+    types: list[object]
+    rules: dict[str, list[dict[str, object]]]
+
+
+class _Pod(TypedDict):
+    namespace: str
+    name: str
+    labels: dict[str, object]
+    ip: object
+    ports: list[object]
+
+
+def _parse_netpols(items: list[object], field: str) -> list[_NetPol]:
+    policies: list[_NetPol] = []
     for index, doc in enumerate(items):
         namespace, name = _meta(doc, field, index, "NetworkPolicy")
         spec = _spec(doc, field, index)
@@ -1280,22 +1391,31 @@ def _parse_netpols(items: list, field: str) -> list[dict]:
         if "podSelector" not in spec:
             raise _Invalid(field, f"{subject}: spec.podSelector is required (use {{}} to select every pod)")
         selector = _dict(spec["podSelector"], field, f"{subject} spec.podSelector")
-        types = spec.get("policyTypes")
-        if types is None:  # Kubernetes default (SetDefaults_NetworkPolicy): Ingress always, Egress only when the egress list is non-empty
-            types = ["Ingress"] + (["Egress"] if spec.get("egress") else [])
+        declared_types = spec.get("policyTypes")
+        types: list[object]
+        if declared_types is None:  # Kubernetes default (SetDefaults_NetworkPolicy): Ingress always, Egress only when the egress list is non-empty
+            types = ["Ingress", *(["Egress"] if spec.get("egress") else [])]
         else:
-            types = _list(types, field, f"{subject} policyTypes")
+            types = _list(declared_types, field, f"{subject} policyTypes")
             if not types or any(t not in POLICY_TYPES for t in types):
                 raise _Invalid(field, f"{subject}: policyTypes must be a non-empty list of {', '.join(POLICY_TYPES)}")
-        rules = {}
+        rules: dict[str, list[dict[str, object]]] = {}
         for direction, key in (("Ingress", "ingress"), ("Egress", "egress")):
-            rules[direction] = [_dict(r, field, f"{subject} {key} rule") for r in _list(spec.get(key), field, f"{subject} {key}")]
+            peers_key = _PEER_KEY[direction]
+            rules[direction] = []
+            for r in _list(spec.get(key), field, f"{subject} {key}"):
+                rule = _dict(r, field, f"{subject} {key} rule")
+                for peer in _list(rule.get(peers_key), field, f"{subject} {key} {peers_key}"):
+                    _dict(peer, field, f"{subject} {key} {peers_key} peer")
+                for entry in _list(rule.get("ports"), field, f"{subject} {key} ports"):
+                    _dict(entry, field, f"{subject} {key} port")
+                rules[direction].append(rule)
         policies.append({"namespace": namespace, "name": name, "selector": selector, "types": types, "rules": rules})
     return policies
 
 
-def _parse_pods(items: list, field: str) -> list[dict]:
-    pods = []
+def _parse_pods(items: list[object], field: str) -> list[_Pod]:
+    pods: list[_Pod] = []
     for index, item in enumerate(items):
         item = _dict(item, field, f"{field}[{index}]")
         pods.append({
@@ -1311,41 +1431,41 @@ def _parse_pods(items: list, field: str) -> list[dict]:
 _PEER_KEY = {"Ingress": "from", "Egress": "to"}
 
 
-def _all_ports(rule: dict) -> bool:
+def _all_ports(rule: dict[str, object]) -> bool:
     """Whether a rule's ports admit every port: no ports at all, or an entry without `port` (every port of its protocol)."""
     entries = _list(rule.get("ports"), "network_policies", "ports")
     return not entries or any(_dict(entry, "network_policies", "NetworkPolicy port").get("port") is None for entry in entries)
 
 
-def _rule_open(rule: dict, direction: str) -> bool:
+def _rule_open(rule: dict[str, object], direction: str) -> bool:
     """A rule without peers that admits every port matches all traffic of its direction (empty from/to mean 'any')."""
     return not rule.get(_PEER_KEY[direction]) and _all_ports(rule)
 
 
-def _rule_world_open(rule: dict, direction: str) -> bool:
+def _rule_world_open(rule: dict[str, object], direction: str) -> bool:
     """A rule that admits every port whose peers include an ipBlock that spans the whole address space (a /0 without `except`)."""
     if not _all_ports(rule):
         return False
-    for peer in rule.get(_PEER_KEY[direction]) or []:
+    for peer in _list(rule.get(_PEER_KEY[direction]), "network_policies", "peers"):
         block = peer.get("ipBlock") if isinstance(peer, dict) else None
         if not isinstance(block, dict) or block.get("except"):
             continue
         try:
-            if ipaddress.ip_network(block.get("cidr"), strict=False).prefixlen == 0:
+            if _ip_network(block.get("cidr"), strict=False).prefixlen == 0:
                 return True
         except (ValueError, TypeError):
             continue
     return False
 
 
-def _default_deny(policy: dict, direction: str) -> bool:
+def _default_deny(policy: _NetPol, direction: str) -> bool:
     return direction in policy["types"] and _selector_empty(policy["selector"]) and not policy["rules"][direction]
 
 
 # --- mesh_netpol_coverage ------------------------------------------------------------------------------------------
 
 
-def _netpol_coverage(payload: dict) -> dict:
+def _netpol_coverage(payload: dict[str, object]) -> dict[str, object]:
     policies = _parse_netpols(_list(payload["network_policies"], "network_policies", "network_policies"), "network_policies")
     pods = _parse_pods(_list(payload["pods"], "pods", "pods"), "pods")
     require_egress = bool(payload.get("require_egress", False))
@@ -1353,12 +1473,13 @@ def _netpol_coverage(payload: dict) -> dict:
     namespaces |= {_str(n, "namespaces", "namespace") for n in _list(payload.get("namespaces"), "namespaces", "namespaces")}
     if len(namespaces) > MAX_NAMESPACES:
         raise _Invalid("network_policies", f"at most {MAX_NAMESPACES} namespaces are analysed per call, got {len(namespaces)}")
-    findings: list[dict] = []
-    rows, uncovered = [], []
+    findings: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
+    uncovered: list[str] = []
     for namespace in sorted(namespaces):
         local = [p for p in policies if p["namespace"] == namespace]
         members = [p for p in pods if p["namespace"] == namespace]
-        row = {"namespace": namespace, "pod_count": len(members)}
+        row: dict[str, object] = {"namespace": namespace, "pod_count": len(members)}
         for direction in POLICY_TYPES:
             lower = direction.lower()
             open_pods = 0
@@ -1398,7 +1519,7 @@ def _netpol_coverage(payload: dict) -> dict:
             "uncovered_namespaces": uncovered, **_report(findings)}
 
 
-def netpol_coverage(payload: dict) -> dict:
+def netpol_coverage(payload: dict[str, object]) -> dict[str, object]:
     """NetworkPolicy default-deny coverage per namespace. Kubernetes semantics: a pod is isolated for a direction once any
     policy selects it with that policyType (default policyTypes: Ingress always, Egress only when the egress list is non-empty);
     policies are purely additive allow-lists, so a rule with no peers that admits every port (no ports, or an entry without
@@ -1408,13 +1529,13 @@ def netpol_coverage(payload: dict) -> dict:
     ingress default-deny is major (minor/info for egress and when every pod is already isolated individually); `require_egress`
     raises egress to major. A port entry without `port` counts as open whatever its protocol, so an allow-all UDP entry is
     treated as open too (conservative: the reachability tool checks one protocol at a time)."""
-    return respond(payload, _guarded(_netpol_coverage, payload))
+    return _respond(payload, _netpol_coverage)
 
 
 # --- mesh_netpol_reachability --------------------------------------------------------------------------------------
 
 
-def _peer_matches(peer, policy_ns: str, other: dict, ns_labels: dict, notes: list[str]) -> bool:
+def _peer_matches(peer: object, policy_ns: str, other: _Pod, ns_labels: dict[str, dict[str, object]], notes: list[str]) -> bool:
     peer = _dict(peer, "network_policies", "NetworkPolicy peer")
     block, pod_selector, ns_selector = peer.get("ipBlock"), peer.get("podSelector"), peer.get("namespaceSelector")
     if block is not None:
@@ -1422,15 +1543,15 @@ def _peer_matches(peer, policy_ns: str, other: dict, ns_labels: dict, notes: lis
             raise _Invalid("network_policies", "a NetworkPolicy peer cannot combine ipBlock with a selector")
         block = _dict(block, "network_policies", "ipBlock")
         try:
-            network = ipaddress.ip_network(block.get("cidr"), strict=False)
-            excluded = [ipaddress.ip_network(x, strict=False) for x in _list(block.get("except"), "network_policies", "ipBlock.except")]
+            network = _ip_network(block.get("cidr"), strict=False)
+            excluded = [_ip_network(x, strict=False) for x in _list(block.get("except"), "network_policies", "ipBlock.except")]
         except (ValueError, TypeError):
             raise _Invalid("network_policies", f"ipBlock {block!r} has an invalid cidr or except entry") from None
         if not other["ip"]:
             notes.append(f"ipBlock peer not evaluated: pod {other['namespace']}/{other['name']} has no ip")
             return False
         try:
-            address = ipaddress.ip_address(other["ip"])
+            address = _ip_address(other["ip"])
         except ValueError:
             raise _Invalid("pods", f"pod {other['namespace']}/{other['name']} ip {other['ip']!r} is not an IP address") from None
         notes.append("ipBlock evaluated against a pod ip: Kubernetes documents ipBlock for cluster-external addresses and CNI plugins differ")
@@ -1446,7 +1567,7 @@ def _peer_matches(peer, policy_ns: str, other: dict, ns_labels: dict, notes: lis
     return pod_selector is None or _selector_matches(pod_selector, other["labels"], "network_policies")
 
 
-def _ports_match(ports: list, port: int, protocol: str, destination: dict) -> bool:
+def _ports_match(ports: list[object], port: int, protocol: str, destination: _Pod) -> bool:
     if not ports:
         return True
     for entry in ports:
@@ -1480,14 +1601,14 @@ def _ports_match(ports: list, port: int, protocol: str, destination: dict) -> bo
     return False
 
 
-def _side(direction: str, policies: list[dict], subject: dict, other: dict, destination: dict, ns_labels: dict, port: int,
-          protocol: str, notes: list[str]) -> tuple[bool, bool, list[str]]:
+def _side(direction: str, policies: list[_NetPol], subject: _Pod, other: _Pod, destination: _Pod,
+          ns_labels: dict[str, dict[str, object]], port: int, protocol: str, notes: list[str]) -> tuple[bool, bool, list[str]]:
     """(isolated, allowed, names of allowing policies) for one pod and direction."""
     selecting = [p for p in policies if p["namespace"] == subject["namespace"] and direction in p["types"]
                  and _selector_matches(p["selector"], subject["labels"], "network_policies")]
     if not selecting:
         return False, True, []
-    allowing = []
+    allowing: list[str] = []
     for policy in selecting:
         for rule in policy["rules"][direction]:
             peers = _list(rule.get(_PEER_KEY[direction]), "network_policies", "peers")
@@ -1498,23 +1619,26 @@ def _side(direction: str, policies: list[dict], subject: dict, other: dict, dest
     return True, bool(allowing), sorted(allowing)
 
 
-def _netpol_reachability(payload: dict) -> dict:
+def _netpol_reachability(payload: dict[str, object]) -> dict[str, object]:
     policies = _parse_netpols(_list(payload["network_policies"], "network_policies", "network_policies"), "network_policies")
     pods = _parse_pods(_list(payload["pods"], "pods", "pods"), "pods")
-    ns_labels: dict[str, dict] = {}
+    ns_labels: dict[str, dict[str, object]] = {}
     for index, item in enumerate(_list(payload.get("namespaces"), "namespaces", "namespaces")):
         item = _dict(item, "namespaces", f"namespaces[{index}]")
         name = _str(item.get("name"), "namespaces", f"namespaces[{index}].name")
         ns_labels[name] = {NAMESPACE_NAME_LABEL: name, **_labels(item.get("labels"), "namespaces", "labels")}
-    port, protocol = payload["port"], payload.get("protocol", "TCP")
-    if protocol not in NETWORK_PROTOCOLS:
+    port = cast(int, payload["port"])  # schema: integer 1..65535 (input_schema); _ports_match compares it with pod ports
+    protocol = payload.get("protocol", "TCP")
+    if not isinstance(protocol, str) or protocol not in NETWORK_PROTOCOLS:
         raise _Invalid("protocol", f"protocol {protocol!r} must be one of {', '.join(NETWORK_PROTOCOLS)}")
-    found = {}
+    found: dict[str, _Pod] = {}
     for field in ("source", "destination"):
-        ref = payload[field]
-        match = [p for p in pods if (p["namespace"], p["name"]) == (ref["namespace"], ref["name"])]
+        ref = _dict(payload[field], field, f"{field} pod reference")
+        namespace = _str(ref.get("namespace"), field, f"{field}.namespace")
+        name = _str(ref.get("name"), field, f"{field}.name")
+        match = [p for p in pods if (p["namespace"], p["name"]) == (namespace, name)]
         if not match:
-            raise _Invalid(field, f"pod {ref['namespace']}/{ref['name']} is not in pods")
+            raise _Invalid(field, f"pod {namespace}/{name} is not in pods")
         found[field] = match[0]
     source, destination = found["source"], found["destination"]
     if source is destination:
@@ -1549,22 +1673,22 @@ def _netpol_reachability(payload: dict) -> dict:
     }
 
 
-def netpol_reachability(payload: dict) -> dict:
+def netpol_reachability(payload: dict[str, object]) -> dict[str, object]:
     """Can `source` reach `destination` on protocol/port. Both sides must allow it: the source's egress policies and the
     destination's ingress policies. A direction without any selecting policy is open; otherwise some rule must name the other
     pod (bare podSelector = policy namespace, namespaceSelector = labels incl. kubernetes.io/metadata.name, both = AND,
     ipBlock matches the pod `ip` minus `except`) and the port (protocol defaults TCP, numeric, named via the destination
     pod's ports, or a port..endPort range). A rule without peers or ports matches everything. At most 50 allowing policy names
     are listed per side."""
-    return respond(payload, _guarded(_netpol_reachability, payload))
+    return _respond(payload, _netpol_reachability)
 
 
 # --- call-chain tools ----------------------------------------------------------------------------------------------
 
 
-def _chain(calls: list, field: str) -> list[dict]:
+def _chain(calls: list[object], field: str) -> list[dict[str, object]]:
     """Validate an ordered call chain: calls[i+1].caller must be calls[i].callee."""
-    out = []
+    out: list[dict[str, object]] = []
     for index, item in enumerate(calls):
         item = _dict(item, field, f"{field}[{index}]")
         caller = _str(item.get("caller"), field, f"{field}[{index}].caller")
@@ -1575,16 +1699,18 @@ def _chain(calls: list, field: str) -> list[dict]:
     return out
 
 
-def _chain_cycle(chain: list[dict]) -> list[str]:
-    path = [chain[0]["caller"]] + [c["callee"] for c in chain]
+def _chain_cycle(chain: list[dict[str, object]]) -> list[str]:
+    path = [str(chain[0]["caller"])] + [str(c["callee"]) for c in chain]
     return sorted({s for s in path if path.count(s) > 1})
 
 
-def _retry_amplification(payload: dict) -> dict:
+def _retry_amplification(payload: dict[str, object]) -> dict[str, object]:
     chain = _chain(_list(payload["calls"], "calls", "calls"), "calls")
     limit = _dec(payload["max_multiplier"])
-    findings: list[dict] = []
-    cumulative, hops, crossed, unbudgeted = Decimal(1), [], None, 0
+    findings: list[dict[str, str]] = []
+    cumulative, unbudgeted = Decimal(1), 0
+    hops: list[dict[str, object]] = []
+    crossed: tuple[int, dict[str, object]] | None = None
     for index, call in enumerate(chain):
         retries = _nonneg_int(call.get("retries"), "calls", f"calls[{index}].retries")
         budget = call.get("budget_percent")
@@ -1611,28 +1737,30 @@ def _retry_amplification(payload: dict) -> dict:
             "over_budget": cumulative > limit, "hops": hops, **_report(findings)}
 
 
-def retry_amplification(payload: dict) -> dict:
+def retry_amplification(payload: dict[str, object]) -> dict[str, object]:
     """Worst-case load multiplication of retries along caller->callee hops. `retries` are extra attempts after the first
     (Istio retries.attempts, Envoy num_retries), so a hop multiplies load by 1+retries and the load on hop k is the product up
     to k when every attempt fails. A `budget_percent` (Envoy retry budget, an Envoy-level setting that VirtualService does not
     expose: concurrent retries may use at most that share of active requests, default 20) is modelled as capping a hop's extra
     load at min(retries, budget/100); Envoy's min_retry_concurrency (default 3) is ignored, so the figure is an approximation.
     Over budget means strictly above `max_multiplier`."""
-    return respond(payload, _guarded(_retry_amplification, payload))
+    return _respond(payload, _retry_amplification)
 
 
-def _timeout_hierarchy(payload: dict) -> dict:
+def _timeout_hierarchy(payload: dict[str, object]) -> dict[str, object]:
     chain = _chain(_list(payload["calls"], "calls", "calls"), "calls")
-    min_gap = payload.get("min_gap_ms", 1)
-    findings: list[dict] = []
-    totals, attempts = [], []
+    min_gap = cast(int, payload.get("min_gap_ms", 1))  # schema: integer 1..3600000 (input_schema); compared with whole gaps below
+    findings: list[dict[str, str]] = []
+    totals: list[int] = []
+    attempts: list[int] = []
     for index, call in enumerate(chain):
         timeout = call.get("timeout_ms")
         if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
             raise _Invalid("calls", f"calls[{index}].timeout_ms must be a positive integer")
         per_try = call.get("per_try_timeout_ms")
-        if per_try is not None and (isinstance(per_try, bool) or not isinstance(per_try, int) or per_try <= 0):
-            raise _Invalid("calls", f"calls[{index}].per_try_timeout_ms must be a positive integer")
+        if per_try is not None:
+            if isinstance(per_try, bool) or not isinstance(per_try, int) or per_try <= 0:
+                raise _Invalid("calls", f"calls[{index}].per_try_timeout_ms must be a positive integer")
         retries = _nonneg_int(call.get("retries", 0), "calls", f"calls[{index}].retries")
         label = f"{call['caller']}->{call['callee']}"
         if per_try is not None and per_try > timeout:
@@ -1640,7 +1768,7 @@ def _timeout_hierarchy(payload: dict) -> dict:
         elif retries and per_try is None:
             findings.append(_finding("TIMEOUT-RETRIES-NO-PERTRY", "minor", f"{label}: {retries} retries without a per-try timeout; the first "
                                      f"attempt can consume the whole {timeout}ms"))
-        elif retries and per_try * (retries + 1) > timeout:
+        elif retries and per_try is not None and per_try * (retries + 1) > timeout:
             findings.append(_finding("TIMEOUT-RETRIES-EXCEED-TOTAL", "minor", f"{label}: {retries + 1} tries of {per_try}ms cannot finish within {timeout}ms"))
         totals.append(timeout)
         attempts.append(min(per_try, timeout) if per_try is not None else timeout)
@@ -1658,18 +1786,18 @@ def _timeout_hierarchy(payload: dict) -> dict:
             "tightest_gap_ms": min(gaps) if gaps else 0, **_report(findings)}
 
 
-def timeout_hierarchy(payload: dict) -> dict:
+def timeout_hierarchy(payload: dict[str, object]) -> dict[str, object]:
     """Timeouts must shrink toward the leaf. For consecutive calls the caller's attempt budget (per_try_timeout_ms capped at
     timeout_ms, else timeout_ms) must exceed the callee's own total timeout by at least `min_gap_ms`: a negative gap is major
     (the caller gives up first and the callee keeps working), a gap below the minimum is minor, equality with the minimum is
     accepted. Also flags per-try above total, retries without a per-try timeout, and (retries+1) x per-try above the total."""
-    return respond(payload, _guarded(_timeout_hierarchy, payload))
+    return _respond(payload, _timeout_hierarchy)
 
 
 # --- mesh_dns_ndots ------------------------------------------------------------------------------------------------
 
 
-def _name_cost(name: str, target: str, ndots: int, search: list[str], expected: list[str]) -> tuple[int, int, str]:
+def _name_cost(name: str, target: object, ndots: int, search: list[str], expected: list[str]) -> tuple[int, int, str]:
     """(dots, lookups until the answer, how it resolves). A lookup is one candidate name sent to the resolver (A and AAAA
     together). A name with fewer than ndots dots tries the search list first, otherwise it is tried as written first.
     A trailing dot marks an absolute name; IP literals need no lookup. A `cluster` name written as svc, svc.ns or svc.ns.svc
@@ -1688,20 +1816,21 @@ def _name_cost(name: str, target: str, ndots: int, search: list[str], expected: 
     return dots, (len(search) + 1 if dots < ndots else 1), "absolute"
 
 
-def _dns_ndots(payload: dict) -> dict:
-    ndots, namespace = payload["ndots"], _str(payload["namespace"], "namespace", "namespace")
+def _dns_ndots(payload: dict[str, object]) -> dict[str, object]:
+    ndots = cast(int, payload["ndots"])  # schema: integer 0..15 (input_schema); compared with dot counts in _name_cost
+    namespace = _str(payload["namespace"], "namespace", "namespace")
     domain = _str(payload.get("cluster_domain", DEFAULT_CLUSTER_DOMAIN), "cluster_domain", "cluster_domain").strip(".")
     search = [_str(s, "search_domains", "search domain") for s in _list(payload["search_domains"], "search_domains", "search_domains")]
     for entry in search:
         if any(c.isspace() for c in entry) or ".." in entry:
             raise _Invalid("search_domains", f"search domain {entry!r} is not a valid DNS suffix")
     expected = [f"{namespace}.svc.{domain}", f"svc.{domain}", domain]
-    findings: list[dict] = []
+    findings: list[dict[str, str]] = []
     joined = len(" ".join(search))
     if len(search) > MAX_DNS_SEARCH_PATHS or joined > MAX_DNS_SEARCH_CHARS:
         findings.append(_finding("DNS-SEARCH-LIMIT", "major", f"search list has {len(search)} domains / {joined} characters; Kubernetes allows at "
                                  f"most {MAX_DNS_SEARCH_PATHS} / {MAX_DNS_SEARCH_CHARS}"))
-    entries = []
+    entries: list[tuple[str, object]] = []
     for index, item in enumerate(_list(payload["names"], "names", "names")):
         item = _dict(item, "names", f"names[{index}]")
         name = _str(item.get("name"), "names", f"names[{index}].name")
@@ -1711,7 +1840,8 @@ def _dns_ndots(payload: dict) -> dict:
         if target not in ("cluster", "external"):
             raise _Invalid("names", f"names[{index}].target must be cluster or external")
         entries.append((name, target))
-    rows, total, wasted = [], 0, 0
+    rows: list[dict[str, object]] = []
+    total, wasted = 0, 0
     for name, target in entries:
         dots, lookups, via = _name_cost(name, target, ndots, search, expected)
         rows.append({"name": name, "target": target, "dots": dots, "lookups": lookups, "wasted_lookups": max(lookups - 1, 0)})
@@ -1723,10 +1853,10 @@ def _dns_ndots(payload: dict) -> dict:
         elif lookups > 1 and dots >= ndots:
             findings.append(_finding("DNS-SHORT-NAME-WASTE", "minor", f"{name}: ndots {ndots} makes the resolver try it as written first "
                                      f"({lookups - 1} wasted lookup(s)) before the search list"))
-    best, best_total = 1, None
-    for candidate in range(1, MAX_NDOTS + 1):
+    best, best_total = 1, sum(_name_cost(n, t, 1, search, expected)[1] for n, t in entries)
+    for candidate in range(2, MAX_NDOTS + 1):
         candidate_total = sum(_name_cost(n, t, candidate, search, expected)[1] for n, t in entries)
-        if best_total is None or candidate_total < best_total:
+        if candidate_total < best_total:
             best, best_total = candidate, candidate_total
     if best_total < total:
         findings.append(_finding("DNS-NDOTS-TUNE", "info", f"ndots {best} would cut lookups for these names from {total} to {best_total}"))
@@ -1734,13 +1864,13 @@ def _dns_ndots(payload: dict) -> dict:
             "wasted_lookups": wasted, "best_ndots": best, "best_total_lookups": best_total, "names": rows, **_report(findings)}
 
 
-def dns_ndots(payload: dict) -> dict:
+def dns_ndots(payload: dict[str, object]) -> dict[str, object]:
     """Resolver cost of a pod's DNS settings (Kubernetes ClusterFirst default: ndots 5 and the search list
     <ns>.svc.<domain>, svc.<domain>, <domain>). A name with fewer dots than ndots goes through the search list before it is
     tried absolute, so an external name like api.example.com costs 4 lookups at ndots 5; a trailing dot avoids it. Each name
     declares whether it is a `cluster` service or `external`. `best_ndots` is the smallest ndots in 1..15 with the fewest total
     lookups. Kubernetes limits the search list to 32 domains and 2048 characters; ndots is clamped to 15 by glibc."""
-    return respond(payload, _guarded(_dns_ndots, payload))
+    return _respond(payload, _dns_ndots)
 
 
 # --- mesh_egress_coverage ------------------------------------------------------------------------------------------
@@ -1762,10 +1892,17 @@ def _protocol_clash(destination: str, declared: str) -> bool:
     return (destination in _TLS_CLASS and declared in _HTTP_CLASS) or (destination in _HTTP_CLASS and declared in _TLS_CLASS)
 
 
-def _egress_coverage(payload: dict) -> dict:
+class _SEntry(TypedDict):
+    subject: str
+    hosts: list[str]
+    ports: list[tuple[int, str]]
+    used: bool
+
+
+def _egress_coverage(payload: dict[str, object]) -> dict[str, object]:
     mode = payload["outbound_policy"]
-    findings: list[dict] = []
-    entries = []
+    findings: list[dict[str, str]] = []
+    entries: list[_SEntry] = []
     for index, doc in enumerate(_list(payload["service_entries"], "service_entries", "service_entries")):
         namespace, name = _meta(doc, "service_entries", index, "ServiceEntry")
         spec = _spec(doc, "service_entries", index)
@@ -1773,7 +1910,7 @@ def _egress_coverage(payload: dict) -> dict:
         hosts = [_str(h, "service_entries", f"{subject} hosts").lower() for h in _list(spec.get("hosts"), "service_entries", f"{subject} hosts")]
         if not hosts:
             raise _Invalid("service_entries", f"{subject}: spec.hosts must not be empty")
-        ports = []
+        ports: list[tuple[int, str]] = []
         for item in _list(spec.get("ports"), "service_entries", f"{subject} ports"):
             item = _dict(item, "service_entries", f"{subject} port")
             number = item.get("number")
@@ -1797,7 +1934,8 @@ def _egress_coverage(payload: dict) -> dict:
                 findings.append(_finding("SE-WILDCARD-DNS", "major", f"{subject}: wildcard host {host} cannot be resolved with {resolution} "
                                          "and no endpoints; use resolution NONE"))
         entries.append({"subject": subject, "hosts": hosts, "ports": ports, "used": False})
-    uncovered, covered, destinations = [], 0, _list(payload["destinations"], "destinations", "destinations")
+    uncovered: list[str] = []
+    covered, destinations = 0, _list(payload["destinations"], "destinations", "destinations")
     for index, item in enumerate(destinations):
         item = _dict(item, "destinations", f"destinations[{index}]")
         host = _str(item.get("host"), "destinations", f"destinations[{index}].host").lower()
@@ -1826,30 +1964,30 @@ def _egress_coverage(payload: dict) -> dict:
             "unused_entries": sorted(e["subject"] for e in entries if not e["used"] and e["ports"]), **_report(findings)}
 
 
-def egress_coverage(payload: dict) -> dict:
+def egress_coverage(payload: dict[str, object]) -> dict[str, object]:
     """Match observed outbound destinations (host, port, protocol) to Istio ServiceEntries. A ServiceEntry covers a
     destination when one host pattern ("*", "*.suffix" or exact) matches and the port number is declared. Uncovered traffic is
     blocked under outboundTrafficPolicy REGISTRY_ONLY (major) and passes unmanaged under ALLOW_ANY (minor). Also flags
     over-broad entries ("*" and top-level-domain wildcards), wildcard hosts with DNS resolution and no endpoints, resolution
     NONE on a TCP port without addresses (Istio then allows any IP on that port: major under REGISTRY_ONLY), a TLS-class
     destination on an HTTP-class port declaration (or the reverse), and unused entries."""
-    return respond(payload, _guarded(_egress_coverage, payload))
+    return _respond(payload, _egress_coverage)
 
 
 # --- mesh_cidr_overlap ---------------------------------------------------------------------------------------------
 
 _CIDR_KINDS = ("pod", "service", "node")
-_SAME_CLUSTER = {("pod", "service"): "blocker", ("node", "pod"): "major", ("node", "service"): "major",
+_SAME_CLUSTER: dict[tuple[str, ...], str] = {("pod", "service"): "blocker", ("node", "pod"): "major", ("node", "service"): "major",
                  ("pod", "pod"): "major", ("service", "service"): "major", ("node", "node"): "major"}
-_ROUTED = {("pod", "pod"): "blocker", ("node", "node"): "blocker", ("node", "pod"): "blocker", ("pod", "service"): "major",
+_ROUTED: dict[tuple[str, ...], str] = {("pod", "pod"): "blocker", ("node", "node"): "blocker", ("node", "pod"): "blocker", ("pod", "service"): "major",
            ("node", "service"): "major", ("service", "service"): "minor"}
 
 
-def _cidr_overlap(payload: dict) -> dict:
+def _cidr_overlap(payload: dict[str, object]) -> dict[str, object]:
     connectivity = payload["connectivity"]
     if connectivity not in ("routed", "gateway"):
         raise _Invalid("connectivity", "connectivity must be routed or gateway")
-    entries: list[tuple[str, str, object]] = []
+    entries: list[tuple[str, str, _Network]] = []
     names: set[str] = set()
     for index, cluster in enumerate(_list(payload["clusters"], "clusters", "clusters")):
         cluster = _dict(cluster, "clusters", f"clusters[{index}]")
@@ -1860,10 +1998,10 @@ def _cidr_overlap(payload: dict) -> dict:
         for kind in _CIDR_KINDS:
             for text in _list(cluster.get(f"{kind}_cidrs"), "clusters", f"{name} {kind}_cidrs"):
                 try:
-                    entries.append((name, kind, ipaddress.ip_network(text, strict=True)))
+                    entries.append((name, kind, _ip_network(text, strict=True)))
                 except (ValueError, TypeError):
                     raise _Invalid("clusters", f"{name} {kind}_cidrs entry {text!r} is not a CIDR with zeroed host bits") from None
-    findings: list[dict] = []
+    findings: list[dict[str, str]] = []
     overlaps = 0
     for i, (cluster_a, kind_a, net_a) in enumerate(entries):
         for cluster_b, kind_b, net_b in entries[i + 1:]:
@@ -1874,14 +2012,14 @@ def _cidr_overlap(payload: dict) -> dict:
             same = cluster_a == cluster_b
             severity = _SAME_CLUSTER[kinds] if same else _ROUTED[kinds] if connectivity == "routed" else (
                 "major" if kinds == ("node", "node") else "info")
-            relation = "is identical to" if net_a == net_b else "contains" if net_b.subnet_of(net_a) else "is inside"
+            relation = "is identical to" if net_a == net_b else "contains" if _subnet_of(net_b, net_a) else "is inside"
             scope = "SAME" if same else "CROSS"
             findings.append(_finding(f"CIDR-{scope}-{kinds[0].upper()}-{kinds[1].upper()}", severity,
                                      f"{cluster_a} {kind_a} {net_a} {relation} {cluster_b} {kind_b} {net_b}"))
     return {"state": "SUCCESS", "cluster_count": len(names), "cidr_count": len(entries), "overlap_count": overlaps, **_report(findings)}
 
 
-def cidr_overlap(payload: dict) -> dict:
+def cidr_overlap(payload: dict[str, object]) -> dict[str, object]:
     """Pod, service and node CIDR overlaps within and between clusters (same IP version only; host bits must be zero). The
     severity table is this tool's policy, not a standard. Inside one cluster pod/service overlap is a blocker and every other
     overlap is major. Between clusters with `routed` connectivity (pod IPs routed directly: flat VPC peering, Cilium Cluster Mesh,
@@ -1889,13 +2027,13 @@ def cidr_overlap(payload: dict) -> dict:
     major, service/service is minor (assumes ClusterIPs stay cluster-local; global-service setups such as Submariner may need it
     disjoint). With `gateway` connectivity (east-west gateways) only node/node overlap matters (major); the rest is reported as
     info for a later move to routed networking."""
-    return respond(payload, _guarded(_cidr_overlap, payload))
+    return _respond(payload, _cidr_overlap)
 
 
 # --- mesh_ingress_tls ----------------------------------------------------------------------------------------------
 
 
-def _tls_version(value, field: str, what: str):
+def _tls_version(value: object, field: str, what: str) -> tuple[int, int] | None:
     """Wire version tuple for SSLv3 / TLSv1.0..1.3 in nginx, Envoy (TLSv1_2) or Istio (TLSV1_2) spelling; None for TLS_AUTO."""
     text = str(value).strip().upper().replace("_", ".")
     if text == "TLS.AUTO":
@@ -1935,8 +2073,8 @@ def _san_covers(san: str, host: str) -> bool:
     return False
 
 
-def _ingress_tls(payload: dict) -> dict:
-    findings: list[dict] = []
+def _ingress_tls(payload: dict[str, object]) -> dict[str, object]:
+    findings: list[dict[str, str]] = []
     listeners = _list(payload["listeners"], "listeners", "listeners")
     terminating = 0
     for index, item in enumerate(listeners):
@@ -1964,8 +2102,9 @@ def _ingress_tls(payload: dict) -> dict:
         if ciphers and low != TLS_VERSIONS["1.3"]:  # a TLS 1.3 floor makes the (configurable) TLS 1.2 list irrelevant
             groups: dict[str, list[str]] = {"weak": [], "no_pfs": [], "cbc": [], "unknown": []}
             for cipher in ciphers:
-                for flag in _cipher_flags(_str(cipher, "listeners", f"{name} cipher")) & set(groups):
-                    groups[flag].append(cipher)
+                cipher_name = _str(cipher, "listeners", f"{name} cipher")
+                for flag in _cipher_flags(cipher_name) & set(groups):
+                    groups[flag].append(cipher_name)
             for flag, fid, severity, text in (("weak", "TLS-CIPHER-WEAK", "major", "weak (RC4, RC2, DES/3DES, NULL, EXPORT, anonymous or MD5)"),
                                               ("no_pfs", "TLS-CIPHER-NO-PFS", "minor", "without forward secrecy (no ECDHE/DHE)"),
                                               ("cbc", "TLS-CIPHER-CBC", "minor", "non-AEAD (CBC)"),
@@ -1996,11 +2135,11 @@ def _ingress_tls(payload: dict) -> dict:
     return {"state": "SUCCESS", "listener_count": len(listeners), "tls_listener_count": terminating, **_report(findings)}
 
 
-def ingress_tls(payload: dict) -> dict:
+def ingress_tls(payload: dict[str, object]) -> dict[str, object]:
     """TLS hygiene of ingress listeners. Version floor: SSLv3 blocker (RFC 7568), TLS 1.0/1.1 major (RFC 8996). Ciphers (up to
     TLS 1.2; names in IANA or OpenSSL spelling): RC4, RC2, DES/3DES, NULL, EXPORT, anonymous and MD5 are major, suites without
     ECDHE/DHE and non-AEAD CBC suites minor (house classification). Certificate: a reference is required and, when SANs are
     given, every hostname must be covered (a wildcard SAN covers exactly one label, RFC 6125). HSTS (RFC 6797): missing or
     max-age below one year (the hstspreload.org minimum, used here as the recommendation) is minor, preload needs a one-year
     max-age and includeSubDomains. Plaintext listeners are minor unless they only redirect."""
-    return respond(payload, _guarded(_ingress_tls, payload))
+    return _respond(payload, _ingress_tls)

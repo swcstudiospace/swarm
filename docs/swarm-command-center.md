@@ -441,7 +441,7 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `SWARM_STALL_AFTER_S` | 180 | `telemetry.py` | No-activity limit for `stalled` |
 | `SWARM_CANCEL_GRACE_S` | 10 | `swarm_run.py` | Cooperative-cancel wait (see section 4 for the cap) |
 | `SWARM_SHUTDOWN_BUDGET_S` | 15 | `swarm_run.py` | Whole-shutdown budget; set by `autonomous_run.py` from `SWARM_AUTONOMOUS_RUN_GRACE_S` |
-| `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 2 / 120 | `swarm/retry.py`, `swarm/limiter.py` | Backoff base and cap; the cap also bounds `Retry-After` |
+| `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 0.1 / 5 | `swarm/retry.py`; `swarm/limiter.py` | Backoff base and cap. When set, `SWARM_RETRY_CAP_S` also bounds `Retry-After` (its own default there stays 120 s) |
 | `SWARM_RATE_COOLDOWN_S` | 60 | `swarm/limiter.py` | Wait before one slot is added back after a rate limit or a failure circuit trip |
 | `SWARM_FAIL_STREAK` | 3 | `scripts/swarm_run.py` | Consecutive failures of distinct tasks (no success between) that halve the effective parallelism once; `0` disables the circuit; a malformed value is an input error |
 | `SWARM_HANDOVER_MAX_BYTES` | 16384 | `swarm/handover.py` | Size cap of one handover |

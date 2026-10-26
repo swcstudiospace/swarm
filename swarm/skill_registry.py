@@ -16,6 +16,8 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Callable
+from typing import Any
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,7 +28,7 @@ MAX_BYTES = 6 * 1024
 MAX_DESCRIPTION = 160
 FRONTMATTER_KEYS = ("name", "description", "owner", "tools")
 SECTIONS = ("When to Use", "Procedure", "Outputs", "Failure Handling", "Handover")
-DEFAULT_POLICY: dict = {"tools": {"min": 10, "max": 15}, "skills": {"min": 10, "max": 15}}
+DEFAULT_POLICY: dict[str, dict[str, int]] = {"tools": {"min": 10, "max": 15}, "skills": {"min": 10, "max": 15}}
 SIMILARITY_LIMIT = 0.85
 # omp skills the generator itself writes (build_agents: A01's driver skill); a source skill may never take the name.
 # Agent index skills are named by agent slug, which no source name can equal (`<slug>--<short>` or `swarm-<short>`).
@@ -153,7 +155,7 @@ def skills_for_owner(skills: list[Skill], owner: str) -> list[Skill]:
     return [s for s in skills if s.owner_dir == owner]
 
 
-def skills_for(owner: str, *, root: Path | str | None = None) -> list[dict]:
+def skills_for(owner: str, *, root: Path | str | None = None) -> list[dict[str, Any]]:
     """Catalog view of one owner's skills (an agent slug or `shared`): dicts with name, description, owner, tools."""
     return [
         {"name": s.name, "description": s.description, "owner": s.owner_dir, "tools": list(s.tools), "path": s.path}
@@ -210,7 +212,7 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / len(a | b)
 
 
-def _policy(agents_doc: dict) -> tuple[dict, bool]:
+def _policy(agents_doc: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """(effective policy, whether the registry states a skills minimum explicitly)."""
     given = agents_doc.get("capability_policy")
     given = given if isinstance(given, dict) else {}
@@ -224,10 +226,10 @@ def _min_enforced(entry: object) -> bool:
     return not (isinstance(entry, dict) and entry.get("enforce") is False)
 
 
-def _tool_callers(agents_doc: dict) -> dict[str, set[str]]:
+def _tool_callers(agents_doc: dict[str, Any]) -> dict[str, set[str]]:
     """Registry tool name -> permitted caller agent ids, over agent registered_tools and shared_tools."""
     callers: dict[str, set[str]] = {}
-    containers: list[dict] = []
+    containers: list[dict[str, Any]] = []
     for agent in agents_doc.get("agents") or []:
         if isinstance(agent, dict):
             containers.extend(t for t in agent.get("registered_tools") or [] if isinstance(t, dict))
@@ -240,7 +242,7 @@ def _tool_callers(agents_doc: dict) -> dict[str, set[str]]:
     return callers
 
 
-def validate_skills(skills: list[Skill], agents_doc: dict, *, counts: bool = True) -> list[str]:
+def validate_skills(skills: list[Skill], agents_doc: dict[str, Any], *, counts: bool = True) -> list[str]:
     """One message per problem, each starting with the offending file (or `agents.json`). Empty means valid.
 
     `counts=False` skips the per-owner count policy (the generator validates content only; counts are a registry gate).
@@ -288,7 +290,7 @@ def validate_skills(skills: list[Skill], agents_doc: dict, *, counts: bool = Tru
     return errors
 
 
-def _check_name(s: Skill, err, reserved: frozenset[str] = frozenset()) -> None:
+def _check_name(s: Skill, err: Callable[[str], None], reserved: frozenset[str] = frozenset()) -> None:
     if s.name in reserved:
         err(f"{s.path}: skill name {s.name!r} is reserved for a generated skill (driver or agent index); pick another name")
     if s.owner_dir == SHARED_OWNER:
@@ -303,7 +305,8 @@ def _check_name(s: Skill, err, reserved: frozenset[str] = frozenset()) -> None:
         err(f"{s.path}: file name {s.stem + '.md'!r} must equal the <short> part of the name ({s.short + '.md'!r})")
 
 
-def _check_tools(s: Skill, callers: dict[str, set[str]], agent_ids: set[str], slug_to_id: dict[str, str], err) -> None:
+def _check_tools(s: Skill, callers: dict[str, set[str]], agent_ids: set[str], slug_to_id: dict[str, str],
+                 err: Callable[[str], None]) -> None:
     seen: set[str] = set()
     for tool in s.tools:
         if tool in seen:
@@ -320,7 +323,7 @@ def _check_tools(s: Skill, callers: dict[str, set[str]], agent_ids: set[str], sl
             err(f"{s.path}: owner {s.owner_dir} ({slug_to_id[s.owner_dir]}) is not a permitted caller of {tool!r}")
 
 
-def _check_cited_tools(s: Skill, callers: dict[str, set[str]], err) -> None:
+def _check_cited_tools(s: Skill, callers: dict[str, set[str]], err: Callable[[str], None]) -> None:
     """Every registry tool a Procedure step calls (`call <tool>`, `Call `<tool>``) must be in the skill's own `tools`
     list: the list is what the agent page and the generated skill advertise. A tool only mentioned (`never call the
     <tool>`, `<tool> gives only names`) is prose, not a call."""
@@ -331,7 +334,7 @@ def _check_cited_tools(s: Skill, callers: dict[str, set[str]], err) -> None:
             err(f"{s.path}: procedure step {number} calls tool {tool!r}, which is not in the skill's tools list")
 
 
-def _check_sections(s: Skill, err) -> None:
+def _check_sections(s: Skill, err: Callable[[str], None]) -> None:
     found = _h2_headings(s.body)
     for section in SECTIONS:
         if section not in found:
@@ -355,7 +358,8 @@ def _check_sections(s: Skill, err) -> None:
                 err(f"{s.path}: procedure step {number} names no tool or script it uses")
 
 
-def _check_counts(skills: list[Skill], agents_doc: dict, slug_to_id: dict[str, str], policy: dict, explicit_min: bool) -> list[str]:
+def _check_counts(skills: list[Skill], agents_doc: dict[str, Any], slug_to_id: dict[str, str], policy: dict[str, Any],
+                  explicit_min: bool) -> list[str]:
     errors: list[str] = []
     lo, hi = _bounds(policy.get("skills"))
     if not _min_enforced(policy.get("skills")):
@@ -413,7 +417,7 @@ def _check_duplicates(skills: list[Skill]) -> list[str]:
     return errors
 
 
-def _check_baseline(agents_doc: dict, names: dict[str, str]) -> list[str]:
+def _check_baseline(agents_doc: dict[str, Any], names: dict[str, str]) -> list[str]:
     """When `shared_baseline.skills` is a list of names, each must exist as a skill source."""
     baseline = agents_doc.get("shared_baseline")
     wanted = baseline.get("skills") if isinstance(baseline, dict) else None
@@ -452,7 +456,7 @@ def _tools_cell(tools: tuple[str, ...]) -> str:
     return ", ".join(f"`{t}`" for t in tools) if tools else "none"
 
 
-def _owners(skills: list[Skill], agents_doc: dict) -> list[tuple[str, str]]:
+def _owners(skills: list[Skill], agents_doc: dict[str, Any]) -> list[tuple[str, str]]:
     """(owner dir, display title) in page order: shared first, then agents in registry order."""
     owners = [(SHARED_OWNER, "Shared baseline")]
     for agent in agents_doc.get("agents") or []:
@@ -466,7 +470,7 @@ def _owners(skills: list[Skill], agents_doc: dict) -> list[tuple[str, str]]:
     return owners
 
 
-def render_docs(skills: list[Skill], agents_doc: dict) -> dict[str, str]:
+def render_docs(skills: list[Skill], agents_doc: dict[str, Any]) -> dict[str, str]:
     """Repo-relative path -> generated text: the catalog plus one page per owner (shared included)."""
     owners = _owners(skills, agents_doc)
     catalog = [
@@ -504,7 +508,7 @@ def render_docs(skills: list[Skill], agents_doc: dict) -> dict[str, str]:
     return {CATALOG_PATH: "\n".join(catalog), **pages}
 
 
-def write_docs(skills: list[Skill], agents_doc: dict, root: Path, *, check: bool) -> int:
+def write_docs(skills: list[Skill], agents_doc: dict[str, Any], root: Path, *, check: bool) -> int:
     """Write the generated docs under `root`, or with `check` fail naming each stale, missing or orphan file."""
     rendered = render_docs(skills, agents_doc)
     drifted: list[str] = []

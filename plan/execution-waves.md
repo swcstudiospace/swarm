@@ -12,8 +12,8 @@ fan-out/fan-in with barrier join; Wasmer = FULL core sandbox (user override 2026
 perf = parity-or-better `[ASSUMPTION]` (n5 §6, not a measured SLO); cap ≤ 30
 threads/session; Python truth on any divergence; no mixed-engine joins within one
 session join (U4.3 / n4 §3); combo = B-shell/A-engine/C-supervisor × R-S strangler
-with R-G fallback discipline; out of scope: no 31st agent, no TS rewrite, no UI
-design, no workflowz language, no merged matrix/nexus abstraction. Browser delivery
+with R-G fallback discipline; out of scope: no 31st agent, no TS rewrite, no product UI
+design (the Phase 13 browser runtime and its status surface are in scope), no workflowz language, no merged matrix/nexus abstraction. Browser delivery
 (Phase 13, COOP/COEP-isolated runtime) is in scope per the 2026-10-22 user decision.
 
 ## Binding constraints on all waves (n5 may-NOT-assume list)

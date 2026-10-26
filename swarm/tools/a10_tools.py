@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -55,8 +56,8 @@ _CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.ASCII)
 _PINNED_VERSION = re.compile(r"v?\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?(?:\+[0-9A-Za-z.]+)?", re.ASCII)
 
 
-def credential_scan(payload: dict) -> dict:
-    def work() -> dict:
+def credential_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         # Match objects are discarded; only the rule name and 1-based line number leave this function.
         findings = [
             {"rule": name, "line": number}
@@ -69,8 +70,8 @@ def credential_scan(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def cvss_band(payload: dict) -> dict:
-    def work() -> dict:
+def cvss_band(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         score = payload["score"]
         if score == 0:
             band = "none"
@@ -96,8 +97,8 @@ def _day(text: str) -> dt.date | None:
         return None
 
 
-def dependency_age(payload: dict) -> dict:
-    def work() -> dict:
+def dependency_age(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         released = _day(payload["released"])
         if released is None:
             return {"state": "INVALID_INPUT", "field": "released", "message": "released must be a valid YYYY-MM-DD date"}
@@ -112,8 +113,8 @@ def dependency_age(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def license_risk(payload: dict) -> dict:
-    def work() -> dict:
+def license_risk(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         licenses = {value.strip() for value in payload["licenses"]}
         allowed = {value.strip().lower() for value in payload["allowlist"]}
         if "" in licenses:
@@ -137,8 +138,8 @@ def _tls_key(text: str) -> str:
     return key.replace("TLSV", "TLS").replace("SSLV", "SSL")
 
 
-def tls_min_version(payload: dict) -> dict:
-    def work() -> dict:
+def tls_min_version(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         floor = _TLS_RANK[_tls_key(payload["minimum_version"])]
         below: set[str] = set()
         unrecognized: set[str] = set()
@@ -160,8 +161,8 @@ def tls_min_version(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def header_presence(payload: dict) -> dict:
-    def work() -> dict:
+def header_presence(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         observed = {value.strip().lower() for value in payload["headers"]}
         required = {value.strip().lower() for value in payload["required_headers"]}
         if "" in observed:
@@ -181,8 +182,8 @@ def _cve_set(values: list[str]) -> set[str] | None:
     return cves
 
 
-def kev_match_count(payload: dict) -> dict:
-    def work() -> dict:
+def kev_match_count(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         checked = _cve_set(payload["cve_ids"])
         if checked is None:
             return {"state": "INVALID_INPUT", "field": "cve_ids", "message": "entries must be CVE-YYYY-NNNN identifiers"}
@@ -201,8 +202,8 @@ def kev_match_count(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def sbom_summary(payload: dict) -> dict:
-    def work() -> dict:
+def sbom_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         unpinned_names: set[str] = set()
         unpinned_count = 0
         for component in payload["components"]:
@@ -229,14 +230,15 @@ def sbom_summary(payload: dict) -> dict:
 _GATE_SEVERITIES = ("info", "minor", "major", "critical", "blocker")
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _finding_key(finding: dict, group_by: str) -> str:
+def _finding_key(finding: dict[str, Any], group_by: str) -> str:
     """Group key. Findings missing a CWE or a location can never be proven the same issue: unique key."""
     if group_by == "rule":
-        return finding["rule"].strip()
+        rule: str = finding["rule"].strip()
+        return rule
     cwe = str(finding.get("cwe") or "").strip().upper()
     location = str(finding.get("location") or "").strip()
     if cwe and location:
@@ -244,15 +246,15 @@ def _finding_key(finding: dict, group_by: str) -> str:
     return f"unkeyed:{finding['id'].strip()}"
 
 
-def finding_dedup(payload: dict) -> dict:
+def finding_dedup(payload: dict[str, Any]) -> dict[str, Any]:
     """Merge findings of several scanners; severity of a group is the maximum, differing severities are conflicts."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         group_by = payload.get("group_by", "cwe_location")
         if group_by not in ("cwe_location", "rule"):
             return _invalid("group_by", "group_by must be cwe_location or rule")
         seen_ids: set[str] = set()
-        groups: dict[str, dict] = {}
+        groups: dict[str, dict[str, Any]] = {}
         for index, finding in enumerate(payload["findings"]):
             fid = finding["id"].strip()
             if not fid or not finding["tool"].strip() or not finding["rule"].strip():
@@ -267,8 +269,8 @@ def finding_dedup(payload: dict) -> dict:
             tool = finding["tool"].strip()
             rank = _GATE_SEVERITIES.index(finding["severity"])
             group["by_tool"][tool] = max(group["by_tool"].get(tool, rank), rank)
-        out_groups = []
-        conflicts = []
+        out_groups: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
         for key, group in groups.items():
             ranks = group["by_tool"].values()
             severity = _GATE_SEVERITIES[max(ranks)]
@@ -298,10 +300,10 @@ def finding_dedup(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def allowlist_check(payload: dict) -> dict:
+def allowlist_check(payload: dict[str, Any]) -> dict[str, Any]:
     """The sec_gate allow-list rules over supplied data: justification required, expired on or after `expires`."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         as_of = _day(payload["as_of"])
         if as_of is None:
             return _invalid("as_of", "as_of must be an ISO date YYYY-MM-DD")
@@ -348,7 +350,7 @@ def allowlist_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _component_map(components: list[dict], field: str) -> tuple[dict[str, str] | None, dict | None]:
+def _component_map(components: list[dict[str, Any]], field: str) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
     """name -> stripped version ("" when absent). A blank or repeated name is an error naming `field`."""
     mapping: dict[str, str] = {}
     for index, component in enumerate(components):
@@ -365,16 +367,17 @@ def _is_pinned(version: str) -> bool:
     return bool(_PINNED_VERSION.fullmatch(version))
 
 
-def sbom_diff(payload: dict) -> dict:
+def sbom_diff(payload: dict[str, Any]) -> dict[str, Any]:
     """Compare two component lists: added, removed, version-changed, and components that became unpinned."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         before, problem = _component_map(payload["before"], "before")
         if problem:
             return problem
         after, problem = _component_map(payload["after"], "after")
         if problem:
             return problem
+        assert before is not None and after is not None  # _component_map returns a mapping whenever it reports no problem
         added = [{"name": n, "version": after[n]} for n in sorted(after.keys() - before.keys())]
         removed = [{"name": n, "version": before[n]} for n in sorted(before.keys() - after.keys())]
         changed = [
