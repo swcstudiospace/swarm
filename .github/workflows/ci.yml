@@ -10,7 +10,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Every job runs on the Omega CI runner pool, never on GitHub-hosted runners
+    # (docs: swcstudiospace/Omega-Prime docs/ci-runners.md). Fork pull requests are
+    # skipped instead of queuing: the pool only takes this organisation's own code.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    # The full suite takes about 65-70 minutes (64 min on GitHub-hosted, 69 min on the pool). Bound it well
+    # above that, so a stuck test fails the job instead of holding a pool slot for GitHub's 6-hour default.
+    timeout-minutes: 120
     # Tooling and the omp suite import swarm; wheel.yml builds and gates the native extension.
     env:
       SWARM_PURE_PYTHON: "1"
@@ -20,8 +27,15 @@ jobs:
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
+      # The pool's tool cache is read-only, so a plain `pip install` falls back to the user site
+      # (~/.local). tests/conftest.py points HOME at a temp dir for every test, so the scripts the tests
+      # spawn with sys.executable could not see pytest, PyYAML or cryptography there (149 failures on main).
+      # A venv keeps the packages next to the interpreter, whatever HOME is.
       - name: install test dependencies
-        run: python3 -m pip install pytest ruff pyyaml cryptography
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install pytest ruff pyyaml cryptography
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - name: ruff
         run: ruff check .
       - name: pytest
