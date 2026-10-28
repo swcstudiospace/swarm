@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use gsd_codes::ErrorCode;
 
 mod orch_status_wire;
+pub mod pydumps;
 
 pub use orch_status_wire::{decode_reply_wire, orch_status_invoke, orch_status_reply};
 
@@ -138,6 +139,8 @@ fn write_str(text: &str, out: &mut String) {
 }
 
 /// Formats a float the way Python's `float.__repr__` does.
+///
+/// The digits are the shortest that read back as `number`; exponent form is used below `1e-4` and from `1e16` on.
 pub fn py_float(number: f64) -> String {
     if number.is_nan() {
         return "NaN".to_string();
@@ -149,28 +152,64 @@ pub fn py_float(number: f64) -> String {
             "-Infinity".to_string()
         };
     }
-    let magnitude = number.abs();
-    if magnitude != 0.0 && (magnitude >= 1e16 || magnitude < 1e-4) {
-        let scientific = format!("{:e}", number);
-        let parts = scientific
-            .split_once('e')
-            .map(|(mantissa, exponent)| (mantissa.to_string(), exponent.to_string()));
-        return match parts {
-            Some((mantissa, exponent)) => {
-                let (sign, digits) = match exponent.strip_prefix('-') {
-                    Some(rest) => ('-', rest.to_string()),
-                    None => ('+', exponent.clone()),
-                };
-                format!("{mantissa}e{sign}{digits:0>2}")
-            }
-            None => scientific,
-        };
+    let scientific = shortest_scientific(number);
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return scientific;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return scientific;
+    };
+    if !(-4..16).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{mantissa}e{sign}{:02}", exponent.unsigned_abs());
     }
-    let fixed = format!("{}", number);
-    if fixed.contains('.') {
-        fixed
-    } else {
-        format!("{fixed}.0")
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let mut out = String::new();
+    if mantissa.starts_with('-') {
+        out.push('-');
+    }
+    match usize::try_from(exponent) {
+        Ok(point) if digits.len() > point + 1 => {
+            out.push_str(&digits[..=point]);
+            out.push('.');
+            out.push_str(&digits[point + 1..]);
+        }
+        Ok(point) => {
+            out.push_str(&digits);
+            out.extend(std::iter::repeat_n('0', point + 1 - digits.len()));
+            out.push_str(".0");
+        }
+        Err(_) => {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n(
+                '0',
+                exponent.unsigned_abs() as usize - 1,
+            ));
+            out.push_str(&digits);
+        }
+    }
+    out
+}
+
+/// Rust's shortest `{:e}` text for a finite `number`, moved to the even digit where Python would pick it.
+///
+/// When `number` lies exactly halfway between two candidates of the shortest length (`-749382848194079.25`), Rust rounds the
+/// tie up and Python's `repr` rounds it to the even last digit (`-749382848194079.2`). A tie leaves one odd and one even
+/// neighbour, so only a result with an odd last digit can be the wrong one: for those the correctly rounded (half to even)
+/// text of the same length replaces it, if it still reads back as `number`.
+fn shortest_scientific(number: f64) -> String {
+    let shortest = format!("{number:e}");
+    let Some((mantissa, _)) = shortest.split_once('e') else {
+        return shortest;
+    };
+    if mantissa.bytes().last().is_none_or(|digit| digit % 2 == 0) {
+        return shortest;
+    }
+    let digits = mantissa.bytes().filter(u8::is_ascii_digit).count();
+    let rounded = format!("{number:.prec$e}", prec = digits - 1);
+    match rounded.parse::<f64>() {
+        Ok(read_back) if read_back == number => rounded,
+        _ => shortest,
     }
 }
 
@@ -417,11 +456,15 @@ pub fn obj_get<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> 
         .map(|(_, value)| value)
 }
 
-/// A failure carrying one taxonomy code and the Python-shaped message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A failure carrying one taxonomy code, the Python-shaped message and the `details` object.
+///
+/// `details` holds what `SwarmError(code, message, **details)` carries (`task_id=tid` on the write routes). It is [`Json`]
+/// data, so the type is `PartialEq` only: a float inside `details` has no `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SeamError {
     code: ErrorCode,
     message: String,
+    details: Fields,
 }
 
 impl SeamError {
@@ -430,6 +473,7 @@ impl SeamError {
         Self {
             code,
             message: format!("{}: {}", code.as_str(), message.as_ref()),
+            details: Vec::new(),
         }
     }
 
@@ -438,7 +482,22 @@ impl SeamError {
         Self {
             code,
             message: message.into(),
+            details: Vec::new(),
         }
+    }
+
+    /// Sets the `details` object, as `SwarmError(code, message, **details)` does: keys keep the order given and a repeated key
+    /// keeps its first position with the last value, like the `dict` Python builds from keyword arguments.
+    ///
+    /// A call replaces any details set before. Without a call `details` stays `{}`, so an error built by [`SeamError::new`]
+    /// or [`SeamError::unprefixed`] renders as it always did.
+    #[must_use]
+    pub fn with_details(mut self, details: Fields) -> Self {
+        self.details = Vec::with_capacity(details.len());
+        for (key, value) in details {
+            upsert(&mut self.details, key, value);
+        }
+        self
     }
 
     /// Returns the taxonomy code.
@@ -451,12 +510,17 @@ impl SeamError {
         &self.message
     }
 
+    /// Returns the `details` fields in the order they render.
+    pub fn details(&self) -> &[(String, Json)] {
+        &self.details
+    }
+
     /// Renders the `SwarmError.to_dict()` shape: `code`, `message`, `details`, `handling`.
     pub fn to_json(&self) -> Json {
         Json::Obj(vec![
             ("code".to_string(), jstr(self.code.as_str())),
             ("message".to_string(), jstr(&self.message)),
-            ("details".to_string(), Json::Obj(Vec::new())),
+            ("details".to_string(), Json::Obj(self.details.clone())),
             ("handling".to_string(), jstr(handling(self.code))),
         ])
     }
@@ -1200,6 +1264,32 @@ mod tests {
     }
 
     #[test]
+    fn python_float_repr_places_the_point_and_rounds_halfway_digits_to_even() -> TestResult {
+        // Expected texts are Python's `repr`. The first three are exactly halfway between two shortest candidates: Rust's own
+        // formatting rounds them up, Python to the even digit.
+        for (number, expected) in [
+            (-(749382848194079.0 + 0.25), "-749382848194079.2"),
+            (749382848194079.0 + 0.25, "749382848194079.2"),
+            (749382848194079.0 + 0.75, "749382848194079.8"),
+            (1e15, "1000000000000000.0"),
+            (9999999999999998.0, "9999999999999998.0"),
+            (123456.0, "123456.0"),
+            (12345678.9, "12345678.9"),
+            (0.001, "0.001"),
+            (0.00012345, "0.00012345"),
+            (9.9999e-5, "9.9999e-05"),
+            (1.5e300, "1.5e+300"),
+            (5e-324, "5e-324"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::NAN, "NaN"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            assert_eq!(py_float(number), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn parser_keeps_key_order_and_int_float_split() -> TestResult {
         let parsed = parse_json("{\"b\": 1, \"a\": 2.0, \"c\": [true, null]}").map_err(message)?;
         let expected = Json::Obj(vec![
@@ -1225,6 +1315,31 @@ mod tests {
         assert_eq!(error.message(), "E-INPUT: unknown task nope");
         let expected = "{\n  \"code\": \"E-INPUT\",\n  \"message\": \"E-INPUT: unknown task nope\",\n  \"details\": {},\n  \"handling\": \"Nack + task.status FAILED; notify artifact producer\"\n}";
         assert_eq!(to_python_json(&error.to_json()), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn seam_error_details_follow_swarm_error_keyword_arguments() -> TestResult {
+        let error =
+            SeamError::new(ErrorCode::Contract, "concurrent transition").with_details(cols(&[
+                ("task_id", jstr("T-1")),
+                ("write_state", jstr("not_started")),
+                ("task_id", jstr("T-2")),
+            ]));
+        assert_eq!(
+            error.details(),
+            cols(&[
+                ("task_id", jstr("T-2")),
+                ("write_state", jstr("not_started"))
+            ])
+        );
+        let expected = "{\n  \"code\": \"E-CONTRACT\",\n  \"message\": \"E-CONTRACT: concurrent transition\",\n  \"details\": {\n    \"task_id\": \"T-2\",\n    \"write_state\": \"not_started\"\n  },\n  \"handling\": \"Bounded fix loop per agent spec\"\n}";
+        assert_eq!(to_python_json(&error.to_json()), expected);
+        let replaced = error.with_details(cols(&[("n", Json::Float(1.0))]));
+        assert_eq!(replaced.details(), cols(&[("n", Json::Float(1.0))]));
+        let plain = SeamError::unprefixed(ErrorCode::Input, "ValueError: x");
+        assert!(plain.details().is_empty());
+        assert!(to_python_json(&plain.to_json()).contains("\"details\": {},"));
         Ok(())
     }
 
