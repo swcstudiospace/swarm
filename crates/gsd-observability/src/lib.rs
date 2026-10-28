@@ -43,7 +43,6 @@ impl Default for ObservabilityConfig {
 
 /// Tracing layer for structured logging
 pub struct TracingLayer {
-    config: ObservabilityConfig,
     tracer_provider: Option<SdkTracerProvider>,
     metrics_sink: Arc<MetricsSink>,
 }
@@ -77,7 +76,6 @@ impl TracingLayer {
         };
 
         Self {
-            config,
             tracer_provider,
             metrics_sink,
         }

@@ -222,7 +222,7 @@ where
         .iter()
         .map(|task| task_id_of(task).to_string())
         .collect();
-    let mut pool: HashMap<String, Task> = built
+    let pool: HashMap<String, Task> = built
         .tasks
         .into_iter()
         .map(|task| (task_id_of(&task).to_string(), task))

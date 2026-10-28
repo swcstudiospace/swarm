@@ -112,9 +112,7 @@ where
         let session = Arc::clone(&session);
         let worker = Arc::clone(&worker);
         async move {
-            if let Err(failure) = start_task(&session, task_id_of(&task)) {
-                return Err(failure);
-            }
+            start_task(&session, task_id_of(&task))?;
             (*worker)(task).await
         }
     };

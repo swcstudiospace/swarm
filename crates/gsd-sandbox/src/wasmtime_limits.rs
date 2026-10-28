@@ -67,7 +67,7 @@ impl Limits {
         if self.fuel < 1 {
             return Err(LimitsError::Invalid("fuel must be at least 1"));
         }
-        if self.memory_bytes == 0 || self.memory_bytes % PAGE_BYTES != 0 {
+        if self.memory_bytes == 0 || !self.memory_bytes.is_multiple_of(PAGE_BYTES) {
             return Err(LimitsError::Invalid(
                 "memory must be a positive multiple of 65536 bytes",
             ));
@@ -83,16 +83,9 @@ impl Limits {
 /// as a trap carrying [`CapacityRefused`]. A raw `memory.grow` returns -1 on refusal, and the S-04
 /// measurement recorded that -1 under `StoreLimits` alone; a guest can ignore -1 but cannot ignore a
 /// trap.
+#[derive(Default)]
 pub(crate) struct GuestLimiter {
     inner: StoreLimits,
-}
-
-impl Default for GuestLimiter {
-    fn default() -> Self {
-        Self {
-            inner: StoreLimits::default(),
-        }
-    }
 }
 
 /// A memory growth the store's limits refused. A guest that grows past its cap traps with this

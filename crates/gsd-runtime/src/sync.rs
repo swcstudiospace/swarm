@@ -74,8 +74,7 @@ impl<T> Default for LockFreeQueue<T> {
 
 /// Lock-free MPMC channel using crossbeam
 pub struct LockFreeChannel<T> {
-    sender: Sender<T>,
-    receiver: Receiver<T>,
+    _marker: std::marker::PhantomData<T>,
 }
 
 impl<T> LockFreeChannel<T> {
@@ -315,7 +314,6 @@ impl AsyncBarrier {
 #[derive(Debug, Default)]
 pub struct WaitForGraph {
     edges: Arc<RwLock<HashMap<usize, Vec<usize>>>>,
-    node_counter: AtomicUsize,
 }
 
 impl WaitForGraph {
@@ -499,7 +497,7 @@ impl TokenBucket {
     }
 
     pub fn try_take(&self, tokens: usize) -> bool {
-        let mut tokens_guard = self.tokens.try_lock();
+        let tokens_guard = self.tokens.try_lock();
         if let Ok(mut guard) = tokens_guard {
             if *guard >= tokens as f64 {
                 *guard -= tokens as f64;
@@ -521,16 +519,12 @@ impl TokenBucket {
 /// Semaphore with fairness guarantee
 pub struct FairSemaphore {
     permits: Arc<Semaphore>,
-    wait_queue: Arc<AsyncMutex<VecDeque<tokio::sync::oneshot::Sender<()>>>>,
-    max_permits: usize,
 }
 
 impl FairSemaphore {
     pub fn new(permits: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(permits)),
-            wait_queue: Arc::new(AsyncMutex::new(VecDeque::new())),
-            max_permits: permits,
         }
     }
 
@@ -572,7 +566,7 @@ mod tests {
     async fn test_semaphore() {
         let sem = Semaphore::new(2);
         let p1 = sem.acquire().await.unwrap();
-        let p2 = sem.acquire().await.unwrap();
+        let _p2 = sem.acquire().await.unwrap();
         assert!(sem.try_acquire().is_err());
         drop(p1);
         assert!(sem.try_acquire().is_ok());
@@ -597,7 +591,7 @@ mod tests {
         let wg = WaitGroup::new();
         wg.add(3);
 
-        for i in 0..3 {
+        for _ in 0..3 {
             let wg = wg.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(10)).await;

@@ -296,7 +296,7 @@ fn link(
             .map_err(|_| LoadError::Instantiate)?;
         let host = Arc::clone(shared);
         inst.func_wrap("emit", move |_, (message,): (String,)| {
-            log::Host::emit(&mut Imports(&*host), message)
+            log::Host::emit(&mut Imports(&host), message)
         })
         .map_err(|_| LoadError::Instantiate)?;
     }
@@ -306,7 +306,7 @@ fn link(
             .map_err(|_| LoadError::Instantiate)?;
         let host = Arc::clone(shared);
         inst.func_wrap("now", move |_, (): ()| -> wasmtime::Result<(u64,)> {
-            Ok((time::Host::now(&mut Imports(&*host))?,))
+            Ok((time::Host::now(&mut Imports(&host))?,))
         })
         .map_err(|_| LoadError::Instantiate)?;
     }
@@ -316,7 +316,7 @@ fn link(
             .map_err(|_| LoadError::Instantiate)?;
         let host = Arc::clone(shared);
         inst.func_wrap("next", move |_, (): ()| -> wasmtime::Result<(u64,)> {
-            Ok((rand::Host::next(&mut Imports(&*host))?,))
+            Ok((rand::Host::next(&mut Imports(&host))?,))
         })
         .map_err(|_| LoadError::Instantiate)?;
     }
@@ -326,14 +326,14 @@ fn link(
             .map_err(|_| LoadError::Instantiate)?;
         let host = Arc::clone(shared);
         inst.func_wrap("put", move |_, (key, value): (String, String)| {
-            storage::Host::put(&mut Imports(&*host), key, value)
+            storage::Host::put(&mut Imports(&host), key, value)
         })
         .map_err(|_| LoadError::Instantiate)?;
         let host = Arc::clone(shared);
         inst.func_wrap(
             "contains",
             move |_, (key,): (String,)| -> wasmtime::Result<(bool,)> {
-                Ok((storage::Host::contains(&mut Imports(&*host), key)?,))
+                Ok((storage::Host::contains(&mut Imports(&host), key)?,))
             },
         )
         .map_err(|_| LoadError::Instantiate)?;

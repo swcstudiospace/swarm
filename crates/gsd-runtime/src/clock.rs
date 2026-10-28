@@ -168,7 +168,6 @@ impl Clock for SimClock {
         if self.sim_mode.load(Ordering::SeqCst) {
             // In sim mode, advance virtual time and wait for next advancement
             let self_clone = self.clone();
-            let duration_ns = duration.as_nanos() as u64;
 
             Box::pin(async move {
                 let target_time =
@@ -359,8 +358,6 @@ mod tests {
         let clock = SimClock::new();
         clock.set_sim_mode(true);
 
-        let start = clock.virtual_time_ns();
-
         // Spawn a task that advances time
         let clock_clone = clock.clone();
         tokio::spawn(async move {
@@ -369,9 +366,7 @@ mod tests {
         });
 
         clock.sleep(Duration::from_millis(30)).await;
-
-        let elapsed = clock.virtual_time_ns() - clock.virtual_time_ns();
-        // Should have advanced by at least 50ms (from the spawned task)
+        // Reaching this point means the sleep completed once the spawned task advanced virtual time.
     }
 
     #[test]

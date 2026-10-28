@@ -55,6 +55,9 @@ const PARTIAL_JOIN_TIMEOUT: &str = "E-TIMEOUT";
 /// Result type for session join operations.
 pub type JoinResult<T> = Result<T, JoinError>;
 
+/// The stage logs to collect and the ids of the tasks forced at the window, as settled for a nexus run.
+type NexusSettlement = (Vec<(JoinKey, CompletionLog)>, Vec<String>);
+
 /// Typed refusal or failure from a session join.
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
@@ -590,7 +593,7 @@ fn settle_nexus(
     stage_keys: &[JoinKey],
     ids: &[String],
     joined: Option<SchedulerResult<NexusJoinReport>>,
-) -> JoinResult<(Vec<(JoinKey, CompletionLog)>, Vec<String>)> {
+) -> JoinResult<NexusSettlement> {
     let Some(result) = joined else {
         let mut guard = session.lock();
         for id in ids {
@@ -912,7 +915,7 @@ pub(crate) mod test_fixtures {
         for (thread, task_id) in pairs {
             bind_thread(
                 &mut state,
-                &governor,
+                governor,
                 ThreadBinding {
                     thread_id: ChatThreadId {
                         value: thread.to_string(),

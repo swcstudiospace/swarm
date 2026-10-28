@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn id_boundaries_follow_the_pattern_length_and_dotdot_rule() {
-        assert!(is_valid_id(&"a".repeat(1)));
+        assert!(is_valid_id("a"));
         assert!(is_valid_id(&"a".repeat(128)));
         assert!(!is_valid_id(&"a".repeat(129)));
         assert!(!is_valid_id(""));

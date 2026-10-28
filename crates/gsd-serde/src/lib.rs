@@ -42,8 +42,6 @@ pub struct SerdeConfig {
     pub use_bincode: bool,
     /// Include field names in output (for debugging)
     pub include_field_names: bool,
-    /// Maximum recursion depth for nested messages
-    max_depth: usize,
 }
 
 impl Default for SerdeConfig {
@@ -51,7 +49,6 @@ impl Default for SerdeConfig {
         Self {
             use_bincode: true,
             include_field_names: false,
-            max_depth: 100,
         }
     }
 }

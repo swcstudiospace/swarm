@@ -1346,7 +1346,7 @@ mod tests {
             serde_json::from_str(&reply.stdout).map_err(|e| e.to_string())?;
         assert_eq!(value["task_id"].as_str(), Some("T-A"));
         assert_eq!(value["history"][0]["to_state"].as_str(), Some("CREATED"));
-        assert_eq!(value["history"][0]["from_state"].is_null(), true);
+        assert!(value["history"][0]["from_state"].is_null());
         assert_eq!(
             value["verdicts"]["review"]["verdict"].as_str(),
             Some("pass")

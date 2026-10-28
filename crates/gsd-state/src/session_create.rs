@@ -137,10 +137,7 @@ pub async fn bind_thread(
         .clone()
         .ok_or(CreateError::MissingSessionId)?;
     let thread_key = binding.thread_id.value.clone();
-    let snapshot = state
-        .budget_snapshot
-        .clone()
-        .ok_or(CreateError::MissingBudget)?;
+    let snapshot = state.budget_snapshot.ok_or(CreateError::MissingBudget)?;
 
     let mut request = binding.reservation.clone();
     request.session_id = Some(session_id);
@@ -432,7 +429,7 @@ mod tests {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = session(vec![task("a", "w")], 100)?;
         bind_thread(&mut state, &governor, binding("t1", "a", "w", 40)).await?;
-        let snapshot = state.budget_snapshot.clone().unwrap_or_default();
+        let snapshot = state.budget_snapshot.unwrap_or_default();
         assert_eq!(snapshot.tokens_used, 40);
         assert_eq!(snapshot.tokens_remaining, 60);
         Ok(())

@@ -877,8 +877,7 @@ open(sys.argv[1], "w").close()
     fn init_without_any_root_is_dep_error() {
         let package = TempRoot::bare("init-none");
         let err = init(&package.path, Some("/gsd-sdk-no-such-root"))
-            .err()
-            .expect("no root holds orch_plan.py");
+            .expect_err("no root holds orch_plan.py");
         assert_eq!(err.code, ErrorCode::Dep);
         assert_eq!(
             err.message,

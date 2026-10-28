@@ -142,18 +142,16 @@ pub trait StateBackend: Send + Sync {
 
 /// State store
 pub struct StateStore {
-    config: StateConfig,
     cache:
         Arc<dashmap::DashMap<String, Arc<parking_lot::RwLock<gsd_proto::gsd::v1::SessionState>>>>,
     metrics: Arc<StateMetrics>,
 }
 
 impl StateStore {
-    pub async fn new(config: StateConfig) -> StateResult<Self> {
+    pub async fn new(_config: StateConfig) -> StateResult<Self> {
         Ok(Self {
-            config,
             cache: Arc::new(dashmap::DashMap::new()),
-            metrics: Arc::new(StateMetrics::default()),
+            metrics: Arc::new(StateMetrics),
         })
     }
 
@@ -184,26 +182,4 @@ impl StateStore {
     }
 }
 
-struct StateMetrics {
-    gets: std::sync::atomic::AtomicU64,
-    puts: std::sync::atomic::AtomicU64,
-    checkpoints: std::sync::atomic::AtomicU64,
-    branches: std::sync::atomic::AtomicU64,
-    merges: std::sync::atomic::AtomicU64,
-    cache_hits: std::sync::atomic::AtomicU64,
-    cache_misses: std::sync::atomic::AtomicU64,
-}
-
-impl Default for StateMetrics {
-    fn default() -> Self {
-        Self {
-            gets: std::sync::atomic::AtomicU64::new(0),
-            puts: std::sync::atomic::AtomicU64::new(0),
-            checkpoints: std::sync::atomic::AtomicU64::new(0),
-            branches: std::sync::atomic::AtomicU64::new(0),
-            merges: std::sync::atomic::AtomicU64::new(0),
-            cache_hits: std::sync::atomic::AtomicU64::new(0),
-            cache_misses: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-}
+pub struct StateMetrics;

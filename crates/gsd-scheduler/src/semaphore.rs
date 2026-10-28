@@ -14,6 +14,12 @@ pub struct SemaphoreManager {
     resource_semaphores: DashMap<String, Arc<Semaphore>>,
 }
 
+impl Default for SemaphoreManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SemaphoreManager {
     /// Creates a manager with the global pool at its default size.
     pub fn new() -> Self {

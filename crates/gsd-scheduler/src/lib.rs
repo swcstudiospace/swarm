@@ -18,15 +18,12 @@ pub mod ready_frontier;
 pub mod semaphore;
 
 pub use aimd_limiter::AimdLimiter;
-pub use clock::*;
 pub use dag::*;
 pub use dag_build::*;
-pub use dynamic::*;
 pub use force_parallel_dispatch::{
     effective_global_cap, run_force_parallel, sort_dispatch_order, DispatchConfig, DispatchMode,
     DispatchReport, TaskFailure, TaskOutcome,
 };
-pub use hitl::*;
 pub use matrix_join::*;
 pub use nexus_barrier_join::*;
 pub use policy::*;
@@ -34,24 +31,10 @@ pub use policy_config::*;
 pub use ready_frontier::*;
 pub use semaphore::*;
 
-use dashmap::DashMap;
-use gsd_failure::{CircuitBreaker, RetryPolicy};
-use gsd_governor::Governor;
-use gsd_observability::{MetricsSink, TracingLayer};
-use gsd_pool::{PoolError, PoolResult, ThreadPool};
-use gsd_proto::gsd::v1::{ChatThreadId, SubagentType};
-use gsd_proto::gsd::v1::{SchedulingPolicy, Task, TaskId, WorkflowDef};
-use gsd_runtime::{RuntimeError, RuntimeResult};
+use gsd_proto::gsd::v1::{SchedulingPolicy, TaskId};
 use parking_lot::RwLock;
-use petgraph::algo::toposort;
-use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::EdgeRef;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{Mutex, Notify, Semaphore};
-use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 /// Result type for scheduler operations
@@ -108,25 +91,18 @@ impl Default for SchedulerConfig {
 
 /// Matrix Scheduler
 pub struct MatrixScheduler {
-    config: SchedulerConfig,
     dag: Arc<RwLock<TaskDag>>,
     thread_pool: Arc<gsd_pool::ThreadPool>,
     governor: Arc<gsd_governor::Governor>,
-    observability: Arc<gsd_observability::TracingLayer>,
-    failure_isolation: Arc<gsd_failure::FailureIsolation>,
     policy: Arc<RwLock<Box<dyn SchedulingPolicyTrait>>>,
     semaphores: Arc<SemaphoreManager>,
-    wait_for_graph: Arc<gsd_runtime::sync::WaitForGraph>,
     metrics: Arc<SchedulerMetrics>,
 }
 
 impl MatrixScheduler {
     pub fn new(
-        config: SchedulerConfig,
         thread_pool: Arc<gsd_pool::ThreadPool>,
         governor: Arc<gsd_governor::Governor>,
-        observability: Arc<gsd_observability::TracingLayer>,
-        failure_isolation: Arc<gsd_failure::FailureIsolation>,
     ) -> Self {
         let policy = match SchedulingPolicy::CriticalPathThroughputHybrid {
             gsd_proto::gsd::v1::SchedulingPolicy::CriticalPathThroughputHybrid => {
@@ -138,15 +114,11 @@ impl MatrixScheduler {
         };
 
         Self {
-            config,
             dag: Arc::new(RwLock::new(TaskDag::new())),
             thread_pool,
             governor,
-            observability,
-            failure_isolation,
             policy: Arc::new(RwLock::new(policy)),
             semaphores: Arc::new(SemaphoreManager::new()),
-            wait_for_graph: Arc::new(gsd_runtime::sync::WaitForGraph::new()),
             metrics: Arc::new(SchedulerMetrics::new()),
         }
     }
@@ -174,18 +146,19 @@ impl MatrixScheduler {
         }
 
         // Add to DAG
-        let node_id = self.dag.write().add_task(task.clone())?;
+        self.dag.write().add_task(task.clone())?;
 
         // Check for cycles
         self.check_cycles()?;
 
         // Submit to policy for scheduling
-        let policy = self.policy.read();
-        let priority = policy.priority(&task, &*self.dag.read());
-        drop(policy);
+        let _priority = {
+            let policy = self.policy.read();
+            policy.priority(&task, &self.dag.read())
+        };
 
         // Submit to thread pool
-        let handle = self
+        let _handle = self
             .thread_pool
             .acquire(gsd_proto::gsd::v1::SubagentType {
                 value: task
@@ -238,22 +211,14 @@ impl MatrixScheduler {
     }
 }
 
-struct SchedulerMetrics {
+pub struct SchedulerMetrics {
     submitted: AtomicU64,
-    completed: AtomicU64,
-    failed: AtomicU64,
-    cancelled: AtomicU64,
-    scheduling_overhead_ns: AtomicU64,
 }
 
 impl SchedulerMetrics {
     fn new() -> Self {
         Self {
             submitted: AtomicU64::new(0),
-            completed: AtomicU64::new(0),
-            failed: AtomicU64::new(0),
-            cancelled: AtomicU64::new(0),
-            scheduling_overhead_ns: AtomicU64::new(0),
         }
     }
 }
@@ -261,17 +226,5 @@ impl SchedulerMetrics {
 impl SchedulerMetrics {
     fn inc_submitted(&self) {
         self.submitted.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_completed(&self) {
-        self.completed.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_failed(&self) {
-        self.failed.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_cancelled(&self) {
-        self.cancelled.fetch_add(1, Ordering::Relaxed);
-    }
-    fn add_scheduling_overhead(&self, ns: u64) {
-        self.scheduling_overhead_ns.fetch_add(ns, Ordering::Relaxed);
     }
 }

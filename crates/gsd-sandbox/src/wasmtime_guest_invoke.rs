@@ -161,8 +161,7 @@ mod tests {
     fn an_unknown_history_task_is_an_invoke_error_not_a_trap() {
         let mut instance = start();
         let native = gsd_route::orch_status_invoke(HISTORY_UNKNOWN.as_bytes())
-            .err()
-            .expect("the native route refuses an unknown task");
+            .expect_err("the native route refuses an unknown task");
         match instance.invoke(HISTORY_UNKNOWN.as_bytes()) {
             Err(GuestInvokeError::Guest { code, message }) => {
                 assert_eq!(code, ErrorCode::Input);

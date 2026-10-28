@@ -2,7 +2,6 @@
 //!
 //! Provides async I/O utilities for file operations, streaming, and buffering.
 
-use bytes::BytesMut;
 use std::io;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -189,14 +188,12 @@ impl<W: AsyncWrite + Unpin> NdjsonWriter<W> {
 /// Streaming JSON reader for NDJSON input
 pub struct NdjsonReader<R: AsyncRead + Unpin> {
     reader: BufReader<R>,
-    buffer: String,
 }
 
 impl<R: AsyncRead + Unpin> NdjsonReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader: BufReader::new(reader),
-            buffer: String::new(),
         }
     }
 
@@ -330,23 +327,20 @@ where
     Ok(total)
 }
 
-/// Async line reader with configurable delimiter
+/// Async line reader; lines are always terminated by `\n` (the `delimiter`
+/// passed to [`AsyncLineReader::new`] is not used).
 pub struct AsyncLineReader<R: AsyncRead + Unpin> {
     reader: BufReader<R>,
-    delimiter: Vec<u8>,
-    buffer: BytesMut,
 }
 
 impl<R: AsyncRead + Unpin> AsyncLineReader<R> {
-    pub fn new(reader: R, delimiter: Vec<u8>) -> Self {
+    pub fn new(reader: R, _delimiter: Vec<u8>) -> Self {
         Self {
             reader: BufReader::new(reader),
-            delimiter,
-            buffer: BytesMut::with_capacity(8192),
         }
     }
 
-    pub async fn read_line(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+    pub async fn read_line(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
         let mut buf = Vec::new();
         let n = self.reader.read_until(b'\n', &mut buf).await?;
         Ok(n)
@@ -474,6 +468,10 @@ impl MmapReader {
 
     pub fn len(&self) -> usize {
         self.mmap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
     }
 }
 

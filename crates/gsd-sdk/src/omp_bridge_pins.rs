@@ -242,6 +242,10 @@ fn map_depth(map: &Map<String, Value>) -> usize {
 /// with `status: "fail"`, (8) exit 2 with a wire error code, (9) everything else.
 ///
 /// `stderr` and `stdout` are cut to their last [`TAIL_CHARS`] characters in error text.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a parameter struct would change this public function's signature, a breaking API change for every caller"
+)]
 pub fn classify_exit(
     script: &str,
     timeout_ms: u64,

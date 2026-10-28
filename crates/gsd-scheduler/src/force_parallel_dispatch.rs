@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gsd_failure::{ErrorCode, FailureError};
-use gsd_proto::gsd::v1::{Task, TaskId};
+use gsd_proto::gsd::v1::Task;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::aimd_limiter::AimdLimiter;
@@ -475,7 +475,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gsd_proto::gsd::v1::SubagentType;
+    use gsd_proto::gsd::v1::{SubagentType, TaskId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;

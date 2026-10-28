@@ -52,7 +52,7 @@ impl Default for GovernorConfig {
         Self {
             default_session_budget: gsd_proto::gsd::v1::Budget {
                 max_tokens: 100_000,
-                max_wall_time_ms: 3600_000, // 1 hour
+                max_wall_time_ms: 3_600_000, // 1 hour
                 max_tool_calls: 1000,
                 max_cost_usd: 10.0,
             },
@@ -90,7 +90,6 @@ pub struct Governor {
     thread_budgets: Arc<DashMap<String, Arc<parking_lot::RwLock<BudgetSnapshot>>>>,
     global_usage: Arc<GlobalUsage>,
     rate_limiters: Arc<RateLimiterRegistry>,
-    cost_tracker: Arc<CostTracker>,
     metrics: Arc<GovernorMetrics>,
 }
 
@@ -102,7 +101,6 @@ impl Governor {
             thread_budgets: Arc::new(DashMap::new()),
             global_usage: Arc::new(GlobalUsage::new()),
             rate_limiters: Arc::new(RateLimiterRegistry::new()),
-            cost_tracker: Arc::new(CostTracker::new()),
             metrics: Arc::new(GovernorMetrics::default()),
         }
     }
@@ -136,7 +134,7 @@ impl Governor {
         }
 
         // Check rate limits
-        if !self.rate_limiters.check_rate_limit(&request) {
+        if !self.rate_limiters.check_rate_limit() {
             return gsd_proto::gsd::v1::BudgetGrant {
                 granted: false,
                 tokens_granted: 0,
@@ -264,7 +262,7 @@ impl Governor {
         session_id: &str,
     ) -> GovernorResult<gsd_proto::gsd::v1::BudgetSnapshot> {
         if let Some(budget) = self.session_budgets.get(session_id) {
-            let snapshot = budget.read().clone();
+            let snapshot = *budget.read();
             Ok(snapshot)
         } else {
             Err(GovernorError::InvalidBudget(
@@ -281,8 +279,6 @@ impl Governor {
 struct GlobalUsage {
     tokens_used: std::sync::atomic::AtomicU64,
     cost_usd_used: std::sync::atomic::AtomicU64, // Store as micros USD
-    token_limit: u64,
-    cost_limit_usd: f64,
 }
 
 impl GlobalUsage {
@@ -290,8 +286,6 @@ impl GlobalUsage {
         Self {
             tokens_used: std::sync::atomic::AtomicU64::new(0),
             cost_usd_used: std::sync::atomic::AtomicU64::new(0),
-            token_limit: 1_000_000,
-            cost_limit_usd: 100.0,
         }
     }
 
@@ -316,72 +310,22 @@ impl GlobalUsage {
     }
 }
 
-struct RateLimiterRegistry {
-    limiters: dashmap::DashMap<String, Arc<RateLimiter>>,
-}
+struct RateLimiterRegistry;
 
 impl RateLimiterRegistry {
     fn new() -> Self {
-        Self {
-            limiters: DashMap::new(),
-        }
+        Self
     }
 
-    fn check_rate_limit(&self, request: &gsd_proto::gsd::v1::BudgetRequest) -> bool {
+    fn check_rate_limit(&self) -> bool {
         // Simplified rate limiting
         true
     }
 }
 
-struct RateLimiter {
-    max_requests_per_min: u32,
-    max_tokens_per_min: u64,
-    request_count: std::sync::atomic::AtomicU32,
-    token_count: std::sync::atomic::AtomicU64,
-    window_start: std::sync::atomic::AtomicU64,
-}
-
-impl RateLimiter {
-    fn check(&self, tokens: u64) -> bool {
-        // Simplified rate limiting
-        true
-    }
-}
-
-struct CostTracker {
-    total_cost_usd: std::sync::atomic::AtomicU64, // micros USD
-    cost_by_model: dashmap::DashMap<String, AtomicU64>,
-    cost_by_thread: dashmap::DashMap<String, AtomicU64>,
-}
-
-impl CostTracker {
-    fn new() -> Self {
-        Self {
-            total_cost_usd: std::sync::atomic::AtomicU64::new(0),
-            cost_by_model: DashMap::new(),
-            cost_by_thread: DashMap::new(),
-        }
-    }
-
-    fn record_cost(&self, model: &str, thread_id: &str, cost_usd: f64) {
-        let micros = (cost_usd * 1_000_000.0) as u64;
-        self.total_cost_usd.fetch_add(micros, Ordering::AcqRel);
-        self.cost_by_model
-            .entry(model.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(micros, Ordering::AcqRel);
-        self.cost_by_thread
-            .entry(thread_id.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(micros, Ordering::AcqRel);
-    }
-}
-
-struct GovernorMetrics {
+pub struct GovernorMetrics {
     reservations: AtomicU64,
     releases: AtomicU64,
-    denials: AtomicU64,
-    rate_limit_hits: AtomicU64,
 }
 
 impl Default for GovernorMetrics {
@@ -389,8 +333,6 @@ impl Default for GovernorMetrics {
         Self {
             reservations: AtomicU64::new(0),
             releases: AtomicU64::new(0),
-            denials: AtomicU64::new(0),
-            rate_limit_hits: AtomicU64::new(0),
         }
     }
 }
@@ -401,12 +343,6 @@ impl GovernorMetrics {
     }
     fn inc_releases(&self) {
         self.releases.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_denials(&self) {
-        self.denials.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_rate_limit_hits(&self) {
-        self.rate_limit_hits.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -524,14 +460,14 @@ mod tests {
     fn session_snapshot(gov: &Governor, id: &str) -> BudgetSnapshot {
         gov.session_budgets
             .get(id)
-            .map(|b| b.read().clone())
+            .map(|b| *b.read())
             .expect("session budget exists")
     }
 
     fn thread_snapshot(gov: &Governor, id: &str) -> BudgetSnapshot {
         gov.thread_budgets
             .get(id)
-            .map(|b| b.read().clone())
+            .map(|b| *b.read())
             .expect("thread budget exists")
     }
 

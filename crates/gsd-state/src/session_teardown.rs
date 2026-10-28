@@ -424,7 +424,7 @@ mod tests {
 
         assert_eq!(report.refunded.tokens, 600);
         assert!(!report.overrun);
-        let snapshot = state.budget_snapshot.clone().ok_or("snapshot missing")?;
+        let snapshot = state.budget_snapshot.ok_or("snapshot missing")?;
         assert_eq!(snapshot.tokens_used, 400);
         assert_eq!(snapshot.tokens_remaining, 9_600);
         assert_eq!(governor.get_budget_snapshot("s1")?.tokens_used, 400);

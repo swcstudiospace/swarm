@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use gsd_codes::ErrorCode;
@@ -154,12 +154,8 @@ impl ThreadPool {
         let handle = ChatThreadHandle::new(thread_id.clone(), subagent_type.clone());
 
         let entry = ThreadEntry {
-            id: thread_id.clone(),
             subagent_type,
             state: ThreadStateKind::Initializing,
-            handle: handle.clone(),
-            created_at: gsd_runtime::clock::now(),
-            last_checkpoint: None,
         };
 
         self.threads.insert(
@@ -189,20 +185,14 @@ impl ThreadPool {
 }
 
 struct ThreadEntry {
-    id: ChatThreadId,
     subagent_type: SubagentType,
     state: ThreadStateKind,
-    handle: ChatThreadHandle,
-    created_at: Instant,
-    last_checkpoint: Option<Instant>,
 }
 
-struct PoolMetrics {
+pub struct PoolMetrics {
     created: std::sync::atomic::AtomicU64,
     acquired_from_warm: std::sync::atomic::AtomicU64,
     released: std::sync::atomic::AtomicU64,
-    evicted: std::sync::atomic::AtomicU64,
-    failed: std::sync::atomic::AtomicU64,
 }
 
 impl PoolMetrics {
@@ -211,8 +201,6 @@ impl PoolMetrics {
             created: std::sync::atomic::AtomicU64::new(0),
             acquired_from_warm: std::sync::atomic::AtomicU64::new(0),
             released: std::sync::atomic::AtomicU64::new(0),
-            evicted: std::sync::atomic::AtomicU64::new(0),
-            failed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -226,12 +214,6 @@ impl PoolMetrics {
     }
     fn inc_released(&self) {
         self.released.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_evicted(&self) {
-        self.evicted.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_failed(&self) {
-        self.failed.fetch_add(1, Ordering::Relaxed);
     }
 }
 

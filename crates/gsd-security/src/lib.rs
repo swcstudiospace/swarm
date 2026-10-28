@@ -110,10 +110,8 @@ fn now_secs() -> SecurityResult<u64> {
 }
 
 /// Capability token for thread authorization
-pub struct CapabilityToken {
-    token: String,
-    claims: CapabilityClaims,
-}
+#[non_exhaustive]
+pub struct CapabilityToken;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CapabilityClaims {
@@ -184,7 +182,6 @@ fn decode_claims(config: &SecurityConfig, token: &str) -> SecurityResult<Capabil
 /// Capability token manager
 pub struct CapabilityTokenManager {
     config: SecurityConfig,
-    issued_tokens: DashMap<String, CapabilityClaims>,
     revoked_tokens: DashMap<String, u64>,
 }
 
@@ -194,7 +191,6 @@ impl CapabilityTokenManager {
         config.validate()?;
         Ok(Self {
             config,
-            issued_tokens: DashMap::new(),
             revoked_tokens: DashMap::new(),
         })
     }
@@ -267,7 +263,6 @@ pub struct AuditEntry {
 
 /// Audit logger
 pub struct AuditLogger {
-    config: SecurityConfig,
     file: Mutex<std::fs::File>,
     merkle_tree: Mutex<MerkleTree>,
 }
@@ -283,7 +278,6 @@ impl AuditLogger {
             .open(&config.audit_log_path)?;
 
         Ok(Self {
-            config,
             file: Mutex::new(file),
             merkle_tree: Mutex::new(MerkleTree::new()),
         })
