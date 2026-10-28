@@ -1211,6 +1211,9 @@ pub fn history_fields(
     ])
 }
 
+// Host-only planner; declared after the code above so that no line the default guest's panic locations name moves.
+pub mod reconcile_plan;
+
 #[cfg(test)]
 mod tests {
     use super::*;
