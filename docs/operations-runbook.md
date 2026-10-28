@@ -273,6 +273,12 @@ Open sign-offs:
 - A2 quiet-host performance baseline: waived (`.planning/ROADMAP.md:82`) and not measured. A default flip needs it.
 - `GSD_RUST_BACKEND=sandbox` stays opt-in until the A10 and A11 items are recorded.
 
+## Rust redaction engine (opt-in)
+
+`swarm.redact` finds secret spans in pure Python by default. Set `SWARM_REDACT_ENGINE=rust` in the runner's environment to compute them in `swarm._native.redact_spans` instead (crate `gsd-redact`, bound by `gsd-python`). The Python module stays the oracle: the Rust spans must equal its spans for every input. `redact()` and `redact_text()` behave the same under either engine. Unset, empty or `python` is the default.
+
+Fallback, so redaction never fails on configuration: `SWARM_PURE_PYTHON=1` wins over `rust` (one warning). Any other value warns once and uses Python. A missing extension, an extension without `redact_spans` (stale build) or an exception from the Rust call uses Python for that call. Each reason logs one `swarm.redact` warning per process. A string holding a lone surrogate cannot be encoded for Rust and is redacted by Python without a warning. A Rust panic surfaces as an `E-INTERNAL` `ValueError`, which the adapter treats as a failed call.
+
 ## Task Store journal mode (opt-in WAL)
 
 The default is the rollback journal. Set `SWARM_TASKSTORE_WAL=1` in the runner's environment to make `TaskStore` open `tasks.db` in WAL mode with `synchronous=NORMAL` (set on open, fail-open to the current mode; any other value does nothing).

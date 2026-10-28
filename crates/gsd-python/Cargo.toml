@@ -2,7 +2,7 @@
 name = "gsd-python"
 version = "0.1.0"
 edition = "2021"
-description = "PyO3 extension module swarm._native: the Rust error codes, retry policy and orch_status wire for the Python package"
+description = "PyO3 extension module swarm._native: the Rust error codes, retry policy, orch_status wire and opt-in redaction span scanner for the Python package"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/swcstudiospace/agent-swarm"
 
@@ -19,3 +19,4 @@ pyo3 = { workspace = true }
 gsd-codes = { path = "../gsd-codes" }
 gsd-failure = { path = "../gsd-failure" }
 gsd-route = { path = "../gsd-route" }
+gsd-redact = { path = "../gsd-redact" }

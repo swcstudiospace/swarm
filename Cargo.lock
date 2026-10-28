@@ -1652,8 +1652,16 @@ version = "0.1.0"
 dependencies = [
  "gsd-codes",
  "gsd-failure",
+ "gsd-redact",
  "gsd-route",
  "pyo3",
+]
+
+[[package]]
+name = "gsd-redact"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

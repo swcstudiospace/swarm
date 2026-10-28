@@ -44,10 +44,14 @@ the same kind on its line (`"mysql -p" ok`: a flag in a sentence).
 from __future__ import annotations
 
 import functools
+import logging
+import os
 import re
 from array import array
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable
+
+from ._native_loader import load_native, pure_python_requested
 
 REDACTED = "[REDACTED]"
 
@@ -1103,11 +1107,69 @@ def _spans(s: str) -> list[tuple[int, int]]:
     return spans
 
 
+# Opt-in Rust span scanner (`swarm._native.redact_spans`, crate gsd-redact). The pure-Python detectors above are the oracle and the
+# default; `SWARM_REDACT_ENGINE=rust` only swaps who computes the spans, and every failure of the Rust path falls back to Python for that
+# call: redaction never fails because of a configuration typo, a missing or stale extension, or a scanner error.
+_ENGINE_ENV = "SWARM_REDACT_ENGINE"
+_engine_log = logging.getLogger("swarm.redact")
+# Reasons already reported this process. The two extension reasons double as a negative cache (no import retry per call); tests reset
+# it with `monkeypatch.setattr(redact, "_ENGINE_WARNED", set())`.
+_ENGINE_WARNED: set[str] = set()
+
+
+def _engine_warn_once(reason: str, message: str) -> None:
+    if reason in _ENGINE_WARNED:
+        return
+    _ENGINE_WARNED.add(reason)
+    _engine_log.warning("%s: %s; using the pure-Python redactor", _ENGINE_ENV, message)
+
+
+def _rust_engine_selected() -> bool:
+    """True when `SWARM_REDACT_ENGINE=rust` is set and not overridden. Unset, empty or `python` is the default; `SWARM_PURE_PYTHON=1`
+    always wins over `rust`; any other value warns once and selects Python."""
+    engine = os.environ.get(_ENGINE_ENV, "")
+    if engine in ("", "python"):
+        return False
+    if engine != "rust":
+        _engine_warn_once("unknown-engine", f"unknown value {engine!r} (expected 'python' or 'rust')")
+        return False
+    if pure_python_requested():
+        _engine_warn_once("pure-python", "'rust' requested but SWARM_PURE_PYTHON=1 is set")
+        return False
+    return True
+
+
+def _native_spans(s: str) -> list[tuple[int, int]] | None:
+    """The spans from the Rust scanner, or None when this call must use the Python path."""
+    if "missing-extension" in _ENGINE_WARNED or "stale-extension" in _ENGINE_WARNED:
+        return None
+    try:
+        native = load_native()
+    except ImportError as exc:
+        _engine_warn_once("missing-extension", f"swarm._native is unavailable ({exc})")
+        return None
+    fn = getattr(native, "redact_spans", None)
+    if fn is None:
+        _engine_warn_once("stale-extension", "swarm._native has no redact_spans (stale build: reinstall with `pip install .`)")
+        return None
+    try:
+        return [(start, end) for start, end in fn(s)]
+    except UnicodeEncodeError:
+        return None  # a lone surrogate cannot be encoded for Rust: a normal input, answered by Python without a warning
+    except Exception as exc:  # noqa: BLE001 - any native failure must degrade to the oracle, never propagate
+        _engine_warn_once("native-error", f"swarm._native.redact_spans failed ({type(exc).__name__}: {str(exc)[:200]})")
+        return None
+
+
 def redact_spans(s: str) -> list[tuple[int, int]]:
     """The disjoint, ascending `(start, end)` ranges of `s` that `redact_text` replaces: the union of every detector's spans, where
     overlapping or touching spans become one range."""
     if not isinstance(s, str) or len(s) < 6:
         return []
+    if _rust_engine_selected():
+        native_spans = _native_spans(s)
+        if native_spans is not None:
+            return native_spans
     spans = [sp for sp in _spans(s) if sp[0] < sp[1]]  # an empty span hides nothing (the TypeScript union drops it too)
     if not spans:
         return []

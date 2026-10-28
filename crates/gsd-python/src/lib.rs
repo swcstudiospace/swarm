@@ -1,8 +1,9 @@
 //! The `swarm._native` extension module (P6 unit U1).
 //!
-//! Binds three pieces of the pure Rust engine to Python: the seven shared error codes
-//! (`gsd-codes`), the default retry policy (`gsd-failure`) and the read-only `orch_status` wire
-//! (`gsd-route`). The logic lives in [`pure`], which has no PyO3 types; the `#[pyfunction]`
+//! Binds four pieces of the pure Rust engine to Python: the seven shared error codes
+//! (`gsd-codes`), the default retry policy (`gsd-failure`), the read-only `orch_status` wire
+//! (`gsd-route`) and the opt-in secret-span scanner (`gsd-redact`, selected by
+//! `SWARM_REDACT_ENGINE=rust`). The logic lives in [`pure`], which has no PyO3 types; the `#[pyfunction]`
 //! wrappers at the bottom only convert values and raise exceptions.
 
 use std::time::Duration;
@@ -17,6 +18,7 @@ use pyo3::types::{PyBytes, PyDict};
 pub mod pure {
     use super::{Duration, ErrorCode, RetryPolicy};
     use gsd_route::SeamError;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     /// The seven wire codes in `gsd-codes` order.
     pub const CODES: [ErrorCode; 7] = [
@@ -86,6 +88,30 @@ pub mod pure {
             .unwrap_or(message);
         format!("{code}: {operation} failed: {detail}")
     }
+
+    /// Runs `work`, turning a panic into the `E-INTERNAL` wire message for `operation`.
+    ///
+    /// The message never carries the panic payload: a panic text can quote the input.
+    pub fn guard_panic<T>(operation: &str, work: impl FnOnce() -> T) -> Result<T, String> {
+        catch_unwind(AssertUnwindSafe(work)).map_err(|_| {
+            format!(
+                "{}: {operation} failed: internal panic",
+                ErrorCode::Internal.as_str()
+            )
+        })
+    }
+
+    /// `gsd_redact::redact_spans`, with a panic reported as an `E-INTERNAL` message instead of
+    /// unwinding into the interpreter, and a text beyond the scanner's length limit reported as
+    /// `E-INPUT` (the caller then falls back to the Python scanner; the text is never skipped).
+    pub fn redact_spans(text: &str) -> Result<Vec<(usize, usize)>, String> {
+        guard_panic("redact_spans", || gsd_redact::redact_spans(text))?.map_err(|error| {
+            format!(
+                "{}: redact_spans failed: {error}",
+                ErrorCode::Input.as_str()
+            )
+        })
+    }
 }
 
 /// Canonical wire string for one of the seven codes; any other input raises `ValueError`.
@@ -144,6 +170,17 @@ fn decode_reply_wire<'py>(py: Python<'py>, reply: &[u8]) -> PyResult<Bound<'py, 
     Ok(dict)
 }
 
+/// Secret spans of `text` as `(start, end)` code-point offsets, ascending and disjoint.
+///
+/// The GIL is released while Rust runs. A scanner panic raises `ValueError` whose message carries
+/// `E-INTERNAL` (not PyO3's `PanicException`, which `except Exception` would miss). A string
+/// with a lone surrogate cannot be encoded as UTF-8 and raises `UnicodeEncodeError` on the way in.
+#[pyfunction]
+fn redact_spans(py: Python<'_>, text: &str) -> PyResult<Vec<(usize, usize)>> {
+    py.detach(|| pure::redact_spans(text))
+        .map_err(PyValueError::new_err)
+}
+
 /// The `swarm._native` module.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -152,6 +189,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(retry_policy, m)?)?;
     m.add_function(wrap_pyfunction!(orch_status_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(decode_reply_wire, m)?)?;
+    m.add_function(wrap_pyfunction!(redact_spans, m)?)?;
     Ok(())
 }
 
@@ -177,6 +215,35 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), 7, "wire codes are distinct");
+    }
+
+    #[test]
+    fn redact_spans_returns_the_oracle_spans_in_code_points() {
+        for (text, expected) in [
+            ("", vec![]),
+            ("short", vec![]),
+            ("password=hunter2hunter2 ok", vec![(9, 23)]),
+            ("caf\u{e9} token=abcdef \u{1f600}", vec![(11, 17)]),
+        ] {
+            assert_eq!(pure::redact_spans(text), Ok(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_panic_becomes_the_coded_internal_error_without_the_payload() {
+        let secret = "hunter2-do-not-echo";
+        let result: Result<u8, String> = pure::guard_panic("redact_spans", || {
+            panic!("index out of range near {secret}")
+        });
+        assert_eq!(
+            result,
+            Err("E-INTERNAL: redact_spans failed: internal panic".to_owned())
+        );
+    }
+
+    #[test]
+    fn guard_panic_passes_a_normal_result_through() {
+        assert_eq!(pure::guard_panic("redact_spans", || 7), Ok(7));
     }
 
     #[test]

@@ -1,0 +1,12 @@
+[package]
+name = "gsd-redact"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+description = "Secret-span detection for run-log text, a port of swarm/redact.py with the Python module as the parity oracle."
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = { workspace = true }
