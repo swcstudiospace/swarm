@@ -67,6 +67,18 @@ impl From<anyhow::Error> for SchedulerError {
     }
 }
 
+impl From<gsd_sched_core::ClaimError> for SchedulerError {
+    fn from(e: gsd_sched_core::ClaimError) -> Self {
+        SchedulerError::Other(e.to_string())
+    }
+}
+
+impl From<gsd_sched_core::LimiterError> for SchedulerError {
+    fn from(e: gsd_sched_core::LimiterError) -> Self {
+        SchedulerError::Other(e.to_string())
+    }
+}
+
 /// Scheduler configuration
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {

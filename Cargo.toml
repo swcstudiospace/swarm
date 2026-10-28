@@ -20,6 +20,7 @@ members = [
     "crates/gsd-sdk",
     "crates/gsd-python",
     "crates/gsd-redact",
+    "crates/gsd-sched-core",
 ]
 # ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli has an invalid manifest.
 exclude = ["crates/gsd-ipc", "crates/gsd-cli"]
