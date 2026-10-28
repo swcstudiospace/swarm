@@ -4,10 +4,12 @@
 //! input, so the 100 000-byte `--input` cap does not apply to it (GA2). Each call instantiates the
 //! verified guest with an empty linker (OD-6), invokes it and decodes the reply. A sandbox fault
 //! (identity, instantiation, or a trap other than a timeout) is answered in-process by the host Rust
-//! logic on the same snapshot (GA3, OD-5). A guest answer, including the error it reports, is final,
-//! and so is a timeout. Every other entrypoint refuses with `E-DEP`.
+//! logic on the same snapshot (GA3, OD-5), and the engine records that it did and with which wire
+//! code ([`SandboxEngine::failover`], [`failover_notice`]) so the binary can say so on stderr. A guest
+//! answer, including the error it reports, is final, and so is a timeout. Every other entrypoint
+//! refuses with `E-DEP`.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::fmt::Display;
 use std::time::{Duration, Instant};
 
@@ -43,6 +45,8 @@ pub struct SandboxEngine {
     pin: &'static str,
     /// The module after its first successful identity check and compile; later calls reuse it.
     loaded: OnceCell<LoadedGuest>,
+    /// The code of the sandbox fault the latest read failed over on; None when it did not fail over.
+    failover: Cell<Option<ErrorCode>>,
 }
 
 /// One guest call: what the guest or the wire answered, or a fault of the sandbox itself.
@@ -68,6 +72,7 @@ impl SandboxEngine {
             module,
             pin,
             loaded: OnceCell::new(),
+            failover: Cell::new(None),
         })
     }
 
@@ -95,6 +100,13 @@ impl SandboxEngine {
                 "guest probe reply is not a success",
             )),
         }
+    }
+
+    /// The code of the sandbox fault the latest read failed over on, answered by host Rust, or None
+    /// when that read was answered by the guest (its error included), timed out, or was refused.
+    /// Each read resets it. It carries the wire code only, never a path or a message.
+    pub fn failover(&self) -> Option<ErrorCode> {
+        self.failover.get()
     }
 
     /// Verifies the module bytes against the pin and compiles them.
@@ -162,6 +174,7 @@ impl SandboxEngine {
         call: &Invocation,
         make_limits: impl Fn(Duration) -> Limits,
     ) -> Result<Reply, SeamError> {
+        self.failover.set(None);
         let started = Instant::now();
         let request = read_snapshot(args, call).await?;
         let budget = budget_after(call.deadline, started.elapsed())?;
@@ -169,6 +182,7 @@ impl SandboxEngine {
         let outcome = self.answer(&wire, &make_limits(budget));
         // The guest call is synchronous: a result that lands past the deadline is not reported.
         budget_after(call.deadline, started.elapsed())?;
+        self.failover.set(failover_code(&outcome));
         settle(outcome, &request)
     }
 }
@@ -202,6 +216,27 @@ fn settle(outcome: GuestCall, request: &Json) -> Result<Reply, SeamError> {
         GuestCall::Faulted(error) if is_timeout(&error) => Err(into_seam(error)),
         GuestCall::Faulted(_) => orch_status_reply(request),
     }
+}
+
+/// The code of the sandbox fault that `settle` answers from host Rust, or None when it does not
+/// fail over: a guest answer, its error included, and a timeout are final.
+fn failover_code(outcome: &GuestCall) -> Option<ErrorCode> {
+    match outcome {
+        GuestCall::Faulted(PoolError::Sandbox { code, .. }) if *code != ErrorCode::Timeout => {
+            Some(*code)
+        }
+        GuestCall::Faulted(error) if !is_timeout(error) => Some(ErrorCode::Internal),
+        GuestCall::Answered(_) | GuestCall::Faulted(_) => None,
+    }
+}
+
+/// The one line a failover prints to stderr. It is built from the wire code only: no path, message
+/// or environment value can reach it.
+pub fn failover_notice(code: ErrorCode) -> String {
+    format!(
+        "gsd_engine: sandbox fault {}; answered by host Rust",
+        code.as_str()
+    )
 }
 
 /// Builds a sandbox fault in the seam's `CODE: text` form.
@@ -249,6 +284,7 @@ impl CoreBackend for SandboxEngine {
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
+        self.failover.set(None);
         if !is_read_only_route(Entrypoint::OrchStatus, &call.argv) {
             return Err(no_route(&call.script));
         }
@@ -629,6 +665,147 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Every wire code, so a new variant is not forgotten by the notice tests.
+    const ALL_CODES: [ErrorCode; 7] = [
+        ErrorCode::Input,
+        ErrorCode::Timeout,
+        ErrorCode::Dep,
+        ErrorCode::Capacity,
+        ErrorCode::Contract,
+        ErrorCode::Policy,
+        ErrorCode::Internal,
+    ];
+
+    /// The code of a line that the harness's `FAILOVER_NOTICE` accepts, else None. The pattern
+    /// `^gsd_engine: sandbox fault (E-[A-Z]+); answered by host Rust$` (`tests/parity/harness.py`) is
+    /// spelled out by hand here, not imported, so a change to either side fails this test.
+    fn harness_notice_code(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("gsd_engine: sandbox fault ")?;
+        let code = rest.strip_suffix("; answered by host Rust")?;
+        let letters = code.strip_prefix("E-")?;
+        let upper = !letters.is_empty() && letters.bytes().all(|b| b.is_ascii_uppercase());
+        upper.then_some(code)
+    }
+
+    #[test]
+    fn failover_notice_text_is_fixed_for_every_code() {
+        for code in ALL_CODES {
+            let line = failover_notice(code);
+            assert_eq!(
+                line,
+                format!(
+                    "gsd_engine: sandbox fault {}; answered by host Rust",
+                    code.as_str()
+                )
+            );
+            assert_eq!(harness_notice_code(&line), Some(code.as_str()));
+            assert!(!line.contains('\n'), "the notice is one line");
+        }
+        assert_eq!(
+            failover_notice(ErrorCode::Dep),
+            "gsd_engine: sandbox fault E-DEP; answered by host Rust"
+        );
+        assert_eq!(
+            failover_notice(ErrorCode::Internal),
+            "gsd_engine: sandbox fault E-INTERNAL; answered by host Rust"
+        );
+        assert_eq!(harness_notice_code("gsd_engine: sandbox fault E-DEP"), None);
+        assert_eq!(
+            harness_notice_code("gsd_engine: sandbox fault e-dep; answered by host Rust"),
+            None
+        );
+    }
+
+    #[test]
+    fn failover_code_is_the_fault_code_and_none_for_final_outcomes() -> TestResult {
+        for code in ALL_CODES {
+            let expected = (code != ErrorCode::Timeout).then_some(code);
+            assert_eq!(
+                failover_code(&GuestCall::Faulted(fault(code, "reason"))),
+                expected,
+                "{code:?}"
+            );
+            let guest_error = PoolError::Sandbox {
+                code,
+                message: "guest said so".to_string(),
+            };
+            assert_eq!(failover_code(&GuestCall::Answered(Err(guest_error))), None);
+        }
+        let reply = decode_reply_wire(br#"{"exit_code": 0, "stdout": ""}"#).map_err(message)?;
+        assert_eq!(failover_code(&GuestCall::Answered(Ok(reply))), None);
+        // A fault that is not a sandbox error is answered by host Rust and reported as internal.
+        let other = GuestCall::Faulted(PoolError::Other("x".to_string()));
+        assert_eq!(failover_code(&other), Some(ErrorCode::Internal));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failover_is_recorded_with_its_code_and_the_answer_is_the_host_answer() -> TestResult {
+        let root = TempDir::new().map_err(|e| e.to_string())?;
+        let swarm = root.path().join(".swarm");
+        block(seed(&swarm, 3))??;
+        let broken = SandboxEngine::with_module(GUEST_MODULE.0, WRONG_PIN).map_err(message)?;
+        let fault_code = match broken.loaded_guest() {
+            Err(PoolError::Sandbox { code, .. }) => code,
+            _ => return Err("the pin mismatch did not fault the guest".to_string()),
+        };
+        let read = call(root.path(), &swarm, &["--json"]);
+        assert_eq!(broken.failover(), None, "nothing is recorded before a read");
+
+        let answer = broken.orch_status(&read).map_err(message)?;
+        let host_answer = host()?.orch_status(&read).map_err(message)?;
+        // The notice goes to stderr only: what the caller reads is exactly the host backend's reply.
+        assert_eq!(answer.stdout.as_bytes(), host_answer.stdout.as_bytes());
+        assert_eq!(answer.exit_code, host_answer.exit_code);
+
+        assert_eq!(broken.failover(), Some(fault_code));
+        let line = failover_notice(fault_code);
+        assert_eq!(harness_notice_code(&line), Some(fault_code.as_str()));
+        assert!(!line.contains(&root.path().display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_guest_answer_records_no_failover() -> TestResult {
+        let root = TempDir::new().map_err(|e| e.to_string())?;
+        let swarm = root.path().join(".swarm");
+        block(seed(&swarm, 3))??;
+        let sandbox = engine()?;
+        let list = call(root.path(), &swarm, &["--json"]);
+        assert!(matches!(
+            guest_call(&sandbox, &list)?,
+            GuestCall::Answered(_)
+        ));
+        sandbox.orch_status(&list).map_err(message)?;
+        assert_eq!(sandbox.failover(), None);
+
+        // An error the guest reports is its answer too, and is not failed over.
+        let unknown = call(root.path(), &swarm, &["--history", "T-9999", "--json"]);
+        let _ = sandbox.orch_status(&unknown);
+        assert_eq!(sandbox.failover(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_refused_call_clears_the_failover_record() -> TestResult {
+        let root = TempDir::new().map_err(|e| e.to_string())?;
+        let swarm = root.path().join(".swarm");
+        block(seed(&swarm, 1))??;
+        let broken = SandboxEngine::with_module(GUEST_MODULE.0, WRONG_PIN).map_err(message)?;
+        broken
+            .orch_status(&call(root.path(), &swarm, &["--json"]))
+            .map_err(message)?;
+        assert!(broken.failover().is_some());
+        let refused = call(
+            root.path(),
+            &swarm,
+            &["--transition", "T-0000", "DONE", "--json"],
+        );
+        assert!(broken.orch_status(&refused).is_err());
+        assert_eq!(broken.failover(), None);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -928,6 +1105,67 @@ mod read_route_faults {
                 .ok_or("a truncated reply decoded")?;
             assert_eq!(into_seam(sandbox_answer(error)).code(), ErrorCode::Contract);
         }
+        Ok(())
+    }
+
+    /// The host backend's answer to the list call.
+    fn host_reply(list: &Invocation) -> Result<Reply, String> {
+        RustEngine::new()
+            .map_err(message)?
+            .orch_status(list)
+            .map_err(message)
+    }
+
+    #[test]
+    fn a_timeout_records_no_failover() -> TestResult {
+        let root = TempDir::new().map_err(|e| e.to_string())?;
+        let (sandbox, list, _) = seeded(&root)?;
+        let starved = |budget: Duration| custom_limits(1_000_000, MEMORY_BYTES, Some(budget));
+        let error = seam_answer(&sandbox, &list, starved)?
+            .err()
+            .ok_or("a starved guest with a deadline was answered")?;
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        assert_eq!(sandbox.failover(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fault_records_its_code_and_leaves_the_host_stdout_unchanged() -> TestResult {
+        let root = TempDir::new().map_err(|e| e.to_string())?;
+        let (sandbox, list, _) = seeded(&root)?;
+        let host_answer = host_reply(&list)?;
+
+        let starved = |_: Duration| custom_limits(1_000_000, MEMORY_BYTES, None);
+        let answer = seam_answer(&sandbox, &list, starved)?.map_err(message)?;
+        assert_eq!(answer.stdout.as_bytes(), host_answer.stdout.as_bytes());
+        assert_eq!(answer.exit_code, host_answer.exit_code);
+        assert_eq!(sandbox.failover(), Some(ErrorCode::Internal));
+        assert_eq!(
+            failover_notice(ErrorCode::Internal),
+            "gsd_engine: sandbox fault E-INTERNAL; answered by host Rust"
+        );
+
+        let capped = |budget: Duration| custom_limits(FUEL, FOUR_MIB, Some(budget));
+        let answer = seam_answer(&sandbox, &list, capped)?.map_err(message)?;
+        assert_eq!(answer.stdout.as_bytes(), host_answer.stdout.as_bytes());
+        assert_eq!(sandbox.failover(), Some(ErrorCode::Capacity));
+        assert_eq!(
+            failover_notice(ErrorCode::Capacity),
+            "gsd_engine: sandbox fault E-CAPACITY; answered by host Rust"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_guest_answer_under_the_production_limits_records_no_failover() -> TestResult {
+        let root = TempDir::new().map_err(|e| e.to_string())?;
+        let (sandbox, list, _) = seeded(&root)?;
+        let answer = seam_answer(&sandbox, &list, limits)?.map_err(message)?;
+        assert_eq!(
+            answer.stdout.as_bytes(),
+            host_reply(&list)?.stdout.as_bytes()
+        );
+        assert_eq!(sandbox.failover(), None);
         Ok(())
     }
 }

@@ -1,9 +1,10 @@
 //! Per-invocation engine routing for the strangler seam (U4.2).
 //!
-//! `GSD_ENGINE` is read on every call. `python` is the default. `rust` applies to one route class
-//! only: the read-only `orch_status --json` listing and history. Every other `rust` request is
-//! refused with `E-DEP`, so nothing past read-only flips (G-strangler-order). An unknown value is
-//! rejected with `E-INPUT`.
+//! `GSD_ENGINE` is read on every call. An unset or empty value resolves through the per-route default
+//! table ([`default_engine`]); `python` is explicit Python. `rust` applies to one route class only:
+//! the read-only `orch_status --json` listing and history. Every other `rust` request is refused with
+//! `E-DEP`, so nothing past read-only flips (G-strangler-order). An unknown value is rejected with
+//! `E-INPUT`. Today every row of the table is Python; a route's row changes in the phase that flips it.
 
 use gsd_failure::ErrorCode;
 
@@ -14,7 +15,8 @@ use gsd_route::{parse_orch_status_read, Reply, SeamError};
 /// Environment variable that selects the engine for each invocation.
 pub const ENGINE_ENV: &str = "GSD_ENGINE";
 
-/// Parses the `GSD_ENGINE` value. Unset or empty means `python`; the value is never echoed in the error.
+/// Parses the `GSD_ENGINE` value. Unset or empty means `python` here; a call resolves them through
+/// [`default_engine`] instead (see [`select_engine`]). The value is never echoed in the error.
 pub fn parse_engine(raw: Option<&str>) -> Result<Engine, SeamError> {
     match raw {
         None | Some("") | Some("python") => Ok(Engine::Python),
@@ -31,6 +33,24 @@ pub fn parse_engine(raw: Option<&str>) -> Result<Engine, SeamError> {
 pub fn is_read_only_route(entry: Entrypoint, argv: &[String]) -> bool {
     matches!(entry, Entrypoint::OrchStatus)
         && parse_orch_status_read(argv).is_some_and(|args| args.json)
+}
+
+/// The engine the `orch_status` read route runs on when `GSD_ENGINE` is unset or empty.
+///
+/// Python until the flip unit (R12 of Phase 14.3) sets it, after parity evidence and the user's
+/// approval. Setting it to `Engine::Rust` is the whole flip for this route.
+pub const ORCH_STATUS_READ_DEFAULT: Engine = Engine::Python;
+
+/// The per-route default engine: the engine that answers a call when `GSD_ENGINE` is unset or empty.
+///
+/// The `orch_status` read route resolves to [`ORCH_STATUS_READ_DEFAULT`]; every other route is Python
+/// until its own phase adds a row. An explicit `GSD_ENGINE` never goes through this table.
+pub fn default_engine(entry: Entrypoint, argv: &[String]) -> Engine {
+    if is_read_only_route(entry, argv) {
+        ORCH_STATUS_READ_DEFAULT
+    } else {
+        Engine::Python
+    }
 }
 
 /// Applies the requested engine to one call. `rust` on any route outside the read-only set is `E-DEP`.
@@ -50,12 +70,18 @@ pub fn route_for_call(
 }
 
 /// Resolves `GSD_ENGINE` and the route for one call to the engine that must answer it.
+///
+/// Unset or empty takes the route's table default; `python` and `rust` are explicit and `rust` still
+/// goes through [`route_for_call`], so it is `E-DEP` on a route Rust does not serve.
 pub fn select_engine(
     env_value: Option<&str>,
     entry: Entrypoint,
     argv: &[String],
 ) -> Result<Engine, SeamError> {
-    let requested = parse_engine(env_value)?;
+    let requested = match env_value {
+        None | Some("") => default_engine(entry, argv),
+        Some(_) => parse_engine(env_value)?,
+    };
     route_for_call(requested, entry, argv)
 }
 
@@ -80,7 +106,7 @@ pub fn invoke_routed(
 mod tests {
     use super::*;
     use crate::strangler_seam::{PythonEngine, RustEngine};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     type TestResult = Result<(), String>;
@@ -196,12 +222,12 @@ mod tests {
         Ok(())
     }
 
-    fn call_for(script: &str, flags: &[&str], root: &PathBuf) -> Invocation {
+    fn call_for(script: &str, flags: &[&str], root: &Path) -> Invocation {
         Invocation {
             agent: "A01".to_string(),
             script: script.to_string(),
             argv: argv(flags),
-            root: root.clone(),
+            root: root.to_path_buf(),
             env: Vec::new(),
             deadline: Duration::from_secs(5),
         }
@@ -247,5 +273,103 @@ mod tests {
             serde_json::from_str(&reply.stdout).map_err(|e| e.to_string())?;
         assert_eq!(value["error"]["code"].as_str(), Some("E-INPUT"));
         Ok(())
+    }
+
+    #[test]
+    fn unset_and_empty_resolve_through_the_route_table() -> TestResult {
+        let read = argv(&["--json"]);
+        let history = argv(&["--history", "T-A", "--json"]);
+        for value in [None, Some("")] {
+            for route in [&read, &history] {
+                let chosen = select_engine(value, Entrypoint::OrchStatus, route)
+                    .map_err(|e| e.message().to_string())?;
+                assert_eq!(chosen, default_engine(Entrypoint::OrchStatus, route));
+                assert_eq!(chosen, ORCH_STATUS_READ_DEFAULT);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unset_and_empty_on_a_non_read_route_resolve_to_python() -> TestResult {
+        let routes = [
+            (
+                Entrypoint::OrchStatus,
+                argv(&["--transition", "T", "DONE", "--json"]),
+            ),
+            (
+                Entrypoint::OrchStatus,
+                argv(&["--ingest", "r.json", "--json"]),
+            ),
+            (Entrypoint::OrchStatus, argv(&["--history", "T-A"])),
+            (Entrypoint::SwarmRun, argv(&["--json"])),
+            (Entrypoint::LaneVerb, argv(&["--json"])),
+        ];
+        for value in [None, Some("")] {
+            for (entry, flags) in &routes {
+                let chosen =
+                    select_engine(value, *entry, flags).map_err(|e| e.message().to_string())?;
+                assert_eq!(chosen, Engine::Python);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_non_read_route_defaults_to_python_whatever_the_read_row_says() {
+        assert_eq!(
+            default_engine(Entrypoint::SwarmRun, &argv(&["--json"])),
+            Engine::Python
+        );
+        assert_eq!(
+            default_engine(Entrypoint::LaneVerb, &argv(&["--json"])),
+            Engine::Python
+        );
+        for flags in [
+            &["--transition", "T", "DONE", "--json"][..],
+            &["--ingest", "r.json", "--json"][..],
+            &["--history", "T-A"][..],
+            &[][..],
+        ] {
+            assert_eq!(
+                default_engine(Entrypoint::OrchStatus, &argv(flags)),
+                Engine::Python,
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_python_and_rust_ignore_the_table() -> TestResult {
+        let read = argv(&["--json"]);
+        let write = argv(&["--transition", "T", "DONE", "--json"]);
+        assert_eq!(
+            select_engine(Some("python"), Entrypoint::OrchStatus, &read).ok(),
+            Some(Engine::Python)
+        );
+        assert_eq!(
+            select_engine(Some("python"), Entrypoint::OrchStatus, &write).ok(),
+            Some(Engine::Python)
+        );
+        assert_eq!(
+            select_engine(Some("rust"), Entrypoint::OrchStatus, &read).ok(),
+            Some(Engine::Rust)
+        );
+        assert_eq!(
+            code_of(select_engine(Some("rust"), Entrypoint::OrchStatus, &write)),
+            Some(ErrorCode::Dep)
+        );
+        assert_eq!(
+            code_of(select_engine(Some("rust"), Entrypoint::SwarmRun, &read)),
+            Some(ErrorCode::Dep)
+        );
+        Ok(())
+    }
+
+    /// The one default-asserting test of the read-route row: the flip unit (R12 of Phase 14.3) edits
+    /// this test, and only this test, when it sets `ORCH_STATUS_READ_DEFAULT`.
+    #[test]
+    fn read_route_default_is_python_until_the_flip() {
+        assert_eq!(ORCH_STATUS_READ_DEFAULT, Engine::Python);
     }
 }
