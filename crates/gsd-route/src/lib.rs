@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use gsd_codes::ErrorCode;
 
+pub mod gate_facts;
 mod orch_status_wire;
 pub mod pydumps;
 pub mod result_parse;

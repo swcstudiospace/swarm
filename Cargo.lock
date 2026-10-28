@@ -1474,6 +1474,20 @@ name = "gsd-codes"
 version = "0.1.0"
 
 [[package]]
+name = "gsd-envelope"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "gsd-codes",
+ "gsd-route",
+ "hex",
+ "hmac",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "gsd-failure"
 version = "0.1.0"
 dependencies = [
