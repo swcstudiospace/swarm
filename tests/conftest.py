@@ -145,8 +145,35 @@ _BASE_ENV_ALLOW = frozenset({
 })
 
 
+_ENGINES = ("python", "rust")
+
+
+def _test_engine() -> str:
+    """The scheduler engine the children run on: SWARM_TEST_ENGINE=python (default when unset) or rust.
+
+    Any other value, including an empty one, is a usage error: a typo must not silently run the Python engine and report a
+    green Rust leg. pytest_configure below raises it at session start; a direct call raises it too.
+    """
+    engine = os.environ.get("SWARM_TEST_ENGINE", "python")
+    if engine not in _ENGINES:
+        raise pytest.UsageError(f"SWARM_TEST_ENGINE must be one of {', '.join(_ENGINES)}; got {engine!r}")
+    return engine
+
+
+def pytest_configure(config):
+    _test_engine()
+
+
 def _scrubbed_base_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k in _BASE_ENV_ALLOW or k.startswith("LC_")}
+    """The child environment. With SWARM_TEST_ENGINE=rust (children only; this process stays SWARM_PURE_PYTHON=1) it adds
+    GSD_ENGINE=rust, SWARM_PURE_PYTHON=0 and, when the parent has it, GSD_ENGINE_BIN; with python or unset it is unchanged."""
+    env = {k: v for k, v in os.environ.items() if k in _BASE_ENV_ALLOW or k.startswith("LC_")}
+    if _test_engine() == "rust":
+        env["GSD_ENGINE"] = "rust"
+        env["SWARM_PURE_PYTHON"] = "0"
+        if "GSD_ENGINE_BIN" in os.environ:
+            env["GSD_ENGINE_BIN"] = os.environ["GSD_ENGINE_BIN"]
+    return env
 
 
 def run_script(name, *args, env=None):
