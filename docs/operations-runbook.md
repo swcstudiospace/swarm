@@ -272,3 +272,15 @@ Open sign-offs:
 - A11 approval of the pin change: open (`plan/wasmer-spike.md:55`, `:572`).
 - A2 quiet-host performance baseline: waived (`.planning/ROADMAP.md:82`) and not measured. A default flip needs it.
 - `GSD_RUST_BACKEND=sandbox` stays opt-in until the A10 and A11 items are recorded.
+
+## Task Store journal mode (opt-in WAL)
+
+The default is the rollback journal. Set `SWARM_TASKSTORE_WAL=1` in the runner's environment to make `TaskStore` open `tasks.db` in WAL mode with `synchronous=NORMAL` (set on open, fail-open to the current mode; any other value does nothing).
+
+Measured effect: 400 commits run 2.0x faster wall (5.17 to 2.58 ms per op) and a 13-task dry run 1.25x faster wall. Real runs are dominated by model sessions, so the gain there is small.
+
+Durability: a committed transition survives a process crash; after an OS crash or power loss the last few commits can roll back while the file stays consistent. `tasks.db-wal` and `tasks.db-shm` sit beside the database while a connection is open, so the directory must be writable, and `.swarm/.gitignore` already ignores them. A read-only opener (`StoreReader`, `ReadOnlyTaskStore`) also creates those side files. Never copy `tasks.db` alone while a connection is open: copy it with its `-wal` file, or close every connection first.
+
+Check it: `sqlite3 .swarm/tasks.db 'PRAGMA journal_mode'`. The mode is stored in the database file, so once set it stays after the variable is unset or the code is reverted. To revert: `sqlite3 .swarm/tasks.db 'PRAGMA journal_mode=DELETE'` with no other connection open.
+
+Known interaction: with WAL on, `tests/test_scheduler_continuous.py::test_a_success_between_failures_resets_the_streak` fails because commit latency changes retry-versus-priority ordering. Turning WAL on by default needs that test and the two read-only tests (`tests/test_shared_handover.py::test_read_tools_change_nothing_on_disk`, `omp/test/tools.int.test.ts:165`) reviewed by a human.

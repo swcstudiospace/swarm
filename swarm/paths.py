@@ -33,12 +33,14 @@ def swarm_dir(root: str | Path | None = None, *, create: bool = False) -> Path:
         base = str(Path(root).resolve() if root is not None else Path.cwd().resolve())
     d = _resolve(env_val, base)
     if create:
-        d.mkdir(parents=True, exist_ok=True)
-        try:
-            with (d / ".gitignore").open("x", encoding="utf-8") as fh:
-                fh.write("*")
-        except FileExistsError:
-            pass
+        ignore = d / ".gitignore"
+        if not ignore.exists():  # one stat on the common path; the directory and the file are made only when the file is missing
+            d.mkdir(parents=True, exist_ok=True)
+            try:
+                with ignore.open("x", encoding="utf-8") as fh:
+                    fh.write("*")
+            except FileExistsError:
+                pass
     return d
 
 

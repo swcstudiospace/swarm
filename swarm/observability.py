@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .atomic_file import write_text_atomic
 from .paths import swarm_dir
 from .runlog import emit
 from .state_store import claude_state_dir, get_swarm_state_store
@@ -106,9 +107,7 @@ def write_claude_state(data: dict[str, Any], *, root: str | Path | None = None) 
     cdir = claude_state_dir(Path(swarm_dir(root, create=True)).parent / ".claude")
     cdir.mkdir(parents=True, exist_ok=True)
     p = cdir / "swarm-state.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(p)
+    write_text_atomic(p, json.dumps(data, indent=2) + "\n")
     return p
 
 

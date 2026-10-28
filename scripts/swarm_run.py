@@ -77,6 +77,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from swarm.atomic_file import write_text_atomic  # noqa: E402
 from swarm.observability import emit_gsd_omp, stream_subagent_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
@@ -1539,9 +1540,7 @@ def write_cancel_flag(sdir: Path, corr: str, reason: str, grace_s: float) -> Pat
     cancel-check tool); the runner waits `grace_s` for them to finish before it kills their process groups."""
     path = cancel_flag_path(sdir, corr)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"requested_wall": time.time(), "reason": reason, "grace_s": grace_s}))
-    os.replace(tmp, path)
+    write_text_atomic(path, json.dumps({"requested_wall": time.time(), "reason": reason, "grace_s": grace_s}))
     return path
 
 

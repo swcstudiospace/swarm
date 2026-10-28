@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Iterator
 
+from .atomic_file import write_text_atomic
 from .paths import swarm_dir
 
 
@@ -112,9 +113,7 @@ class SwarmStateStore:
 
     def _write(self, p: Path, data: dict[str, Any]) -> None:
         try:
-            tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(data, indent=2) + "\n")
-            tmp.replace(p)
+            write_text_atomic(p, json.dumps(data, indent=2) + "\n")
         except Exception:
             pass  # isolate
 

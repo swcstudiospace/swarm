@@ -115,8 +115,25 @@ class TaskStore:
         self.conn.row_factory = sqlite3.Row
         self._tx_depth = 0
         self._live_dirty = False  # a transition committed-in-intent inside transaction(): refresh live.json after the outermost commit
+        self._tune_journal()
         self.conn.executescript(_SCHEMA)
         self._migrate_verdicts()
+
+    def _tune_journal(self) -> None:
+        """Opt-in (SWARM_TASKSTORE_WAL=1, read at every open): WAL + synchronous=NORMAL, so a commit costs no fsync of
+        the main file instead of about two (measured 17% of a dry run). Off by default: default-on changes the scheduler's
+        retry-versus-priority ordering in timing-sensitive scenarios (faster commits) and makes read-only openers leave
+        tasks.db-wal and tasks.db-shm behind."""
+        if os.environ.get("SWARM_TASKSTORE_WAL") != "1":
+            return
+        try:
+            mode = str(self.conn.execute("PRAGMA journal_mode").fetchone()[0])
+            if mode.lower() != "wal":
+                self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            # read-only filesystem, no shared memory, or a concurrent opener holds the lock: keep the current mode, only slower
+            pass
 
     def _migrate_verdicts(self) -> None:
         """D-14: in-place, idempotent add of the signed-envelope columns to a v1 verdicts table.
