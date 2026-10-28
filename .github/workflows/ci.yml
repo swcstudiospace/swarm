@@ -23,6 +23,8 @@ jobs:
       SWARM_PURE_PYTHON: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -61,12 +63,106 @@ jobs:
       - name: omp package suite
         working-directory: omp
         run: bun run test
+  # The Rust jobs below build cold on the pool: a debug gsd_engine is about 450 MB, too large to hand between jobs, so each one has the
+  # full 120 minutes. They need Python 3.12 with a shared libpython (pyo3 runs the interpreter in its build script and `cargo test`
+  # links it). scripts/ci_rust_toolchain.sh installs the toolchain pinned in rust-toolchain.toml.
   rust:
-    name: rust (build and test, locked)
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
       - name: Build (locked)
         run: cargo build --workspace --locked
       - name: Test (locked)
         run: cargo test --workspace --locked --no-fail-fast
+  clippy:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (all targets, warnings are errors)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+  parity-rust:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
+      - name: parity gate (Python and Rust legs, fault tests, budget record)
+        run: scripts/ci_parity_rust.sh parity-out
+      - name: upload the parity records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-out
+          path: parity-out/
+          if-no-files-found: ignore
+  # Headless Chrome against the cross-origin-isolation headers and the SharedArrayBuffer vectors (tests/acceptance/*.mjs). Chrome must
+  # exist on the runner image; without it scripts/_ci_browser_gate.py exits 3 and says so. The repository variable BROWSER_GATE=skip
+  # turns the job off without a code change.
+  browser:
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.BROWSER_GATE != 'skip'
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: install web dependencies (no lifecycle scripts)
+        working-directory: web
+        run: npm ci --ignore-scripts
+      - name: browser acceptance
+        run: python3 scripts/_ci_browser_gate.py
+  supply-chain:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
+      - name: cargo-deny (advisories, bans, licenses, sources)
+        run: scripts/ci_cargo_deny.sh deny-report.txt
+      - name: upload the cargo-deny report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-deny-report
+          path: deny-report.txt
+          if-no-files-found: ignore

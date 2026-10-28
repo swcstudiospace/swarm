@@ -2,7 +2,7 @@
 
 Commands assume the repo root. The registry command is `python3 -m swarm.tool_registry`. Docs and contract tests are generated; do not hand-edit `docs/tools/`, `docs/skills/` or `tests/generated/test_tool_contracts.py`. The v2.2 runtime (scheduler, telemetry, handover, skills, bar) is described in [swarm-command-center.md](swarm-command-center.md).
 
-CI (`.github/workflows/ci.yml`) runs `ruff`, `pytest`, `build_agents.py --check`, the tool registry `check`, `docs --check` and `gen-tests --check`, the skill registry `check` and `docs --check`, `scripts/_registry_intake.py --check`, and both TS suites on every push and pull request. `.pre-commit-config.yaml` runs the registry, skill and intake checks (not the TS suites or pytest) before a commit when the hook is installed. Both are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
+CI (`.github/workflows/ci.yml`) has six jobs on every push to `main` and every pull request, all on the Omega runner pool: `test` (`ruff`, `pytest`, `build_agents.py --check`, `scripts/_check_pins.py`, the tool registry `check`, `docs --check` and `gen-tests --check`, the skill registry `check` and `docs --check`, `scripts/_registry_intake.py --check`, both TS suites), `rust` (build and test), `clippy` (`cargo fmt --check` and clippy), `parity-rust`, `browser` and `supply-chain`. `.github/workflows/wheel.yml` (job `wheel`, then `install-and-gate`) is the one GitHub-hosted workflow. Commands, knobs and rollback are in "CI gates" below. `.pre-commit-config.yaml` runs the registry, skill and intake checks (not the TS suites or pytest) before a commit when the hook is installed. Both are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
 
 ## Enable the commit-time drift gate
 
@@ -16,6 +16,55 @@ pre-commit run --all-files
 The hooks use the existing `python3` runtime, pass no filenames, and run even when the staged files are unrelated to the registry. At commit time, pre-commit temporarily stashes unstaged changes, so the checks see the staged snapshot. If a hook fails, regenerate the docs and contract tests using the commands below, stage the generated files with the registry change, and retry.
 
 Without pre-commit, run `python3 -m swarm.tool_registry check`, `docs --check`, and `gen-tests --check` locally before pushing. The swarm runtime does not depend on pre-commit, and the existing CI checks remain active.
+
+## CI gates
+
+No job has run on GitHub yet: the first run happens at the pull request that ships this branch. Until then the local equivalents below are the evidence, and everything in "Pool unknowns" is unconfirmed. Every pool job runs on `[self-hosted, linux, x64, omega-ci]`, is skipped on pull requests from forks (`head.repo.full_name == github.repository` guard), and starts with `scripts/ci_host_facts.sh`, which prints kernel, glibc, CPU count, load, memory, disk, `HOME` writability, tool versions (`rustup cargo rustc python3 node bun google-chrome pkg-config`), `Py_ENABLE_SHARED`, the OpenSSL version and egress probes, and always exits 0. The Rust jobs then run `scripts/ci_rust_toolchain.sh` (installs the channel pinned in `rust-toolchain.toml` with `rustfmt`, `clippy` and the `wasm32-unknown-unknown` target; exits 1 when `rustup` is absent). Timeouts: 120 minutes for `test`, `rust`, `clippy` and `parity-rust`, 30 for `browser` and `supply-chain`. Run the commands from the repo root.
+
+| Job | Local equivalent | A failure means |
+| --- | --- | --- |
+| `test` | `SWARM_PURE_PYTHON=1 python3 -m pytest`, plus the other steps of the job in order: `ruff check .`, `python3 scripts/build_agents.py --check`, `python3 scripts/_check_pins.py`, `python3 -m swarm.tool_registry check`, `... docs --check`, `... gen-tests --check`, `python3 -m swarm.skill_registry check`, `... docs --check`, `python3 scripts/_registry_intake.py --check`, `bun test tests/ts`, `cd omp && bun run test` | A test, lint, pin or drift check failed; the step name says which. Drift: regenerate as in "Regenerate docs" and commit the result. Install `pytest ruff pyyaml cryptography` into a venv first, as the job does |
+| `rust` | `cargo build --workspace --locked`, then `cargo test --workspace --locked --no-fail-fast` | The workspace does not build or a Rust test failed (`--no-fail-fast` lists every failing test binary). Needs Python 3.12 with a shared libpython, `libssl-dev` and `pkg-config`. |
+| `clippy` | `cargo fmt --all --check`, then `cargo clippy --workspace --all-targets --locked -- -D warnings` | A file is not rustfmt-formatted (`cargo fmt --all` fixes it) or clippy reports any warning, which is an error here |
+| `parity-rust` | `scripts/ci_parity_rust.sh <out dir>` | The Python truth leg and a Rust leg (host or sandbox backend) of `tests/parity/harness.py` disagree on a case, a leg did not end in `N/N cases pass` with N at least 11, or the read-route fault tests failed. The read-route budget test is a record, not a threshold. Exit 2: no out dir given. The records land in `<out dir>`; CI uploads them as `parity-out`. When `import swarm._native` fails the script builds it with `maturin develop` into a venv (needs PyPI) and leaves a gitignored `swarm/_native*.so` in the tree |
+| `browser` | `cd web && npm ci --ignore-scripts`, then `python3 scripts/_ci_browser_gate.py` | Exit 1: `tests/acceptance/browser_headers.mjs` or `browser_sab.mjs` exited non-zero, printed a `FAIL` line, printed fewer than 5 (headers) or 20 (sab) `PASS` lines, or took over 300 s. Exit 3: the gate did not run (no Chrome, or no node); that is a runner problem, not a code failure |
+| `supply-chain` | `bash scripts/ci_cargo_deny.sh [report]` (report defaults to `./deny-report.txt`) | Exit 1 or 2 before cargo-deny: an ignore in `deny.toml` is malformed, expired or too far out (exit 2: `deny.toml` unreadable). Otherwise `cargo deny --locked check` found an advisory, a yanked crate, a disallowed licence or an unknown registry or git source; the script's own exit 2 means cargo is absent, the pinned cargo-deny could not be installed, or its SHA-256 did not match. Downloads cargo-deny 0.20.2 from GitHub, and cargo-deny fetches the advisory database from github.com |
+| `wheel` (`wheel.yml`) | `scripts/ci_build_wheel.sh dist` (needs Docker and the pinned toolchain installed with rustup; `SWARM_WHEEL_NO_DOCKER=1` builds directly on a manylinux_2_28 host), after `mypy` (strict, repo config) passes | `mypy` found a type error, or the abi3-py312 `manylinux_2_28` x86_64 wheel did not build or exceeded the glibc 2.28 floor |
+| `install-and-gate` (`wheel.yml`) | In a clean Python 3.12 environment: `python -m pip install dist/*.whl mypy==1.18.2 pytest==9.1.1`; from a directory outside the repo run `python -c "import swarm._native"` and `python -m mypy.stubtest swarm._native`; then, in a directory holding only `tests/parity/test_extension_parity.py`, `tests/parity/test_extension_threads.py` and `scripts/orch_status.py` (no `swarm/` package), run `python -m pytest -o addopts="" -q tests/parity/test_extension_parity.py tests/parity/test_extension_threads.py` | The installed wheel does not import, its stubs disagree with the extension, or a parity test fails against the wheel instead of the source tree |
+
+### Knobs
+
+- `CHROME_PATH`: when set and non-empty it is the only Chrome candidate and must be an executable file; there is no fallback to `PATH`, so a typo cannot test another browser (the gate exits 3). Unset, the gate takes the first of `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser` on `PATH`.
+- Repository variable `BROWSER_GATE=skip` (Settings, Secrets and variables, Actions, Variables): the `browser` job is skipped without a code change. A skipped job shows as skipped and is not evidence that the browser gate passed.
+- Browser gate exit code 3: not run (no Chrome or no node). The job fails red with `browser acceptance NOT RUN` rather than passing silently.
+- cargo-deny ignores: `deny.toml` ignores six advisories. cargo-deny has no expiry key, so every ignore reason ends in `expires YYYY-MM-DD` (all six say `expires 2027-01-26`). `scripts/_check_deny_ignores.py` runs first in `ci_cargo_deny.sh` and fails the job when an ignore has no valid id, no reason or no expiry, when the date has passed, or when it lies more than 120 days ahead (exit 0 valid, 1 violation, 2 unreadable `deny.toml`). Renewing or adding an ignore needs a new user decision; do not push a date out to make the job pass.
+- `scripts/ci_host_facts.sh`: first step of every pool job; read-only apart from one `HOME` write test, prints no environment, never fails the job. Read its block at the top of a run's log first.
+
+### Roll back a gate
+
+Remove the job from `ci.yml`. If the check is on the repository's required-checks list, remove it from branch protection first: a pull request would otherwise wait forever for a check that no longer reports. Only a repository admin can change that list. Required-checks state is a repository setting and is not recorded in this repo. For `browser` alone, set the repository variable `BROWSER_GATE=skip` instead (and remove it later); no file changes. A job that is red only because the pool lacks a tool (`rustup`, Chrome, `libssl-dev`) is a pool-image request, not a reason to weaken the gate.
+
+### Pool unknowns
+
+Each row is unconfirmed until the first run. The first run's logs (host-facts block and each job's own output) settle them; the plan's evidence contract is the "First-run evidence contract" in `.planning/phases/14.2-ci-evidence-and-runner-decision/14.2-PLAN.md`, to be filled in after the pull request opens.
+
+| Unknown | Needed by | Where the first run shows it |
+| --- | --- | --- |
+| `rustup` and `cargo` on the image | `rust`, `clippy`, `parity-rust`, `supply-chain` | host facts tool versions; `ci_rust_toolchain.sh` exits 1 with `rustup is not installed` |
+| Writable `HOME` and `~/.cargo` | rustup toolchain install, cargo registry and git caches, `pip` | host facts `HOME writable: yes\|no`, `df` of `HOME` |
+| Egress to `static.rust-lang.org`, `index.crates.io`, `registry.npmjs.org`, `pypi.org`, `github.com` | toolchain, crates, `npm ci`, `pip`, cargo-deny and its advisory database | host facts egress probes |
+| Python 3.12 with a shared libpython | `rust`, `clippy`, `parity-rust` (PyO3 runs and links the interpreter) | host facts `Py_ENABLE_SHARED`; a PyO3 build-script or link error in the cargo step |
+| `libssl-dev` and `pkg-config` | every cargo job (`openssl-sys` is built by the workspace) | host facts `pkg-config` and `openssl` lines; an `openssl-sys` build-script error |
+| Node | `browser` | host facts `node`; `actions/setup-node` step |
+| Chrome | `browser` | the gate's `chrome: <path> (<version>)` line, or exit 3 `NOT RUN: no Chrome`; host facts probes only `google-chrome` |
+| Whether `~/.cargo` and `target` persist between jobs | the length of every Rust job (all build cold today) | not printed; compare the compile time of consecutive runs |
+| How many jobs run at once | job duration, saturation | host facts `loadavg` and `nproc`; start times of the six jobs |
+
+On the pool the `test` job took about 69 minutes (per its comment in `ci.yml`), and an earlier run on `main` was cancelled at 32.6 minutes with the cause unknown; the Rust jobs build cold and can run long.
+
+### The wheel exception
+
+`wheel.yml` is the one workflow on GitHub-hosted `ubuntu-latest` (decision D-P22, user, 2026-10-28), an exception to the rule that every job runs on the Omega pool. The manylinux wheel is built inside a Docker container (`scripts/ci_build_wheel.sh`), the `install-and-gate` job runs in `python:3.12-slim-bookworm`, and the pool's runners are unprivileged containers without Docker. Not chosen: `maturin --zig` on the pool, a Docker runner on the VPS `srv1778002`, and no wheel job. The workflow uses no secrets and a read-only token.
 
 ## Validate the omp shell guard
 
