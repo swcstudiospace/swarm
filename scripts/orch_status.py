@@ -130,15 +130,52 @@ def add_args(p):
     p.add_argument("--history", metavar="TASK_ID")
 
 
-# GSD_ENGINE selector (U12.6, OD-1). Unset, empty or `python` runs the body unchanged. `rust` asks the
-# gsd_engine binary at GSD_ENGINE_BIN first; the body answers when run_rust returns None (see its docstring).
-# E-TIMEOUT is never retried and never falls back (D-P5-21).
+# GSD_ENGINE selector (U12.6, OD-1; Phase 14.3 R5). Resolution order: SWARM_PURE_PYTHON=1 is Python; GSD_ENGINE=python is
+# Python; `rust` is explicit (every call goes to the gsd_engine binary, which is required: E-DEP exit 2 when none is found);
+# unset or empty is DEFAULT_ENGINE; any other value is E-INPUT. A call resolved through DEFAULT_ENGINE reaches the binary only
+# when a binary is found and rust_serves(argv) holds; otherwise Python answers, silently. The body answers whenever
+# run_rust returns None (see its docstring). E-TIMEOUT is never retried and never falls back (D-P5-21).
 # RUST_CALL_TIMEOUT_S bounds the whole call. The binary has its own 600 s deadline, which does not cover its
 # start-up or its stdin read, so this outer bound is 60 s larger. GSD_RUST_TIMEOUT_S, when set to a positive
 # integer (seconds), overrides it; tests use that to keep the timeout short.
+DEFAULT_ENGINE = "python"  # the engine an unset or empty GSD_ENGINE resolves to for the read routes; "python" or "rust"
 RUST_CALL_TIMEOUT_S = 660
 RUST_FALLBACK_CODES = frozenset({"E-INTERNAL", "E-DEP", "E-CAPACITY", "E-CONTRACT", "E-INPUT"})
 RUST_ENV_KEYS = ("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
+RELEASE_BINARY = Path(__file__).resolve().parent.parent / "target" / "release" / "gsd_engine"
+# flags of the read grammar that take a value (crates/gsd-route/src/lib.rs `parse_orch_status_read`)
+READ_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id", "--history"})
+
+SCRIPT = AgentScript("A01", "orch_status", run, description=__doc__, add_args=add_args)
+
+
+def rust_serves(argv: list[str]) -> bool:
+    """True exactly for the argv the gsd_engine binary serves: the read-only `--json` grammar of `parse_orch_status_read`.
+
+    `argv` is the full argv the selector forwards. Accepted: `--json` (no inline value), `--dry-run` (no inline value) and
+    the value flags of READ_VALUE_FLAGS with either `--flag=value` or `--flag value` (a separate value must not start with
+    `-`), and `--json` at least once. Everything else is refused: a positional, an unknown or abbreviated flag, `--transition`,
+    `--ingest`, `--advisory`, `--reason`, a missing value. The binary answers those with exit 2 E-DEP.
+    """
+    json_seen = False
+    index = 0
+    while index < len(argv):
+        head, equals, _ = argv[index].partition("=")
+        has_inline = bool(equals) and head.startswith("--")  # `--flag=value`; any other `=` belongs to an unknown token
+        name = head if has_inline else argv[index]
+        if name in ("--json", "--dry-run"):
+            if has_inline:
+                return False
+            json_seen = json_seen or name == "--json"
+        elif name in READ_VALUE_FLAGS:
+            if not has_inline:
+                index += 1
+                if index >= len(argv) or argv[index].startswith("-"):
+                    return False
+        else:
+            return False
+        index += 1
+    return json_seen
 
 
 def _refuse(code: ErrorCode, message: str) -> int:
@@ -171,18 +208,18 @@ def _rust_timeout_s() -> int:
     return RUST_CALL_TIMEOUT_S
 
 
-def run_rust(argv: list[str]) -> int | None:
-    """Answers the call on the Rust engine. None hands the call to the Python body.
+def run_rust(argv: list[str], binary: str, *, explicit: bool) -> int | None:
+    """Answers the call on the Rust engine at `binary`. None hands the call to the Python body.
 
     None (fallback) is returned exactly for these triggers: a reply whose error.code is in RUST_FALLBACK_CODES;
     an argument the binary cannot take (the request is not UTF-8 encodable); an exit-2 reply without a typed
-    error.code; a reply that is not a JSON object; an exit code other than 0, 1 or 2.
-    Refused with exit 2 and never a fallback: GSD_ENGINE_BIN unset or not startable (E-DEP), and a binary that
-    did not answer within the call deadline (E-TIMEOUT).
+    error.code; a reply that is not a JSON object; an exit code other than 0, 1 or 2; a binary that cannot be
+    started when the call did not ask for `rust` explicitly (`explicit` False); and a run-log record that cannot be
+    written (AgentScript.record_external_reply raised, so the Python body answers and applies its own failure rules).
+    A Rust answer is recorded in the run log before it is printed, as the Python path's own `main` does (D1).
+    Refused with exit 2 and never a fallback: a binary that cannot be started when `explicit`, and a binary that
+    did not answer within the call deadline (E-TIMEOUT), explicit or not.
     """
-    binary = os.environ.get("GSD_ENGINE_BIN", "")
-    if not binary:
-        return _refuse(ErrorCode.E_DEP, "GSD_ENGINE=rust needs GSD_ENGINE_BIN set to the gsd_engine binary")
     request = {"agent": "A01", "script": "orch_status", "argv": argv, "root": os.getcwd(),
                "env": {key: os.environ[key] for key in RUST_ENV_KEYS if os.environ.get(key)}}
     try:
@@ -194,6 +231,8 @@ def run_rust(argv: list[str]) -> int | None:
     except subprocess.TimeoutExpired:
         return _refuse(ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
     except OSError:
+        if not explicit:
+            return None  # fallback: the default engine never turns an unusable binary into an error
         return _refuse(ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")
     reply = _reply_object(done.stdout)
     if reply is None:
@@ -205,20 +244,40 @@ def run_rust(argv: list[str]) -> int | None:
         # fallback: an exit-2 reply without a typed error.code, or one whose code the Python body serves
         if code is None or code in RUST_FALLBACK_CODES:
             return None
+    try:
+        SCRIPT.record_external_reply(argv, reply, done.returncode)
+    except Exception:  # noqa: BLE001 - any failure to record hands the call to the Python body, which answers on its own rules
+        return None
     sys.stdout.buffer.write(done.stdout)
     sys.stdout.flush()
     return done.returncode
 
 
+def select_engine(argv: list[str]) -> int | None:
+    """Resolves the engine for one call. An int is the final exit code (the selector already printed the answer); None runs the Python body."""
+    if os.environ.get("SWARM_PURE_PYTHON") == "1":
+        return None
+    requested = os.environ.get("GSD_ENGINE", "")
+    if requested == "python":
+        return None
+    if requested not in ("", "rust"):
+        return _refuse(ErrorCode.E_INPUT, "GSD_ENGINE must be 'python' or 'rust'")
+    explicit = requested == "rust"
+    if not explicit and DEFAULT_ENGINE != "rust":
+        return None
+    binary = os.environ.get("GSD_ENGINE_BIN", "")
+    if not binary and RELEASE_BINARY.is_file() and os.access(RELEASE_BINARY, os.X_OK):
+        binary = str(RELEASE_BINARY)
+    if not explicit:
+        if not rust_serves(argv) or not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
+            return None
+    if os.environ.get("GSD_RUST_BACKEND", "") not in ("", "host", "sandbox"):
+        return _refuse(ErrorCode.E_INPUT, "GSD_RUST_BACKEND must be 'host' or 'sandbox' when set")
+    if not binary:
+        return _refuse(ErrorCode.E_DEP, "GSD_ENGINE=rust needs GSD_ENGINE_BIN set to the gsd_engine binary")
+    return run_rust(argv, binary, explicit=explicit)
+
+
 if __name__ == "__main__":
-    engine = os.environ.get("GSD_ENGINE", "")
-    if engine == "rust":
-        backend = os.environ.get("GSD_RUST_BACKEND", "")
-        if backend not in ("", "host", "sandbox"):
-            sys.exit(_refuse(ErrorCode.E_INPUT, "GSD_RUST_BACKEND must be 'host' or 'sandbox' when set"))
-        answer = run_rust(sys.argv[1:])
-        if answer is not None:
-            sys.exit(answer)
-    elif engine not in ("", "python"):
-        sys.exit(_refuse(ErrorCode.E_INPUT, "GSD_ENGINE must be 'python' or 'rust'"))
-    sys.exit(AgentScript("A01", "orch_status", run, description=__doc__, add_args=add_args).main())
+    answer = select_engine(sys.argv[1:])
+    sys.exit(answer if answer is not None else SCRIPT.main())
