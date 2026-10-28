@@ -53,6 +53,7 @@ Citation keys: `R:` `plan/rust-wasmer-omp-options.md` · `E:` `plan/execution-wa
 - **Decision (provisional):** pin the sandbox target to `wasm32-wasip1` core modules, WASI 0.1, with host-side deny-by-default shims for the four imports.
 - **Justification:** the wasi-only-with-justification clause (`R:154-157`) is met by the component result in 2.2. The wasi-fallback justification that `P-dist` step 2 left as `[MEASURE: pending]` is now recorded.
 - **Status:** not applied to `Cargo.toml:157` or `rust-toolchain.toml`. Needs A03 and A11 approval, then a pin change in its own commit.
+  Update 2026-10-28: approved by the user 2026-10-26 (chat); record in `.planning/phases/10-wasmer-sandbox-and-omp-validation/10-VERIFICATION.md`, section "Sign-off record". The pin landed as `wasm32-unknown-unknown` (D-P5-13, `Cargo.toml:168`) inside commit `eb7a2b9`; the text above is the historic state.
 - **Consequence:** W-row names in section 6 are WASI 0.2 names. Under this decision they must be restated against 0.1 (section 6.1, note W-N4).
 
 ---
@@ -570,6 +571,7 @@ Found during the spike or the policy review. Recorded, not fixed. Each is a bloc
 
 - **A03:** approve D-P3-1 (wasip1 target, WASI 0.1) and record the WASI version (Q-8). Approve D1 to D4 (`P-sizing` section 4).
 - **A11:** approve the target pin change (D-P3-1) in its own commit; add the CI digest step (`P-dist` step 8); D3 link-time import list enforcement.
+  Update 2026-10-28: approved by the user 2026-10-26 (chat); record in `.planning/phases/10-wasmer-sandbox-and-omp-validation/10-VERIFICATION.md`, section "Sign-off record", which states the state of these three conditions and the two accepted exceptions (the pin is not in its own commit; `ci.yml` has no guest-digest step).
 - **A10:** rule on Q-1 to Q-7; F-03; F-04; approve T-01 to T-04 before C3; approve the sign-off list S-01 to S-24 and the exceptions E-01 to E-16.
 - **A03 with A06:** D5 (argv-carried tool input frozen for the Python path).
 - **A03 with A10:** D2 (UDS-gRPC and memfd host-only).
@@ -652,6 +654,7 @@ The user chose: keep the `wasm32-wasip2` target and change the runtime. Sections
 - The compile/stub table (section 4) is still valid for the target, because the target is unchanged.
 - The pins are not yet changed in the repo. Cargo.toml still declares `wasmer = "=7.5.0"`. Changing it to wasmtime is a separate commit, after the component gate in Phase 10.
 - A10 review of this runtime change is pending. The earlier A10 conditions (section 11) still apply where they name fuel, the trap mapping, and the import allowlist.
+  Update 2026-10-28: approved by the user 2026-10-26 (chat); record in `.planning/phases/10-wasmer-sandbox-and-omp-validation/10-VERIFICATION.md`, section "Sign-off record". "Pending" above is the historic state.
 
 ### 13.4 Reproduction
 
