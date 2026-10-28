@@ -15,6 +15,8 @@ Every script therefore gets: --task-id, --correlation-id, --json, --dry-run, exi
 """
 from __future__ import annotations
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -138,6 +140,42 @@ class AgentScript:
             ctx.emit(f"script.{self.name}.error", err)
             self._print(err, args.json)
             return self.EXIT_ERROR
+
+    def record_external_reply(self, argv: list[str], reply: dict[str, Any], exit_code: int) -> None:
+        """Writes the run-log record `main` would have written for this call, for a reply another engine produced (D1).
+
+        `argv` is parsed with this script's own parser (usage text is swallowed: a rejected argv, `--help` included, raises
+        SwarmError E-INPUT and writes nothing), `Ctx` is built as in `main`, and the record is emitted through `ctx.emit`
+        (so `tee=not dry_run`, redaction and the run-log format are the Python path's own) as `script.<name>`, or
+        `script.<name>.error` when `exit_code` is 2. `reply` is not mutated: a copy gets `setdefault` of agent, script
+        and status, so a key the reply already carries is kept.
+
+        Returns None once the record is written. It raises, and has written nothing, for a rejected argv, an exit code
+        other than 0, 1, 2, or (exit 0 or 1 only) a task or correlation id that fails `check_task_id`; `main` answers those
+        with its own error record, so the caller is expected to fall back to it. For exit 2 an invalid id is dropped from
+        the record as `main` does. The only write is the one `emit` makes, a single appended line, so a raise from
+        `emit` (state dir not writable) leaves no half-written record that this method could undo; errors are never swallowed.
+        """
+        if exit_code not in (self.EXIT_OK, self.EXIT_FAIL, self.EXIT_ERROR):
+            raise SwarmError(ErrorCode.E_INPUT, f"exit code {exit_code} has no run-log record; expected 0, 1 or 2")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = self.parser().parse_args(argv)
+        except SystemExit as exc:
+            raise SwarmError(ErrorCode.E_INPUT, f"argv rejected by the {self.name} parser (exit {exc.code})") from exc
+        ctx = Ctx(self.agent_id, self.name, args.task_id, args.correlation_id, args.dry_run, Path(args.root).resolve())
+        record = dict(reply)
+        if exit_code == self.EXIT_ERROR:
+            ctx.task_id, ctx.correlation_id = _logged_id(ctx.task_id), _logged_id(ctx.correlation_id)
+        else:
+            if ctx.task_id is not None:
+                check_task_id(ctx.task_id)
+            if ctx.correlation_id is not None:
+                check_task_id(ctx.correlation_id, "correlation id")
+        record.setdefault("agent", self.agent_id)
+        record.setdefault("script", self.name)
+        record.setdefault("status", "error" if exit_code == self.EXIT_ERROR else "ok")
+        ctx.emit(f"script.{self.name}.error" if exit_code == self.EXIT_ERROR else f"script.{self.name}", record)
 
     @staticmethod
     def _print(obj: dict[str, Any], as_json: bool) -> None:
