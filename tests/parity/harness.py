@@ -12,16 +12,26 @@ written under the repository's .swarm/. Standard library only.
   python3 tests/parity/harness.py --json   the case table as JSON
 
 The Rust leg is an explicit mode, never detected from the environment (U12.9):
-  GSD_ENGINE_BIN=<built gsd_engine> python3 tests/parity/harness.py --rust
+  GSD_ENGINE_BIN=<built gsd_engine> python3 tests/parity/harness.py --rust [--backend host|sandbox]
 Under --rust each orch_status leg (happy_path, transition, gate_pass_fail_major --history, validation_error, empty,
-large) runs the Python truth, then the same argv on the gsd_engine binary from the same restored state. Exit 0 or 1 from
-the binary must print Python's stdout bytes with Python's exit code. An exit 2 whose code is a fallback code (E-INTERNAL,
-E-DEP, E-CAPACITY, E-CONTRACT, E-INPUT) is a recorded refusal, and the script run with GSD_ENGINE=rust must then print
-Python's bytes; any other answer must match Python's bytes too. The legal transition is the one call that mutates
-state: the wall-clock updated_at it reports is masked on both sides, and nothing else is. A byte mismatch writes
-tests/parity/fixtures/<case>-<digest>.json (case, argv, every leg's exit code and stdout) and fails the case.
-Without --rust, GSD_ENGINE_BIN is ignored. --rust with GSD_ENGINE_BIN unset, not a file, or not executable, or a binary
-that cannot be started, exits 1 with a message. Nothing is skipped silently.
+large) runs the Python truth (GSD_ENGINE=python, named explicitly so a Rust default cannot move it), then the same argv
+plus --json on the gsd_engine binary from the same restored state, as the SDK bridge sends it (the binary passes argv
+through and serves only the --json read grammar). --backend names GSD_RUST_BACKEND for the Rust-served legs (default
+host). Exit 0 or 1 from the binary must print Python's stdout bytes with Python's exit code. An exit 2 whose code is a
+fallback code (E-INTERNAL, E-DEP, E-CAPACITY, E-CONTRACT, E-INPUT) is a recorded refusal, and the script run with
+GSD_ENGINE=rust must then print Python's bytes; any other answer must match Python's bytes too. A third leg runs the
+script with GSD_ENGINE unset and GSD_ENGINE_BIN set, the default selector, and must print Python's bytes as well. The
+legal transition is the one call that mutates state: the wall-clock updated_at it reports is masked on both sides, and
+nothing else is. A byte mismatch writes tests/parity/fixtures/<case>-<digest>.json (case, argv, every leg's exit code
+and stdout) and fails the case.
+
+Every check records served_by: `rust` (the binary answered), `fallback:<CODE>` (the binary refused with a fallback code,
+or fell back from the sandbox backend, and the answer came from the fallback) or `python` (the Python script answered;
+every check on the truth leg, the default selector while its default is Python, and the static checks). The evidence
+is the answer shape, the exit code, the stderr, and a marker the harness's recording wrapper around GSD_ENGINE_BIN
+leaves when the selector actually started the binary. --json-out PATH writes the per-check results and the served_by
+counts as one JSON object. Without --rust, GSD_ENGINE_BIN is ignored. --rust with GSD_ENGINE_BIN unset, not a file, or
+not executable, or a binary that cannot be started, exits 1 with a message. Nothing is skipped silently.
 """
 from __future__ import annotations
 
@@ -33,13 +43,15 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,6 +64,18 @@ LARGE_TASKS = 200
 # The selector's fallback codes as literals. scripts/orch_status.py RUST_FALLBACK_CODES must equal this set; the
 # classifier case checks that it does, so changing either side fails a check instead of moving the leg's answer.
 SELECTOR_FALLBACK_CODES = frozenset({"E-INTERNAL", "E-DEP", "E-CAPACITY", "E-CONTRACT", "E-INPUT"})
+BACKENDS = ("host", "sandbox")
+
+# Unit R3b makes the binary print this one line to stderr when the sandbox backend faulted and host Rust answered. It
+# is parsed in failover_code() and nowhere else; the line is built from the code only.
+FAILOVER_NOTICE = re.compile(rb"^gsd_engine: sandbox fault (E-[A-Z]+); answered by host Rust$", re.MULTILINE)
+
+# The selector legs must reach the binary, so SWARM_PURE_PYTHON (which the selector treats as "Python" ahead of
+# GSD_ENGINE once Phase 14.3 R5 lands) is not set for them; the truth leg and the direct binary keep it.
+SELECTOR_LEG_UNSET = ("SWARM_PURE_PYTHON",)
+
+# What the Rust router answers for argv it does not serve (crates/gsd-adapter/src/route_table.rs route_for_call).
+NO_ROUTE_MESSAGE = "no rust route for this entrypoint and flags"
 
 FIXTURES = REPO / "tests" / "parity" / "fixtures"
 STATE_DIRS = ("state", "workspace", "home")
@@ -71,6 +95,7 @@ class Check:
     label: str
     ok: bool
     detail: str = ""
+    served_by: str = "python"  # rust, fallback:<CODE> or python: who answered the call the check inspects
 
 
 @dataclass(frozen=True)
@@ -105,24 +130,36 @@ class CaseResult:
     description: str
     status: str
     checks: list[Check]
+    pending: list[str] = field(default_factory=list)  # mirror checks that cannot run yet, each with its reason
 
 
 class Sandbox:
     """Per-case temporary state: a workspace, SWARM_DIR, HOME and a fresh signing key (never a host key)."""
 
-    def __init__(self, base: Path, case_name: str, rust_bin: Optional[str] = None) -> None:
+    def __init__(self, base: Path, case_name: str, rust_bin: Optional[str] = None, backend: str = "host") -> None:
         self.base = base
         self.case_name = case_name
         self.rust_bin = rust_bin  # the gsd_engine binary under --rust; None leaves the Rust leg off
+        self.backend = backend  # GSD_RUST_BACKEND for the Rust-served legs
         self.parity: list[Check] = []  # Rust-leg checks, appended by orch_status_leg
+        self.pending: list[str] = []
         self.workspace = base / "workspace"
         self.swarm_dir = base / "state" / ".swarm"
         self.home = base / "home"
         self.signing_key = secrets.token_hex(32)
-        for directory in (self.workspace, self.swarm_dir, self.home):
+        self.started_marker = base / "probe" / "started"  # one byte appended per start of the recorded binary
+        self.recorded_bin = base / "probe" / "gsd_engine"
+        for directory in (self.workspace, self.swarm_dir, self.home, self.recorded_bin.parent):
             directory.mkdir(parents=True)
+        if rust_bin is not None:
+            # The selector legs name this wrapper as GSD_ENGINE_BIN: it records that the selector started the binary,
+            # then becomes the binary with stdin, argv, environment and exit code untouched.
+            self.recorded_bin.write_text(
+                f"#!/bin/sh\nprintf x >> {shlex.quote(str(self.started_marker))}\nexec {shlex.quote(rust_bin)} \"$@\"\n",
+                encoding="utf-8")
+            self.recorded_bin.chmod(0o700)
 
-    def env(self, overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
+    def env(self, overrides: Optional[dict[str, str]] = None, unset: tuple[str, ...] = ()) -> dict[str, str]:
         """A scrubbed child environment: host PATH and locale only, then this sandbox's state."""
         env = {key: value for key, value in os.environ.items() if key in HOST_ENV_KEYS or key.startswith("LC_")}
         env.update(
@@ -136,6 +173,8 @@ class Sandbox:
             PYTHONIOENCODING="utf-8",
         )
         env.update(overrides or {})
+        for key in unset:
+            env.pop(key, None)
         return env
 
     def snapshot(self, name: str) -> Path:
@@ -179,7 +218,7 @@ def task_store(sandbox: Sandbox) -> Iterator[Any]:
             store.conn.close()
 
 
-def seed_tasks(sandbox: Sandbox, *task_ids: str, correlation_id: str = "C-parity", notes: Optional[dict] = None) -> None:
+def seed_tasks(sandbox: Sandbox, *task_ids: str, correlation_id: str = "C-parity", notes: Optional[dict[str, Any]] = None) -> None:
     """Create CREATED tasks through the real TaskStore, the same path orch_plan.py uses."""
     with task_store(sandbox) as store:
         for task_id in task_ids:
@@ -199,24 +238,34 @@ def invoke(sandbox: Sandbox, script: str, args: list[str], *, engine: str = "pyt
            env: Optional[dict[str, str]] = None) -> Probe:
     """Runs one invocation with --root <workspace> appended to `args`.
 
-    engine "python": scripts/<script>.py with GSD_ENGINE unset and --json appended. This is the truth.
-    engine "selector": the same script with GSD_ENGINE=rust and GSD_ENGINE_BIN, so its Python fallback can answer.
-    engine "rust": the gsd_engine binary with the same argv; the binary appends --json itself, as the SDK bridge does.
+    engine "python": scripts/<script>.py with GSD_ENGINE=python and --json appended. This is the truth.
+    engine "selector": the same script with GSD_ENGINE=rust, GSD_ENGINE_BIN (the recording wrapper) and GSD_RUST_BACKEND,
+        so its Python fallback can answer.
+    engine "default": the same script with GSD_ENGINE unset and GSD_ENGINE_BIN set: the selector's own default. The
+        backend is left to the binary's default.
+    engine "rust": the gsd_engine binary with the same argv, --json included, as the SDK bridge sends it.
     """
-    argv = [*args, "--root", str(sandbox.workspace)]
+    argv = [*args, "--root", str(sandbox.workspace), "--json"]
     if engine == "rust":
         return _invoke_binary(sandbox, script, argv)
-    if engine not in ("python", "selector"):
-        raise ValueError(f"unknown engine {engine!r}")
     overrides = dict(env or {})
-    if engine == "selector":
+    unset: tuple[str, ...] = ()
+    if engine == "python":
+        overrides["GSD_ENGINE"] = "python"
+    elif engine in ("selector", "default"):
         if sandbox.rust_bin is None:
             raise RuntimeError("the Rust leg is off: no gsd_engine binary was named")
-        overrides.update(GSD_ENGINE="rust", GSD_ENGINE_BIN=sandbox.rust_bin)
+        overrides["GSD_ENGINE_BIN"] = str(sandbox.recorded_bin)
+        if engine == "selector":
+            overrides.update(GSD_ENGINE="rust", GSD_RUST_BACKEND=sandbox.backend)
+        unset = SELECTOR_LEG_UNSET
+        sandbox.started_marker.unlink(missing_ok=True)
+    else:
+        raise ValueError(f"unknown engine {engine!r}")
     proc = subprocess.run(
-        [sys.executable, str(SCRIPTS / f"{script}.py"), *argv, "--json"],
+        [sys.executable, str(SCRIPTS / f"{script}.py"), *argv],
         cwd=sandbox.workspace,
-        env=sandbox.env(overrides),
+        env=sandbox.env(overrides, unset),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=PROCESS_TIMEOUT_S,
@@ -229,7 +278,7 @@ def _invoke_binary(sandbox: Sandbox, script: str, argv: list[str]) -> Probe:
     """Runs the gsd_engine binary directly with the stdin object that scripts/orch_status.py builds for it."""
     if sandbox.rust_bin is None:
         raise RuntimeError("the Rust leg is off: no gsd_engine binary was named")
-    env = sandbox.env()
+    env = sandbox.env({"GSD_RUST_BACKEND": sandbox.backend})
     keys = _selector(sandbox).RUST_ENV_KEYS
     request = {"agent": "A01", "script": script, "argv": argv, "root": str(sandbox.workspace),
                "env": {key: env[key] for key in keys if env.get(key)}}
@@ -292,27 +341,69 @@ def _record_mismatch(sandbox: Sandbox, args: list[str], legs: dict[str, Probe], 
     return str(path.relative_to(REPO))
 
 
+def failover_code(stderr: bytes) -> Optional[str]:
+    """The sandbox fault code in unit R3b's failover notice on stderr, else None. This is the one place the notice is
+    parsed; the binary prints nothing of the kind until R3b lands, so today it always returns None."""
+    match = FAILOVER_NOTICE.search(stderr)
+    return match.group(1).decode("ascii") if match else None
+
+
+def served_by(binary: Probe, answered: Probe, binary_started: bool = True) -> str:
+    """Who answered one call: `python`, `rust` or `fallback:<CODE>`.
+
+    `binary` is the gsd_engine binary's own reply to the argv; `answered` is the probe a check judges (the same probe on
+    the direct leg, the script's probe on a selector leg); `binary_started` is False when the selector never started the
+    binary. A refusal with a fallback code, or a sandbox failover notice on the answer's stderr, is a fallback."""
+    if not binary_started:
+        return "python"
+    refusal = _error_code(binary)
+    if refusal in SELECTOR_FALLBACK_CODES:
+        return f"fallback:{refusal}"
+    fault = failover_code(answered.stderr)
+    return f"fallback:{fault}" if fault else "rust"
+
+
 def _rust_checks(sandbox: Sandbox, before: Path, args: list[str], truth: Probe, mutating: bool) -> list[Check]:
-    """The binary's answer to one call, or the selector's fallback where the binary refuses, against Python."""
+    """The binary's answer to one call, or the selector's fallback where the binary refuses, and the default selector's
+    answer, each against Python."""
     label = f"orch_status {' '.join(args)}"
-    fallback_codes = SELECTOR_FALLBACK_CODES
     sandbox.restore(before)
     rust = invoke(sandbox, "orch_status", args, engine="rust")
     refusal = _error_code(rust)
     legs: dict[str, Probe] = {"python": truth, "rust": rust}
-    if refusal in fallback_codes:
+    if refusal in SELECTOR_FALLBACK_CODES:
         sandbox.restore(before)
         legs["selector"] = invoke(sandbox, "orch_status", args, engine="selector")
         answer = legs["selector"]
         name = f"{label}: rust refuses {refusal}, the script fallback prints Python's bytes"
+        answer_served = served_by(rust, answer, sandbox.started_marker.exists())
     else:
         answer = rust
         suffix = f", refused {refusal}" if refusal else ""
         name = f"{label}: rust answers exit {rust.exit_code}{suffix} with Python's bytes"
-    if _same(answer, truth, mutating):
-        return [Check(name, True, f"exit {truth.exit_code}")]
-    where = _record_mismatch(sandbox, args, legs, mutating)
-    return [Check(name, False, f"exit {answer.exit_code} vs Python exit {truth.exit_code}; fixture {where}")]
+        answer_served = served_by(rust, rust)
+    sandbox.restore(before)
+    legs["default"] = invoke(sandbox, "orch_status", args, engine="default")
+    default_served = served_by(rust, legs["default"], sandbox.started_marker.exists())
+    # Before Phase 14.3 R5 the selector has no DEFAULT_ENGINE and its default is Python.
+    selector = _selector(sandbox)
+    rust_serves = getattr(selector, "rust_serves", None)
+    script_argv = [*args, "--root", str(sandbox.workspace), "--json"]
+    python_expected = getattr(selector, "DEFAULT_ENGINE", "python") == "python" or (
+        rust_serves is not None and not rust_serves(script_argv))
+    answer_problems = [] if _same(answer, truth, mutating) else [f"exit {answer.exit_code} vs Python exit {truth.exit_code}"]
+    default_problems = [] if _same(legs["default"], truth, mutating) else [
+        f"exit {legs['default'].exit_code} vs Python exit {truth.exit_code}"]
+    if (default_served == "python") != python_expected:
+        default_problems.append(f"served_by {default_served}, expected {'python' if python_expected else 'rust or a fallback'}")
+    where = _record_mismatch(sandbox, args, legs, mutating) if answer_problems or default_problems else ""
+    answer_detail = "; ".join([*answer_problems, f"fixture {where}"]) if answer_problems else f"exit {truth.exit_code}"
+    default_detail = "; ".join([*default_problems, f"fixture {where}"]) if default_problems else f"exit {truth.exit_code}"
+    return [
+        Check(name, not answer_problems, answer_detail, answer_served),
+        Check(f"{label}: the default selector (GSD_ENGINE unset) prints Python's bytes", not default_problems, default_detail,
+              default_served),
+    ]
 
 
 def orch_status_leg(sandbox: Sandbox, args: list[str], *, mutating: bool = False) -> Probe:
@@ -593,7 +684,7 @@ def case_malformed(sandbox: Sandbox) -> list[Check]:
     not_json = invoke(sandbox, "swarm_tool", ["call", "--caller", "A05", "--name", "be_route_norm", "--input", "{oops"])
     not_object = invoke(sandbox, "swarm_tool", ["call", "--caller", "A05", "--name", "be_route_norm", "--input", "[1]"])
     no_name = invoke(sandbox, "swarm_tool", ["call", "--caller", "A05", "--input", "{}"])
-    refused = dict(exit_code=2, keys=("status", "error"), predicate=error_code("E-INPUT"))
+    refused: dict[str, Any] = dict(exit_code=2, keys=("status", "error"), predicate=error_code("E-INPUT"))
     return [
         expect("input that is not JSON is E-INPUT, never uncaught", not_json, **refused),
         expect("input that is not a JSON object is E-INPUT", not_object, **refused),
@@ -638,7 +729,7 @@ def case_policy(sandbox: Sandbox) -> list[Check]:
                                                "--plan-mode", "--input", "{}"])
     gate_move = invoke(sandbox, "orch_status", ["--transition", "T-foreign-gate", "IN_REVIEW",
                                                 "--reason", "parity foreign gate"])
-    refused = dict(exit_code=2, keys=("status", "error"))
+    refused: dict[str, Any] = dict(exit_code=2, keys=("status", "error"))
     return [
         expect("plan mode refuses a WRITE tool before its handler is imported", plan_mode,
                predicate=all_of(error_code("E-POLICY"), no_leak(sandbox.base)), **refused),
@@ -647,14 +738,86 @@ def case_policy(sandbox: Sandbox) -> list[Check]:
     ]
 
 
-def _diff(got: set[str], want: set[str]) -> str:
+def _diff(got: AbstractSet[str], want: AbstractSet[str]) -> str:
     return f"missing {sorted(want - got)}, extra {sorted(got - want)}"
+
+
+# Complete orch_status argv as the selector sees them; "{root}" is the sandbox workspace. The first group is the read
+# grammar of parse_orch_status_read plus --json; the rest is outside it, for one reason per entry.
+ROUTING_CORPUS: tuple[tuple[str, ...], ...] = (
+    ("--json",),
+    ("--correlation-id", "C-1", "--json"),
+    ("--correlation-id=C-1", "--json"),
+    ("--task-id", "T-1", "--json"),
+    ("--history", "T-1", "--json"),
+    ("--repo", "{root}", "--json"),
+    ("--root={root}", "--json"),
+    ("--dry-run", "--json"),
+    (),  # no --json
+    ("--correlation-id", "C-1"),  # no --json
+    ("--json=1",),  # an inline value on a flag
+    ("--dry-run=1", "--json"),
+    ("--transition", "T-1", "CANCELLED", "--json"),  # mutating
+    ("--ingest", "result.json", "--json"),  # mutating
+    ("--advisory", "--json"),
+    ("--reason", "why", "--json"),
+    ("--unknown", "--json"),
+    ("--corr", "C-1", "--json"),  # argparse's prefix match, not served
+    ("--correlation-id", "--json"),  # a value that starts with '-'
+    ("--history", "--json"),
+    ("positional", "--json"),
+)
+
+
+def _routing_checks(sandbox: Sandbox, rust_serves: Callable[[list[str]], bool]) -> list[Check]:
+    """The selector's rust_serves() against the binary's own routing for each argv of ROUTING_CORPUS. The binary serves an
+    argv unless it answers exit 2 E-DEP with its no-route message; nothing else it prints counts as a refusal to route."""
+    checks = []
+    for template in ROUTING_CORPUS:
+        argv = [part.replace("{root}", str(sandbox.workspace)) for part in template]
+        reply = _invoke_binary(sandbox, "orch_status", argv)
+        error = (reply.payload or {}).get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        binary_serves = not (_error_code(reply) == "E-DEP" and isinstance(message, str) and NO_ROUTE_MESSAGE in message)
+        selector_serves = bool(rust_serves(argv))
+        checks.append(Check(f"rust_serves agrees with the binary's routing for argv {list(template)}",
+                            selector_serves == binary_serves,
+                            f"selector rust_serves {selector_serves}, binary serves {binary_serves}",
+                            served_by(reply, reply)))
+    return checks
+
+
+def _default_mirror_checks(sandbox: Sandbox, selector: Any) -> list[Check]:
+    """Static and dynamic mirrors of the selector's default. Each one runs only once its symbol exists: the selector's
+    DEFAULT_ENGINE and rust_serves() come with Phase 14.3 R5, ORCH_STATUS_READ_DEFAULT with R3a. A missing symbol is
+    listed as pending on the case result, never passed. The dynamic one needs the binary, so it runs under --rust."""
+    checks: list[Check] = []
+    table = (REPO / "crates" / "gsd-adapter" / "src" / "route_table.rs").read_text(encoding="utf-8")
+    declared = re.search(r"ORCH_STATUS_READ_DEFAULT\s*:\s*Engine\s*=\s*Engine::(\w+)", table)
+    default_engine = getattr(selector, "DEFAULT_ENGINE", None)
+    if default_engine is None or declared is None:
+        missing = [name for name, found in (("scripts/orch_status.py DEFAULT_ENGINE", default_engine is not None),
+                                            ("route_table.rs ORCH_STATUS_READ_DEFAULT", declared is not None))
+                   if not found]
+        sandbox.pending.append(f"DEFAULT_ENGINE equals ORCH_STATUS_READ_DEFAULT: not defined yet: {', '.join(missing)}")
+    else:
+        checks.append(Check("scripts/orch_status.py DEFAULT_ENGINE equals route_table.rs ORCH_STATUS_READ_DEFAULT",
+                            default_engine == declared.group(1).lower(),
+                            f"selector {default_engine!r}, route table {declared.group(1).lower()!r}"))
+    rust_serves = getattr(selector, "rust_serves", None)
+    if rust_serves is None:
+        sandbox.pending.append("rust_serves matches the binary's routing on the argv corpus: "
+                               "scripts/orch_status.py has no rust_serves() yet")
+    elif sandbox.rust_bin is not None:
+        checks.extend(_routing_checks(sandbox, rust_serves))
+    return checks
 
 
 def case_classifier(sandbox: Sandbox) -> list[Check]:
     """Static mirror check: ErrorCode, the retry partitions, omp/src/bridge.ts and classify() must agree.
 
-    scripts/orch_status.py RUST_FALLBACK_CODES must equal SELECTOR_FALLBACK_CODES (checked below).
+    scripts/orch_status.py RUST_FALLBACK_CODES must equal SELECTOR_FALLBACK_CODES (checked below), and the selector's
+    default and routing grammar must equal the Rust side's (_default_mirror_checks).
     """
     with in_process(sandbox):
         from swarm.errors import ErrorCode, SwarmError, classify
@@ -689,12 +852,14 @@ def case_classifier(sandbox: Sandbox) -> list[Check]:
     for exc_type, code in expected_map.items():
         got = classify(exc_type("parity probe")).value
         checks.append(Check(f"classify({exc_type.__name__}) is {code}", got == code, f"got {got}"))
-    selector_codes = set(_selector(sandbox).RUST_FALLBACK_CODES)
+    selector = _selector(sandbox)
+    selector_codes = set(selector.RUST_FALLBACK_CODES)
     checks.append(Check(
         "scripts/orch_status.py RUST_FALLBACK_CODES equals the harness copy",
         selector_codes == SELECTOR_FALLBACK_CODES,
         _diff(selector_codes, SELECTOR_FALLBACK_CODES),
     ))
+    checks.extend(_default_mirror_checks(sandbox, selector))
     return checks
 
 
@@ -727,15 +892,16 @@ CASES: tuple[Case, ...] = (
 )
 
 
-def run_case(case: Case, rust_bin: Optional[str] = None) -> CaseResult:
-    """Run one case in a fresh temporary directory, removed afterwards; rust_bin is set under --rust."""
+def run_case(case: Case, rust_bin: Optional[str] = None, backend: str = "host") -> CaseResult:
+    """Run one case in a fresh temporary directory, removed afterwards; rust_bin is set under --rust and backend names
+    the Rust backend of its Rust-served legs."""
     base = Path(tempfile.mkdtemp(prefix=f"parity-{case.name}-"))
     sandbox: Optional[Sandbox] = None
     try:
         resolved = base.resolve()
         if resolved == REPO or REPO in resolved.parents:
             raise RuntimeError(f"temporary state {resolved} lies inside the repository")
-        sandbox = Sandbox(base, case.name, rust_bin)
+        sandbox = Sandbox(base, case.name, rust_bin, backend)
         checks = case.run(sandbox)
     except RustLegUnavailable:
         raise
@@ -746,7 +912,7 @@ def run_case(case: Case, rust_bin: Optional[str] = None) -> CaseResult:
     if sandbox is not None:
         checks = [*checks, *sandbox.parity]
     status = "pass" if checks and all(check.ok for check in checks) else "fail"
-    return CaseResult(case.name, case.route, case.description, status, checks)
+    return CaseResult(case.name, case.route, case.description, status, checks, sandbox.pending if sandbox else [])
 
 
 def render_table(results: list[CaseResult]) -> str:
@@ -755,6 +921,7 @@ def render_table(results: list[CaseResult]) -> str:
         passed = sum(check.ok for check in result.checks)
         lines.append(f"{result.name:<30}{result.route:<28}{result.status:<8}{passed}/{len(result.checks)}")
         lines.extend(f"    FAIL {check.label}: {check.detail}" for check in result.checks if not check.ok)
+        lines.extend(f"    PENDING {note}" for note in result.pending)
     lines.append(f"{sum(result.status == 'pass' for result in results)}/{len(results)} cases pass")
     return "\n".join(lines)
 
@@ -770,18 +937,60 @@ def _rust_binary() -> str:
     return str(path)
 
 
+def _require_native_extension() -> None:
+    """The selector legs run without SWARM_PURE_PYTHON, so the Python body they fall back to needs swarm._native."""
+    env = {key: os.environ[key] for key in HOST_ENV_KEYS if key in os.environ}
+    done = subprocess.run([sys.executable, "-c", "import swarm._native"], cwd=REPO, env=env, capture_output=True,
+                          timeout=PROCESS_TIMEOUT_S, check=False)
+    if done.returncode != 0:
+        raise RustLegUnavailable("swarm._native cannot be imported; the selector legs run without SWARM_PURE_PYTHON "
+                                 "(build it with `pip install .`)")
+
+
+def summarize(results: list[CaseResult], *, rust: bool, backend: str) -> dict[str, Any]:
+    """The per-check results with the served_by counts, as --json-out writes them."""
+    counts: dict[str, int] = {}
+    for result in results:
+        for check in result.checks:
+            counts[check.served_by] = counts.get(check.served_by, 0) + 1
+    return {
+        "mode": {"rust": rust, "backend": backend if rust else None},
+        "cases_passed": sum(result.status == "pass" for result in results),
+        "cases_total": len(results),
+        "served_by_counts": dict(sorted(counts.items())),
+        "pending": [f"{result.name}: {note}" for result in results for note in result.pending],
+        "cases": [asdict(result) for result in results],
+    }
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="A1 parity runner: 11 cases for the read-only route, Python as truth.")
     parser.add_argument("--json", action="store_true", help="print the case table as JSON")
     parser.add_argument("--rust", action="store_true",
                         help="also compare each orch_status leg with the gsd_engine binary at GSD_ENGINE_BIN")
+    parser.add_argument("--backend", choices=BACKENDS, default=None,
+                        help="GSD_RUST_BACKEND for the Rust-served legs under --rust (default host)")
+    parser.add_argument("--json-out", metavar="PATH", default=None,
+                        help="write the per-check results and the served_by counts to PATH as one JSON object")
     args = parser.parse_args(argv)
+    if args.backend is not None and not args.rust:
+        parser.error("--backend applies to the Rust leg: pass --rust")
+    backend = args.backend or "host"
     try:
         rust_bin = _rust_binary() if args.rust else None
-        results = [run_case(case, rust_bin) for case in CASES]
+        if args.rust:
+            _require_native_extension()
+        results = [run_case(case, rust_bin, backend) for case in CASES]
     except RustLegUnavailable as exc:
         print(f"parity: the --rust leg cannot run: {exc}", file=sys.stderr)
         return 1
+    if args.json_out is not None:
+        try:
+            Path(args.json_out).write_text(
+                json.dumps(summarize(results, rust=args.rust, backend=backend), indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"parity: cannot write {args.json_out}: {exc.strerror or type(exc).__name__}", file=sys.stderr)
+            return 1
     if args.json:
         print(json.dumps([asdict(result) for result in results], indent=2))
     else:
