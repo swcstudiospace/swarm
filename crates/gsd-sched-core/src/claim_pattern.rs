@@ -20,7 +20,7 @@ pub enum ClaimMode {
     Shared,
 }
 
-/// A claim pattern was empty, absolute, drive-qualified or contained `..`.
+/// A claim pattern was empty, absolute, `~`-prefixed, drive-qualified or contained `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimError {
     /// The pattern as it was passed to [`PathClaim::new`], before normalization.
@@ -45,13 +45,20 @@ pub struct PathClaim {
 impl PathClaim {
     /// Parses `pattern` into a claim. A trailing `/` means the whole directory.
     ///
-    /// Returns [`ClaimError`] for an empty, absolute, drive-qualified, or `..`-containing pattern.
+    /// Returns [`ClaimError`] for an empty, absolute, `~`-prefixed, drive-qualified, or `..`-containing pattern.
     pub fn new(pattern: &str, mode: ClaimMode) -> Result<Self, ClaimError> {
-        let normalized = pattern.trim().replace('\\', "/");
+        // Python `str.strip()` also strips the four ASCII separators U+001C to U+001F, which `char::is_whitespace` does not.
+        let normalized = pattern
+            .trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+            .replace('\\', "/");
         let invalid = || ClaimError {
             pattern: pattern.to_string(),
         };
-        if normalized.is_empty() || normalized.starts_with('/') || is_drive_qualified(&normalized) {
+        if normalized.is_empty()
+            || normalized.starts_with('/')
+            || normalized.starts_with('~')
+            || is_drive_qualified(&normalized)
+        {
             return Err(invalid());
         }
         let directory = normalized.ends_with('/');
@@ -111,6 +118,15 @@ pub fn claims_conflict(a: &PathClaim, b: &PathClaim) -> bool {
         .any(|x| right.iter().any(|y| path_segments_overlap(x, y)))
 }
 
+/// Two claims can match a common path, whatever their modes: the glob-against-glob overlap of the normalized patterns themselves
+/// (the Python `swarm.claims.overlaps`). Unlike [`claims_conflict`] it ignores the mode and does not extend an exclusive bare
+/// name to its subtree, so `src` and `src/a.rs` do not overlap.
+pub fn claims_overlap(a: &PathClaim, b: &PathClaim) -> bool {
+    let left: Vec<&str> = a.segments.iter().map(String::as_str).collect();
+    let right: Vec<&str> = b.segments.iter().map(String::as_str).collect();
+    path_segments_overlap(&left, &right)
+}
+
 /// Decides whether two segment lists can match a common path. `**` matches any number of segments.
 fn path_segments_overlap(a: &[&str], b: &[&str]) -> bool {
     glob_overlap(
@@ -141,9 +157,9 @@ fn tokenize(segment: &str) -> Vec<Token> {
             }
             '?' => tokens.push(Token::Any),
             '[' => {
-                if let Some(offset) = chars[i + 1..].iter().position(|&c| c == ']') {
+                if let Some(end) = class_end(&chars, i) {
                     tokens.push(Token::Any);
-                    i += offset + 2;
+                    i = end;
                     continue;
                 }
                 tokens.push(Token::Literal('['));
@@ -153,6 +169,25 @@ fn tokenize(segment: &str) -> Vec<Token> {
         i += 1;
     }
     tokens
+}
+
+/// Where the character class that opens at `chars[start]` (a `[`) ends, as an exclusive index, or `None` when it is no class.
+///
+/// This is the match of the Python regex `\[(?:[^\]]|(?<=\[)\])+\]`: the body is a non-empty run of characters that are not `]`,
+/// except that a `]` directly after a `[` belongs to the body. The match is greedy, so the class ends at the first `]` that does
+/// not directly follow a `[`; when the text ends first, it ends at the last `]` that has at least one body character before it.
+/// `[]` is therefore no class, and `[]a]` is one.
+fn class_end(chars: &[char], start: usize) -> Option<usize> {
+    for (offset, &c) in chars[start + 1..].iter().enumerate() {
+        let at = start + 1 + offset;
+        if c == ']' && chars[at - 1] != '[' {
+            return Some(at + 1);
+        }
+    }
+    (start + 2..chars.len())
+        .rev()
+        .find(|&at| chars[at] == ']')
+        .map(|at| at + 1)
 }
 
 /// Decides whether two single-segment globs can match a common name. Character classes count as `?`.

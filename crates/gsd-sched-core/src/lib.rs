@@ -9,8 +9,16 @@
 #![warn(missing_docs)]
 
 pub mod aimd;
+pub mod backoff;
 pub mod claim_pattern;
+pub mod claims;
+pub mod drain;
+pub mod pool;
 pub mod ports;
+pub mod priority;
+
+#[cfg(test)]
+mod jsonlite;
 
 pub use aimd::{AimdLimiter, LimiterError, DEFAULT_RETRY_CAP, DEFAULT_STREAK_THRESHOLD};
-pub use claim_pattern::{claims_conflict, ClaimError, ClaimMode, PathClaim};
+pub use claim_pattern::{claims_conflict, claims_overlap, ClaimError, ClaimMode, PathClaim};
