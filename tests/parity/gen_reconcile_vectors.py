@@ -574,6 +574,15 @@ def _dependants(clock: _Clock) -> Iterator[Row]:
     w.verdict("T-1", "review", "fail")
     yield w.finish()
 
+    w = _world(clock, "rerun-clone-drops-ingest-keys", "clone")
+    w.task("T-1")
+    w.gate_task("G-review", "review", ["T-1"], "IN_REVIEW",
+                notes={"ingest_keys": [{"task_id": "G-review", "attempt": 1, "digest": "d" * 64, "reply": {"state": "IN_REVIEW"}},
+                                       {"task_id": "G-review", "attempt": 2, "digest": "e" * 64, "reply": {"state": "IN_REVIEW"}}],
+                       "keep_first": 1, "result": {"x": 1}, "feedback": [{"n": 1}], "meta": {"y": 2}, "keep_last": "z"})
+    w.verdict("T-1", "review", "fail")
+    yield w.finish()
+
     w = _world(clock, "rerun-clone-empty-acceptance-and-budget", "clone")
     w.task("T-1")
     w.gate_task("G-review", "review", ["T-1"], "DONE", title="", budget={})

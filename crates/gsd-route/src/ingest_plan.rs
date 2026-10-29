@@ -1136,12 +1136,7 @@ pub fn plan_ingest(facts: &IngestFacts, now: f64) -> Result<IngestPlan, IngestEr
                     }
                     IngestOp::Transition { task_id, plan }
                 }
-                ReconcileOp::CreateTask(mut task) => {
-                    // `results.reconcile` clones a gate task's notes without `result`, `meta` and `ingest_keys` (D-P24): a replay key
-                    // belongs to the task it was written for. `plan_reconcile` drops the first two only, and it is not this unit's file.
-                    task.notes.retain(|(key, _)| key != "ingest_keys");
-                    IngestOp::CreateTask(task)
-                }
+                ReconcileOp::CreateTask(task) => IngestOp::CreateTask(task),
                 ReconcileOp::SetDependsOn {
                     task_id,
                     depends_on,

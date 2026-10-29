@@ -161,7 +161,7 @@ pub struct NewTask {
     pub risk_class: Json,
     /// `priority` of the cloned task.
     pub priority: Json,
-    /// `notes` of the cloned task without its `result` and `meta` keys.
+    /// `notes` of the cloned task without its `result`, `meta` and `ingest_keys` keys (a replay key belongs to the task it was written for).
     pub notes: Fields,
 }
 
@@ -708,7 +708,7 @@ impl<'a> Sim<'a> {
         let notes: Fields = source
             .notes
             .iter()
-            .filter(|(key, _)| key != "result" && key != "meta")
+            .filter(|(key, _)| key != "result" && key != "meta" && key != "ingest_keys")
             .cloned()
             .collect();
         let new_task = NewTask {
