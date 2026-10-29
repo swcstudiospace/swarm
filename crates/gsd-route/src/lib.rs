@@ -1549,3 +1549,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(feature = "write-routes-2")]
+pub mod catalog;
