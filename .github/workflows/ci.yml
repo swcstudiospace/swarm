@@ -120,6 +120,18 @@ jobs:
           if-no-files-found: ignore
       - name: Test (locked)
         run: cargo test --workspace --locked --no-fail-fast
+      # The suites behind a Cargo feature, which the workspace run above does not enable: the writer's fault-injection points (phase
+      # 14.5, unit U3.2d) and the sandbox backend's write guest (U3.3b).
+      - name: Test (fault-injection, sandbox-write)
+        run: |
+          cargo test -p gsd-taskwriter --features fault-injection --locked --no-fail-fast
+          cargo test -p gsd-adapter --features sandbox-write --locked --no-fail-fast
+      # The selector and the real binary under races, kill -9 and a lost reply (U3.2d). The default build serves the host backend,
+      # which is what the suite exercises; it uses the debug binary the key tests copied aside.
+      - name: write fault suite (Python, default build)
+        env:
+          SWARM_PURE_PYTHON: "1"
+        run: GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/test_write_faults.py -p no:cacheprovider
   clippy:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, omega-ci]
