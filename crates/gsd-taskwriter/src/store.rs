@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gsd_codes::ErrorCode;
+use gsd_route::gate_facts::VerdictRow;
 use gsd_route::{parse_json, Fields, Json};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, Sqlite, SqlitePool, Transaction, TypeInfo, ValueRef};
@@ -667,6 +668,82 @@ impl Tx {
                 format!("task store rollback failed: {error}"),
             )
         })
+    }
+
+    /// `TaskStore._latest_rows`' query: `SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id`, as the columns the pure gate
+    /// facts read. Read-only: it does not mark the transaction as written, so a refusal after it still leaves the store byte-identical.
+    ///
+    /// Python runs `json.loads(findings)` on EVERY row the query returns (`d["findings"] = json.loads(d["findings"])`), a required
+    /// gate or not, a `NULL` gate or not, and a `NULL` or invalid `findings` makes the whole `missing_gates` raise and the transition
+    /// refuse. The check is made here, before the `NULL`-gate row is skipped: a row whose `findings` is `NULL`, is not text or is
+    /// not JSON that [`parse_json`] reads is an [`ErrorKind::Unsupported`] error, so Python answers (it refuses with its own text).
+    /// [`parse_json`] reads no more than Python's `json` does (it declines `NaN`, `Infinity` and integers beyond `i64`, which Python
+    /// accepts), so it can only decline more.
+    ///
+    /// A row whose columns have a type this crate cannot prove Python reads the same way is an [`ErrorKind::Unsupported`] error too.
+    pub async fn verdict_rows(
+        &mut self,
+        task_id: &str,
+        since: f64,
+    ) -> Result<Vec<VerdictRow>, WriterError> {
+        let wrote = self.wrote;
+        let rows = sqlx::query(
+            "SELECT id, task_id, gate, verdict, findings, envelope_json, ts FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id",
+        )
+        .bind(task_id)
+        .bind(since)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(|error| {
+            failure(
+                wrote,
+                ErrorKind::Database,
+                format!("task store verdict read of {task_id}: {error}"),
+            )
+        })?;
+        let unsupported = |problem: String| {
+            failure(
+                wrote,
+                ErrorKind::Unsupported,
+                format!("verdicts of {task_id}: {problem}"),
+            )
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let fields = row_fields(row).map_err(unsupported)?;
+            let text = |name: &str| match fields.iter().find(|(column, _)| column == name) {
+                Some((_, Json::Str(value))) => Ok(Some(value.clone())),
+                Some((_, Json::Null)) => Ok(None),
+                _ => Err(format!("column {name} is not text")),
+            };
+            let number = match fields.iter().find(|(column, _)| column == "ts") {
+                Some((_, Json::Float(value))) => *value,
+                Some((_, Json::Int(value))) => *value as f64,
+                _ => return Err(unsupported("column ts is not a number".to_string())),
+            };
+            let id = match fields.iter().find(|(column, _)| column == "id") {
+                Some((_, Json::Int(value))) => *value,
+                _ => return Err(unsupported("column id is not an integer".to_string())),
+            };
+            match text("findings").map_err(unsupported)? {
+                Some(findings) if parse_json(&findings).is_ok() => {}
+                Some(_) => return Err(unsupported("column findings is not JSON".to_string())),
+                None => return Err(unsupported("column findings is NULL".to_string())),
+            }
+            // A NULL gate is a key no required gate (a string) can equal, so Python's dict never offers it to `_check_row`.
+            let Some(gate) = text("gate").map_err(unsupported)? else {
+                continue;
+            };
+            out.push(VerdictRow {
+                id,
+                task_id: task_id.to_string(),
+                gate,
+                verdict: text("verdict").map_err(unsupported)?,
+                envelope_json: text("envelope_json").map_err(unsupported)?,
+                ts: number,
+            });
+        }
+        Ok(out)
     }
 }
 

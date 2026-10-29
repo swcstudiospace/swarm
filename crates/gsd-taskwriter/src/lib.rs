@@ -25,6 +25,7 @@
 #![warn(missing_docs)]
 
 mod apply;
+pub mod approval;
 mod error;
 pub mod gate_issue;
 mod ops;
@@ -34,6 +35,7 @@ mod store;
 pub use apply::{
     Applied, AppliedAudit, ApplyCause, ApplyError, Decider, HostDecider, TaskStoreWriter,
 };
+pub use approval::{ApprovalKeys, ApprovalSource, EnvApprovalSource, FixedApprovalSource};
 pub use error::{ErrorKind, WriteState, WriterError};
 pub use gate_issue::{
     derive_gate_issue, Decline, EnvelopeIds, GateEvent, GateFile, GateIssueRequest, GatePlan,

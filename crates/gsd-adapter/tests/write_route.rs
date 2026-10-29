@@ -15,6 +15,9 @@
 //! - every argv outside the grammar, the sandbox backend, a missing `effects_path`, a missing or unmigrated store and an unreadable
 //!   `latest_correlation` are refused before the first write;
 //! - the `git rev-parse` child of the swarm-directory resolution gets no environment but `PATH` and `HOME`.
+//! - a transition to APPROVED (unit U3.4d) answers Python's bytes and leaves Python's rows, on Python-signed verdict rows with a key in
+//!   the binary's environment, and refuses with Python's `E-POLICY` text without a key or with a failing gate; a key-file reference is
+//!   left to Python before any write.
 //!
 //! The repository root is `SWARM_REPO_ROOT` or two levels above this crate. Temporary files follow `TMPDIR`.
 
@@ -32,6 +35,8 @@ use gsd_route::{obj_get, parse_json, Fields, Json};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Column, ConnectOptions, Connection, Row, SqliteConnection, TypeInfo, ValueRef};
 use tempfile::TempDir;
+
+mod signed_store;
 
 const VECTORS: &str = include_str!("../../gsd-route/tests/vectors/transition.json");
 
@@ -489,7 +494,8 @@ fn compare_with_python(case: &Case) -> Result<(), String> {
     let ours = rust(&rust_world, &argv);
     let id = &case.id;
     if ours.code == 2 && ours.write_state().as_deref() == Some("not_started") {
-        // A legal APPROVED needs the approval facts the host cannot read yet (unit U3.4d): not started, whatever the vector says.
+        // A legal APPROVED may be refused as not started when the host cannot read its gate facts (a key-file reference under HOME, a task
+        // row whose facts the host does not reproduce): Python answers then, and no vector flags that.
         if !case.rust_not_started && case.outcome != "exception" && case.to != "APPROVED" {
             return Err(format!(
                 "{id}: refused as not_started although the vector is served: {}",
@@ -506,7 +512,10 @@ fn compare_with_python(case: &Case) -> Result<(), String> {
         }
         return Ok(());
     }
-    if case.rust_not_started || case.outcome == "exception" {
+    // A recorded decision reverses this line's premise (unit U3.4d): the vectors of a manual APPROVED are flagged `rust_not_started`
+    // because their writer had no approval facts; the host reads them from the store and the key policy now, so the route serves them
+    // and the comparison with Python below is the check. Every other flagged vector is still never served.
+    if (case.rust_not_started && case.to != "APPROVED") || case.outcome == "exception" {
         return Err(format!(
             "{id}: served although Python cannot be matched: {}",
             ours.stdout
@@ -1086,4 +1095,262 @@ fn the_git_child_gets_path_and_home_and_nothing_else() {
         .collect();
     assert_eq!(names, ["HOME", "PATH"], "git was started with {seen:?}");
     assert!(!run.stdout.contains("canary") && !run.stderr.contains("canary"));
+}
+
+// ---- a transition to APPROVED (U3.4d) -------------------------------------------------------------------------------------------
+
+/// A random 64-digit hex secret, from the randomly keyed hasher of the standard library. Never written to a file, never printed.
+fn random_key() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    (0..4)
+        .map(|_| format!("{:016x}", RandomState::new().build_hasher().finish()))
+        .collect()
+}
+
+/// Python's `orch_status.py` on `world` with `extra` in its (otherwise empty) environment. `HOME` is a directory with no key file under
+/// it: a conventional `signing-key.hex` under the real home would make both engines load it (the binary leaves that to Python).
+fn python_with(world: &World, argv: &[String], extra: &[(&str, String)]) -> Run {
+    let mut command = Command::new("python3");
+    command
+        .arg(repo_root().join("scripts/orch_status.py"))
+        .args(argv)
+        .current_dir(&world.root)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", world.dir.path().join("home"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("SWARM_PURE_PYTHON", "1")
+        .env("SWARM_GSD_STATE_FILE", "")
+        .env(
+            "SWARM_CLAUDE_STATE_DIR",
+            world.dir.path().join("claude-state"),
+        )
+        .env("SWARM_DIR", &world.swarm);
+    for (name, value) in extra {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run python3");
+    Run {
+        code: output.status.code().expect("exit code"),
+        stdout: String::from_utf8(output.stdout).expect("utf8 stdout"),
+        stderr: String::from_utf8(output.stderr).expect("utf8 stderr"),
+    }
+}
+
+/// A world whose store holds T-1 in IN_REVIEW with the rows of `spec` signed under `sign`, and an identical twin for the oracle.
+fn signed_worlds(spec: &str, sign: &[(&str, String)]) -> (World, World) {
+    let world = World::new(&[]);
+    let scratch = world.dir.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("scratch");
+    let sign: Vec<(String, String)> = sign
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), value.clone()))
+        .collect();
+    fs::remove_file(world.db()).expect("remove the template copy");
+    signed_store::seed_into(&repo_root(), &world.db(), &scratch, spec, &sign);
+    let twin = World::new(&[]);
+    fs::write(twin.db(), world.db_bytes()).expect("copy the signed store");
+    (world, twin)
+}
+
+const APPROVE: [&str; 5] = ["--json", "--transition", "T-1", "APPROVED", "--reason"];
+
+/// Runs `--transition T-1 APPROVED --reason signed` on the binary (with `run_env` as its only environment besides PATH and HOME) and on
+/// Python (with the same variables) on identical stores. Returns both answers and both worlds.
+fn approve_on_both(
+    spec: &str,
+    sign: &[(&str, String)],
+    run_env: &[(&str, String)],
+) -> (Run, Run, World, World) {
+    let (world, twin) = signed_worlds(spec, sign);
+    let mut argv: Vec<&str> = APPROVE.to_vec();
+    argv.push("signed");
+    let mut call = Call::new(&world, &argv);
+    call.extra_process_env
+        .push(("HOME", world.dir.path().join("home").display().to_string()));
+    for (name, value) in run_env {
+        call.extra_process_env.push((name, value.clone()));
+    }
+    let ours = call.run();
+    let theirs = python_with(&twin, &argv_strings(&argv), run_env);
+    (ours, theirs, world, twin)
+}
+
+const PASSING: &str = r#"{"verdicts": [["review", "pass"], ["quality", "pass"]]}"#;
+
+#[test]
+fn an_approved_transition_with_a_key_and_signed_rows_commits_what_python_commits_and_hands_on_its_effects(
+) {
+    for (label, sign_and_run) in [
+        ("hmac", vec![("SWARM_SIGNING_KEY", random_key())]),
+        ("ed25519", vec![("SWARM_ED25519_KEY", random_key())]),
+        (
+            "dev key",
+            vec![("SWARM_ALLOW_INSECURE_DEV_KEY", "1".to_string())],
+        ),
+    ] {
+        let (ours, theirs, world, twin) = approve_on_both(PASSING, &sign_and_run, &sign_and_run);
+        assert_eq!(ours.code, 0, "{label}: {} {}", ours.stdout, ours.stderr);
+        assert_eq!(
+            theirs.code, 0,
+            "{label}: Python approves too: {}",
+            theirs.stdout
+        );
+        assert_eq!(mask(&ours.stdout), mask(&theirs.stdout), "{label}: stdout");
+        assert_eq!(
+            block(content(&world.db())),
+            block(content(&twin.db())),
+            "{label}: the stores differ"
+        );
+        assert_eq!(ours.json()["task"]["state"], "APPROVED", "{label}");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&world.manifest()).expect("a manifest");
+        let types: Vec<&str> = manifest["effects"]
+            .as_array()
+            .expect("effects")
+            .iter()
+            .filter_map(|effect| effect["type"].as_str())
+            .collect();
+        let kinds: Vec<&str> = manifest["post"]
+            .as_array()
+            .expect("post")
+            .iter()
+            .filter_map(|step| step["kind"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            ["task.transition"],
+            "{label}: Python's transition emits nothing else (no security.dev_key)"
+        );
+        assert_eq!(
+            kinds,
+            ["live_refresh", "lease_settle", "inline_transition"],
+            "{label}"
+        );
+        for (name, value) in &sign_and_run {
+            if *name == "SWARM_ALLOW_INSECURE_DEV_KEY" {
+                continue; // the opt-in is the flag 1, not a secret: it is in every reply as a number
+            }
+            assert!(
+                !ours.stdout.contains(value.as_str())
+                    && !ours.stderr.contains(value.as_str())
+                    && !world.manifest().contains(value.as_str()),
+                "{label}: the value of {name} appears in the output"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_approved_transition_without_a_key_or_with_a_failing_gate_is_pythons_policy_refusal_and_writes_nothing(
+) {
+    let key = random_key();
+    let signed = [("SWARM_SIGNING_KEY", key.clone())];
+    for (label, spec, run_env, text) in [
+        (
+            "no key",
+            PASSING,
+            vec![],
+            "fail-closed: no signing key configured",
+        ),
+        (
+            "require without a key",
+            PASSING,
+            vec![("SWARM_REQUIRE_KEY", "1".to_string())],
+            "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+        ),
+        (
+            "a failing gate",
+            r#"{"verdicts": [["review", "pass"], ["quality", "fail"]]}"#,
+            vec![("SWARM_SIGNING_KEY", key.clone())],
+            "lacks passing gates ['quality']",
+        ),
+        (
+            "a gate task that was never accepted",
+            r#"{"verdicts": [["review", "pass"], ["quality", "pass"]], "issuer": "FAILED"}"#,
+            vec![("SWARM_SIGNING_KEY", key.clone())],
+            "has unaccepted gates ['quality', 'review']",
+        ),
+    ] {
+        let (world, twin) = signed_worlds(spec, &signed);
+        let before = world.db_bytes();
+        let argv = [
+            "--json",
+            "--transition",
+            "T-1",
+            "APPROVED",
+            "--reason",
+            "signed",
+        ];
+        let mut call = Call::new(&world, &argv);
+        call.extra_process_env
+            .push(("HOME", world.dir.path().join("home").display().to_string()));
+        for (name, value) in &run_env {
+            call.extra_process_env.push((name, value.clone()));
+        }
+        let ours = call.run();
+        let theirs = python_with(&twin, &argv_strings(&argv), &run_env);
+        assert_eq!(ours.code, 2, "{label}: {}", ours.stdout);
+        assert_eq!(
+            (ours.code, &ours.stdout),
+            (theirs.code, &theirs.stdout),
+            "{label}: Python's bytes"
+        );
+        assert_eq!(ours.error_code().as_deref(), Some("E-POLICY"), "{label}");
+        assert!(ours.stdout.contains(text), "{label}: {}", ours.stdout);
+        assert_eq!(
+            ours.write_state(),
+            None,
+            "{label}: Python's own refusal carries no write_state"
+        );
+        assert_eq!(
+            world.db_bytes(),
+            before,
+            "{label}: a refusal leaves the store byte-identical"
+        );
+        assert_eq!(
+            world.manifest(),
+            "",
+            "{label}: a refusal writes no manifest"
+        );
+        assert!(
+            !ours.stdout.contains(&key) && !ours.stderr.contains(&key),
+            "{label}: the key is in the answer"
+        );
+    }
+}
+
+#[test]
+fn an_approved_transition_with_a_key_file_reference_is_left_to_python_before_any_write() {
+    let key = random_key();
+    let reference = (
+        "SWARM_ED25519_KEY_FILE",
+        "/nonexistent/agent-swarm/signing.pem".to_string(),
+    );
+    let (ours, theirs, world, twin) =
+        approve_on_both(PASSING, &[("SWARM_SIGNING_KEY", key)], &[reference]);
+    assert_eq!(ours.code, 2, "{}", ours.stdout);
+    assert_eq!(ours.error_code().as_deref(), Some("E-DEP"));
+    assert_eq!(ours.write_state().as_deref(), Some("not_started"));
+    assert!(
+        !ours.stdout.contains("/nonexistent"),
+        "the path of the reference is not in the refusal: {}",
+        ours.stdout
+    );
+    assert_eq!(world.manifest(), "");
+    // Python then answers: the reference cannot be loaded, so there is no key and it refuses without writing, as the store shows.
+    assert_eq!(theirs.code, 2, "{}", theirs.stdout);
+    assert!(
+        theirs
+            .stdout
+            .contains("fail-closed: no signing key configured"),
+        "{}",
+        theirs.stdout
+    );
+    assert_eq!(
+        block(content(&world.db())),
+        block(content(&twin.db())),
+        "nothing was written by either"
+    );
 }

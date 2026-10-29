@@ -59,6 +59,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Column, ConnectOptions, Connection, Row, SqliteConnection, TypeInfo, ValueRef};
 use tempfile::TempDir;
 
+mod signed_store;
+
 const VECTORS: &str = include_str!("../../gsd-route/tests/vectors/transition.json");
 
 /// The Python-built empty store: the schema and the migrations are Python's.
@@ -340,10 +342,13 @@ enum Script {
     Bytes(Vec<u8>),
     /// The call faults with this code before any reply (a trap, fuel, memory, a pin mismatch, a spent deadline).
     Fault(ErrorCode),
-    /// Takes this long, then answers faithfully: a guest that burns the deadline and still replies.
-    Slow(Duration),
     /// Takes this long, then faults with this code: a guest the sandbox stops late.
     SlowFault(Duration, ErrorCode),
+    /// Waits until this instant (the call has run that long by the decider's clock), then faults with this code. The wait does not
+    /// depend on how long the host took to reach the call, so a loaded host cannot move the fault out of the window a case aims at.
+    FaultAt(Instant, ErrorCode),
+    /// Waits until this instant, then answers faithfully (as [`Script::FaultAt`] waits before it faults).
+    ReplyAt(Instant),
 }
 
 struct Scripted {
@@ -409,13 +414,17 @@ impl WriteGuest for Scripted {
             Script::Text(edit) => Ok(edit(&encode_reply(&faithful(request))).into_bytes()),
             Script::Bytes(bytes) => Ok(bytes.clone()),
             Script::Fault(code) => Err(*code),
-            Script::Slow(delay) => {
-                std::thread::sleep(*delay);
-                Ok(encode_reply(&faithful(request)).into_bytes())
-            }
             Script::SlowFault(delay, code) => {
                 std::thread::sleep(*delay);
                 Err(*code)
+            }
+            Script::FaultAt(instant, code) => {
+                std::thread::sleep(instant.saturating_duration_since(Instant::now()));
+                Err(*code)
+            }
+            Script::ReplyAt(instant) => {
+                std::thread::sleep(instant.saturating_duration_since(Instant::now()));
+                Ok(encode_reply(&faithful(request)).into_bytes())
             }
         }
     }
@@ -757,7 +766,8 @@ fn a_hostile_reply_is_answered_by_the_host_decision_with_the_host_backends_bytes
     );
 }
 
-/// IN_REVIEW → APPROVED: the host has no approval facts, so it refuses with `not_started` (Python answers).
+/// IN_REVIEW → APPROVED with no verdict row: the host refuses with Python's own `E-POLICY` (no key in this process, else no passing
+/// gate), so a guest that commits it is a forgery. Before U3.4d the host had no approval facts and the refusal was `not_started`.
 fn approving() -> (Vec<Fields>, Vec<&'static str>) {
     (
         vec![row_in("IN_REVIEW", "T-1")],
@@ -1325,15 +1335,19 @@ fn duplicate_keys_whose_last_value_is_the_host_decision_are_the_answer() {
     assert_eq!(guest.calls(), 1);
 }
 
-/// A not_started answer from the guest is the answer when the host makes it too (a legal APPROVED without approval facts): the host's
+/// A not_started answer from the guest is the answer when the host makes it too (a target that is not a state name): the host's
 /// bytes, no failover, nothing written. A guest that says it cannot decide where the host would commit is a forgery, held with the
 /// hostile cases below.
 ///
-/// This test's premise is reversed by D-P29: it used to give the guest a not_started marker of its own for a legal transition and
-/// expect that marker to be the answer, which the verified shadow now refuses to take on the guest's word.
+/// This test's premise is reversed twice. D-P29: it used to give the guest a not_started marker of its own for a legal transition and
+/// expect that marker to be the answer, which the verified shadow now refuses to take on the guest's word. U3.4d: its not_started
+/// decision was a legal APPROVED without approval facts; the host reads those facts itself now (a legal APPROVED without a key is
+/// Python's own `E-POLICY`), so the decision the host and the guest share is a target that is not a state name, which Python answers
+/// with a traceback.
 #[test]
 fn a_not_started_answer_the_host_gives_too_writes_nothing_and_is_not_a_fault() {
-    let (rows, argv) = approving();
+    let rows = vec![row_in("IN_REVIEW", "T-1")];
+    let argv = vec!["--transition", "T-1", "BOGUS", "--reason", "because"];
     let guest = Scripted::new(Script::Rewrite(|decision| decision));
     let (sandbox, failover, world) = run_sandbox(&rows, &argv, &guest, DEADLINE);
     assert_eq!(sandbox, run_host(&rows, &argv));
@@ -1447,29 +1461,26 @@ fn a_budget_inside_the_reserve_is_timeout_and_one_before_it_calls_the_guest() {
 #[test]
 fn a_guest_that_spends_the_deadline_ends_the_call_as_timeout_with_no_failover() {
     let secs = Duration::from_secs;
+    // Each case backdates its call by `age`, which leaves the guest `18 s - age` of its own budget when it is called: three seconds, so
+    // a host that needs seconds to open the store (load 40 to 150 here) still reaches the call with budget left. The guest then waits
+    // until the offset the case aims at, counted from the start of the call, whatever the host's delay was. The guest's budget is 18 s
+    // and the call deadline 20 s: 19 s is inside the reserve, 20.5 s is after the deadline.
+    let age = secs(15);
     let cases = [
-        (
-            "stopped inside the reserve",
-            Script::SlowFault(secs(1), ErrorCode::Timeout),
-            secs(17),
-        ),
-        (
-            "stopped after the call deadline",
-            Script::SlowFault(Duration::from_millis(3_600), ErrorCode::Timeout),
-            Duration::from_millis(16_500),
-        ),
-        (
-            "failed after the call deadline",
-            Script::SlowFault(Duration::from_millis(3_600), ErrorCode::Dep),
-            Duration::from_millis(16_500),
-        ),
+        ("stopped inside the reserve", 19.0, ErrorCode::Timeout),
+        ("stopped after the call deadline", 20.5, ErrorCode::Timeout),
+        ("failed after the call deadline", 20.5, ErrorCode::Dep),
     ];
-    for (label, script, age) in cases {
+    for (label, offset, code) in cases {
+        let started = ago(age);
         let (rows, _) = legal();
         let world = World::new(&rows);
         let before = world.db_bytes();
-        let guest = Scripted::new(script);
-        let (outcome, failover) = decide_through_writer(&world, &guest, ago(age), secs(20));
+        let guest = Scripted::new(Script::FaultAt(
+            started + Duration::from_secs_f64(offset),
+            code,
+        ));
+        let (outcome, failover) = decide_through_writer(&world, &guest, started, secs(20));
         let error = outcome.expect_err("the deadline is spent");
         assert_eq!(error.code(), ErrorCode::Timeout, "{label}");
         assert_eq!(error.cause(), &ApplyCause::Refused, "{label}");
@@ -1505,10 +1516,13 @@ fn an_e_timeout_before_the_budget_is_spent_is_fuel_and_the_host_answers() {
 /// have the rest of the reserve.
 #[test]
 fn a_reply_inside_the_reserve_is_used() {
+    // 15 s of a 20 s call are gone when the guest is called (three seconds of its own budget left, which a loaded host cannot spend
+    // before the call); it replies at 19 s, after its budget (18 s) and before the call deadline.
     let secs = Duration::from_secs;
     let world = World::new(&[row_in("CREATED", "T-1")]);
-    let guest = Scripted::new(Script::Slow(secs(1)));
-    let (outcome, failover) = decide_through_writer(&world, &guest, ago(secs(17)), secs(20));
+    let started = ago(secs(15));
+    let guest = Scripted::new(Script::ReplyAt(started + secs(19)));
+    let (outcome, failover) = decide_through_writer(&world, &guest, started, secs(20));
     outcome.expect("a faithful reply inside the reserve commits");
     assert_eq!(failover, None);
     assert_eq!(guest.calls(), 1);
@@ -1565,12 +1579,15 @@ fn a_budget_that_is_spent_before_the_guest_is_called_is_timeout_and_the_guest_is
 /// and the host does not decide in its place.
 #[test]
 fn a_reply_that_lands_after_the_deadline_is_timeout_and_rolls_back() {
+    // 6 s of a 10 s call are gone when the guest is called (three seconds of its own budget left, which a loaded host cannot spend
+    // before the call); it replies at 10.4 s, after the call deadline.
     let world = World::new(&[row_in("CREATED", "T-1")]);
     let before = world.db_bytes();
-    let guest = Scripted::new(Script::Slow(Duration::from_millis(2_400)));
+    let started = ago(Duration::from_secs(6));
+    let guest = Scripted::new(Script::ReplyAt(started + Duration::from_millis(10_400)));
     let error = block(async {
         let writer = writer(&world.db(), Duration::from_secs(10)).await;
-        let decider = SandboxDecider::new(&guest, Instant::now(), Duration::from_secs(2));
+        let decider = SandboxDecider::new(&guest, started, Duration::from_secs(10));
         let outcome = writer
             .transition(&request("T-1", "VALIDATED"), NOW, &decider)
             .await;
@@ -2341,6 +2358,119 @@ mod real_guest {
                 "{label}: answered as the host backend answers"
             );
             assert_eq!(sandbox.exit_code, 0, "{label}: {}", sandbox.stdout);
+        }
+    }
+
+    /// A transition to APPROVED on the real guest (unit U3.4d): the host reads the key policy and the Python-signed verdict rows inside
+    /// its own transaction and hands the guest booleans and gate names; the guest's decision is the host's, with no failover, for an
+    /// approval and for each of Python's policy refusals. (The writer takes its keys from a fixed environment here: a process-wide key
+    /// variable would race the other tests of this binary.)
+    #[test]
+    fn the_real_guest_serves_an_approved_transition_with_no_failover() {
+        use gsd_taskwriter::{FixedApprovalSource, WriteState as RefusalState};
+
+        let key: String = (0..4)
+            .map(|_| {
+                use std::collections::hash_map::RandomState;
+                use std::hash::{BuildHasher, Hasher};
+                format!("{:016x}", RandomState::new().build_hasher().finish())
+            })
+            .collect();
+        let sign = vec![("SWARM_SIGNING_KEY".to_string(), key.clone())];
+        let engine = SandboxEngine::new().expect("sandbox engine");
+        // label, store spec, the environment of the run, the refusal text Python gives (None when it approves)
+        type Case<'a> = (&'a str, &'a str, Vec<(String, String)>, Option<&'a str>);
+        let cases: [Case; 4] = [
+            (
+                "a signed approval",
+                r#"{"verdicts": [["review", "pass"], ["quality", "pass"]]}"#,
+                sign.clone(),
+                None,
+            ),
+            (
+                "a failing gate",
+                r#"{"verdicts": [["review", "pass"], ["quality", "fail"]]}"#,
+                sign.clone(),
+                Some("lacks passing gates ['quality']"),
+            ),
+            (
+                "an unaccepted gate task",
+                r#"{"verdicts": [["review", "pass"], ["quality", "pass"]], "issuer": "FAILED"}"#,
+                sign.clone(),
+                Some("has unaccepted gates ['quality', 'review']"),
+            ),
+            (
+                "no key",
+                r#"{"verdicts": [["review", "pass"], ["quality", "pass"]]}"#,
+                Vec::new(),
+                Some("fail-closed: no signing key configured"),
+            ),
+        ];
+        for (label, spec, run_env, refusal) in cases {
+            let dir = TempDir::new().expect("tempdir");
+            let scratch = dir.path().join("scratch");
+            fs::create_dir(&scratch).expect("scratch");
+            let host_db = dir.path().join("host.db");
+            let sandbox_db = dir.path().join("sandbox.db");
+            signed_store::seed_into(&repo_root(), &host_db, &scratch, spec, &sign);
+            fs::copy(&host_db, &sandbox_db).expect("copy the signed store");
+            let source = std::sync::Arc::new(FixedApprovalSource::new(run_env.clone()));
+            let decide = |path: PathBuf, decider: &dyn Decider| {
+                block(async {
+                    let store = open_for_write(&WriterConfig::new(&path))
+                        .await
+                        .expect("open_for_write");
+                    let writer = TaskStoreWriter::with_approval(store, source.clone());
+                    let outcome = writer
+                        .transition(&request("T-1", "APPROVED"), NOW, decider)
+                        .await;
+                    writer.close().await;
+                    outcome
+                })
+            };
+            let host = decide(host_db.clone(), &gsd_taskwriter::HostDecider);
+            let shadow = SandboxDecider::new(&engine, Instant::now(), DEADLINE);
+            let served = decide(sandbox_db.clone(), &shadow);
+            assert_eq!(
+                shadow.failover(),
+                None,
+                "{label}: the guest served, no failover"
+            );
+            match (&host, &served, refusal) {
+                (Ok(host), Ok(served), None) => {
+                    assert_eq!(host.task, served.task, "{label}: the committed row");
+                    assert_eq!(
+                        obj_get(&served.task, "state"),
+                        Some(&jstr("APPROVED")),
+                        "{label}"
+                    );
+                }
+                (Err(host), Err(served), Some(text)) => {
+                    assert_eq!(
+                        (host.code(), host.message()),
+                        (served.code(), served.message()),
+                        "{label}"
+                    );
+                    assert_eq!(served.code(), ErrorCode::Policy, "{label}");
+                    assert_eq!(served.write_state(), RefusalState::Final, "{label}");
+                    assert!(
+                        served.message().contains(text),
+                        "{label}: {}",
+                        served.message()
+                    );
+                }
+                other => panic!("{label}: the guest and the host disagree: {other:?}"),
+            }
+            assert_eq!(
+                block(content(&sandbox_db, true)),
+                block(content(&host_db, true)),
+                "{label}: the stores are the same"
+            );
+            let spent = format!("{host:?}{served:?}");
+            assert!(
+                !spent.contains(&key),
+                "{label}: the key is in a Debug output"
+            );
         }
     }
 }

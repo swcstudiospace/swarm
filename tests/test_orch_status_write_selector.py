@@ -9,6 +9,7 @@ import io
 import json
 import os
 import random
+import resource
 import shutil
 import sqlite3
 import subprocess
@@ -78,7 +79,7 @@ class Fake:
 
 
 FAKE_BODY = '''#!{python}
-import json, os, sqlite3, sys, time
+import json, os, resource, sqlite3, sys, time
 folder = {folder!r}
 cfg = json.load(open(os.path.join(folder, "cfg.json")))
 with open(os.path.join(folder, "starts"), "a") as fh:
@@ -86,13 +87,14 @@ with open(os.path.join(folder, "starts"), "a") as fh:
 request = json.load(sys.stdin)
 json.dump(request, open(os.path.join(folder, "stdin.json"), "w"))
 json.dump(dict(os.environ), open(os.path.join(folder, "env.json"), "w"))
+json.dump(list(resource.getrlimit(resource.RLIMIT_CORE)), open(os.path.join(folder, "rlimit_core.json"), "w"))
 effects = request.get("effects_path")
 present = bool(effects) and os.path.exists(effects)
 seen = {{"exists": present, "size": os.path.getsize(effects) if present else None, "mode": oct(os.stat(effects).st_mode & 0o777) if present else None}}
 json.dump(seen, open(os.path.join(folder, "effects.json"), "w"))
 if cfg["set_state"]:
     tid, state, *stamp = cfg["set_state"]  # an optional third value is the row's updated_at, as a committing binary stamps it
-    conn = sqlite3.connect(os.path.join(os.environ["SWARM_DIR"], "tasks.db"))
+    conn = sqlite3.connect(os.path.join(request["env"]["SWARM_DIR"], "tasks.db"))  # the binary's environment is an allowlist: the request carries it
     conn.execute("UPDATE tasks SET state=?" + (", updated_at=?" if stamp else "") + " WHERE task_id=?", (state, *stamp, tid))
     conn.commit()
 if cfg["manifest"] is not None and effects:
@@ -488,9 +490,14 @@ def test_a_write_request_carries_an_effects_file_the_selector_owns(mod: ModuleTy
 
 # --- the environment of the binary ------------------------------------------------------------------------------------------
 
+# A recorded decision reverses the premise of this test (design item 13 of phase 14.5, D-P30): the binary's environment was every GSD_* and
+# SWARM_* variable minus a deny-list of key names; it is now an explicit allowlist of names (BINARY_ENV_NAMES). The swarm directory and the
+# ids reach the binary in the request's `env` (asserted above), GSD_ENGINE and SWARM_TASKSTORE_WAL are read by nobody in it, and a name
+# nobody listed is not handed on. The signing variables go only to a transition to APPROVED (the next test).
 @pytest.mark.parametrize("argv", [["--json"], WRITE], ids=["read", "write"])
-def test_the_binary_never_gets_signing_keys_and_gets_what_it_needs(argv: list[str], mod: ModuleType, fake_binary: Callable[..., Fake],
-                                                                   store: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_binary_gets_an_allowlist_of_names_and_no_signing_keys_outside_approved(
+        argv: list[str], mod: ModuleType, fake_binary: Callable[..., Fake], store: None, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
     fake = fake_binary(stdout=_rendered(_error_reply("E-DEP", "not_started")), exit=2)
     monkeypatch.setenv("GSD_ENGINE", "rust")
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
@@ -499,6 +506,8 @@ def test_the_binary_never_gets_signing_keys_and_gets_what_it_needs(argv: list[st
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("UNRELATED_TOKEN", "canary-unrelated")
+    monkeypatch.setenv("SWARM_AGENT_SESSION", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     for name in SIGNING_ENV:
         monkeypatch.setenv(name, f"canary-{name}")
 
@@ -507,11 +516,116 @@ def test_the_binary_never_gets_signing_keys_and_gets_what_it_needs(argv: list[st
     environment = fake.seen("env.json")
     assert fake.starts == 1
     assert not set(SIGNING_ENV) & set(environment)
-    assert not [value for value in environment.values() if "canary-" in value] and "UNRELATED_TOKEN" not in environment
-    assert {key: environment.get(key) for key in ("GSD_RUST_BACKEND", "GSD_ENGINE", "SWARM_DIR", "SWARM_TASKSTORE_WAL", "HOME", "LANG")} == {
-        "GSD_RUST_BACKEND": "host", "GSD_ENGINE": "rust", "SWARM_DIR": str(tmp_path / ".swarm"), "SWARM_TASKSTORE_WAL": "1",
-        "HOME": str(tmp_path / "home"), "LANG": "C.UTF-8"}
+    assert not [value for value in environment.values() if "canary-" in value]
+    assert not {"UNRELATED_TOKEN", "GSD_ENGINE", "GSD_ENGINE_BIN", "SWARM_DIR", "SWARM_TASKSTORE_WAL", "SWARM_AGENT_SESSION",
+                "XDG_CONFIG_HOME"} & set(environment)
+    assert {key: environment.get(key) for key in ("GSD_RUST_BACKEND", "HOME", "LANG")} == {
+        "GSD_RUST_BACKEND": "host", "HOME": str(tmp_path / "home"), "LANG": "C.UTF-8"}
     assert environment["PATH"] == os.environ["PATH"]
+    assert set(environment) - {"LC_CTYPE"} <= set(mod.BINARY_ENV_NAMES)  # LC_CTYPE: the fake is a Python script and coerces a C locale
+
+
+APPROVED_GRANT = (*SIGNING_ENV, "SWARM_AGENT_SESSION", "XDG_CONFIG_HOME")
+
+
+@pytest.mark.parametrize(
+    ("target", "flags", "granted"),
+    [
+        ("CANCELLED", [], False),
+        ("VALIDATED", [], False),
+        ("DONE", [], False),
+        ("approved", [], False),  # not a state name: Rust refuses it and Python raises, so no key is needed
+        ("APPROVED", ["--dry-run"], False),  # a dry run verifies nothing
+        ("APPROVED", [], True),
+        ("APPROVED", ["--reason", "signed"], True),
+    ],
+    ids=["cancelled", "validated", "done", "lowercase", "approved-dry-run", "approved", "approved-with-reason"],
+)
+def test_only_a_real_transition_to_approved_is_handed_the_key_variables(
+        target: str, flags: list[str], granted: bool, mod: ModuleType, fake_binary: Callable[..., Fake], store: None,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = fake_binary(stdout=_rendered(_error_reply("E-DEP", "not_started")), exit=2)
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    monkeypatch.setenv("SWARM_AGENT_SESSION", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/xdg")
+    for name in SIGNING_ENV:
+        monkeypatch.setenv(name, f"canary-{name}")
+
+    mod.select_engine(["--json", "--transition", "T-1", target, *flags])
+
+    environment = fake.seen("env.json")
+    assert fake.starts == 1, "the call reached the binary"
+    handed = set(environment) & set(APPROVED_GRANT)
+    assert handed == (set(APPROVED_GRANT) if granted else set())
+    for name in handed & set(SIGNING_ENV):
+        assert environment[name] == f"canary-{name}"
+    request_text = json.dumps(fake.seen("stdin.json"))
+    assert "canary-" not in request_text, "a key never rides in the request"
+
+
+@pytest.fixture
+def core_limit() -> Any:
+    """This process's `RLIMIT_CORE` raised to a non-zero soft limit (the host's own is often 0, which would hide a child that sets none),
+    put back afterwards. Yields (soft, hard); a host whose hard limit is 0 cannot show the difference, and the test says so."""
+    original = resource.getrlimit(resource.RLIMIT_CORE)
+    hard = original[1]
+    if hard == 0:
+        pytest.skip("the hard RLIMIT_CORE of this host is 0: a child cannot be told apart from one that lowered it")
+    soft = 1 << 20 if hard == resource.RLIM_INFINITY else min(hard, 1 << 20)
+    resource.setrlimit(resource.RLIMIT_CORE, (soft, hard))
+    try:
+        yield soft, hard
+    finally:
+        resource.setrlimit(resource.RLIMIT_CORE, original)
+
+
+@pytest.mark.parametrize(
+    ("target", "flags", "expected_zero"),
+    [("APPROVED", [], True), ("APPROVED", ["--dry-run"], False), ("CANCELLED", [], False)],
+    ids=["approved", "approved-dry-run", "cancelled"],
+)
+def test_only_the_approved_child_is_started_with_core_dumps_off(
+        target: str, flags: list[str], expected_zero: bool, mod: ModuleType, fake_binary: Callable[..., Fake], store: None,
+        monkeypatch: pytest.MonkeyPatch, core_limit: tuple[int, int]) -> None:
+    """The process that holds the signing keys is started with `RLIMIT_CORE` 0, soft and hard, so a crash leaves no core file with them. The
+    fake binary reports its own limit; every other child inherits this process's, and this process's limit does not change."""
+    fake = fake_binary(stdout=_rendered(_error_reply("E-DEP", "not_started")), exit=2)
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+
+    mod.select_engine(["--json", "--transition", "T-1", target, *flags])
+
+    assert fake.starts == 1
+    assert fake.seen("rlimit_core.json") == ([0, 0] if expected_zero else list(core_limit))
+    assert resource.getrlimit(resource.RLIMIT_CORE) == core_limit, "the selector's own limit is not touched"
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "default"])
+def test_a_child_that_cannot_be_given_the_core_limit_is_not_started_and_is_a_start_failure(
+        explicit: bool, mod: ModuleType, fake_binary: Callable[..., Fake], store: None, monkeypatch: pytest.MonkeyPatch,
+        capsysbinary: pytest.CaptureFixture[bytes]) -> None:
+    """A `preexec_fn` that fails ends the child before its exec, so nothing was started: Python answers by default and E-DEP under
+    GSD_ENGINE=rust, exactly as for a binary that cannot be started. It is never an uncaught SubprocessError."""
+
+    def refuse() -> None:
+        raise OSError("no limits for you")
+
+    fake = fake_binary(stdout=_rendered(_error_reply("E-DEP", "not_started")), exit=2)
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    monkeypatch.setattr(mod, "_no_core_dumps", refuse)
+    if explicit:
+        monkeypatch.setenv("GSD_ENGINE", "rust")
+    else:
+        monkeypatch.setattr(mod, "DEFAULT_ENGINE_WRITE", "rust")
+
+    code = mod.select_engine(["--json", "--transition", "T-1", "APPROVED"])
+
+    assert fake.starts == 0
+    if explicit:
+        assert code == 2 and json.loads(capsysbinary.readouterr().out)["error"]["code"] == "E-DEP"
+    else:
+        assert code is None, "the Python body answers"
 
 
 # --- the outcome table ------------------------------------------------------------------------------------------------------

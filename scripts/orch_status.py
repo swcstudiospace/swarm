@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import resource
 import shlex
 import sqlite3
 import subprocess
@@ -163,7 +164,8 @@ def add_args(p):
 # DEFAULT_ENGINE_WRITE, and a default-resolved call reaches the binary only when rust_serves_write(argv) holds. A write is
 # never run twice: run_rust_write answers from a table (see its docstring) in which Python answers only when the binary
 # says that nothing was written, and any answer that leaves the outcome unknown is refused with a typed E-INTERNAL.
-# The binary is started with an allowlisted environment (BINARY_ENV_NAMES, the GSD_* and SWARM_* variables, no signing key).
+# The binary is started with an explicit allowlist of environment names (BINARY_ENV_NAMES); signing-key variables only for a transition to
+# APPROVED, whose child also starts with core dumps off (RLIMIT_CORE 0, `_no_core_dumps`).
 DEFAULT_ENGINE = "python"  # the engine an unset or empty GSD_ENGINE resolves to for the read routes; "python" or "rust"
 RUST_CALL_TIMEOUT_S = 660
 RUST_FALLBACK_CODES = frozenset({"E-INTERNAL", "E-DEP", "E-CAPACITY", "E-CONTRACT", "E-INPUT"})
@@ -174,12 +176,23 @@ READ_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id
 DEFAULT_ENGINE_WRITE = "python"  # the engine an unset or empty GSD_ENGINE resolves to for the --transition route; "python" or "rust"
 # flags of the --transition write grammar that take a value; --repo is --root's alias, so a call names the pair once
 WRITE_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id", "--reason"})
-# The environment the binary is started with (security review F-2): what a process needs to run, and the GSD_* and SWARM_*
-# variables, minus the signing key material, which only a route that signs or verifies is given.
-BINARY_ENV_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"})
-BINARY_ENV_PREFIXES = ("GSD_", "SWARM_")
+# The environment the binary is started with (security review F-2, D-P24, design item 13 of phase 14.5): an explicit allowlist of
+# names, never a prefix. BINARY_ENV_NAMES is what a process needs to run plus the one variable the binary reads (GSD_RUST_BACKEND; the
+# ids and the swarm directory travel in the request's `env`). Signing material is a per-route grant (ROUTE_KEY_ENV): only a transition
+# to APPROVED verifies signatures, so it alone receives the key policy's variables, and every other route and target receives none.
+BINARY_ENV_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GSD_RUST_BACKEND"})
 SIGNING_KEY_ENV = frozenset({"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_ALLOW_INSECURE_DEV_KEY",
                              "SWARM_REQUIRE_KEY"})
+# What `KeyMaterial::from_env` reads (crates/gsd-envelope/src/keys.rs `Environment::read`) beyond HOME: the five signing variables,
+# SWARM_AGENT_SESSION (it changes how a key-file reference is read) and XDG_CONFIG_HOME (the conventional key-file path). Without
+# a reference the binary would answer "no signing key configured" where Python loads the file, so these must arrive together.
+APPROVED_KEY_ENV = SIGNING_KEY_ENV | {"SWARM_AGENT_SESSION", "XDG_CONFIG_HOME"}
+ROUTE_KEY_ENV: dict[str, frozenset[str]] = {
+    "list": frozenset(),
+    "history": frozenset(),
+    "transition": frozenset(),
+    "transition-approved": APPROVED_KEY_ENV,
+}
 POST_KINDS = frozenset({"live_refresh", "lease_settle", "inline_transition"})
 
 SCRIPT = AgentScript("A01", "orch_status", run, description=__doc__, add_args=add_args)
@@ -281,10 +294,19 @@ def rust_serves_write(argv: list[str]) -> bool:
     return parse_write_argv(argv) is not None
 
 
-def _binary_env() -> dict[str, str]:
-    """The environment of the gsd_engine process: BINARY_ENV_NAMES and the GSD_* and SWARM_* variables, never SIGNING_KEY_ENV."""
-    return {key: value for key, value in os.environ.items()
-            if (key in BINARY_ENV_NAMES or key.startswith(BINARY_ENV_PREFIXES)) and key not in SIGNING_KEY_ENV}
+def _binary_env(route: str) -> dict[str, str]:
+    """The environment of the gsd_engine process for `route` (a key of ROUTE_KEY_ENV): exactly the names of BINARY_ENV_NAMES and of
+    ROUTE_KEY_ENV[route] that are set, nothing else. A name nobody listed is never handed on, so a new variable, a prefix or a
+    secret stored under another name cannot reach the binary by accident. An unknown route is a KeyError, never a silent no-key run."""
+    names = BINARY_ENV_NAMES | ROUTE_KEY_ENV[route]
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _no_core_dumps() -> None:
+    """`preexec_fn` of the APPROVED child: `RLIMIT_CORE` 0 (soft and hard, so the child cannot raise it), so a crash of the process that
+    holds the signing keys in its environment and heap leaves no core file that carries them. It runs in the child between fork and exec
+    and makes one system call (no import, no allocation worth the name: this process may have threads), so it sets nothing here."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
 def _refuse(code: ErrorCode, message: str) -> int:
@@ -336,7 +358,8 @@ def run_rust(argv: list[str], binary: str, *, explicit: bool) -> int | None:
     except UnicodeEncodeError:
         return None  # fallback: an argument the binary cannot take
     try:
-        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s(), env=_binary_env())
+        route = "history" if any(token == "--history" or token.startswith("--history=") for token in argv) else "list"
+        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s(), env=_binary_env(route))
     except subprocess.TimeoutExpired:
         return _refuse(ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
     except OSError:
@@ -548,10 +571,14 @@ def _answer_write(argv: list[str], binary: str, explicit: bool, call: WriteCall 
     except UnicodeEncodeError:
         return None  # fallback: an argument the binary cannot take
     try:
-        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s(), env=_binary_env())
+        # Only a real transition to APPROVED verifies signatures: a dry run and every other target get no key variable, and only the
+        # APPROVED child, which holds the keys, is started with core dumps off (a preexec_fn that fails is a start that did not happen).
+        route = "transition-approved" if call is not None and call.state == "APPROVED" and not call.dry_run else "transition"
+        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s(), env=_binary_env(route),
+                              preexec_fn=_no_core_dumps if route == "transition-approved" else None)
     except subprocess.TimeoutExpired:
         return _unknown_outcome(argv, call, "the gsd_engine binary did not answer within the call deadline")
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         if not explicit:
             return None  # fallback: nothing was started
         return _refuse(ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")

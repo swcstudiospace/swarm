@@ -17,7 +17,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,6 +30,7 @@ STATES = ("CREATED", "VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIE
 I64_MAX = 9_223_372_036_854_775_807
 MAX_DEPTH = 128  # the nesting the Rust JSON reader accepts (`gsd_route::parse_json`)
 JSON_COLUMNS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
+GATES_BY_RISK = ("low", "medium", "high")  # the risk classes `GATES_BY_RISK` of swarm/taskstore.py names (its gates are in gate_facts.rs)
 
 # The masks, each a clock reading that no two runs can share. Stdout, the run-log records and the database dump are masked at the same
 # two keys; nothing else of the answer is.
@@ -172,7 +173,38 @@ def refusal(row: Optional[Row], to: str) -> Optional[str]:
         if row["attempt"] + 1 > I64_MAX:
             return "the new attempt is beyond i64"
     if to == "APPROVED":
-        return "APPROVED needs the host's key and verdict facts, which no unit supplies yet: the route refuses before any write"
+        return _approval_refusal(row, notes)
+    return None
+
+
+def _float_text_ok(text: str) -> bool:
+    """Whether the gate facts read `text` as Python's `float()` does: ASCII, no underscore, and `float` accepts it."""
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return text.isascii() and "_" not in text
+
+
+def _approval_refusal(row: Row, notes: Any) -> Optional[str]:
+    """Why the host cannot read the gate facts of a legal APPROVED (`TaskFacts::from_row` and `approval::gather` of `gsd-taskwriter`
+    refuse what Python may read differently), else None: the route answers, with the facts of the harness's key and no verdict row."""
+    if not isinstance(row.get("task_id"), str) or not isinstance(row.get("correlation_id"), str):
+        return "the task row has no text task_id or correlation_id"
+    if row.get("risk_class") is not None and not isinstance(row.get("risk_class"), str):
+        return "risk_class is not text"
+    fields: dict[str, Any] = notes if isinstance(notes, dict) else {}
+    gates = fields.get("gates")
+    if gates is None:
+        if row.get("risk_class") not in GATES_BY_RISK:
+            return "the risk class is outside GATES_BY_RISK and notes.gates does not name the gates"
+    elif not (isinstance(gates, list) and all(isinstance(gate, str) for gate in gates)):
+        return "notes.gates is not a list of strings"
+    since = fields.get("verdicts_since")
+    if isinstance(since, str) and since and not _float_text_ok(since):
+        return "notes.verdicts_since is text that float() may read in a way Rust does not reproduce"
+    if isinstance(since, (list, dict)) and since:
+        return "notes.verdicts_since is not a number"
     return None
 
 
@@ -192,9 +224,9 @@ def cross_check(cases: list[Row]) -> list[str]:
         request = case["request"]
         if not request["manual"]:
             continue
-        flagged = bool(case["rust_not_started"]) or case["expect"]["outcome"] == "exception"
         if request["to"] == "APPROVED" and case["task"] is not None and case["task"]["state"] == "IN_REVIEW":
-            flagged = True  # the vectors carry the key facts the route does not have
+            continue  # the vector carries injected key facts; the route reads the key and gate facts itself now (the signed cells prove it)
+        flagged = bool(case["rust_not_started"]) or case["expect"]["outcome"] == "exception"
         derived = refusal(case["task"], request["to"]) is not None
         if derived != flagged:
             problems.append(f"{case['id']}: vectors say {'refused' if flagged else 'answered'}, the derivation says "
@@ -448,3 +480,268 @@ class FakeSubstrate:
     def env(self) -> dict[str, str]:
         """The environment that turns the substrate on for a leg, with A05's own token (the agent the leases belong to)."""
         return {"SUBSTRATE_URL": f"http://127.0.0.1:{self._server.server_address[1]}", SUBSTRATE_TOKEN_VAR: SUBSTRATE_TOKEN}
+
+
+# --- the signed cells (Phase 14.5, unit U3.4d) --------------------------------------------------------------------------------------
+#
+# A transition to APPROVED reads the signing keys and the verdict rows. These cells run the REAL Python `TaskStore.transition` (through the
+# script) and the binary (through the selector and alone) on identical copies of a store whose verdict rows were signed by the REAL
+# `swarm.gates.make_verdict` under a key profile of the cell. Keys are `secrets.token_hex(32)` made when a cell runs; they are in no file
+# and in no argument, only in the environment of the processes of that cell. `harness.py` does not run them (its sandbox environment
+# fixes one HMAC key); `test_write_parity.py` does.
+
+SIGNING_ENV = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_REQUIRE_KEY")
+TARGET, ISSUER, CORRELATION = "T-signed", "T-gate", "C-signed"
+
+# Key profiles: variable -> `@slot` (a secret made per cell and slot at run time) or a literal (`{root}` is a directory of the cell).
+PROFILES: dict[str, Mapping[str, str]] = {
+    "none": {},
+    "hmac": {"SWARM_SIGNING_KEY": "@hmac"},
+    "hmac-other": {"SWARM_SIGNING_KEY": "@other"},
+    "ed25519": {"SWARM_ED25519_KEY": "@ed"},
+    "both": {"SWARM_SIGNING_KEY": "@hmac", "SWARM_ED25519_KEY": "@ed"},
+    "dev": {"SWARM_ALLOW_INSECURE_DEV_KEY": "1"},
+    "require": {"SWARM_REQUIRE_KEY": "1"},
+    "require-hmac": {"SWARM_REQUIRE_KEY": "1", "SWARM_SIGNING_KEY": "@hmac"},
+    "dev-require": {"SWARM_ALLOW_INSECURE_DEV_KEY": "1", "SWARM_REQUIRE_KEY": "1"},
+    "ed25519-unloadable": {"SWARM_ED25519_KEY": "zz"},
+    "ed25519-unloadable-hmac": {"SWARM_ED25519_KEY": "zz", "SWARM_SIGNING_KEY": "@hmac"},
+    "key-file": {"SWARM_ED25519_KEY_FILE": "{root}/no-such-key.pem"},
+    # a conventional key file (`$XDG_CONFIG_HOME/agent-swarm/signing-key.hex`, run-time random content) beside the dev opt-in: Python loads it
+    "dev-xdg-key-file": {"SWARM_ALLOW_INSECURE_DEV_KEY": "1", "XDG_CONFIG_HOME": "{root}/xdg"},
+}
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One verdict row of a scenario. Times are seconds after the store was built."""
+
+    gate: str
+    verdict: str = "pass"
+    issued: float = 0.0  # the signed `issued_at`
+    expires_s: int = 86400
+    correlation: str = CORRELATION
+    row_ts: float = 0.0  # `verdicts.ts`
+    extra: Mapping[str, Any] = field(default_factory=dict)  # more payload (`dry_run`, `gate_task`, `waived_by`)
+
+
+REVIEW, QUALITY = Verdict("review"), Verdict("quality")
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """The store of a signed cell: a medium-risk task in IN_REVIEW (gates review and quality) and the rows recorded on it, in order."""
+
+    verdicts: tuple[Verdict, ...] = (REVIEW, QUALITY)
+    notes: Mapping[str, Any] = field(default_factory=dict)
+    since: Optional[float] = None  # `notes.verdicts_since`
+    issuer_state: Optional[str] = None  # the state of the gate task ISSUER; None leaves no such task
+    after: tuple[str, ...] = ()  # edits to the stored rows: `tamper-first-signature`, `unsign-first`
+
+
+def _issued_by(gate_task: str) -> Mapping[str, Any]:
+    return {"gate_task": gate_task}
+
+
+SCENARIOS: dict[str, Scenario] = {
+    "pass": Scenario(),
+    "quality-fails": Scenario((REVIEW, Verdict("quality", "fail"))),
+    "quality-missing": Scenario((REVIEW,)),
+    "quality-expired": Scenario((REVIEW, Verdict("quality", issued=-1000.0, expires_s=60))),
+    "issuer-failed": Scenario((Verdict("review", extra=_issued_by(ISSUER)), Verdict("quality", extra=_issued_by(ISSUER))), issuer_state="FAILED"),
+    "issuer-accepted": Scenario((Verdict("review", extra=_issued_by(ISSUER)), Verdict("quality", extra=_issued_by(ISSUER))),
+                                issuer_state="IN_REVIEW"),
+    "issuer-unknown": Scenario((Verdict("review", extra=_issued_by("T-nope")), QUALITY)),
+    "wrong-correlation": Scenario((Verdict("review", correlation="C-other"), QUALITY)),
+    "rows-before-since": Scenario(since=3600.0),
+    "signed-before-since": Scenario((Verdict("review", issued=-100.0), Verdict("quality", issued=-100.0)), since=-50.0),
+    "tampered-signature": Scenario(after=("tamper-first-signature",)),
+    "unsigned-row": Scenario(after=("unsign-first",)),
+    "dry-run-rows": Scenario((Verdict("review", extra={"dry_run": True}), Verdict("quality", extra={"dry_run": True}))),
+    "dry-run-task": Scenario((Verdict("review", extra={"dry_run": True}), QUALITY), notes={"dry_run": True}),
+    "no-gates": Scenario((), notes={"gates": []}),
+    "gates-override": Scenario((Verdict("security"),), notes={"gates": ["security"]}),
+    "latest-pass-wins": Scenario((Verdict("review", "fail"), REVIEW, QUALITY)),
+    "latest-fail-wins": Scenario((REVIEW, Verdict("review", "fail"), QUALITY)),
+    "waived": Scenario((Verdict("review", "waive", extra={"waived_by": "human"}), QUALITY)),
+    # Python's `_latest_rows` runs `json.loads(findings)` on every row of the task with `ts >= since`, whatever its gate
+    "findings-invalid-required": Scenario(after=("corrupt-findings",)),
+    "findings-null-required": Scenario(after=("null-findings",)),
+    "findings-invalid-other-gate": Scenario(after=("extra-row-other-gate-corrupt",)),
+    "findings-invalid-null-gate": Scenario(after=("extra-row-null-gate-corrupt",)),
+    "findings-valid-other-gate": Scenario(after=("extra-row-other-gate-valid",)),
+    # a corrupt row of a required gate that Python's query never returns (older than `verdicts_since`) shadows nothing
+    "findings-invalid-before-since": Scenario(since=-500.0, after=("extra-row-before-since-corrupt",)),
+}
+
+
+@dataclass(frozen=True)
+class SignedCell:
+    """One signed cell: the rows are signed under the `sign` profile, the call runs under the `call` profile."""
+
+    cell_id: str
+    scenario: str
+    sign: str
+    call: str
+    message: Optional[str]  # the E-POLICY text Python prints; None when Python approves (the task ends APPROVED)
+    fallback: Optional[str] = None  # why the binary must refuse with write_state not_started (Python answers); None when it answers
+    code: str = "E-POLICY"  # the error code Python prints for a refusal
+    key_file: bool = False  # the call profile names `$XDG_CONFIG_HOME`: a conventional key file with run-time content is made there
+
+    @property
+    def masks(self) -> tuple[re.Pattern[str], ...]:
+        return (CLOCK_KEYS,)
+
+
+def _approves(cell_id: str, scenario: str, sign: str, call: str) -> SignedCell:
+    return SignedCell(cell_id, scenario, sign, call, None)
+
+
+NO_KEY = "fail-closed: no signing key configured"
+REQUIRE = "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
+BOTH_GATES = "lacks passing gates ['review', 'quality']"
+QUALITY_GATE = "lacks passing gates ['quality']"
+REVIEW_GATE = "lacks passing gates ['review']"
+FINDINGS_INVALID = "JSONDecodeError"
+FINDINGS_NULL = "TypeError"
+FINDINGS_FALLBACK = "a findings column Python's json.loads cannot read: Python's own refusal stands"
+SIGNED_CELLS: tuple[SignedCell, ...] = (
+    _approves("pass-hmac", "pass", "hmac", "hmac"),
+    _approves("pass-ed25519", "pass", "ed25519", "ed25519"),
+    _approves("pass-both-keys", "pass", "both", "both"),
+    _approves("pass-hmac-signed-under-both-keys", "pass", "hmac", "both"),
+    _approves("pass-ed25519-signed-under-both-keys", "pass", "ed25519", "both"),
+    _approves("pass-dev-key-opt-in", "pass", "dev", "dev"),
+    _approves("pass-require-key-with-hmac", "pass", "hmac", "require-hmac"),
+    _approves("pass-hmac-beside-an-unloadable-ed25519-seed", "pass", "hmac", "ed25519-unloadable-hmac"),
+    _approves("pass-no-gates-required", "no-gates", "hmac", "hmac"),
+    _approves("pass-gates-override", "gates-override", "hmac", "hmac"),
+    _approves("pass-latest-row-wins", "latest-pass-wins", "hmac", "hmac"),
+    _approves("pass-waived", "waived", "hmac", "hmac"),
+    _approves("pass-issuer-accepted", "issuer-accepted", "hmac", "hmac"),
+    _approves("pass-dry-run-row-on-a-dry-run-task", "dry-run-task", "hmac", "hmac"),
+    SignedCell("refused-failing-verdict", "quality-fails", "hmac", "hmac", QUALITY_GATE),
+    SignedCell("refused-missing-verdict", "quality-missing", "hmac", "hmac", QUALITY_GATE),
+    SignedCell("refused-expired-verdict", "quality-expired", "hmac", "hmac", QUALITY_GATE),
+    SignedCell("refused-unaccepted-gate-task", "issuer-failed", "hmac", "hmac", "has unaccepted gates ['quality', 'review']"),
+    SignedCell("refused-unknown-gate-task", "issuer-unknown", "hmac", "hmac", "has unaccepted gates ['review']"),
+    SignedCell("refused-wrong-correlation", "wrong-correlation", "hmac", "hmac", REVIEW_GATE),
+    SignedCell("refused-rows-before-verdicts-since", "rows-before-since", "hmac", "hmac", BOTH_GATES),
+    SignedCell("refused-signed-before-verdicts-since", "signed-before-since", "hmac", "hmac", BOTH_GATES),
+    SignedCell("refused-tampered-signature", "tampered-signature", "hmac", "hmac", REVIEW_GATE),
+    SignedCell("refused-tampered-ed25519-signature", "tampered-signature", "ed25519", "ed25519", REVIEW_GATE),
+    SignedCell("refused-unsigned-row", "unsigned-row", "hmac", "hmac", REVIEW_GATE),
+    SignedCell("refused-dry-run-rows", "dry-run-rows", "hmac", "hmac", BOTH_GATES),
+    SignedCell("refused-latest-row-fails", "latest-fail-wins", "hmac", "hmac", REVIEW_GATE),
+    SignedCell("refused-other-hmac-key", "pass", "hmac", "hmac-other", BOTH_GATES),
+    SignedCell("refused-hmac-rows-under-ed25519-only", "pass", "hmac", "ed25519", BOTH_GATES),
+    SignedCell("refused-ed25519-rows-under-hmac-only", "pass", "ed25519", "hmac", BOTH_GATES),
+    SignedCell("refused-real-key-rows-under-dev-key", "pass", "hmac", "dev", BOTH_GATES),
+    SignedCell("refused-no-key", "pass", "hmac", "none", NO_KEY),
+    SignedCell("refused-require-key-without-a-key", "pass", "hmac", "require", REQUIRE),
+    SignedCell("refused-require-key-beats-the-dev-key", "pass", "dev", "dev-require", REQUIRE),
+    SignedCell("refused-unloadable-ed25519-seed", "pass", "hmac", "ed25519-unloadable", NO_KEY),
+    SignedCell("key-file-reference-goes-to-python", "pass", "hmac", "key-file", NO_KEY,
+               "SWARM_ED25519_KEY_FILE names a key file: only Python opens key files"),
+    # F-3: the parent has a conventional key file and the dev opt-in, the rows are dev-signed. Python loads the key (the dev key is off), so
+    # the rows are bad-sig and it refuses. The binary must see XDG_CONFIG_HOME to know the file exists; without it, it would approve.
+    SignedCell("refused-dev-rows-beside-a-conventional-key-file", "pass", "dev", "dev-xdg-key-file", BOTH_GATES,
+               "a conventional key file exists: only Python opens key files", key_file=True),
+    # F-2: a `findings` column Python's `json.loads` cannot read refuses the transition, with intact signed envelopes
+    SignedCell("refused-invalid-findings-on-a-required-row", "findings-invalid-required", "hmac", "hmac", FINDINGS_INVALID,
+               FINDINGS_FALLBACK, code="E-INPUT"),
+    SignedCell("refused-null-findings-on-a-required-row", "findings-null-required", "hmac", "hmac", FINDINGS_NULL, FINDINGS_FALLBACK,
+               code="E-INTERNAL"),
+    SignedCell("refused-invalid-findings-on-a-gate-that-is-not-required", "findings-invalid-other-gate", "hmac", "hmac", FINDINGS_INVALID,
+               FINDINGS_FALLBACK, code="E-INPUT"),
+    SignedCell("refused-invalid-findings-on-a-row-with-a-null-gate", "findings-invalid-null-gate", "hmac", "hmac", FINDINGS_INVALID,
+               FINDINGS_FALLBACK, code="E-INPUT"),
+    _approves("pass-valid-findings-on-a-gate-that-is-not-required", "findings-valid-other-gate", "hmac", "hmac"),
+    _approves("pass-invalid-findings-on-a-row-before-verdicts-since", "findings-invalid-before-since", "hmac", "hmac"),
+)
+
+# The script that builds a signed cell's store, run as `python -c` from the repository root with the SIGN profile in its environment.
+# It reads the scenario as JSON on stdin and prints nothing.
+SEED_SCRIPT = """
+import json, sys, time
+from swarm.gates import make_verdict
+from swarm.taskstore import TaskStore
+
+spec = json.load(sys.stdin)
+base = time.time()
+store = TaskStore(spec["db"])
+notes = dict(spec["notes"])
+if spec["since"] is not None:
+    notes["verdicts_since"] = base + spec["since"]
+store.create(task_id=spec["target"], correlation_id=spec["correlation"], capability="code.backend", risk_class="medium", notes=notes)
+store.conn.execute("UPDATE tasks SET state='IN_REVIEW' WHERE task_id=?", (spec["target"],))
+if spec["issuer_state"] is not None:
+    store.create(task_id=spec["issuer"], correlation_id=spec["correlation"], capability="qa.gate")
+    store.conn.execute("UPDATE tasks SET state=? WHERE task_id=?", (spec["issuer_state"], spec["issuer"]))
+store.conn.commit()
+for item in spec["verdicts"]:
+    extra = dict(item["extra"])
+    extra["issued_at"] = base + item["issued"]
+    envelope = make_verdict(gate=item["gate"], task_id=spec["target"], agent_id="A09", verdict=item["verdict"],
+                            expires_s=item["expires_s"], correlation_id=item["correlation"], extra=extra, root=spec["scratch"])
+    store.record_verdict(spec["target"], envelope)
+    store.conn.execute("UPDATE verdicts SET ts=? WHERE id=(SELECT max(id) FROM verdicts)", (base + item["row_ts"],))
+store.conn.commit()
+# step -> (gate, findings, ts offset): rows with no envelope that only `_latest_rows` can trip over (a NULL gate is a NULL column)
+EXTRA_ROWS = {
+    "extra-row-other-gate-corrupt": ("security", "{oops", 1.0),
+    "extra-row-null-gate-corrupt": (None, "{oops", 1.0),
+    "extra-row-other-gate-valid": ("security", "[]", 1.0),
+    "extra-row-before-since-corrupt": ("review", "{oops", -1000.0),
+}
+for step in spec["after"]:
+    first = store.conn.execute("SELECT id, envelope_json FROM verdicts ORDER BY id LIMIT 1").fetchone()
+    if step == "tamper-first-signature":
+        envelope = json.loads(first["envelope_json"])
+        chars = list(envelope["sig"])
+        chars[20] = "A" if chars[20] != "A" else "B"
+        envelope["sig"] = "".join(chars)
+        store.conn.execute("UPDATE verdicts SET envelope_json=?, sig=? WHERE id=?", (json.dumps(envelope), envelope["sig"], first["id"]))
+    elif step == "unsign-first":
+        store.conn.execute("UPDATE verdicts SET envelope_json=NULL, sig=NULL WHERE id=?", (first["id"],))
+    elif step == "corrupt-findings":
+        store.conn.execute("UPDATE verdicts SET findings='{oops' WHERE id=?", (first["id"],))
+    elif step == "null-findings":
+        store.conn.execute("UPDATE verdicts SET findings=NULL WHERE id=?", (first["id"],))
+    elif step in EXTRA_ROWS:
+        gate, findings, offset = EXTRA_ROWS[step]
+        store.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json, sig)"
+                           " VALUES (?,?,?,?,?,?,?,NULL,NULL)", (spec["target"], gate, "pass", "A09", findings, base + 86400, base + offset))
+    else:
+        raise SystemExit("unknown step " + step)
+store.conn.commit()
+store.conn.close()
+"""
+
+
+def seed_spec(scenario: Scenario, db: Path, scratch: Path) -> dict[str, Any]:
+    """The JSON `SEED_SCRIPT` reads for `scenario`."""
+    return {"db": str(db), "scratch": str(scratch), "target": TARGET, "issuer": ISSUER, "correlation": CORRELATION,
+            "notes": dict(scenario.notes), "since": scenario.since, "issuer_state": scenario.issuer_state, "after": list(scenario.after),
+            "verdicts": [{"gate": item.gate, "verdict": item.verdict, "issued": item.issued, "expires_s": item.expires_s,
+                          "correlation": item.correlation, "row_ts": item.row_ts, "extra": dict(item.extra)} for item in scenario.verdicts]}
+
+
+def profile_env(name: str, secrets: Mapping[str, str], root: Path) -> dict[str, str]:
+    """The key variables of profile `name` with its secrets filled in. `SWARM_SIGNING_KEY` is always set (empty when the profile has no
+    HMAC key) so the harness sandbox's own key never leaks into a cell."""
+    env = {"SWARM_SIGNING_KEY": ""}
+    for variable, value in PROFILES[name].items():
+        env[variable] = secrets[value[1:]] if value.startswith("@") else value.replace("{root}", str(root))
+    return env
+
+
+def write_conventional_key(config_home: Path, seed_hex: str) -> None:
+    """Makes `<config_home>/agent-swarm/signing-key.hex` the way Python's `_private_seed` accepts it (owner-only directory and file, 64 hex
+    characters): the file holds `seed_hex`, which a cell makes at run time and never writes anywhere else."""
+    folder = config_home / "agent-swarm"
+    folder.mkdir(parents=True, mode=0o700)
+    folder.chmod(0o700)
+    path = folder / "signing-key.hex"
+    path.write_text(seed_hex + "\n", encoding="ascii")
+    path.chmod(0o600)

@@ -33,6 +33,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gsd_failure::ErrorCode;
@@ -41,8 +42,8 @@ use gsd_route::transition_args::TransitionArgs;
 use gsd_route::transition_plan::{PlanEffect, Request};
 use gsd_route::{check_safe_id, finish, jstr, obj_get, Fields, Json, Reply, SeamError};
 use gsd_taskwriter::{
-    open_for_write, Applied, ApplyCause, ApplyError, Decider, ErrorKind, TaskStoreWriter,
-    WriteState, WriterConfig, WriterError,
+    open_for_write, Applied, ApplyCause, ApplyError, Decider, EnvApprovalSource, ErrorKind,
+    TaskStoreWriter, WriteState, WriterConfig, WriterError,
 };
 
 use crate::strangler_seam::{
@@ -138,7 +139,9 @@ pub(crate) async fn transition_reply(
             ))
         })?
         .as_secs_f64();
-    let writer = TaskStoreWriter::new(store);
+    // A transition to APPROVED reads the signing keys from this process's environment, once, before the transaction opens (D-P24);
+    // every other target reads none. The route never holds a key itself: it hands the writer a source.
+    let writer = TaskStoreWriter::with_approval(store, Arc::new(EnvApprovalSource));
     let outcome = writer.transition(&request, now, decider).await;
     writer.close().await;
     let applied = outcome.map_err(|error| apply_refusal(&error))?;

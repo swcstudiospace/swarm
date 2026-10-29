@@ -20,15 +20,17 @@
 //! the guest and answers with the host decision; store failures keep the codes of [`WriterError`].
 
 use std::fmt;
+use std::sync::Arc;
 
 use gsd_codes::ErrorCode;
 use gsd_route::pydumps::to_python_dumps;
 use gsd_route::transition_plan::{
-    decide_transition, Facts, PlanEffect, Request, TransitionError, TransitionPlan,
+    decide_transition, legal_targets, Facts, PlanEffect, Request, TransitionError, TransitionPlan,
     WriteState as DecisionWriteState,
 };
-use gsd_route::{jstr, Fields, Json, SeamError};
+use gsd_route::{jstr, obj_get, Fields, Json, SeamError};
 
+use crate::approval::{self, ApprovalKeys, ApprovalSource};
 use crate::error::{ErrorKind, WriteState, WriterError};
 use crate::plan::{PlanValidator, PlanViolation, ValidatedPlan};
 use crate::store::{PlanColumn, StateChange, Tx, WriteStore};
@@ -38,8 +40,9 @@ const JSON_COLUMNS: [&str; 5] = ["inputs", "outputs", "acceptance", "budget", "d
 
 /// The decision step of a transition: pure, runs inside the write lock, and writes nothing.
 ///
-/// `facts.task` is the row read inside the lock (`None` when the task does not exist); `facts.approval` is `None` until the
-/// host can read the gate facts inside the lock, which makes a legal APPROVED a not-started refusal. The writer calls the
+/// `facts.task` is the row read inside the lock (`None` when the task does not exist); `facts.approval` holds the gate facts the
+/// host read in the same transaction for a legal APPROVED target ([`crate::approval`]), and is `None` for every other transition and
+/// for a writer with no approval source, which makes a legal APPROVED a not-started refusal. The writer calls the
 /// decider exactly once per transition. Whatever it returns is checked by [`PlanValidator`] before it is written.
 ///
 /// The call is synchronous and runs while the write lock is held, so an implementation must be bounded in time.
@@ -204,12 +207,26 @@ pub struct Applied {
 #[derive(Debug)]
 pub struct TaskStoreWriter {
     store: WriteStore,
+    approval: Option<Arc<dyn ApprovalSource>>,
 }
 
 impl TaskStoreWriter {
-    /// A writer over an open store.
+    /// A writer over an open store with no approval source: a legal APPROVED is a not-started refusal (Python answers), as it was
+    /// before the host could read the gate facts. Every caller that never transitions to `APPROVED` is unaffected.
     pub fn new(store: WriteStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            approval: None,
+        }
+    }
+
+    /// A writer that serves a transition to `APPROVED`: keys come from `approval` once per call before the transaction opens, and
+    /// the gate facts are read inside it (see [`crate::approval`]).
+    pub fn with_approval(store: WriteStore, approval: Arc<dyn ApprovalSource>) -> Self {
+        Self {
+            store,
+            approval: Some(approval),
+        }
     }
 
     /// The store underneath, for a caller that also reads or arms fault points.
@@ -224,9 +241,11 @@ impl TaskStoreWriter {
 
     /// `TaskStore.transition`: decides and applies one transition in one `BEGIN IMMEDIATE` transaction.
     ///
-    /// `now` is the single clock reading of the call (`updated_at` and every audit `ts`); it must be finite. The decider is
-    /// called exactly once, after the row is read and before any write. On any error the transaction is rolled back; an
-    /// error whose [`ApplyError::write_state`] is [`WriteState::NotStarted`] left the store byte-identical.
+    /// `now` is the single clock reading of the call (`updated_at` and every audit `ts`); it must be finite. The expiry of a verdict
+    /// of an APPROVED transition is NOT compared with it: that reading was taken before the wait for the write lock, so it is compared
+    /// with [`ApprovalSource::clock`], read inside the lock (see [`crate::approval`]). The decider is called exactly once, after the
+    /// row is read and before any write. On any error the transaction is rolled back; an error whose [`ApplyError::write_state`] is
+    /// [`WriteState::NotStarted`] left the store byte-identical.
     pub async fn transition(
         &self,
         request: &Request,
@@ -240,12 +259,22 @@ impl TaskStoreWriter {
                 task_id,
             ));
         }
+        // The keys are read once per call and before the lock: a key-file reference or an unsupported shape refuses here, with
+        // nothing opened and nothing written, so Python answers (D-P24 (2)). Only an APPROVED target reads any key.
+        let keys =
+            match (&self.approval, request.to == "APPROVED") {
+                (Some(source), true) => Some(source.keys().map_err(|declined| {
+                    ApplyError::store(&approval::declined(declined), task_id)
+                })?),
+                _ => None,
+            };
         let mut tx = self
             .store
             .begin()
             .await
             .map_err(|error| ApplyError::store(&error, task_id))?;
-        match decide_and_apply(&mut tx, request, now, decider).await {
+        let approval = self.approval.as_deref().zip(keys.as_ref());
+        match decide_and_apply(&mut tx, request, now, decider, approval).await {
             Ok(applied) => {
                 tx.commit()
                     .await
@@ -263,18 +292,37 @@ impl TaskStoreWriter {
 }
 
 /// Steps 2 to 6 of the module documentation, up to but not including the `COMMIT`.
+///
+/// For a legal transition to `APPROVED` with an approval source and its keys in hand, the approval facts are read here, on `tx`, after
+/// the task row and before the decider: the row, the verdict rows, the clock and the gate tasks are one snapshot under the write lock.
+/// Any other transition, an illegal one included, reads no verdict row and needs no key (the decision refuses an illegal target before
+/// it looks at the facts).
 async fn decide_and_apply(
     tx: &mut Tx,
     request: &Request,
     now: f64,
     decider: &dyn Decider,
+    approval: Option<(&dyn ApprovalSource, &ApprovalKeys)>,
 ) -> Result<Applied, ApplyError> {
     let task_id = request.task_id.as_str();
     let store_error = |error: WriterError| ApplyError::store(&error, task_id);
     let row = tx.task(task_id).await.map_err(store_error)?;
+    let approval = match (approval, &row) {
+        (Some((source, keys)), Some(row))
+            if matches!(obj_get(row, "state"), Some(Json::Str(state))
+                if legal_targets(state).is_some_and(|legal| legal.contains(&"APPROVED"))) =>
+        {
+            Some(
+                approval::gather(tx, keys, source, row, now)
+                    .await
+                    .map_err(store_error)?,
+            )
+        }
+        _ => None,
+    };
     let facts = Facts {
         task: row.clone().map(decision_row),
-        approval: None,
+        approval,
     };
     let plan = decider
         .decide(&facts, request, now)

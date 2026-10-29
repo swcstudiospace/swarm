@@ -16,11 +16,19 @@
 //!   `add_to_linker`): the guest is started on an empty linker only;
 //! - the checks have teeth: an extra key at each level, a canary in each channel and every form of every canary are detected.
 //!
+//! The key-reading path (unit U3.4d, the R2 cases of decision D-P30): `approved_transition_*` run a transition to APPROVED through the
+//! same sandbox path, with Python-signed verdict rows and canary keys in the process environment: Ed25519 only, HMAC only, both keys, the
+//! dev-key opt-in, `SWARM_REQUIRE_KEY=1` without a key, no key, keys only in the request's `env` (which the route never reads) and a
+//! key-file reference. Each scans the guest request, the reply, stdout, the refusal's `Debug`, the effects manifest and the store for
+//! every canary form, checks that `approval` is non-null and shaped on real facts (and that no signature or envelope is in the request),
+//! that no `security.dev_key` effect is in the manifest (Python's transition emits none: only signing does), and that the verdict rows
+//! are read inside the write lock. The reverse dependencies of `gsd-envelope` are pinned in `tests/test_keys_never_in_guest.py`.
+//!
 //! What does not run yet, and why (each item is a `#[cfg(any())]` module below, ready to enable):
 //!
-//! - the key-reading path with canaries (an APPROVED transition that reads keys) waits for U3.4d, which makes `gsd-envelope` a
-//!   dependency of this crate; nothing here claims to cover it, and the `KeyMaterial` trait check waits for the same reason (an
-//!   integration test can only name the dependencies of its own package);
+//! - the `KeyMaterial` trait check: U3.4d made `gsd-envelope` a dependency of `gsd-taskwriter`, not of this crate (the manifest of this
+//!   crate is the orchestrator's, and an integration test can only name the dependencies of its own package). `KeyMaterial` not being
+//!   `Clone` is checked in `crates/gsd-taskwriter/tests/approval.rs`; the `Serialize` half needs `serde` as a dev-dependency (R11);
 //! - the key sets of the read modes (`list`, `history`) wait for a public seam: the request is built by `read_snapshot` and
 //!   `request_json` in `strangler_seam.rs`, `pub(crate)` and private, and `SandboxEngine::answer` hands it to the guest with no hook.
 //!
@@ -47,6 +55,8 @@ use gsd_route::{obj_get, parse_json, Json};
 use gsd_sandbox::wasmtime_limits::deadline_ticks_for;
 use gsd_sandbox::Limits;
 use tempfile::TempDir;
+
+mod signed_store;
 
 // ---- the allowlists (sorted) ---------------------------------------------------------------------------------------------
 
@@ -1129,10 +1139,597 @@ fn the_key_file_check_flags_content_in_every_channel_and_an_untyped_or_changed_r
     assert!(fails(&run), "a planted key file that changed");
 }
 
-// ---- waiting for U3.4d ----------------------------------------------------------------------------------------------------
+// ---- R2: an APPROVED transition that reads keys and signed verdict rows (U3.4d) ------------------------------------------------
 
-/// Enabling condition: `gsd-envelope = { path = "../gsd-envelope" }` in the `[dependencies]` of `gsd-adapter` (U3.4d wires the host
-/// route to the envelope crate). Remove the `#[cfg(any())]` then. The check is the standard stable trick: the method named by
+impl World {
+    /// T-1 in IN_REVIEW with the rows of `spec` signed by the real `make_verdict` under `sign` (see `signed_store`), and the empty
+    /// effects file of the selector. Returns the late row of the scenario, when it made one.
+    fn signed(spec: &str, sign: &[(String, String)]) -> (Self, Option<signed_store::LateRow>) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("work");
+        let swarm = root.join(".swarm");
+        fs::create_dir_all(&swarm).expect("swarm dir");
+        let scratch = dir.path().join("scratch");
+        fs::create_dir_all(&scratch).expect("scratch");
+        let late =
+            signed_store::seed_into(&repo_root(), &swarm.join("tasks.db"), &scratch, spec, sign);
+        let effects = dir.path().join("effects.json");
+        fs::write(&effects, "").expect("effects file");
+        (
+            Self {
+                dir,
+                root,
+                swarm,
+                effects,
+            },
+            late,
+        )
+    }
+}
+
+/// One query on the store of `world` through a plain connection: the values of the first column as text.
+fn column_of(world: &World, sql: &str) -> Vec<String> {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection, Row};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(world.swarm.join("tasks.db"))
+            .connect()
+            .await
+            .expect("connect");
+        let rows = sqlx::query(sql).fetch_all(&mut conn).await.expect(sql);
+        let found = rows.iter().map(|row| row.get::<String, _>(0)).collect();
+        conn.close().await.expect("close");
+        found
+    })
+}
+
+/// `canaries` with only `names` in its environment (the run is given those variables; the scan still looks for every canary).
+fn given(canaries: &Canaries, names: &[&str]) -> Canaries {
+    Canaries {
+        env: canaries
+            .env
+            .iter()
+            .filter(|(name, _)| names.contains(&name.as_str()))
+            .cloned()
+            .collect(),
+        needles: canaries.needles.clone(),
+    }
+}
+
+const SIGNING: &str = "SWARM_SIGNING_KEY";
+const ED25519: &str = "SWARM_ED25519_KEY";
+const KEY_FILE: &str = "SWARM_ED25519_KEY_FILE";
+const ALLOW_DEV: &str = "SWARM_ALLOW_INSECURE_DEV_KEY";
+const REQUIRE: &str = "SWARM_REQUIRE_KEY";
+
+/// The two gates of a medium-risk task, both passing.
+const PASSING: &str = r#"{"verdicts": [["review", "pass"], ["quality", "pass"]]}"#;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Expect {
+    Approved,
+    Policy(&'static str),
+    KeyFile,
+}
+
+struct Approved {
+    /// The variables Python signs the rows under.
+    signed_under: &'static [&'static str],
+    /// The variables the process environment holds when the host verifies.
+    run_with: &'static [&'static str],
+    /// `real_key` and `dev_key` of the facts the host must have read.
+    facts: (bool, bool),
+    expect: Expect,
+}
+
+fn flag_of(value: &Json, key: &str) -> bool {
+    match member(value, key) {
+        Json::Bool(flag) => *flag,
+        other => panic!("{key} is not a bool: {other:?}"),
+    }
+}
+
+fn names_of(value: &Json, key: &str) -> Vec<String> {
+    match member(value, key) {
+        Json::Arr(items) => items
+            .iter()
+            .map(|item| match item {
+                Json::Str(text) => text.clone(),
+                other => panic!("not text: {other:?}"),
+            })
+            .collect(),
+        other => panic!("{key} is not a list: {other:?}"),
+    }
+}
+
+/// One R2 case: signs, runs, scans every channel and checks the facts and the answer.
+fn approved_case(case: &Approved) {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let sign: Vec<(String, String)> = given(&canaries, case.signed_under).env;
+    let (world, _) = World::signed(PASSING, &sign);
+    let envelope = column_of(&world, "SELECT envelope_json FROM verdicts ORDER BY id");
+    let signatures = column_of(&world, "SELECT sig FROM verdicts ORDER BY id");
+    assert_eq!(envelope.len(), 2, "the scenario recorded two signed rows");
+    let run = transition(world, "T-1", "APPROVED", &given(&canaries, case.run_with));
+    let manifest = fs::read_to_string(&run.world.effects).expect("manifest");
+    let state = column_of(&run.world, "SELECT state FROM tasks WHERE task_id='T-1'");
+    let reply = parse_json(&run.stdout).expect("a JSON reply");
+
+    match case.expect {
+        Expect::Approved => {
+            assert_eq!(state, ["APPROVED"], "the transition committed");
+            assert_eq!(member(&reply, "status"), &Json::Str("ok".to_string()));
+            assert!(
+                manifest.contains("task.transition"),
+                "the effects were handed on: {manifest}"
+            );
+        }
+        Expect::Policy(text) => {
+            assert_eq!(state, ["IN_REVIEW"], "a refusal writes nothing");
+            let error = member(&reply, "error");
+            assert_eq!(member(error, "code"), &Json::Str("E-POLICY".to_string()));
+            let message = match member(error, "message") {
+                Json::Str(message) => message.clone(),
+                other => panic!("no message: {other:?}"),
+            };
+            assert!(message.contains(text), "{message} lacks {text}");
+            assert_eq!(manifest, "", "a refusal writes no manifest");
+        }
+        Expect::KeyFile => {
+            assert_eq!(state, ["IN_REVIEW"]);
+            let error = member(&reply, "error");
+            assert_eq!(member(error, "code"), &Json::Str("E-DEP".to_string()));
+            assert_eq!(
+                member(member(error, "details"), "write_state"),
+                &Json::Str("not_started".to_string())
+            );
+            assert!(
+                run.requests.is_empty(),
+                "the decider never ran, so the guest never saw the call"
+            );
+            assert_eq!(manifest, "");
+        }
+    }
+
+    // The guest request, when the call got that far: `approval` is non-null, has exactly its five keys, and its values are the real
+    // facts the host read from the store and the key policy.
+    if case.expect != Expect::KeyFile {
+        assert_eq!(run.requests.len(), 1, "the guest is asked once");
+        let request =
+            parse_json(std::str::from_utf8(&run.requests[0]).expect("UTF-8")).expect("JSON");
+        assert_eq!(shape_drift(&request), Vec::<String>::new());
+        let approval = member(member(&request, "facts"), "approval");
+        assert!(
+            matches!(approval, Json::Obj(_)),
+            "approval is not null for an APPROVED target"
+        );
+        assert_eq!(
+            (flag_of(approval, "real_key"), flag_of(approval, "dev_key")),
+            case.facts
+        );
+        assert_eq!(
+            flag_of(approval, "require_key"),
+            case.run_with.contains(&REQUIRE)
+        );
+        // Both gates pass, and a refused key policy reads no row: no gate name in either case.
+        let empty = Vec::<String>::new();
+        assert_eq!(names_of(approval, "missing_gates"), empty);
+        assert_eq!(names_of(approval, "unaccepted_gates"), empty);
+        let wire = String::from_utf8_lossy(&run.requests[0]).into_owned();
+        for forbidden in ["hmac:", "ed25519:", "\"sig\"", "envelope"] {
+            assert!(
+                !wire.contains(forbidden),
+                "the guest request carries {forbidden}"
+            );
+        }
+        for stored in envelope.iter().chain(&signatures) {
+            assert!(
+                !wire.contains(stored.as_str()),
+                "a stored envelope or signature is in the guest request"
+            );
+        }
+    }
+
+    // Every channel, every canary form.
+    canaries.require_clean(run.stdout.as_bytes(), "the reply on stdout");
+    canaries.require_clean(run.refusal_text.as_bytes(), "the Debug text of a refusal");
+    canaries.require_clean(manifest.as_bytes(), "the effects manifest");
+    for request in &run.requests {
+        canaries.require_clean(request, "the guest request");
+    }
+    for reply in &run.replies {
+        canaries.require_clean(reply, "the guest reply");
+    }
+    for (name, bytes) in files_under(run.world.dir.path()) {
+        canaries.require_clean(&bytes, &format!("the file {name}"));
+    }
+    assert!(
+        !manifest.contains("security.dev_key") && !run.stdout.contains("security.dev_key"),
+        "Python's transition emits no security.dev_key (only signing does), so the manifest must not"
+    );
+}
+
+#[test]
+fn approved_transition_with_an_ed25519_key_only() {
+    approved_case(&Approved {
+        signed_under: &[ED25519],
+        run_with: &[ED25519],
+        facts: (true, false),
+        expect: Expect::Approved,
+    });
+}
+
+#[test]
+fn approved_transition_with_an_hmac_key_only() {
+    approved_case(&Approved {
+        signed_under: &[SIGNING],
+        run_with: &[SIGNING],
+        facts: (true, false),
+        expect: Expect::Approved,
+    });
+}
+
+#[test]
+fn approved_transition_with_both_keys() {
+    approved_case(&Approved {
+        signed_under: &[SIGNING, ED25519],
+        run_with: &[SIGNING, ED25519],
+        facts: (true, false),
+        expect: Expect::Approved,
+    });
+}
+
+#[test]
+fn approved_transition_with_the_dev_key_opt_in() {
+    approved_case(&Approved {
+        signed_under: &[ALLOW_DEV],
+        run_with: &[ALLOW_DEV],
+        facts: (false, true),
+        expect: Expect::Approved,
+    });
+}
+
+#[test]
+fn approved_transition_with_require_key_and_no_key() {
+    approved_case(&Approved {
+        signed_under: &[SIGNING],
+        run_with: &[REQUIRE],
+        facts: (false, false),
+        expect: Expect::Policy("fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"),
+    });
+}
+
+#[test]
+fn approved_transition_with_no_key() {
+    approved_case(&Approved {
+        signed_under: &[SIGNING],
+        run_with: &[],
+        facts: (false, false),
+        expect: Expect::Policy("fail-closed: no signing key configured"),
+    });
+}
+
+#[test]
+fn approved_transition_with_a_key_file_reference() {
+    approved_case(&Approved {
+        signed_under: &[SIGNING],
+        run_with: &[KEY_FILE],
+        facts: (false, false),
+        expect: Expect::KeyFile,
+    });
+}
+
+/// A refusal that is not about the key policy is the only refusal made while a key IS configured, so it is the one refusal that could
+/// carry the key: a failing gate. Its text, its Debug text, the guest traffic and every file must hold no form of any canary (a route
+/// that echoed the signing key into a refusal would show only here).
+#[test]
+fn approved_transition_refused_for_a_failing_gate_with_a_key_leaks_no_key() {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let sign: Vec<(String, String)> = given(&canaries, &[SIGNING]).env;
+    let (world, _) = World::signed(
+        r#"{"verdicts": [["review", "pass"], ["quality", "fail"]]}"#,
+        &sign,
+    );
+    let run = transition(world, "T-1", "APPROVED", &given(&canaries, &[SIGNING]));
+    assert_eq!(
+        column_of(&run.world, "SELECT state FROM tasks WHERE task_id='T-1'"),
+        ["IN_REVIEW"],
+        "a refusal writes nothing"
+    );
+    let reply = parse_json(&run.stdout).expect("a JSON reply");
+    let error = member(&reply, "error");
+    assert_eq!(member(error, "code"), &Json::Str("E-POLICY".to_string()));
+    let message = match member(error, "message") {
+        Json::Str(message) => message.clone(),
+        other => panic!("no message: {other:?}"),
+    };
+    assert!(
+        message.contains("lacks passing gates ['quality']"),
+        "{message}"
+    );
+    canaries.require_clean(run.stdout.as_bytes(), "the reply on stdout");
+    canaries.require_clean(run.refusal_text.as_bytes(), "the Debug text of a refusal");
+    for request in &run.requests {
+        canaries.require_clean(request, "the guest request");
+    }
+    for reply in &run.replies {
+        canaries.require_clean(reply, "the guest reply");
+    }
+    for (name, bytes) in files_under(run.world.dir.path()) {
+        canaries.require_clean(&bytes, &format!("the file {name}"));
+    }
+}
+
+/// The route reads its keys from its own process environment. A key that is only in the request's `env` (a hostile caller's) is not
+/// one: the call is refused for want of a key, and the request's key is in nothing.
+#[test]
+fn approved_transition_never_reads_a_key_from_the_request_env() {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let sign = given(&canaries, &[SIGNING]).env;
+    let (world, _) = World::signed(PASSING, &sign);
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for name in KEY_ENV {
+        std::env::remove_var(name);
+    }
+    let call = world.call(
+        &["--transition", "T-1", "APPROVED", "--reason", "canary"],
+        &given(&canaries, &[SIGNING, ED25519, ALLOW_DEV]).env,
+    );
+    let args = parse_transition_args(&call.argv).expect("a transition argv");
+    let guest = Recording {
+        seen: Mutex::new(Vec::new()),
+        replies: Mutex::new(Vec::new()),
+    };
+    let engine = SandboxEngine::new().expect("sandbox engine");
+    let result = engine.transition_via(&guest, production, &args, &call);
+    let error = result.expect_err("no key in the process environment: refused");
+    let stdout = error_reply("A01", "orch_status", &error).stdout;
+    assert!(
+        stdout.contains("fail-closed: no signing key configured"),
+        "{stdout}"
+    );
+    canaries.require_clean(stdout.as_bytes(), "the refusal");
+    canaries.require_clean(
+        format!("{error:?}").as_bytes(),
+        "the Debug text of the refusal",
+    );
+    for seen in guest
+        .seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        canaries.require_clean(seen, "the guest request");
+    }
+    assert_eq!(column_of(&world, "SELECT state FROM tasks"), ["IN_REVIEW"]);
+}
+
+/// A target other than APPROVED never reads a key, so a key-file reference in the environment does not send it to Python.
+#[test]
+fn approved_transition_is_the_only_target_that_reads_keys() {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let (world, _) = World::signed(PASSING, &given(&canaries, &[SIGNING]).env);
+    let run = transition(
+        world,
+        "T-1",
+        "CHANGES_REQUESTED",
+        &given(&canaries, &[KEY_FILE]),
+    );
+    assert!(
+        run.stdout.contains("\"ok\""),
+        "a rework with a key-file reference in the environment answers: {}",
+        run.stdout
+    );
+    assert_eq!(
+        column_of(&run.world, "SELECT state FROM tasks"),
+        ["CHANGES_REQUESTED"]
+    );
+    let request = parse_json(std::str::from_utf8(&run.requests[0]).expect("UTF-8")).expect("JSON");
+    assert_eq!(
+        member(member(&request, "facts"), "approval"),
+        &Json::Null,
+        "no approval facts for another target"
+    );
+    canaries.require_clean(&run.requests[0], "the guest request");
+}
+
+/// The verdict rows are read inside the write lock, not before it. A second connection holds the lock while the call runs; the row the
+/// task is missing is committed while the call waits; the call must see it. (A host that read the rows before it took the lock would
+/// refuse with the gate missing.) The call is given two seconds to reach the lock; a slower start still passes, so a pass proves less
+/// on a loaded host and a failure is never spurious.
+#[test]
+fn approved_transition_reads_the_verdict_rows_inside_the_write_lock() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let sign = given(&canaries, &[SIGNING]).env;
+    let (world, late) = World::signed(
+        r#"{"verdicts": [["review", "pass"]], "late": ["quality", "pass"]}"#,
+        &sign,
+    );
+    let late = late.expect("a late row");
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for name in KEY_ENV {
+        std::env::remove_var(name);
+    }
+    for (name, value) in &given(&canaries, &[SIGNING]).env {
+        std::env::set_var(name, value);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut holder = runtime.block_on(async {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(world.swarm.join("tasks.db"))
+            .connect()
+            .await
+            .expect("connect");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .expect("the holder takes the write lock");
+        conn
+    });
+    let call = world.call(
+        &["--transition", "T-1", "APPROVED", "--reason", "canary"],
+        &[],
+    );
+    let args = parse_transition_args(&call.argv).expect("a transition argv");
+    let guest = Recording {
+        seen: Mutex::new(Vec::new()),
+        replies: Mutex::new(Vec::new()),
+    };
+    let engine = SandboxEngine::new().expect("sandbox engine");
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| engine.transition_via(&guest, production, &args, &call));
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !worker.is_finished(),
+            "the call is waiting for the lock the holder has"
+        );
+        runtime.block_on(async {
+            sqlx::query(
+                "INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
+            )
+            .bind("T-1")
+            .bind(&late.gate)
+            .bind(&late.verdict)
+            .bind("A09")
+            .bind(&late.findings)
+            .bind(late.expires_at)
+            .bind(late.ts)
+            .bind(&late.envelope_json)
+            .bind(&late.sig)
+            .execute(&mut holder)
+            .await
+            .expect("the late row");
+            sqlx::query("COMMIT").execute(&mut holder).await.expect("commit");
+        });
+        worker.join().expect("the call did not panic")
+    });
+    runtime.block_on(async { holder.close().await.expect("close") });
+    let reply = result.unwrap_or_else(|error| {
+        panic!("the row committed under the call's feet was not seen: {error:?}")
+    });
+    assert!(reply.stdout.contains("\"ok\""), "{}", reply.stdout);
+    assert_eq!(column_of(&world, "SELECT state FROM tasks"), ["APPROVED"]);
+}
+
+/// A verdict that is current when the call starts and expires while the call waits for the write lock is expired: Python reads
+/// `time.time()` inside its lock, so the host compares the expiry with a clock read after the lock was taken, not with the `now` the
+/// route sampled before the wait. The verdicts live 8 seconds; a second connection holds the write lock until they are past; the call
+/// must be refused with Python's text. (A host that compared with the early `now` would approve.) The call has 8 seconds to reach
+/// the lock after the store was built; a slower start is refused either way, so a pass proves less on a loaded host and a failure is
+/// never spurious. The control below approves the same store shape with no wait.
+#[test]
+fn approved_transition_refuses_a_verdict_that_expired_while_the_call_waited_for_the_lock() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let sign = given(&canaries, &[SIGNING]).env;
+    let (world, _) = World::signed(
+        r#"{"verdicts": [["review", "pass"], ["quality", "pass"]], "expires_s": 8}"#,
+        &sign,
+    );
+    let built = std::time::Instant::now();
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for name in KEY_ENV {
+        std::env::remove_var(name);
+    }
+    for (name, value) in &given(&canaries, &[SIGNING]).env {
+        std::env::set_var(name, value);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut holder = runtime.block_on(async {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(world.swarm.join("tasks.db"))
+            .connect()
+            .await
+            .expect("connect");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .expect("the holder takes the write lock");
+        conn
+    });
+    let call = world.call(
+        &["--transition", "T-1", "APPROVED", "--reason", "canary"],
+        &[],
+    );
+    let args = parse_transition_args(&call.argv).expect("a transition argv");
+    let guest = Recording {
+        seen: Mutex::new(Vec::new()),
+        replies: Mutex::new(Vec::new()),
+    };
+    let engine = SandboxEngine::new().expect("sandbox engine");
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| engine.transition_via(&guest, production, &args, &call));
+        // Past the life of the verdicts, counted from the moment the store was complete (they were signed before that).
+        std::thread::sleep(Duration::from_millis(9500).saturating_sub(built.elapsed()));
+        assert!(
+            !worker.is_finished(),
+            "the call is waiting for the lock the holder has"
+        );
+        runtime.block_on(async {
+            sqlx::query("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("release");
+        });
+        worker.join().expect("the call did not panic")
+    });
+    runtime.block_on(async { holder.close().await.expect("close") });
+    let error = result.expect_err("the verdicts expired while the call waited for the lock");
+    let stdout = error_reply("A01", "orch_status", &error).stdout;
+    assert!(
+        stdout.contains("E-POLICY") && stdout.contains("lacks passing gates ['review', 'quality']"),
+        "{stdout}"
+    );
+    assert_eq!(column_of(&world, "SELECT state FROM tasks"), ["IN_REVIEW"]);
+    canaries.require_clean(stdout.as_bytes(), "the refusal");
+}
+
+/// The control of the test above: the same store shape (verdicts that live 10 minutes) approved with no wait.
+#[test]
+fn approved_transition_approves_current_verdicts_with_no_wait() {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let (world, _) = World::signed(
+        r#"{"verdicts": [["review", "pass"], ["quality", "pass"]], "expires_s": 600}"#,
+        &given(&canaries, &[SIGNING]).env,
+    );
+    let run = transition(world, "T-1", "APPROVED", &given(&canaries, &[SIGNING]));
+    assert!(run.stdout.contains("\"ok\""), "{}", run.stdout);
+    assert_eq!(
+        column_of(&run.world, "SELECT state FROM tasks"),
+        ["APPROVED"]
+    );
+}
+
+// ---- disabled modules, each with the one prerequisite it waits for -------------------------------------------------------------
+
+/// Disabled (`#[cfg(any())]`) until R11 is decided: the `Serialize` half needs `serde` as a dev-dependency (a user approval) and the module
+/// needs `gsd-envelope` in this crate's manifest.
+///
+/// Enabling condition: `gsd-envelope = { path = "../gsd-envelope" }` in the `[dependencies]` of `gsd-adapter`. U3.4d wired the envelope
+/// crate into `gsd-taskwriter` (and the adapter through it), not into this manifest, which the orchestrator owns; the `Clone` half of
+/// this check runs in `crates/gsd-taskwriter/tests/approval.rs`. Remove the `#[cfg(any())]` when the dependency exists and `serde` is a
+/// dev-dependency (R11 awaits the user's approval). The check is the standard stable trick: the method named by
 /// `<KeyMaterial as AmbiguousIfImpl<_>>::some_item` is ambiguous, so the line does not compile, exactly when `KeyMaterial` has the
 /// trait. A `KeyMaterial` that is `Clone` would let a caller copy a secret out of the process; one that is `Serialize` would let the
 /// host put it into a request.
@@ -1165,6 +1762,8 @@ mod key_material_is_not_clone_or_serialize {
     };
 }
 
+/// Disabled (`#[cfg(any())]`) until a public seam for the read request exists: `read_snapshot` and `request_json` are not reachable here.
+///
 /// Enabling condition: a public seam for the read request. `read_snapshot` and `read_args` in `strangler_seam.rs` are `pub(crate)`
 /// and `request_json` is private; once `read_snapshot` is `pub` (or `SandboxEngine::answer` takes a recording guest the way
 /// `transition_via` does), remove the `#[cfg(any())]` and replace `snapshot_for` by the seam. The allowlists are the key sets of

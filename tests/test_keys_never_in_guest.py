@@ -26,9 +26,11 @@ B. CANARY over everything that exists: valid-shaped canary values in `SWARM_SIGN
    `RUST_BACKTRACE=1`; a hostile request `env` map (keys and `SWARM_DIR`) is dropped except for the allowlisted `SWARM_DIR`; a canary
    key file under `$HOME/.config/agent-swarm/` and one named by `SWARM_ED25519_KEY_FILE` (with canary CONTENT) are never read into
    anything the run prints or writes, and an APPROVED transition is refused before any write.
-C. SELECTOR. The environment the selector starts the binary with (`_binary_env`) and the request it writes to the binary's stdin
-   (`RUST_ENV_KEYS`) never carry a key variable. A route-by-key-presence table (`ROUTE_KEY_POLICY`) is the one place that says
-   which route may receive which key; today none does, and U3.4d must edit the table with `_binary_env`.
+C. SELECTOR. The request the selector writes to the binary's stdin (`RUST_ENV_KEYS`) never carries a key variable. The environment it
+   starts the binary with (`_binary_env(route)`) is an explicit allowlist, and only a real transition to APPROVED
+   (`transition-approved`) is handed key material: the five signing variables plus `SWARM_AGENT_SESSION` and `XDG_CONFIG_HOME`, which
+   the binary's key policy reads beside them. `ROUTE_KEY_POLICY` is the one place that says which route may receive which key variable
+   (an edit of `_binary_env` and of the table must go together), and a positive pin says the APPROVED route IS handed all seven names.
 D. DRIFT. Every `SWARM_*(KEY|SECRET|TOKEN|SEED|PEM|PRIVATE)` name the key code and the scripts mention is in `SIGNING_KEY_ENV` of
    the selector, and the two lists that strip signing material from child sessions (`hook_trigger.SIGNING_ENV_STRIPPED`,
    `swarm_run.AGENT_SESSION_STRIPPED`) cover it. A divergence is a finding and is pinned with `xfail(strict=True)`.
@@ -36,10 +38,11 @@ D. DRIFT. Every `SWARM_*(KEY|SECRET|TOKEN|SEED|PEM|PRIVATE)` name the key code a
 The canaries are made at run time, held in memory and never written to a file or printed. The binary is `target/debug/gsd_engine` (or
 `GSD_ENGINE_BIN`); outside CI the real-binary tests skip, naming the reason, without it.
 
-Not here, waiting for later units: the key-reading path with canaries (R2: the APPROVED route of U3.4d does not exist, so nothing
-here claims to cover it), the guest request and reply of an APPROVED transition (U3.4d adds `approval` facts that carry booleans
-derived from the key policy), the guest's linear memory after a call, and the effects of the sign routes (U3.6a). The Rust half
-of this unit is `crates/gsd-adapter/tests/keys_never_in_guest.rs`, `crates/gsd-sandbox/tests/guest_imports.rs` and
+What U3.4d added and is covered here: the key-reading path of a transition to APPROVED with canaries (R2: `R2_CASES`, the real binary
+through the selector and directly, on both backends) and the reverse-dependency pin of `gsd-envelope`. The guest request and reply of an
+APPROVED transition (`approval` facts: booleans and gate names) are checked by the Rust half. Not here, waiting for later units: the
+guest's linear memory after a call, and the effects of the sign routes (U3.6a). The Rust half of this unit is
+`crates/gsd-adapter/tests/keys_never_in_guest.rs`, `crates/gsd-sandbox/tests/guest_imports.rs` and
 `crates/gsd-envelope/tests/key_error_canary.rs`.
 """
 
@@ -61,7 +64,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable, Collection, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -161,6 +164,38 @@ def test_the_deny_list_is_not_vacuous() -> None:
     assert CRYPTO <= reachable(meta, "gsd-envelope"), "gsd-envelope no longer reaches the crypto crates: the deny-list names stale crates"
     assert "gsd-security" in reachable(meta, "gsd-sandbox"), "gsd-sandbox no longer reaches gsd-security: the deny-list names a stale crate"
     assert "gsd-envelope" in {pkg["name"] for pkg in meta["packages"]}
+
+
+# The host crates are the only ones that may reach the key code (unit U3.4d): `gsd-taskwriter` depends on `gsd-envelope` (it verifies the
+# verdict rows of an APPROVED and signs a gate's verdict), and `gsd-adapter` reaches it through the writer. `gsd-route`, `gsd-guest` and
+# `gsd-sandbox` never do (the sandbox reaches `ed25519-dalek` through `gsd-security`, which is why this pin names `gsd-envelope` itself).
+KEY_CODE_DEPENDENTS = frozenset({"gsd-adapter", "gsd-taskwriter"})
+NEVER_REACH_ENVELOPE = ("gsd-route", "gsd-guest", "gsd-sandbox")
+
+
+def workspace_reaching(meta: Metadata, target: str, kinds: frozenset[str | None] = SHIPPED) -> set[str]:
+    """The workspace members from which `target` is reachable: the reverse dependencies of `target` in the whole workspace."""
+    names = {pkg["id"]: pkg["name"] for pkg in meta["packages"]}
+    return {names[pid] for pid in meta["workspace_members"] if target in reachable(meta, names[pid], kinds)}
+
+
+def test_only_the_writer_and_the_adapter_reach_gsd_envelope(graph: Metadata) -> None:
+    reaching = workspace_reaching(graph, "gsd-envelope")
+    assert reaching <= KEY_CODE_DEPENDENTS, f"crates that reach gsd-envelope and must not: {sorted(reaching - KEY_CODE_DEPENDENTS)}"
+    assert not set(NEVER_REACH_ENVELOPE) & reaching
+    if graph is _metadata(None):
+        # The positive control: the crates that must reach it do, so a rename or a dropped dependency cannot make this pass for nothing.
+        assert reaching == KEY_CODE_DEPENDENTS, f"the host crates no longer reach gsd-envelope: {sorted(reaching)}"
+
+
+@pytest.mark.parametrize("intruder", [*NEVER_REACH_ENVELOPE, "gsd-codes", "gsd-failure"])
+@pytest.mark.parametrize("kind", [None, "build"])
+def test_the_reverse_dependency_pin_flags_a_crate_that_starts_to_reach_gsd_envelope(intruder: str, kind: str | None) -> None:
+    meta = _metadata(None)
+    assert workspace_reaching(meta, "gsd-envelope") == KEY_CODE_DEPENDENTS
+    mutated = with_edge(meta, intruder, "gsd-envelope", kind)
+    extra = workspace_reaching(mutated, "gsd-envelope") - KEY_CODE_DEPENDENTS
+    assert intruder in extra, f"a new edge {intruder} -> gsd-envelope went unnoticed"
 
 
 @pytest.mark.parametrize(
@@ -540,8 +575,9 @@ def _environ(world: World, canaries: Canaries) -> dict[str, str]:
     }
 
 
-def run_selector(world: World, canaries: Canaries, route: str, backend: str) -> Outcome:
-    """`scripts/orch_status.py` with GSD_ENGINE=rust, the canaries in its environment, and the launcher as the binary."""
+def run_selector(world: World, canaries: Canaries, route: str, backend: str, *, argv: list[str] | None = None) -> Outcome:
+    """`scripts/orch_status.py` with GSD_ENGINE=rust, the canaries in its environment, and the launcher as the binary. `argv` replaces
+    the route's own (the APPROVED cases of section F2 call the `transition` route with another target)."""
     env = {
         **_environ(world, canaries),
         "SWARM_GSD_STATE_FILE": "",
@@ -551,7 +587,7 @@ def run_selector(world: World, canaries: Canaries, route: str, backend: str) -> 
         "GSD_RUST_BACKEND": backend,
     }
     done = subprocess.run(
-        [sys.executable, str(SCRIPT), *ROUTES[route]], cwd=world.root, env=env, capture_output=True, timeout=120, check=False
+        [sys.executable, str(SCRIPT), *(argv or ROUTES[route])], cwd=world.root, env=env, capture_output=True, timeout=120, check=False
     )
     recorded = [world.records / "binary-stdout", world.records / "binary-stderr"]
     answers = [path.read_bytes() if path.exists() else b"" for path in recorded]
@@ -797,28 +833,92 @@ def host_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Canaries:
 
 
 @pytest.mark.parametrize("variable", KEY_VARS)
-def test_the_binary_environment_drops_each_key_variable(host_env: Canaries, monkeypatch: pytest.MonkeyPatch, variable: str) -> None:
+def test_the_binary_environment_of_a_route_that_verifies_nothing_drops_each_key_variable(
+    host_env: Canaries, monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
     monkeypatch.setenv(variable, host_env.env[variable])
-    env = selector()._binary_env()
+    env = selector()._binary_env("transition")
     assert variable not in env
     assert_no_key(env, host_env)
-    # Positive controls: the allowlist is not empty, so the absence above is the filter's doing.
-    assert env["SWARM_DIR"] == os.environ["SWARM_DIR"] and env["GSD_RUST_BACKEND"] == "host" and "PATH" in env
+    # Positive controls: the allowlist is not empty, so the absence above is the filter's doing; and a SWARM_ name nobody listed (the
+    # swarm directory travels in the request's `env`) is not handed on by prefix.
+    assert env["GSD_RUST_BACKEND"] == "host" and "PATH" in env
+    assert "SWARM_DIR" not in env, "the binary's environment is an allowlist of names, not a SWARM_ prefix"
 
 
-def test_the_binary_environment_drops_every_key_variable_at_once(host_env: Canaries, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_binary_environment_of_such_a_route_drops_every_key_variable_at_once(host_env: Canaries, monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in host_env.env.items():
         monkeypatch.setenv(name, value)
-    env = selector()._binary_env()
-    assert_no_key(env, host_env)
-    assert {"SWARM_DIR", "GSD_RUST_BACKEND", "PATH"} <= set(env)
+    for route in ("list", "history", "transition"):
+        env = selector()._binary_env(route)
+        assert_no_key(env, host_env)
+        assert {"GSD_RUST_BACKEND", "PATH"} <= set(env)
 
 
-def test_the_selector_tables_name_no_key_variable() -> None:
+def test_the_binary_environment_is_exactly_the_allowlist_and_the_routes_grant(host_env: Canaries, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whatever the process holds, the binary gets only names of `BINARY_ENV_NAMES` and of the route's grant: not a prefix, not a rename."""
+    module = selector()
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+    monkeypatch.setenv("GSD_FUTURE_SETTING", "x")
+    monkeypatch.setenv("SWARM_FUTURE_SETTING", "x")
+    monkeypatch.setenv("SWARM_TASKSTORE_WAL", "1")
+    monkeypatch.setenv("UNRELATED_TOKEN", "x")
+    for name, value in host_env.env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("SWARM_AGENT_SESSION", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/x")
+    for route, grant in module.ROUTE_KEY_ENV.items():
+        env = module._binary_env(route)
+        assert set(env) <= set(module.BINARY_ENV_NAMES) | set(grant), f"route {route}: {sorted(set(env) - set(module.BINARY_ENV_NAMES) - set(grant))}"
+    with pytest.raises(KeyError):
+        module._binary_env("a-route-nobody-listed")
+
+
+def test_the_selector_tables_name_no_key_variable_outside_the_approved_route() -> None:
     module = selector()
     assert set(KEY_VARS) <= set(module.SIGNING_KEY_ENV), "a key variable of the host is missing from SIGNING_KEY_ENV"
     assert not [name for name in module.RUST_ENV_KEYS if name in KEY_VARS or "KEY" in name]
-    assert not [name for name in module.BINARY_ENV_NAMES if "KEY" in name]
+    assert not [name for name in module.BINARY_ENV_NAMES if "KEY" in name or name in module.APPROVED_KEY_ENV]
+    assert {route: set(grant) & set(KEY_VARS) for route, grant in module.ROUTE_KEY_ENV.items()} == {
+        route: set(allowed) for route, allowed in ROUTE_KEY_POLICY.items()
+    }, "ROUTE_KEY_ENV of the selector and ROUTE_KEY_POLICY of this file must change together"
+
+
+APPROVED_GRANT_NAMES = (*KEY_VARS, "SWARM_AGENT_SESSION", "XDG_CONFIG_HOME")
+APPROVED_GRANT_LINE = 'APPROVED_KEY_ENV = SIGNING_KEY_ENV | {"SWARM_AGENT_SESSION", "XDG_CONFIG_HOME"}'
+
+
+def approved_grant_gaps(module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The names of `APPROVED_GRANT_NAMES` the process has and the selector does NOT hand the APPROVED child, and the routes that are handed
+    one of them although they are not APPROVED. `XDG_CONFIG_HOME` is what lets the binary see the conventional key file Python would load:
+    a binary without it would treat the dev key as active and approve rows Python refuses."""
+    for name in APPROVED_GRANT_NAMES:
+        monkeypatch.setenv(name, f"value-of-{name}")
+    approved = binary_env_for(module, "transition-approved")
+    gaps = [name for name in APPROVED_GRANT_NAMES if approved.get(name) != f"value-of-{name}"]
+    for route in ("list", "history", "transition"):
+        gaps += [f"{route} is handed {name}" for name in APPROVED_GRANT_NAMES if name in binary_env_for(module, route)]
+    return gaps
+
+
+def test_the_approved_route_is_handed_every_name_its_key_policy_reads_and_no_other_route_is(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert approved_grant_gaps(selector(), monkeypatch) == []
+
+
+@pytest.mark.parametrize(
+    ("dropped", "mutated_line"),
+    [
+        ("XDG_CONFIG_HOME", 'APPROVED_KEY_ENV = SIGNING_KEY_ENV | {"SWARM_AGENT_SESSION"}'),
+        ("SWARM_AGENT_SESSION", 'APPROVED_KEY_ENV = SIGNING_KEY_ENV | {"XDG_CONFIG_HOME"}'),
+        ("SWARM_ED25519_KEY_FILE", 'APPROVED_KEY_ENV = (SIGNING_KEY_ENV - {"SWARM_ED25519_KEY_FILE"}) | {"SWARM_AGENT_SESSION", "XDG_CONFIG_HOME"}'),
+    ],
+)
+def test_the_approved_grant_pin_has_teeth(dropped: str, mutated_line: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    original = SCRIPT.read_text(encoding="utf-8")
+    assert APPROVED_GRANT_LINE in original, "the line this mutation changes moved: update it with `APPROVED_KEY_ENV`"
+    mutated = tmp_path / "orch_status_grant.py"
+    mutated.write_text(original.replace(APPROVED_GRANT_LINE, mutated_line), encoding="utf-8")
+    assert approved_grant_gaps(load_selector(mutated, "orch_status_grant"), monkeypatch) == [dropped]
 
 
 def test_the_environment_check_has_teeth(host_env: Canaries) -> None:
@@ -1369,6 +1469,223 @@ def test_the_key_file_check_wants_a_typed_refusal_and_an_untouched_task(tmp_path
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
+# F2. R2: a transition to APPROVED that reads keys and signed verdict rows (unit U3.4d, merge condition of decision D-P30)
+# ---------------------------------------------------------------------------------------------------------------------------------
+#
+# The task T-1 is in IN_REVIEW with one signed `review` verdict (risk class low), signed by the REAL `make_verdict` under canary keys.
+# The binary then verifies it: Ed25519 only, HMAC only, both keys, the dev-key opt-in, SWARM_REQUIRE_KEY=1 without a key, no key, and a
+# key-file reference. Every channel is scanned for every form of every canary: stdout, stderr, what the binary itself printed through the
+# selector, the effects manifest, the Task Store files and the run log. The selector hands the key variables to the binary on this route
+# (and only this one), so the launcher's record of its own environment is checked for names instead of scanned.
+
+APPROVED_ARGV = ["--json", "--transition", "T-1", "APPROVED", "--reason", "canary"]
+NO_KEY_TEXT = "fail-closed: no signing key configured"
+REQUIRE_TEXT = "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
+SIGN_BOTH = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY")
+# case: (the variables the verdict is signed under, the variables the run is given, what the binary answers)
+R2_CASES: dict[str, tuple[tuple[str, ...], tuple[str, ...], str]] = {
+    "ed25519-only": (("SWARM_ED25519_KEY",), ("SWARM_ED25519_KEY",), "approved"),
+    "hmac-only": (("SWARM_SIGNING_KEY",), ("SWARM_SIGNING_KEY",), "approved"),
+    "both-keys": (SIGN_BOTH, SIGN_BOTH, "approved"),
+    "dev-key-opt-in": (("SWARM_ALLOW_INSECURE_DEV_KEY",), ("SWARM_ALLOW_INSECURE_DEV_KEY",), "approved"),
+    "require-key-without-a-key": (("SWARM_SIGNING_KEY",), ("SWARM_REQUIRE_KEY",), REQUIRE_TEXT),
+    "no-key": (("SWARM_SIGNING_KEY",), (), NO_KEY_TEXT),
+    "key-file-reference": (("SWARM_SIGNING_KEY",), ("SWARM_ED25519_KEY_FILE",), "E-DEP"),
+}
+R2_GRANT = (*KEY_VARS, "SWARM_AGENT_SESSION", "XDG_CONFIG_HOME")
+
+
+def record_review_verdict(world: World, signing: Mapping[str, str], monkeypatch: pytest.MonkeyPatch, *, record: bool = True) -> dict[str, Any]:
+    """Puts T-1 into IN_REVIEW and (when `record`) records a `review` verdict signed by the real `make_verdict` under `signing`, which
+    is the whole key environment of the signing. Returns the verdict envelope."""
+    from swarm.gates import make_verdict
+
+    for name in KEY_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in signing.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("SWARM_DIR", str(world.tmp / "sign-state"))
+    store = TaskStore(world.swarm / "tasks.db")
+    try:
+        store.conn.execute("UPDATE tasks SET state = 'IN_REVIEW' WHERE task_id = 'T-1'")
+        store.conn.commit()
+        envelope = make_verdict(gate="review", task_id="T-1", agent_id="A09", correlation_id="C-1", audit=False, root=world.tmp / "sign-root")
+        if record:
+            store.record_verdict("T-1", envelope)
+    finally:
+        store.conn.close()
+        for name in (*KEY_VARS, "SWARM_DIR"):
+            monkeypatch.delenv(name, raising=False)
+    return envelope
+
+
+def given(canaries: Canaries, names: tuple[str, ...]) -> Canaries:
+    """`canaries` with only `names` given to the run (the scan still looks for every canary)."""
+    return Canaries({name: canaries.env[name] for name in names}, canaries.needles)
+
+
+def approved_answer(outcome: Outcome, driver: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(what the binary itself printed, what was printed to the caller) of an APPROVED run."""
+    printed = json.loads(outcome.stdout)
+    return (json.loads(outcome.binary_stdout) if driver == "selector" else printed), printed
+
+
+def check_approved_run(
+    world: World, canaries: Canaries, outcome: Outcome, case: str, driver: str, backend: str, build: str, where: str
+) -> str | None:
+    """The run answered as `case` says, left the task where the answer says, and no canary is in any channel. Returns why the guest was
+    not exercised (a sandbox leg of a build with no write guest), else None."""
+    expected = R2_CASES[case][2]
+    binary, printed = approved_answer(outcome, driver)
+    stderr = outcome.binary_stderr if driver == "selector" else outcome.stderr
+    no_guest = backend == "sandbox" and build == "default"
+    refused_before_write = no_guest or case == "key-file-reference"
+    if refused_before_write:
+        error = binary.get("error") or {}
+        assert binary.get("status") == "error" and error.get("code") == "E-DEP", f"expected the E-DEP refusal before any write {where}"
+        assert (error.get("details") or {}).get("write_state") == "not_started", f"the refusal must come before any write {where}"
+        if no_guest:
+            assert "sandbox-write" in error.get("message", ""), f"the refusal must name the sandbox-write feature {where}"
+    elif expected == "approved":
+        assert binary.get("status") == "ok", f"the binary did not approve {where}"
+        assert FAILOVER_NOTICE not in stderr, f"the sandbox failed over: the guest did not serve this APPROVED {where}"
+    else:
+        error = binary.get("error") or {}
+        assert error.get("code") == "E-POLICY" and expected in error.get("message", ""), f"expected the E-POLICY {expected!r} {where}"
+        assert "write_state" not in (error.get("details") or {}) or error["details"]["write_state"] == "final", f"unexpected write_state {where}"
+    # What the caller was told: through the selector Python answers whatever the binary refused before a write.
+    if driver == "selector" and refused_before_write:
+        final_expected = NO_KEY_TEXT if case == "key-file-reference" else expected
+        if final_expected == "approved":
+            assert printed.get("status") == "ok", f"Python did not answer the refusal with the approval {where}"
+        else:
+            assert final_expected in (printed.get("error") or {}).get("message", ""), f"Python's answer is not {final_expected!r} {where}"
+        approved = final_expected == "approved"
+    else:
+        approved = expected == "approved" and not refused_before_write
+    assert task_state(world) == ("APPROVED" if approved else "IN_REVIEW"), f"the state after the call {where}"
+    for channel, data in (("stdout", outcome.stdout), ("stderr", outcome.stderr), ("the binary's stdout", outcome.binary_stdout),
+                          ("the binary's stderr", outcome.binary_stderr)):
+        require_clean(leaks(data, canaries), f"{channel} {where}")
+    records = [world.records / "binary-env", world.records / "binary-stdin.json"]
+    require_clean(tree_leaks(canaries, *world.scanned(), exclude=records), f"a file {where}")
+    effects = world.tmp / "effects.json"
+    if effects.exists():
+        assert "security.dev_key" not in effects.read_text(encoding="utf-8"), f"Python's transition emits no security.dev_key {where}"
+    events = world.swarm / "events.jsonl"
+    assert not events.exists() or "security.dev_key" not in events.read_text(encoding="utf-8"), f"security.dev_key in the run log {where}"
+    return "the default build has no write guest (E-DEP, nothing written), so no sandbox APPROVED ran" if no_guest else None
+
+
+def approved_world(tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch) -> tuple[World, Canaries]:
+    world = make_world(tmp_path, _real_binary())
+    canaries = make_canaries(tmp_path)
+    signing = {name: canaries.env[name] for name in R2_CASES[case][0]}
+    record_review_verdict(world, signing, monkeypatch)
+    return world, canaries
+
+
+def run_approved(world: World, canaries: Canaries, case: str, driver: str, backend: str) -> Outcome:
+    run_with = given(canaries, R2_CASES[case][1])
+    if driver == "selector":
+        return run_selector(world, run_with, "transition", backend, argv=APPROVED_ARGV)
+    request = direct_request(world, "transition")
+    request["argv"] = APPROVED_ARGV
+    return run_binary(world, run_with, json.dumps(request).encode(), backend, extra_env=BACKTRACE)
+
+
+@pytest.mark.parametrize("backend", ["host", "sandbox"])
+@pytest.mark.parametrize("driver", ["selector", "direct"])
+@pytest.mark.parametrize("case", R2_CASES)
+def test_approved_transition_with_keys_and_signed_rows_leaks_no_key_and_answers_as_python_does(
+    tmp_path: Path, build: str, monkeypatch: pytest.MonkeyPatch, case: str, driver: str, backend: str
+) -> None:
+    world, canaries = approved_world(tmp_path, case, monkeypatch)
+    outcome = run_approved(world, canaries, case, driver, backend)
+    where = f"[engine build: {build}, {driver}-{case}-{backend}]"
+    not_covered = check_approved_run(world, canaries, outcome, case, driver, backend, build, where)
+    check_children(world, canaries, spawned=False)
+    if driver == "selector":
+        raw = (world.records / "binary-env").read_bytes()
+        names = set(environ_names(raw))
+        asked = set(R2_CASES[case][1])
+        assert names & set(R2_GRANT) == asked, f"the selector handed {sorted(names & set(R2_GRANT))}, the case sets {sorted(asked)} {where}"
+        for name in asked & set(SECRET_VARS):
+            assert raw.count(canaries.env[name].encode()) == 1, f"the value of {name} is in the environment under another name {where}"
+    if not_covered is not None:
+        pytest.skip(f"not covered: {not_covered}")
+
+
+@pytest.mark.parametrize("driver", ["selector", "direct"])
+def test_the_approved_check_detects_a_key_in_each_channel_and_a_wrong_answer(tmp_path: Path, build: str, monkeypatch: pytest.MonkeyPatch, driver: str) -> None:
+    case = "hmac-only"
+    world, canaries = approved_world(tmp_path, case, monkeypatch)
+    outcome = run_approved(world, canaries, case, driver, "host")
+    where = "[scratch]"
+    check_approved_run(world, canaries, outcome, case, driver, "host", build, where)
+    key = canaries.needles["SWARM_SIGNING_KEY"]["utf8"]
+    for channel in ("stdout", "stderr", "binary_stdout", "binary_stderr"):
+        if driver == "direct" and channel.startswith("binary"):
+            continue
+        current = getattr(outcome, channel)
+        # a reply stays one JSON object (the check reads it before it scans it); a stream just gets the key appended
+        planted = json.dumps({**json.loads(current), "note": key.decode()}).encode() if channel.endswith("stdout") else current + b" " + key
+        leaked = replace(outcome, **{channel: planted})
+        with pytest.raises(AssertionError, match="canary in"):
+            check_approved_run(world, canaries, leaked, case, driver, "host", build, where)
+    planted = world.tmp / "leak.bin"
+    planted.write_bytes(b"\x00" * 40 + canaries.needles["SWARM_ED25519_KEY"]["key-bytes"])
+    with pytest.raises(AssertionError, match="canary in a file"):
+        check_approved_run(world, canaries, outcome, case, driver, "host", build, where)
+    planted.unlink()
+    with pytest.raises(AssertionError, match="expected the E-POLICY"):
+        check_approved_run(world, canaries, outcome, "no-key", driver, "host", build, where)
+    (world.swarm / "events.jsonl").write_text('{"type": "security.dev_key"}\n', encoding="utf-8")
+    with pytest.raises(AssertionError, match="security.dev_key"):
+        check_approved_run(world, canaries, outcome, case, driver, "host", build, where)
+
+
+def test_an_approved_transition_reads_the_verdict_rows_after_it_has_the_write_lock(tmp_path: Path, build: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second connection holds the write lock and the verdict the task is missing is committed while the binary waits: the binary must
+    see it, which only a read inside its own transaction does. Nothing here is sensitive to how long the binary takes to reach the lock."""
+    world = make_world(tmp_path, _real_binary())
+    canaries = make_canaries(tmp_path)
+    envelope = record_review_verdict(world, {"SWARM_SIGNING_KEY": canaries.env["SWARM_SIGNING_KEY"]}, monkeypatch, record=False)
+    request = direct_request(world, "transition")
+    request["argv"] = APPROVED_ARGV
+    run_with = given(canaries, ("SWARM_SIGNING_KEY",))
+    holder = sqlite3.connect(world.swarm / "tasks.db", timeout=30, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        env = {**_environ(world, run_with), "GSD_RUST_BACKEND": "host"}
+        process = subprocess.Popen(
+            [str(world.binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=world.root, env=env
+        )
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(request).encode())
+        process.stdin.close()
+        try:
+            process.wait(timeout=3)
+            raise AssertionError("the binary finished while another connection held the write lock: it did not wait for it")
+        except subprocess.TimeoutExpired:
+            pass
+        now = envelope["payload"]["issued_at"]
+        holder.execute(
+            "INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("T-1", "review", "pass", "A09", "[]", now + 86400, now, json.dumps(envelope), envelope["sig"]),
+        )
+        holder.execute("COMMIT")
+        assert process.stdout is not None and process.stderr is not None
+        out, err = process.stdout.read(), process.stderr.read()  # the request was written and closed above, so communicate() would flush it
+        process.wait(timeout=120)
+    finally:
+        holder.close()
+    reply = json.loads(out)
+    assert reply.get("status") == "ok" and task_state(world) == "APPROVED", f"the row committed under the binary's feet was not seen [engine build: {build}]"
+    require_clean(leaks(out + err, canaries), "the answer of a call that waited for the lock")
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
 # G. Drift of the key-variable lists, and the route-by-key policy (R5)
 # ---------------------------------------------------------------------------------------------------------------------------------
 
@@ -1456,13 +1773,14 @@ def test_the_two_lists_that_strip_signing_material_agree() -> None:
     assert first == second, f"only in {STRIP_LISTS[0][1]}: {sorted(first - second)}; only in {STRIP_LISTS[1][1]}: {sorted(second - first)}"
 
 
-# The one place that says which route may be handed which key variables. Empty everywhere today: the selector hands the binary no key.
-# U3.4d, which makes the APPROVED route verify signatures, edits this table together with `_binary_env`.
+# The one place that says which route may be handed which key variables (design item 13, decision D-P30). Only a transition whose
+# target is APPROVED verifies signatures, so only it is handed the key variables; `ROUTE_KEY_ENV` of the selector says the same and
+# `test_the_selector_tables_name_no_key_variable_outside_the_approved_route` holds the two together.
 ROUTE_KEY_POLICY: dict[str, frozenset[str]] = {
     "list": frozenset(),
     "history": frozenset(),
     "transition": frozenset(),
-    "transition-approved": frozenset(),
+    "transition-approved": frozenset(KEY_VARS),
 }
 PRESENCES: dict[str, tuple[str, ...]] = {
     "none": (),
@@ -1482,11 +1800,10 @@ def load_selector(path: Path, name: str) -> ModuleType:
 
 
 def binary_env_for(module: ModuleType, route: str) -> dict[str, str]:
-    """The environment the selector hands the binary for `route`. `_binary_env` has no route today; when it takes one, this fails
-    until the call below is changed with the table."""
-    if inspect.signature(module._binary_env).parameters:
-        pytest.fail("_binary_env takes arguments now: call it per route here and give ROUTE_KEY_POLICY the keys each route may get")
-    return dict(module._binary_env())
+    """The environment the selector hands the binary for `route`. `_binary_env` takes the route since U3.4d: an old signature fails here."""
+    if list(inspect.signature(module._binary_env).parameters) != ["route"]:
+        pytest.fail("_binary_env takes no route: the policy table below is about routes, so the selector must say which route it starts")
+    return dict(module._binary_env(route))
 
 
 def check_route_key_policy(module: ModuleType, route: str, present: tuple[str, ...], monkeypatch: pytest.MonkeyPatch, canaries: Canaries) -> None:
@@ -1517,20 +1834,48 @@ def test_the_policy_table_covers_every_route_of_the_tests() -> None:
     assert all(allowed <= set(KEY_VARS) for allowed in ROUTE_KEY_POLICY.values())
 
 
-def test_the_policy_check_catches_a_selector_that_passes_a_key_or_takes_a_route(
+def allowlist_violations(module: ModuleType, monkeypatch: pytest.MonkeyPatch, canaries: Canaries) -> list[str]:
+    """The names some route is handed that neither `BINARY_ENV_NAMES` nor the route's grant lists, with every key variable set."""
+    monkeypatch.setenv("GSD_FUTURE_SETTING", "x")
+    monkeypatch.setenv("SWARM_FUTURE_SETTING", "x")
+    monkeypatch.setenv("SWARM_TASKSTORE_WAL", "1")
+    monkeypatch.setenv("SWARM_AGENT_SESSION", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/x")
+    for name, value in canaries.env.items():
+        monkeypatch.setenv(name, value)
+    found = []
+    for route, grant in module.ROUTE_KEY_ENV.items():
+        extra = set(module._binary_env(route)) - set(module.BINARY_ENV_NAMES) - set(grant)
+        found += [f"{route}: {name}" for name in sorted(extra)]
+    return found
+
+
+def test_the_policy_checks_catch_a_selector_that_passes_a_key_by_prefix_or_to_the_wrong_route(
     host_env: Canaries, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     original = SCRIPT.read_text(encoding="utf-8")
-    leaky = original.replace(" and key not in SIGNING_KEY_ENV}", "}")
-    assert leaky != original, "the deny-list clause moved: update this mutation with `_binary_env`"
-    mutated = tmp_path / "orch_status_leaky.py"
-    mutated.write_text(leaky, encoding="utf-8")
-    module = load_selector(mutated, "orch_status_leaky")
-    for variable in KEY_VARS:
-        with pytest.raises(AssertionError, match="was handed"):
-            check_route_key_policy(module, "list", (variable,), monkeypatch, host_env)
-    check_route_key_policy(module, "list", (), monkeypatch, host_env)
+    assert allowlist_violations(selector(), monkeypatch, host_env) == []
+    mutations = {
+        "a prefix pass-through instead of the allowlist": ("if key in names}", 'if key in names or key.startswith(("GSD_", "SWARM_"))}'),
+        "keys for a transition that is not APPROVED": ('"transition": frozenset(),', '"transition": APPROVED_KEY_ENV,'),
+        "keys for the list route": ('"list": frozenset(),', '"list": SIGNING_KEY_ENV,'),
+        "keys for the history route": ('"history": frozenset(),', '"history": SIGNING_KEY_ENV,'),
+    }
+    for label, (old, new) in mutations.items():
+        assert old in original, f"{label}: the line this mutation changes moved: update it with `_binary_env`"
+        mutated = tmp_path / "orch_status_mutated.py"
+        mutated.write_text(original.replace(old, new), encoding="utf-8")
+        module = load_selector(mutated, "orch_status_mutated")
+        routes = ("list", "history", "transition")
+        failed = False
+        for route in routes:
+            for variable in KEY_VARS:
+                try:
+                    check_route_key_policy(module, route, (variable,), monkeypatch, host_env)
+                except AssertionError as caught:
+                    failed = failed or "was handed" in str(caught)
+        assert failed or allowlist_violations(module, monkeypatch, host_env), f"nothing noticed: {label}"
     changed = tmp_path / "orch_status_route.py"
-    changed.write_text(original.replace("def _binary_env() -> dict[str, str]:", "def _binary_env(route: str) -> dict[str, str]:"), encoding="utf-8")
-    with pytest.raises(pytest.fail.Exception, match="takes arguments"):
+    changed.write_text(original.replace("def _binary_env(route: str) -> dict[str, str]:", "def _binary_env() -> dict[str, str]:"), encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception, match="takes no route"):
         check_route_key_policy(load_selector(changed, "orch_status_route"), "list", (), monkeypatch, host_env)
