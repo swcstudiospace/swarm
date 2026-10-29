@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """A1 parity runner for the first read-only route: scripts/orch_status.py reads and scripts/swarm_tool.py catalog.
 
-The eleven cases follow plan/rust-wasmer-omp-options.md section 7 (n4 §7). Python is the truth: every invocation runs the
+The eleven read cases follow plan/rust-wasmer-omp-options.md section 7 (n4 §7); the twelfth, transition_matrix, is the write-route
+matrix of Phase 14.5 (U3.2c, below). Python is the truth: every invocation runs the
 real script, the exit code must equal the expected exit exactly, stdout must parse as one JSON object, the required
 top-level keys must be present, and a case predicate checks the parsed object.
 
 Every case gets its own temporary state from tempfile (SWARM_DIR, workspace, HOME, a fresh signing key). Nothing is
 written under the repository's .swarm/. Standard library only.
 
-  python3 tests/parity/harness.py          text table; exit 0 only when all eleven cases pass
+  python3 tests/parity/harness.py          text table; exit 0 only when all twelve cases pass
   python3 tests/parity/harness.py --json   the case table as JSON
 
 The Rust leg is an explicit mode, never detected from the environment (U12.9):
@@ -32,6 +33,17 @@ is the answer shape, the exit code, the stderr, and a marker the harness's recor
 leaves when the selector actually started the binary. --json-out PATH writes the per-check results and the served_by
 counts as one JSON object. Without --rust, GSD_ENGINE_BIN is ignored. --rust with GSD_ENGINE_BIN unset, not a file, or
 not executable, or a binary that cannot be started, exits 1 with a message. Nothing is skipped silently.
+
+The twelfth case, transition_matrix (Phase 14.5, U3.2c), runs the cells of tests/parity/_write_matrix.py (the 351 transition vectors
+from the real TaskStore plus dry-run, id, grammar and lease cells) through `orch_status --transition` on the Python script and, under
+--rust, on the binary (the script with GSD_ENGINE=rust, the binary alone, and the default selector on a sample), each from the same
+restored store, WRITE_WORKERS cells at a time. Python alone is checked against what the vectors recorded. A write is judged by its
+stdout bytes and exit code (masks: updated_at and notes.verdicts_since), a dump of the tasks, transitions, verdicts and artifacts
+tables (ts and updated_at masked), and its effects (run log, live.json, files, the calls a loopback fake of the substrate saw). A cell
+the binary serves must have served_by `rust`; a cell on the expected-fallback list (_write_matrix.refusal) must be refused with
+write_state not_started and Python's bytes; under --backend sandbox every cell is such a refusal unless --sandbox-write names a binary
+built with the sandbox-write feature (then the sandbox backend is held to the host expectations). A divergence found and not fixed is
+named in _write_matrix.KNOWN_DIVERGENCES: the cell passes only while it differs in exactly that way. No fixture file is written.
 """
 from __future__ import annotations
 
@@ -50,8 +62,10 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from collections.abc import Set as AbstractSet
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Optional
 
@@ -86,6 +100,8 @@ class RustLegUnavailable(RuntimeError):
     """The --rust leg cannot run: its binary is missing or does not start. The run exits 1; it never skips."""
 
 sys.path.insert(0, str(REPO))  # in-process setup imports the swarm package of this checkout
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # the matrix cells of the transition case sit beside this file
+import _write_matrix as matrix  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -136,11 +152,13 @@ class CaseResult:
 class Sandbox:
     """Per-case temporary state: a workspace, SWARM_DIR, HOME and a fresh signing key (never a host key)."""
 
-    def __init__(self, base: Path, case_name: str, rust_bin: Optional[str] = None, backend: str = "host") -> None:
+    def __init__(self, base: Path, case_name: str, rust_bin: Optional[str] = None, backend: str = "host",
+                 sandbox_writes: bool = False) -> None:
         self.base = base
         self.case_name = case_name
         self.rust_bin = rust_bin  # the gsd_engine binary under --rust; None leaves the Rust leg off
         self.backend = backend  # GSD_RUST_BACKEND for the Rust-served legs
+        self.sandbox_writes = sandbox_writes  # the binary is built with the sandbox-write feature: the sandbox backend serves --transition
         self.parity: list[Check] = []  # Rust-leg checks, appended by orch_status_leg
         self.pending: list[str] = []
         self.workspace = base / "workspace"
@@ -864,6 +882,299 @@ def case_classifier(sandbox: Sandbox) -> list[Check]:
     return checks
 
 
+# --- the transition matrix: `orch_status --transition` on both engines (Phase 14.5, unit U3.2c) ---------------------------------------
+#
+# Each cell of `_write_matrix.load_cells()` is one store state and one argv. From the same restored state the cell runs, in turn: the
+# Python script (the truth), the script with GSD_ENGINE=rust (the selector: it starts the binary, replays its effects, or lets Python
+# answer), the binary alone (with an effects file, as the selector calls it), and, for a sample of cells, the default selector. Every leg
+# is compared with Python on stdout and exit code (masks: `updated_at` and `notes.verdicts_since`; `notes.lease.at` in a lease cell), on
+# a dump of the four store tables (`ts` and `updated_at` masked), and on the effects: the run log without `ts` and `msg_id`, live.json
+# without `seq`, `pid` and the readings of its clock, the files left in the state directory, and the calls a loopback fake of the
+# substrate saw. A cell the binary answers must not fall back; a cell on the expected-fallback list (`_write_matrix.refusal`) must
+# fall back with `write_state not_started` and the store untouched. Under --backend sandbox every cell is refused that way.
+
+WRITE_WORKERS = 16  # each cell is a few short processes on a host that is usually saturated: more of them in flight finishes sooner
+SANDBOX_REFUSES = "the sandbox backend of a binary built without the sandbox-write feature refuses a write call (U3.3b)"
+
+
+@dataclass(frozen=True)
+class WriteLeg:
+    """One leg of one cell: what it printed and what it left behind."""
+
+    probe: Probe
+    dump: str  # the store tables, masked
+    effects: str  # the run log, live.json, the state directory's files and the substrate's calls, masked
+    scrubbed: str  # the same without the difference the cell's known divergence names (equal to `effects` for a cell without one)
+    started: bool  # the selector started the binary
+
+
+@contextmanager
+def _substrate(lease: Optional[matrix.LeaseScript]) -> Iterator[Optional[matrix.FakeSubstrate]]:
+    """The fake substrate for one leg, or nothing when the cell has no lease (the substrate stays off, as in the other cells)."""
+    if lease is None:
+        yield None
+        return
+    with matrix.FakeSubstrate(lease) as fake:
+        yield fake
+
+
+def _write_leg(sandbox: Sandbox, cell: matrix.Cell, argv: list[str], initial: Path, engine: str,
+               lease: Optional[matrix.LeaseScript]) -> WriteLeg:
+    """One script leg of a cell, from the restored initial state."""
+    sandbox.restore(initial)
+    with _substrate(lease) as fake:
+        probe = invoke(sandbox, "orch_status", argv, engine=engine, env=None if fake is None else fake.env)
+        calls = [] if fake is None else list(fake.calls)
+    effects = matrix.effects_of(sandbox.swarm_dir, calls, *cell.masks)
+    scrubbed = effects if cell.known is None else matrix.effects_of(sandbox.swarm_dir, calls, *cell.masks, known=cell.known)
+    return WriteLeg(probe, matrix.dump_store(sandbox.swarm_dir / "tasks.db", *cell.masks), effects, scrubbed,
+                    engine != "python" and sandbox.started_marker.exists())
+
+
+def _write_direct(sandbox: Sandbox, cell: matrix.Cell, argv: list[str], initial: Path, env_keys: tuple[str, ...]) -> tuple[WriteLeg, Path]:
+    """The binary alone, given the request the selector builds (with an effects file it owns); the leg and the effects file."""
+    if sandbox.rust_bin is None:
+        raise RuntimeError("the Rust leg is off: no gsd_engine binary was named")
+    sandbox.restore(initial)
+    manifest = sandbox.base / "probe" / "effects.json"
+    manifest.write_bytes(b"")
+    env = sandbox.env({"GSD_RUST_BACKEND": sandbox.backend})
+    workspace = str(sandbox.workspace)
+    request = {"agent": "A01", "script": "orch_status", "argv": [*argv, "--root", workspace, "--json"], "root": workspace,
+               "env": {key: env[key] for key in env_keys if env.get(key)}, "effects_path": str(manifest)}
+    try:
+        proc = subprocess.run([sandbox.rust_bin], input=json.dumps(request, ensure_ascii=False).encode("utf-8"), capture_output=True,
+                              cwd=sandbox.workspace, env=env, timeout=PROCESS_TIMEOUT_S, check=False)
+    except OSError as exc:
+        raise RustLegUnavailable(f"the gsd_engine binary could not be started ({exc.strerror or type(exc).__name__})") from exc
+    probe = Probe(proc.returncode, proc.stdout, proc.stderr, _parse_object(proc.stdout))
+    effects = matrix.effects_of(sandbox.swarm_dir, [], *cell.masks)
+    return WriteLeg(probe, matrix.dump_store(sandbox.swarm_dir / "tasks.db", *cell.masks), effects, effects, False), manifest
+
+
+def _not_started(probe: Probe) -> Optional[str]:
+    """The error code of a refusal that says nothing was written (`error.details.write_state == "not_started"`), else None."""
+    error = probe.payload.get("error") if probe.exit_code == 2 and probe.payload is not None else None
+    details = error.get("details") if isinstance(error, dict) else None
+    if not (isinstance(details, dict) and details.get("write_state") == "not_started"):
+        return None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else "E-?"
+
+
+def _first_difference(left: str, right: str) -> str:
+    """Where two texts first differ, as one short line."""
+    for number, (one, other) in enumerate(zip_longest(left.splitlines(), right.splitlines(), fillvalue="<missing>"), start=1):
+        if one != other:
+            return f"line {number}: {one[:150]!r} vs {other[:150]!r}"
+    return "same lines, different ends"
+
+
+def _compare(who: str, truth: WriteLeg, other: WriteLeg, cell: matrix.Cell, effects: bool, known: Optional[str]) -> list[str]:
+    """What differs between Python's leg and `other`: exit code, stdout, store dump and, when `effects` is on, the effects and stderr.
+    With `known`, the one difference that divergence names is scrubbed from stdout and the run-log records first."""
+    problems: list[str] = []
+    if truth.probe.exit_code != other.probe.exit_code:
+        problems.append(f"{who}: exit {other.probe.exit_code} vs Python {truth.probe.exit_code}")
+    want = matrix.mask(matrix.scrubbed_stdout(known, truth.probe.stdout.decode("utf-8", "backslashreplace")), *cell.masks)
+    got = matrix.mask(matrix.scrubbed_stdout(known, other.probe.stdout.decode("utf-8", "backslashreplace")), *cell.masks)
+    if want != got:
+        problems.append(f"{who}: stdout differs, {_first_difference(want, got)}")
+    if truth.dump != other.dump:
+        problems.append(f"{who}: store dump differs, {_first_difference(truth.dump, other.dump)}")
+    left, right = (truth.effects, other.effects) if known is None else (truth.scrubbed, other.scrubbed)
+    if effects and left != right:
+        problems.append(f"{who}: effects differ, {_first_difference(left, right)}")
+    if effects and truth.probe.stderr != other.probe.stderr:
+        problems.append(f"{who}: stderr differs, {truth.probe.stderr[:100]!r} vs {other.probe.stderr[:100]!r}")
+    return problems
+
+
+def _differences(who: str, truth: WriteLeg, other: WriteLeg, cell: matrix.Cell, *, effects: bool = True,
+                 known: Optional[str] = None) -> list[str]:
+    """The problems of one leg against Python's. A leg that names a known divergence (`matrix.KNOWN_DIVERGENCES`) is allowed to differ
+    in that way only, and is a problem the day it does not differ at all: the entry must then be deleted."""
+    raw = _compare(who, truth, other, cell, effects, None)
+    if known is None:
+        return raw
+    if not raw:
+        return [f"{who}: known divergence {known} did not occur; delete it from KNOWN_DIVERGENCES in _write_matrix.py"]
+    return _compare(who, truth, other, cell, effects, known)
+
+
+def _manifest_problems(cell: matrix.Cell, probe: Probe, manifest: Path, selector: Any, argv: list[str]) -> list[str]:
+    """The effects file of the binary alone: empty unless a transition committed, `no effects` for a dry run, else a manifest the
+    selector reads."""
+    text = manifest.read_bytes().decode("utf-8", "backslashreplace")
+    if probe.exit_code != 0:
+        return [] if not text else [f"an effects manifest was written by a call that did not commit: {text[:100]!r}"]
+    if "--dry-run" in argv:
+        try:
+            body = json.loads(text)
+        except ValueError:
+            return [f"the dry run's effects file is not JSON: {text[:100]!r}"]
+        return [] if body == {"effects": [], "post": []} else [f"the dry run's effects file names effects: {text[:100]!r}"]
+    if cell.task_id is None or selector._read_manifest(str(manifest), cell.task_id) is None:
+        return [f"the effects manifest is missing or the selector cannot read it: {text[:100]!r}"]
+    return []
+
+
+def _vector_problem(cell: matrix.Cell, probe: Probe, db: Path) -> Optional[str]:
+    """Where Python's own answer to the command line differs from what the vectors recorded (the real TaskStore), else None."""
+    expect = cell.expect
+    if expect is None:
+        return None
+    outcome, payload = expect["outcome"], probe.payload
+    row, audit = (None, []) if cell.task_id is None else matrix.task_state(db, cell.task_id)
+    if payload is None:
+        return f"exit {probe.exit_code} without a JSON reply"
+    if outcome == "ok":
+        if probe.exit_code != 0:
+            return f"exit {probe.exit_code}, the vectors say the transition commits"
+        assert row is not None
+        for name, value in expect["row_diff"].items():
+            if name == "updated_at" or (name == "notes" and not cell.strict) or (name not in ("state", "attempt", "rework_loops") and not cell.strict):
+                continue
+            if name == "notes":
+                left, right = json.loads(row["notes"] or "{}"), json.loads(value or "{}")
+                left.pop("verdicts_since", None)
+                right.pop("verdicts_since", None)
+                if left != right:
+                    return f"notes {left!r} vs the vectors' {right!r}"
+            elif row[name] != value:
+                return f"column {name} is {row[name]!r}, the vectors say {value!r}"
+        keep = 4 if cell.strict else 2  # from, to, actor, reason; the vector's actor and reason are not the command line's otherwise
+        wanted = [(one["from_state"], one["to_state"], one["actor"], one["reason"])[:keep] for one in expect["audit"]]
+        found = [(one["from_state"], one["to_state"], one["actor"], one["reason"])[:keep] for one in audit]
+        return None if wanted == found else f"audit rows {found!r} vs the vectors' {wanted!r}"
+    error = payload.get("error")
+    if probe.exit_code != 2 or not isinstance(error, dict):
+        return f"exit {probe.exit_code}, the vectors say the call is refused"
+    if outcome == "error":
+        recorded = expect["error"]
+        same = error.get("code") == recorded["code"] and error.get("message") == recorded["message"] \
+            and error.get("details") == recorded["details"]
+        return None if same else f"error {error.get('code')} {error.get('message')!r} vs the vectors' {recorded['code']} {recorded['message']!r}"
+    wanted_message = f"{expect['exception']}: {expect['text']}"
+    return None if error.get("message") == wanted_message else f"error {error.get('message')!r} vs the vectors' {wanted_message!r}"
+
+
+def _run_write_cell(base: Path, cell: matrix.Cell, template: Path, rust_bin: Optional[str], backend: str, sandbox_writes: bool,
+                    selector: Any, env_keys: tuple[str, ...]) -> list[Check]:
+    """All legs of one cell, each in its own copy of the template store, and the checks they make."""
+    if rust_bin is None and cell.expect is None:
+        return []  # without the binary only the cells the vectors speak for are run
+    sandbox = Sandbox(base / cell.cell_id, cell.cell_id, rust_bin, backend, sandbox_writes)
+    try:
+        shutil.copyfile(template, sandbox.swarm_dir / "tasks.db")
+        if cell.row is not None:
+            matrix.insert_row(sandbox.swarm_dir / "tasks.db", cell.row)
+        argv = [part.replace("{root}", str(sandbox.workspace)) for part in cell.argv]
+        initial = sandbox.snapshot("initial")
+        truth = _write_leg(sandbox, cell, argv, initial, "python", cell.lease)
+        if rust_bin is None:
+            problem = _vector_problem(cell, truth.probe, sandbox.swarm_dir / "tasks.db")
+            return [Check(f"cell {cell.cell_id}: Python answers the command line as the vectors recorded", problem is None,
+                          problem or f"exit {truth.probe.exit_code}")]
+        return _rust_cell_checks(sandbox, cell, argv, initial, truth, selector, env_keys)
+    finally:
+        shutil.rmtree(sandbox.base, ignore_errors=True)
+
+
+def _rust_cell_checks(sandbox: Sandbox, cell: matrix.Cell, argv: list[str], initial: Path, truth: WriteLeg, selector: Any,
+                      env_keys: tuple[str, ...]) -> list[Check]:
+    chosen = _write_leg(sandbox, cell, argv, initial, "selector", cell.lease)
+    direct, manifest = _write_direct(sandbox, cell, argv, initial, env_keys)
+    # The binary alone runs no lease settlement (the selector replays it), so its oracle is Python with the substrate off.
+    oracle = truth if cell.lease is None else _write_leg(sandbox, cell, argv, initial, "python", None)
+    refused = _not_started(direct.probe)
+    refuses_all = sandbox.backend == "sandbox" and not sandbox.sandbox_writes
+    expected = SANDBOX_REFUSES if refuses_all else cell.fallback
+    served = f"fallback:{refused}" if refused is not None else "rust"
+    problems = [] if (refused is not None) == (expected is not None) else [
+        f"the binary {'refused with write_state not_started' if refused else 'answered'}, the matrix expects it to "
+        f"{'answer' if expected is None else 'refuse: ' + expected}"]
+    known = cell.known if refused is None else None  # a refusal is answered by Python: nothing diverges
+    via_script = [*problems, *_differences("selector leg", truth, chosen, cell, known=known)]
+    if cell.lease is not None:  # the effects comparison above is not vacuous: Python's own run reached the fake substrate as expected
+        seen = truth.effects.count('"tool": "graph_')
+        if seen != (cell.settle is not None) or (cell.settle is not None and f'"tool": "{cell.settle}"' not in truth.effects):
+            via_script.append(f"Python's run made {seen} substrate call(s), the cell expects {cell.settle or 'none'}")
+    if not chosen.started:
+        via_script.append("the selector did not start the binary")
+    alone = list(problems)
+    if refused is not None:
+        untouched = matrix.dump_store(initial / "state" / ".swarm" / "tasks.db", *cell.masks)
+        if direct.dump != untouched:
+            alone.append(f"a refused call changed the store: {_first_difference(untouched, direct.dump)}")
+        if direct.probe.exit_code == 0 or manifest.read_bytes():
+            alone.append("a refused call exited 0 or wrote an effects manifest")
+    else:
+        alone += _differences("binary alone", oracle, direct, cell, effects=False)
+        alone += _manifest_problems(cell, direct.probe, manifest, selector, argv)
+    note = " (sandbox backend: refused before any write, Python answers)" if refuses_all else ""
+    divergence = f" [KNOWN DIVERGENCE {known}: only in that way]" if known is not None else ""
+    checks = [
+        Check(f"cell {cell.cell_id}: GSD_ENGINE=rust prints Python's bytes, store dump and effects{note}{divergence}", not via_script,
+              "; ".join(via_script) or f"exit {truth.probe.exit_code}" + (f"; {matrix.KNOWN_DIVERGENCES[known]}" if known else ""), served),
+        Check(f"cell {cell.cell_id}: the binary alone {'refuses with write_state not_started' if refused else 'answers as Python does'}"
+              f"{note}", not alone, "; ".join(alone) or f"exit {direct.probe.exit_code}", served),
+    ]
+    if cell.sample:
+        default = _write_leg(sandbox, cell, argv, initial, "default", cell.lease)
+        script_argv = [*argv, "--root", str(sandbox.workspace), "--json"]
+        python_expected = selector.DEFAULT_ENGINE_WRITE == "python" or not selector.rust_serves_write(script_argv)
+        defaulted = _differences("default selector", truth, default, cell)
+        if default.started == python_expected:
+            defaulted.append(f"the default selector {'started' if default.started else 'did not start'} the binary, expected "
+                             f"{'Python' if python_expected else 'the binary'}")
+        checks.append(Check(f"cell {cell.cell_id}: the default selector (GSD_ENGINE unset) prints Python's bytes, store dump and effects",
+                            not defaulted, "; ".join(defaulted) or f"exit {truth.probe.exit_code}", served if default.started else "python"))
+    return checks
+
+
+def run_write_cells(root: Path, cells: list[matrix.Cell], rust_bin: Optional[str], backend: str = "host",
+                    sandbox_writes: bool = False) -> list[tuple[matrix.Cell, list[Check]]]:
+    """Runs `cells` (WRITE_WORKERS at a time, each in its own directory under `root`) and returns the checks of each, in order. One
+    template store is built once and copied for every cell. Without `rust_bin` only the cells the vectors speak for run, on Python."""
+    anchor = Sandbox(root / "anchor", "transition_matrix", rust_bin, backend, sandbox_writes)
+    selector = _selector(anchor)
+    env_keys = tuple(selector.RUST_ENV_KEYS)
+    template = root / "template.db"
+    with in_process(anchor):
+        from swarm.taskstore import TaskStore
+
+        TaskStore(path=template).conn.close()
+    done: list[tuple[matrix.Cell, list[Check]]] = []
+    with ThreadPoolExecutor(max_workers=WRITE_WORKERS) as pool:
+        futures = [(cell, pool.submit(_run_write_cell, root / "cells", cell, template, rust_bin, backend, sandbox_writes, selector, env_keys))
+                   for cell in cells]
+        for cell, future in futures:
+            try:
+                done.append((cell, future.result()))
+            except RustLegUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one broken cell must not hide the others
+                done.append((cell, [Check(f"cell {cell.cell_id} ran to completion", False, f"{type(exc).__name__}: {exc}")]))
+    return done
+
+
+def case_transition_matrix(sandbox: Sandbox) -> list[Check]:
+    """Every cell of the matrix on the Python script and, under --rust, on the binary; without it, Python against the vectors."""
+    cells = matrix.load_cells()
+    cases = matrix.vector_cases()
+    disagreements = matrix.cross_check(cases)
+    checks = [
+        Check("the derived Rust refusals agree with the vectors' own flags on every manual vector case", not disagreements,
+              "; ".join(disagreements[:4]) or f"{len(cases)} vector cases"),
+        Check("every vector case is a cell, and the added cells follow them", len(cells) > len(cases) and len({c.cell_id for c in cells}) == len(cells),
+              f"{len(cells)} cells"),
+    ]
+    for _cell, cell_checks in run_write_cells(sandbox.base / "matrix", cells, sandbox.rust_bin, sandbox.backend, sandbox.sandbox_writes):
+        checks.extend(cell_checks)
+    return checks
+
+
 CASES: tuple[Case, ...] = (
     Case("happy_path", "orch_status + swarm_tool",
          "Seeded task read back; catalog lists the caller's tools; call returns a registry result.", case_happy_path),
@@ -890,10 +1201,14 @@ CASES: tuple[Case, ...] = (
     Case("classifier_quadruple_mirror", "errors + retry + omp bridge",
          "ErrorCode, retry partitions, bridge.ts, classify() and the selector's fallback set agree.",
          case_classifier),
+    Case("transition_matrix", "orch_status --transition",
+         "Every (from, to) pair, rework, claim, gate, state-name and unknown-task vector plus dry-run, id, grammar and lease cells: "
+         "the binary leaves Python's stdout, store and effects, or refuses before any write and Python answers.",
+         case_transition_matrix),
 )
 
 
-def run_case(case: Case, rust_bin: Optional[str] = None, backend: str = "host") -> CaseResult:
+def run_case(case: Case, rust_bin: Optional[str] = None, backend: str = "host", sandbox_writes: bool = False) -> CaseResult:
     """Run one case in a fresh temporary directory, removed afterwards; rust_bin is set under --rust and backend names
     the Rust backend of its Rust-served legs."""
     base = Path(tempfile.mkdtemp(prefix=f"parity-{case.name}-"))
@@ -902,7 +1217,7 @@ def run_case(case: Case, rust_bin: Optional[str] = None, backend: str = "host") 
         resolved = base.resolve()
         if resolved == REPO or REPO in resolved.parents:
             raise RuntimeError(f"temporary state {resolved} lies inside the repository")
-        sandbox = Sandbox(base, case.name, rust_bin, backend)
+        sandbox = Sandbox(base, case.name, rust_bin, backend, sandbox_writes)
         checks = case.run(sandbox)
     except RustLegUnavailable:
         raise
@@ -965,23 +1280,28 @@ def summarize(results: list[CaseResult], *, rust: bool, backend: str) -> dict[st
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="A1 parity runner: 11 cases for the read-only route, Python as truth.")
+    parser = argparse.ArgumentParser(description="A1 parity runner: 12 cases (11 read-only, the --transition matrix), Python as truth.")
     parser.add_argument("--json", action="store_true", help="print the case table as JSON")
     parser.add_argument("--rust", action="store_true",
                         help="also compare each orch_status leg with the gsd_engine binary at GSD_ENGINE_BIN")
     parser.add_argument("--backend", choices=BACKENDS, default=None,
                         help="GSD_RUST_BACKEND for the Rust-served legs under --rust (default host)")
+    parser.add_argument("--sandbox-write", action="store_true",
+                        help="with --backend sandbox: the binary is built with the sandbox-write feature, so the sandbox backend serves "
+                             "--transition like the host one (without it every write cell is expected to be refused)")
     parser.add_argument("--json-out", metavar="PATH", default=None,
                         help="write the per-check results and the served_by counts to PATH as one JSON object")
     args = parser.parse_args(argv)
     if args.backend is not None and not args.rust:
         parser.error("--backend applies to the Rust leg: pass --rust")
+    if args.sandbox_write and args.backend != "sandbox":
+        parser.error("--sandbox-write names a sandbox-backend binary: pass --rust --backend sandbox")
     backend = args.backend or "host"
     try:
         rust_bin = _rust_binary() if args.rust else None
         if args.rust:
             _require_native_extension()
-        results = [run_case(case, rust_bin, backend) for case in CASES]
+        results = [run_case(case, rust_bin, backend, args.sandbox_write) for case in CASES]
     except RustLegUnavailable as exc:
         print(f"parity: the --rust leg cannot run: {exc}", file=sys.stderr)
         return 1
