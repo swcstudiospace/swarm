@@ -1035,7 +1035,8 @@ async fn an_empty_list_opens_no_transaction_and_a_busy_store_refuses_a_real_one(
     let path = dir.path().join("tasks.db");
     seeded(&path, &[task_row("T-1", "IN_PROGRESS")]).await;
     let mut config = WriterConfig::new(&path);
-    config.busy_timeout = Duration::from_millis(100);
+    // The busy timeout also bounds the wait for the single pooled connection, so it must stay generous on a loaded host.
+    config.busy_timeout = Duration::from_secs(3);
     let store = TaskStoreWriter::new(open_for_write(&config).await.expect("open"));
     let mut raw = connect(&path).await;
     sqlx::query("BEGIN IMMEDIATE")
@@ -1062,7 +1063,7 @@ async fn an_empty_list_opens_no_transaction_and_a_busy_store_refuses_a_real_one(
         .await
         .expect("release");
     store.close().await;
-    // A writer with the default 30 s timeout: the 100 ms one above may not even get its pooled connection back on a loaded host.
+    // The lock is free again: a writer with the default 30 s timeout gets through.
     apply(&path, &[notes("T-1", &[("a", Json::Int(1))])])
         .await
         .expect("the lock is free");
@@ -1250,7 +1251,8 @@ mod fault_points {
         let before = content(&path).await;
         let holder = Arc::new(writer(&path).await);
         let mut config = WriterConfig::new(&path);
-        config.busy_timeout = Duration::from_millis(300);
+        // The busy timeout also bounds the wait for the single pooled connection, so it must stay generous on a loaded host.
+        config.busy_timeout = Duration::from_secs(3);
         let contender = TaskStoreWriter::new(open_for_write(&config).await.expect("open"));
 
         let mut gate = holder.store().faults().arm(PausePoint::BetweenOps);

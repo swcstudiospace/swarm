@@ -1017,7 +1017,8 @@ async fn the_decider_runs_once_inside_the_lock_on_the_row_read_inside_the_lock()
         .await
         .expect("raw connection");
     let mut config = WriterConfig::new(&path);
-    config.busy_timeout = Duration::from_millis(100);
+    // The busy timeout also bounds the wait for the single pooled connection, so it must stay generous on a loaded host.
+    config.busy_timeout = Duration::from_secs(3);
     let other = TaskStoreWriter::new(open_for_write(&config).await.expect("open"));
 
     let store = Arc::new(writer(&path).await);
