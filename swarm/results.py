@@ -26,8 +26,22 @@ re-read after a race). TaskStore.transition increments attempt when PLANNED, RET
 retry that lands between the script check and the locked recheck is a different attempt: the rejection event is
 emitted and the new lease is left as it stands. Ingest still raises and does not claim or fail that lease.
 Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
+
+Replay of an ingest (D-P24). An ingest that applied a result records `{task_id, attempt, digest, reply}` in
+`notes.ingest_keys` (digest = `result_digest`, the sha256 of the canonical result; reply = the state apply_result
+returned), newest INGEST_KEYS_BOUND (32) kept. The key is the LAST write of the transaction that holds the transition,
+the notes, the artifact rows and the gate feedback, so there are exactly two crash outcomes: before the commit nothing
+is applied and no key exists (the retry applies); after it everything and the key exist (the retry is skipped).
+A retry whose (task, attempt, digest) is already recorded applies nothing: no transition, no artifact row, no feedback,
+no note write. It emits one `task.result.deduplicated` record and returns the stored reply, so the caller sees the
+first answer; there is no extra field (the return value is the state string both callers share, and the event is the
+only trace). Only a move the state machine accepts is skipped: a replay `transition` would refuse (IN_REVIEW again,
+DONE, ...) still raises exactly as before. Refused or invalid results write no key, and a new attempt is a new key.
+Headless is never keyed: its result comes from a live session, not a delivery that can be repeated. The same bytes
+resubmitted after a rework (same attempt) are indistinguishable from a replay and are skipped while the key is kept.
 """
 from __future__ import annotations
+import hashlib
 import json
 import re
 from contextlib import nullcontext
@@ -36,7 +50,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from .errors import SwarmError, ErrorCode
 from .gates import BLOCKING_SEVERITY, SEVERITIES
 from .schema import load_schema, validate
-from .taskstore import TaskStore, TaskState as S
+from .taskstore import LEGAL_TRANSITIONS, TaskStore, TaskState as S
 
 if TYPE_CHECKING:
     from .substrate_handoff import HandoffBridge
@@ -248,6 +262,43 @@ def _refuse_gate(store: TaskStore, tid: str, err: SwarmError, mode: str, emit: E
     raise err
 
 
+# Replay keys: the newest INGEST_KEYS_BOUND entries of `notes.ingest_keys` are kept. A replay is a retry of one delivery
+# (a lost reply, a re-run of the same command), which comes within a few ingests of the original; 32 distinct results
+# for one task is far beyond a task's heartbeats plus its rework loops (MAX_REWORK_LOOPS = 2). A replay older than the
+# bound is applied again, which is today's behaviour: the bound only keeps `notes` from growing without limit.
+INGEST_KEYS_BOUND = 32
+
+
+def result_digest(result: dict[str, Any]) -> str:
+    """sha256 hex of the result serialised with sorted keys, compact separators and ensure_ascii=False, UTF-8: the
+    parameters of `envelope._canonical`. That function is not reused because it drops a top-level `sig` member,
+    so two results that differ only in `sig` would share a key; a result is hashed whole."""
+    body = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(body).hexdigest()
+
+
+def _stored_keys(task: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = task["notes_json"].get("ingest_keys")
+    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def _replay_reply(task: dict[str, Any], *, attempt: int, digest: str) -> str | None:
+    """The reply the first application of this (task, attempt, digest) returned, or None when it was not applied."""
+    for e in _stored_keys(task):
+        if e.get("task_id") == task["task_id"] and e.get("attempt") == attempt and e.get("digest") == digest:
+            reply = e.get("reply")
+            return reply if isinstance(reply, str) else None
+    return None
+
+
+def _record_key(store: TaskStore, tid: str, *, attempt: int, digest: str, reply: str) -> None:
+    """Append the replay key, keeping the newest INGEST_KEYS_BOUND. The caller's write transaction is still open."""
+    task = store.get(tid)
+    kept = [e for e in _stored_keys(task) if not (e.get("attempt") == attempt and e.get("digest") == digest)]
+    kept.append({"task_id": tid, "attempt": attempt, "digest": digest, "reply": reply})
+    store.set_notes(tid, ingest_keys=kept[-INGEST_KEYS_BOUND:])
+
+
 def apply_result(store: TaskStore, task: dict[str, Any], *, agent_id: str, result: dict[str, Any], meta: dict[str, Any],
                  emit: Emit, mode: str) -> str:
     """Apply a validated result to the assigned task only; returns the task's new state."""
@@ -288,6 +339,10 @@ def apply_result(store: TaskStore, task: dict[str, Any], *, agent_id: str, resul
     # nests) and add_artifact's INSERT + outputs UPDATE ride along, so a crash at any point leaves a
     # fully-applied or fully-rolled-back result — never a new state with stale notes or missing
     # artifacts. Lock order matches TaskStore.transition: state row + audit row first, provenance after.
+    # An ingest also records its replay key (`notes.ingest_keys`) as the LAST write of that same transaction and
+    # checks for it first, under the same write lock (see the module docstring, "Replay of an ingest").
+    replayed: tuple[str, int, str] | None = None
+    new_state = ""
     if target is not None:
         # Re-read under the same write lock as the transition. Between the check above and here another caller can
         # move a gate task through RETRY → CLAIMED → IN_PROGRESS; the state is IN_PROGRESS again, so the move to
@@ -295,18 +350,28 @@ def apply_result(store: TaskStore, task: dict[str, Any], *, agent_id: str, resul
         try:
             with store.transaction():
                 fresh = store.get(tid)
-                if target is S.IN_REVIEW:
-                    err = _gate_result_error(store, fresh, result)
-                    if err is not None:
-                        raise err
-                store.transition(tid, target, actor=agent_id, reason=reason)
-                store.set_notes(tid, result=result, meta=meta)
-                for o in result.get("outputs", []) or []:
-                    store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
-                                       version=str(o.get("version", "1")),
-                                       digest=o.get("digest", ""), producer=agent_id)
-                if target is S.IN_REVIEW:
-                    _agent_verdict_feedback(store, fresh, result)
+                digest = result_digest(result)
+                # A replay is skipped only where the state machine would accept the move today; an illegal one
+                # (IN_REVIEW → IN_REVIEW, anything from DONE) falls through and is refused by `transition` as before.
+                hit = _replay_reply(fresh, attempt=fresh["attempt"], digest=digest) if mode == "ingest" else None
+                if hit is not None and target in LEGAL_TRANSITIONS[S(fresh["state"])]:
+                    replayed = (hit, fresh["attempt"], digest)
+                else:
+                    if target is S.IN_REVIEW:
+                        err = _gate_result_error(store, fresh, result)
+                        if err is not None:
+                            raise err
+                    store.transition(tid, target, actor=agent_id, reason=reason)
+                    store.set_notes(tid, result=result, meta=meta)
+                    for o in result.get("outputs", []) or []:
+                        store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
+                                           version=str(o.get("version", "1")),
+                                           digest=o.get("digest", ""), producer=agent_id)
+                    if target is S.IN_REVIEW:
+                        _agent_verdict_feedback(store, fresh, result)
+                    new_state = store.get(tid)["state"]
+                    if mode == "ingest":
+                        _record_key(store, tid, attempt=fresh["attempt"], digest=digest, reply=new_state)
         except _GateRefused as err:
             # `task["attempt"]` is the attempt that produced this result. A retry increments attempt on the
             # way back to CLAIMED; failing the re-read row would kill that replacement lease.
@@ -314,12 +379,24 @@ def apply_result(store: TaskStore, task: dict[str, Any], *, agent_id: str, resul
     else:
         # Heartbeat: no transition, but notes + artifacts still commit together.
         with store.transaction():
-            store.set_notes(tid, result=result, meta=meta)
-            for o in result.get("outputs", []) or []:
-                store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
-                                   version=str(o.get("version", "1")),
-                                   digest=o.get("digest", ""), producer=agent_id)
-    new_state: str = store.get(tid)["state"]
+            fresh = store.get(tid)
+            digest = result_digest(result)
+            hit = _replay_reply(fresh, attempt=fresh["attempt"], digest=digest) if mode == "ingest" else None
+            if hit is not None:
+                replayed = (hit, fresh["attempt"], digest)
+            else:
+                store.set_notes(tid, result=result, meta=meta)
+                for o in result.get("outputs", []) or []:
+                    store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
+                                       version=str(o.get("version", "1")),
+                                       digest=o.get("digest", ""), producer=agent_id)
+                new_state = store.get(tid)["state"]
+                if mode == "ingest":
+                    _record_key(store, tid, attempt=fresh["attempt"], digest=digest, reply=new_state)
+    if replayed is not None:
+        reply, attempt, digest = replayed
+        emit("task.result.deduplicated", {"task_id": tid, "mode": mode, "attempt": attempt, "digest": digest, "reply": reply})
+        return reply
     return new_state
 
 
@@ -415,7 +492,8 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | Non
                                  title=g["title"].removesuffix(" (rerun)") + " (rerun)",
                                  agent_id=g["agent_id"], dag_depth=g["dag_depth"], depends_on=g["depends_on"],
                                  acceptance=g["acceptance"], budget=g["budget"], risk_class=g["risk_class"],
-                                 priority=g["priority"], notes={k: v for k, v in g["notes_json"].items() if k not in ("result", "meta")})
+                                 priority=g["priority"],
+                                 notes={k: v for k, v in g["notes_json"].items() if k not in ("result", "meta", "ingest_keys")})
                     store.transition(new_id, S.VALIDATED)
                     store.transition(new_id, S.PLANNED, reason="gate rerun")
                     created[new_id] = (g["notes_json"].get("gate"), {m["task_id"] for m in members})

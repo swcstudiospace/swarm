@@ -175,7 +175,10 @@ class AgentScript:
         record.setdefault("agent", self.agent_id)
         record.setdefault("script", self.name)
         record.setdefault("status", "error" if exit_code == self.EXIT_ERROR else "ok")
-        ctx.emit(f"script.{self.name}.error" if exit_code == self.EXIT_ERROR else f"script.{self.name}", record)
+        if exit_code == self.EXIT_ERROR:
+            ctx.emit(f"script.{self.name}.error", record)
+        else:
+            ctx.emit(f"script.{self.name}", record)
 
     @staticmethod
     def _print(obj: dict[str, Any], as_json: bool) -> None:

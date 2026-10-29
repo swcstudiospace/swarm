@@ -95,6 +95,7 @@ TYPE_KINDS: dict[str, str] = {
     "gate.findings.synthesized": "warning",    # runner synthesized findings the gate did not produce
     "gate.findings.unattributed": "warning",   # findings named no known gate target
     "task.result.rejected": "warning",         # a task.result failed schema/contract validation
+    "task.result.deduplicated": "note",        # a replayed ingest was skipped: its result is already applied (results.apply_result)
     "escalation.request": "warning",           # rework loops / attempts exhausted: a human is needed
     "security.dev_key": "warning",             # an envelope was signed with the development key
     # the runner's substrate leases (substrate_lease.py); grants, releases and completions are written by the server itself
