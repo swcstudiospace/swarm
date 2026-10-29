@@ -301,14 +301,14 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
   - SIGINT, SIGTERM, SIGHUP and `--swarm-timeout` start a cooperative cancel (`CancelRequest`): `<swarm_dir>/cancel/<correlation_id>` is written, nothing new is dispatched, sessions get up to `min(SWARM_CANCEL_GRACE_S, SWARM_SHUTDOWN_BUDGET_S - 8)` s to leave (shared tool `shared_cancel_check`), then every live session group is killed (`kill_sessions`): SIGTERM first, so omp disposes its session, then SIGKILL after a 5 s grace; a second signal skips the wait, and a session that registers during the teardown is SIGKILLed at once. The killed tasks end FAILED (`E-TIMEOUT: runner shutdown` or `swarm timeout`) with `notes.running` cleared and are retried on the next run; the runner exits 128+signal. A SIGTERM or SIGHUP inherited as ignored (e.g. `nohup`) stays ignored.
   - A runtime binary that cannot be spawned fails the task with E-DEP.
 - `scripts/orch_plan.py` — `PATTERNS`, the custom plan schema, and `--repo` (alias of `--root`). Task IDs default to `T<4 hex of the correlation id>` (6 hex on collision), e.g. `T7f3a-be`; an explicit `--prefix` is optional.
-- `pyproject.toml` — ruff and pytest config only; it has no `[project]` table.
+- `pyproject.toml` — the maturin build (`[build-system]`; `[project]` `agent-swarm` with no Python dependencies; `[tool.maturin]` builds `crates/gsd-python` into `swarm/_native*.so`, PyO3 abi3-py312) plus the ruff and pytest config.
 - `package.json` — `test` (`bun test tests/ts`) and `build-agents`, which calls the Python generator.
 - `tsconfig.json` — strict, noEmit, `bun-types`.
 - `CLAUDE.md` — shorter Claude Code guide; this file is the full contract.
 
 ## Runtime/Tooling Preferences
 
-- **Python 3.12, stdlib-only.** New dependencies must be optional with a fallback:
+- **Python 3.12, no Python dependencies, one required native extension.** `swarm/__init__.py` imports the PyO3 extension `swarm._native` (build it with `pip install .`, which runs maturin) and raises an `ImportError` that names the install step when it is missing; `SWARM_PURE_PYTHON=1` skips that import (the test suite sets it so the Python oracles run without the extension). New Python dependencies must be optional with a fallback:
   - `cryptography` is optional, for Ed25519.
   - PyYAML is optional, with a regex fallback, in `arch_contract_check`, `be_contract_conformance` and `devops_ci_check`.
 - **Bun** runs the TS twins (`#!/usr/bin/env bun`). There are no npm dependencies, no lockfile and no `node_modules`.

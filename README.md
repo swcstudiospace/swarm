@@ -86,7 +86,7 @@ A01–A15 are the core SDLC agents. A16–A30 are three specialist domains of fi
 
 The spec is executable. Each agent is a Claude Code subagent in [.claude/agents/](.claude/agents/) whose
 XML-tagged system prompt lives in [prompts/](prompts/) and whose tools are Python scripts in [scripts/](scripts/),
-built on the stdlib-only runtime in [swarm/](swarm/) (signed `swarm.v1` envelopes, SQLite Task Store with the
+built on the runtime in [swarm/](swarm/) (no Python dependencies, plus the required PyO3 extension `swarm._native`; signed `swarm.v1` envelopes, SQLite Task Store with the
 lifecycle state machine, fail-closed gates, manifest registry). [agents.json](agents.json) is the manifest.
 
 ```bash
