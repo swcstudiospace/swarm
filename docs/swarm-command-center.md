@@ -82,7 +82,9 @@ dependencies are open as `waiting`. `await_input` and `begin_handoff` are in the
 One channel, two sinks, both written by `swarm.telemetry.Telemetry`.
 
 **`<swarm_dir>/events.jsonl`** (schema `swarm/schemas/swarm.event.v1.json`). Records are
-`{ts, type, source, correlation_id, task_id, payload, msg_id}`; every payload passes `swarm.redact`.
+`{ts, type, source, correlation_id, task_id, payload, msg_id}`; every payload passes `swarm.redact`. Each record is appended with one
+`write(2)` on an `O_APPEND` descriptor (`swarm.paths.append_text`) and nothing is buffered across calls: an event that `emit` returned
+survives a SIGKILL of the writer, and records from several threads or processes never mix inside a line.
 
 | Type | Payload |
 |---|---|
@@ -467,7 +469,7 @@ Other variables the runtime reads, documented where they belong:
 
 | Name | Default | Read by | Meaning |
 |---|---|---|---|
-| `SWARM_DIR` | `<git toplevel>/.swarm` | `swarm/paths.py`, bar | State dir (made absolute); every file named in this page lives under it |
+| `SWARM_DIR` | `<git toplevel>/.swarm` | `swarm/paths.py`, bar | State dir (made absolute); every file named in this page lives under it. `swarm_dir()` reads the environment per call and remembers one resolution per input (`SWARM_DIR`, the `root` argument, and the cwd where one of them is relative or absent), so a changed value resolves again |
 | `SWARM_ROOT` | the package's repo | `omp/src/bridge.ts` | Repo whose `scripts/` the omp bridge runs; must hold `scripts/orch_plan.py` |
 | `SWARM_DISPATCH_HOLD_MS` | 30 min with a UI, none headless | `omp/src/commands.ts` | How long `/swarm` holds the session; a positive integer |
 | `SWARM_LEASE_TTL_S` / `SWARM_REPLICA` | 900 (30..86400) / `r0` | `swarm/substrate_lease.py`, `swarm/substrate_tee.py` | Substrate lease TTL and replica name; a malformed value is refused when `swarm_run.py` starts |

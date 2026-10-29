@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .paths import swarm_dir
+from .paths import append_text, swarm_dir
 from .redact import redact
 
 
@@ -76,8 +76,7 @@ def emit(event_type: str, payload: Mapping[str, object], *, source: str, correla
         "payload": _redact_payload(payload),
         "msg_id": uuid.uuid4().hex,
     }
-    with log_file.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_text(log_file, json.dumps(record, ensure_ascii=False) + "\n")
     if not tee:
         return record
     try:  # substrate tee (ADR 0001 S1): after the local write, fail-open, a no-op without SUBSTRATE_URL

@@ -14,7 +14,7 @@ from typing import Any
 from collections.abc import Iterator
 
 from .atomic_file import write_text_atomic
-from .paths import swarm_dir
+from .paths import append_text, swarm_dir
 
 
 def _db_path(root: str | Path | None) -> Path:
@@ -100,8 +100,8 @@ class SwarmStateStore:
             self.root = Path(root) if root else Path(".")
             self.claude_path = claude_state_dir(self.root / ".claude") / "swarm-state.json"
             self.swarm_path = swarm_dir(root, create=True) / "swarm-state.json"
-            self.claude_path.parent.mkdir(parents=True, exist_ok=True)
-            if not self.claude_path.exists():
+            if not self.claude_path.exists():  # an existing file means an existing directory: the mkdir syscall is only for a first write
+                self.claude_path.parent.mkdir(parents=True, exist_ok=True)
                 self._write(self.claude_path, {"version": "1.0", "swarm_state": "INITIALIZING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
             if not self.swarm_path.exists():
                 self._write(self.swarm_path, {"version": "1.0", "swarm_state": "INITIALIZING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
@@ -111,9 +111,10 @@ class SwarmStateStore:
             self.claude_path = claude_state_dir(self.root / ".claude") / "swarm-state.json"
             self.swarm_path = self.root / "swarm-state.json"
 
-    def _write(self, p: Path, data: dict[str, Any]) -> None:
+    def _write(self, p: Path, data: dict[str, Any], text: str | None = None) -> None:
+        """Atomically write `data` as JSON (or `text`, its rendering when the caller already has it); failures are isolated."""
         try:
-            write_text_atomic(p, json.dumps(data, indent=2) + "\n")
+            write_text_atomic(p, json.dumps(data, indent=2) + "\n" if text is None else text)
         except Exception:
             pass  # isolate
 
@@ -146,8 +147,12 @@ class SwarmStateStore:
                 data["error_partial"] = {"subagent_id": (extra or {}).get("subagent_id"), "agg": extra.get("error_agg")}
             if extra and extra.get("error_agg"):
                 data["error_agg"] = extra.get("error_agg")
-            self._write(self.claude_path, data)
-            self._write(self.swarm_path, data)
+            try:
+                text: str | None = json.dumps(data, indent=2) + "\n"  # rendered once for both files
+            except Exception:
+                text = None  # unserialisable: each _write isolates it itself, nothing is written
+            self._write(self.claude_path, data, text)
+            self._write(self.swarm_path, data, text)
             sub_id = (extra or {}).get("subagent_id")
             slc = (extra or {}).get("slice_id") or (extra or {}).get("task_slice")
             try:
@@ -189,8 +194,7 @@ class SwarmStateStore:
             st = (state or "").replace("\n", " ")[:32]
             idt = (identity or "").replace("\n", " ")[:100]
             entry = f"{ts} event={event} subagent_id={sub} task_slice={slc} state={st} identity={idt}\n"
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(entry)
+            append_text(log_path, entry)
         except Exception:
             pass  # isolate
 

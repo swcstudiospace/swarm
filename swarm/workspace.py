@@ -32,7 +32,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Mapping
 
-from .manifest import get_agent
+from .manifest import agent_slug
 
 SPEC: dict[str, Any] = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
 SERVER: str = SPEC["server"]
@@ -379,9 +379,11 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     if surface is None:
         return None, "", f"no substrate surface for agent {agent_id!r}"
     path = None
+    slug: str | None = None  # looked up once, on the first branch that needs it
     if workspace is not None:
         try:
-            path = env_file(workspace, get_agent(agent_id or "")["slug"], e)
+            slug = agent_slug(agent_id or "")
+            path = env_file(workspace, slug, e)
         except KeyError:
             return None, "", f"no agent {agent_id!r} in the manifest"
         try:
@@ -397,10 +399,11 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     given = (e.get(var) or "").strip()
     if valid_token(given):
         return given, f"${var}", ""
-    try:
-        slug = get_agent(agent_id or "")["slug"]
-    except KeyError:
-        slug = ""
+    if slug is None:
+        try:
+            slug = agent_slug(agent_id or "")
+        except KeyError:
+            slug = ""
     if (e.get("SWARM_AGENT_SESSION") or "").strip() == "1" and slug and (e.get("SWARM_AGENT") or "").strip() == slug:
         session_token = (e.get(TOKEN) or "").strip()
         if valid_token(session_token):

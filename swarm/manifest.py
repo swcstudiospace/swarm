@@ -136,7 +136,7 @@ def _describe(value: object) -> str:
 class _Record:
     """Immutable cached view of one validated roster; only JSON text is kept so callers can never alias it."""
 
-    __slots__ = ("all_text", "agent_texts", "index", "capabilities")
+    __slots__ = ("all_text", "agent_texts", "index", "capabilities", "slugs")
 
     def __init__(self, agents: list[dict[str, Any]]) -> None:
         self.all_text: str = json.dumps(agents)
@@ -147,6 +147,7 @@ class _Record:
                 index.setdefault(key.lower(), pos)  # first agent wins, like the old first-match loop
         self.index: dict[str, int] = index
         self.capabilities: tuple[tuple[str, ...], ...] = tuple(tuple(a["capabilities"]) for a in agents)
+        self.slugs: tuple[str, ...] = tuple(a["slug"] for a in agents)
 
 
 _CacheKey = tuple[str, int, int, int]
@@ -221,6 +222,22 @@ def get_agent(ident: str, path: Path | None = None) -> dict[str, Any]:
         pos = rec.index.get(ident_l)
         if pos is not None:
             return cast(dict[str, Any], json.loads(rec.agent_texts[pos]))
+    raise KeyError(f"no agent matches {ident!r}")
+
+
+def agent_slug(ident: str, path: Path | None = None) -> str:
+    """The `slug` of the agent `ident` names (id, code or slug, any case): `get_agent(ident, path)["slug"]` without copying the
+    record. A str is immutable, so the cached roster is never aliased. KeyError when no agent matches."""
+    ident_l = ident.lower()
+    rec = _record(path)
+    if isinstance(rec, list):
+        for a in rec:
+            if ident_l in (a["id"].lower(), a["code"].lower(), a["slug"].lower()):
+                return str(a["slug"])
+    else:
+        pos = rec.index.get(ident_l)
+        if pos is not None:
+            return rec.slugs[pos]
     raise KeyError(f"no agent matches {ident!r}")
 
 
