@@ -16,12 +16,17 @@
 //!
 //! [`TaskStoreWriter::apply_ops`] applies an ordered list of [`WriterOp`]s (the other `TaskStore` writes: notes, artifacts,
 //! feedback, `create`, dependencies, and transitions of a decided plan) in one `BEGIN IMMEDIATE` transaction: every op or none.
+//!
+//! [`TaskStoreWriter::issue_gate`] (module [`gate_issue`], U3.6a) is the gate-issue tail of `swarm/verdicts.py::issue_gate`: it signs the
+//! verdict envelopes with `gsd-envelope`, derives the verdict file, the events and the refusals as data ([`GatePlan`]) and writes the verdict
+//! rows and the `notes.feedback` rewrites of a `fail` in one `BEGIN IMMEDIATE` transaction.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod apply;
 mod error;
+pub mod gate_issue;
 mod ops;
 mod plan;
 mod store;
@@ -30,6 +35,10 @@ pub use apply::{
     Applied, AppliedAudit, ApplyCause, ApplyError, Decider, HostDecider, TaskStoreWriter,
 };
 pub use error::{ErrorKind, WriteState, WriterError};
+pub use gate_issue::{
+    derive_gate_issue, Decline, EnvelopeIds, GateEvent, GateFile, GateIssueRequest, GatePlan,
+    GateWrite, StoreFacts, SystemIds, TaskFacts,
+};
 pub use ops::{NewTask, OpsApplied, OpsAudit, OpsCause, OpsError, WriterOp};
 pub use plan::{PlanValidator, PlanViolation, ValidatedPlan};
 #[cfg(feature = "fault-injection")]
