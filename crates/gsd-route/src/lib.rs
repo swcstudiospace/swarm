@@ -1211,8 +1211,18 @@ pub fn history_fields(
     ])
 }
 
-// Host-only planner; declared after the code above so that no line the default guest's panic locations name moves.
+// Declared after the code above so that no line the default guest's panic locations name moves; the feature keeps this code out
+// of that guest altogether (see `Cargo.toml`).
+#[cfg(feature = "write-routes")]
+pub mod invoke;
+#[cfg(feature = "write-routes")]
+pub mod transition_wire;
+
+// Host-only planner; declared here for the same reason as the lines above.
 pub mod reconcile_plan;
+
+#[cfg(feature = "write-routes")]
+pub use invoke::core_invoke;
 
 #[cfg(test)]
 mod tests {

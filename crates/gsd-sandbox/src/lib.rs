@@ -25,10 +25,11 @@ pub use wasmtime_module_build::{
 pub use wasmtime_module_load::{GuestInstance, GuestLoader, LoadError, LoadedGuest};
 
 /// The built GSD-Core guest component and the SHA-256 pin committed beside this crate, as
-/// `(component bytes, pin)`. The pin is lowercase hex with a trailing newline.
+/// `(component bytes, pin)`. The pin is lowercase hex with a trailing newline. It is `guest-module.sha256`, or
+/// `guest-module-write.sha256` when the crate is built with its `write-routes` feature.
 pub const GUEST_MODULE: (&[u8], &str) = (
     include_bytes!(env!("GSD_GUEST_WASM")),
-    include_str!("../guest-module.sha256"),
+    include_str!(env!("GSD_GUEST_PIN_FILE")),
 );
 
 #[cfg(test)]
@@ -42,9 +43,8 @@ mod guest_digest {
     fn built_guest_digest_matches_the_committed_pin() {
         let built = fs::read_to_string(env!("GSD_GUEST_DIGEST_FILE"))
             .expect("build.rs writes the guest digest to OUT_DIR");
-        let pinned =
-            fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/guest-module.sha256"))
-                .expect("guest-module.sha256 is committed next to Cargo.toml");
+        let pinned = fs::read_to_string(env!("GSD_GUEST_PIN_FILE"))
+            .expect("the guest pin is committed next to Cargo.toml");
         let actual: String = Sha256::digest(GUEST)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -57,7 +57,7 @@ mod guest_digest {
         assert_eq!(
             pinned.trim(),
             actual,
-            "the guest must match guest-module.sha256"
+            "the guest must match its committed pin (guest-module.sha256, or guest-module-write.sha256 with write-routes)"
         );
     }
 }

@@ -8,5 +8,13 @@ repository = "https://github.com/swcstudiospace/agent-swarm"
 categories = ["development-tools"]
 keywords = ["adapter", "json", "route", "migration"]
 
+[features]
+default = ["write-routes"]
+# The guest `transition` mode: `invoke::core_invoke` and `transition_wire`. On by default for the hosts. The sandboxed guest
+# depends on this crate with `default-features = false` and turns it on only with its own `write-routes` feature, so the
+# default guest compiles none of this code (even dead code moves the bytes of the guest: the string pool is laid out
+# across crates, and the guest digest is pinned).
+write-routes = []
+
 [dependencies]
 gsd-codes = { path = "../gsd-codes" }

@@ -10,7 +10,13 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Switches the `transition` mode on (Phase 14.5 pin P1). Off, the guest is the read-only build whose digest is committed in
+# `gsd-sandbox/guest-module.sha256`; on, it is the build pinned by `gsd-sandbox/guest-module-write.sha256`.
+write-routes = ["gsd-route/write-routes"]
+
 [dependencies]
 gsd-codes = { path = "../gsd-codes" }
-gsd-route = { path = "../gsd-route" }
+# `default-features = false`: the guest gets the transition mode only through its own `write-routes` feature (see gsd-route).
+gsd-route = { path = "../gsd-route", default-features = false }
 wit-bindgen = "=0.57.1"

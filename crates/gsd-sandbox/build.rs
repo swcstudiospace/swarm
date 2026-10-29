@@ -7,6 +7,10 @@
 //! published as `GSD_GUEST_WASM` for `include_bytes!(env!("GSD_GUEST_WASM"))`. The SHA-256 of the
 //! component is written to `OUT_DIR/guest-module.sha256` and published as
 //! `GSD_GUEST_DIGEST_FILE`, so a test can compare the build with the committed pin.
+//!
+//! With this crate's `write-routes` feature the nested build gets the guest's `write-routes` feature, and the committed pin is
+//! `guest-module-write.sha256` instead of `guest-module.sha256`. Its path is published as `GSD_GUEST_PIN_FILE`, so the crate and its
+//! pin test read the pin of the guest they embed and nothing else.
 
 use std::env;
 use std::fs;
@@ -21,6 +25,8 @@ const GUEST_TARGET: &str = "wasm32-unknown-unknown";
 const CORE_FILE: &str = "gsd_guest.wasm";
 const COMPONENT_FILE: &str = "gsd_guest.component.wasm";
 const DIGEST_FILE: &str = "guest-module.sha256";
+const PIN_FILE: &str = "guest-module.sha256";
+const WRITE_PIN_FILE: &str = "guest-module-write.sha256";
 
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("cargo did not set {name} for the sandbox build"))
@@ -33,9 +39,12 @@ fn main() {
     let workspace_root = manifest_dir.join("..").join("..");
     let target_dir = out_dir.join("guest-target");
 
+    let write_routes = env::var_os("CARGO_FEATURE_WRITE_ROUTES").is_some();
+
     // The outer build's encoded rustflags describe the host build; the guest must read its own
     // flags from the environment and the cargo config files.
-    let status = Command::new(&cargo)
+    let mut build = Command::new(&cargo);
+    build
         .current_dir(&workspace_root)
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args([
@@ -48,7 +57,11 @@ fn main() {
             GUEST_TARGET,
             "--target-dir",
         ])
-        .arg(&target_dir)
+        .arg(&target_dir);
+    if write_routes {
+        build.args(["--features", "write-routes"]);
+    }
+    let status = build
         .status()
         .unwrap_or_else(|err| panic!("failed to run `{cargo}` for the GSD-Core guest: {err}"));
     if !status.success() {
@@ -85,6 +98,15 @@ fn main() {
         .unwrap_or_else(|err| panic!("cannot write {}: {err}", digest_path.display()));
 
     println!("cargo:rustc-env=GSD_GUEST_WASM={}", output.display());
+    let pin_file = if write_routes {
+        WRITE_PIN_FILE
+    } else {
+        PIN_FILE
+    };
+    println!(
+        "cargo:rustc-env=GSD_GUEST_PIN_FILE={}",
+        manifest_dir.join(pin_file).display()
+    );
     println!(
         "cargo:rustc-env=GSD_GUEST_DIGEST_FILE={}",
         digest_path.display()

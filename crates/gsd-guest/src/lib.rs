@@ -12,7 +12,13 @@ struct GsdCore;
 
 impl Guest for GsdCore {
     fn invoke(input: Vec<u8>) -> Result<Vec<u8>, InvokeError> {
-        gsd_route::orch_status_invoke(&input).map_err(|error| InvokeError {
+        // Default build: the read-only `orch_status` route answers every request. `write-routes` build: `core_invoke` first
+        // sends a `transition` request to the transition decision and hands every other request to the same read route.
+        #[cfg(not(feature = "write-routes"))]
+        let reply = gsd_route::orch_status_invoke(&input);
+        #[cfg(feature = "write-routes")]
+        let reply = gsd_route::core_invoke(&input);
+        reply.map_err(|error| InvokeError {
             code: wit_code(error.code()),
             message: error.message().to_owned(),
         })
