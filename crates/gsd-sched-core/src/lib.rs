@@ -16,6 +16,7 @@ pub mod drain;
 pub mod pool;
 pub mod ports;
 pub mod priority;
+pub mod runtime;
 pub mod select;
 
 #[cfg(test)]
