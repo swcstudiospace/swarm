@@ -1914,6 +1914,7 @@ name = "gsd-taskwriter"
 version = "0.1.0"
 dependencies = [
  "gsd-codes",
+ "gsd-envelope",
  "gsd-route",
  "sqlx",
  "tempfile",

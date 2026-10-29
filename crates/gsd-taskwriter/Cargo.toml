@@ -14,6 +14,9 @@ fault-injection = []
 
 [dependencies]
 gsd-codes = { path = "../gsd-codes" }
+# The host side of signing: verifying a verdict row for APPROVED and signing a gate's verdict. Only gsd-taskwriter and gsd-adapter may
+# reach it; gsd-route, gsd-guest and gsd-sandbox must not (tests/keys_never_in_guest.rs and tests/test_keys_never_in_guest.py).
+gsd-envelope = { path = "../gsd-envelope" }
 gsd-route = { path = "../gsd-route" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
