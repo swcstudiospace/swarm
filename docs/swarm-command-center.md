@@ -427,6 +427,10 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 
 ## 10. Configuration
 
+### 9.5 Use the native claim table
+
+Only a run with hundreds of ready tasks that all declare `notes.claims` gains from it: one scheduling pass over 500 such tasks costs about 5 s of CPU in the Python claim table and about 11 ms in the native one; with few or no claims the claim check is a small part of a pass and the difference is invisible. Build the extension (`pip install .`), make sure `SWARM_PURE_PYTHON` is not `1`, and start the run with `SWARM_CLAIMS_ENGINE=rust` (for example `SWARM_CLAIMS_ENGINE=rust python3 scripts/swarm_run.py ...`). Nothing else changes: the same tasks wait for the same holders (`claim-conflict:<holder>`). A warning from the logger `swarm.claims` on stderr means the run uses the Python table instead (the message names the reason); unset the variable to go back. To see which table a process gets: `SWARM_CLAIMS_ENGINE=rust python3 -c "import swarm.claims as c; print(type(c.make_claim_table()).__name__)"` prints `NativeClaimTable`; `tests/perf/claims_engine.py` measures the cost on your host.
+
 | Name | Default | Read by | Meaning |
 |---|---|---|---|
 | `--max-parallel N` / `SWARM_MAX_PARALLEL` | 4 | `swarm_run.py`, `swarm/subagent_lifecycle.py` | Global concurrent sessions; the flag wins |
@@ -454,6 +458,7 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `notes.claims` | none | `select_batch` | Task notes: file claims (section 4) |
 | `notes.retry_after` | none | `Scheduler._schedule` | Task notes: epoch wall time before which the task is not re-dispatched; written by the scheduler |
 
+| `SWARM_CLAIMS_ENGINE` | `python` | `swarm/claims.py` (`make_claim_table`, called by `Scheduler`) | Opt-in, default python, no flip: `rust` decides file-claim conflicts in `swarm._native.ClaimTable` through `NativeClaimTable` (same results, held view, first conflict owner and idempotent release as the Python table). Unset, empty or `python` uses Python; any other value warns once and uses Python; `SWARM_PURE_PYTHON=1` wins (one warning); a missing or stale extension falls back when the table is built, a native error later falls back in mid-run keeping the claims held, one warning per reason per process. CPU of 50 single-claim acquires: 2.2 ms Python (11.9 ms on first sight), 0.26 ms native; of 500: 5.2 s and 10.6 ms (`tests/perf/records/14.4/claims-engine.txt`) |
 A malformed `SWARM_CANCEL_GRACE_S`, `SWARM_SHUTDOWN_BUDGET_S` or `SWARM_FAIL_STREAK` exits 2 with E-INPUT before anything
 runs; the retry, limiter, heartbeat, handover, output-limit and bar variables fall back to their defaults on a bad value
 (`SWARM_TOOL_OUTPUT_MAX_BYTES` and `SWARM_BAR_IDLE_POLL_MS` are also clamped to their ranges).

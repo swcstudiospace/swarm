@@ -92,7 +92,7 @@ from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
 from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee, workspace  # noqa: E402
-from swarm.claims import ClaimTable, parse_claims  # noqa: E402
+from swarm.claims import ClaimStore, make_claim_table, parse_claims  # noqa: E402
 from swarm.lifecycle import RunEvent  # noqa: E402
 from swarm.limiter import AimdLimiter, detect_rate_limit  # noqa: E402
 from swarm.retry import backoff_s, is_transient  # noqa: E402
@@ -1132,7 +1132,7 @@ def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=froze
 
 
 def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases, *, running: dict[str, int] | None = None,
-                 claims: ClaimTable | None = None, skipped: dict[str, str] | None = None) -> tuple[list[tuple[dict, dict]], list[str]]:
+                 claims: ClaimStore | None = None, skipped: dict[str, str] | None = None) -> tuple[list[tuple[dict, dict]], list[str]]:
     """(task, agent) pairs to dispatch now, and the tasks left waiting on a lease.
 
     `max_parallel` is the number of free global slots. The same agent fills more than one of them, up to that
@@ -1831,7 +1831,7 @@ class Scheduler:
         self.repo, self.corr, self.mgr, self.tel, self.sdir = repo, corr, mgr, tel, sdir
         self.leases, self.handoffs, self.cancel, self.barrier = leases, handoffs, cancel, barrier
         self.limiter = AimdLimiter(mgr.max_concurrent)
-        self.claims = ClaimTable()
+        self.claims = make_claim_table()
         self.error_handler = ErrorHandler()
         self.book = RunBook(tel)
         self.inflight: dict[str, Inflight] = {}

@@ -6,14 +6,22 @@ conflicts. A trailing `/` means the whole directory (`src/` == `src/**`); an EXC
 character in its last segment) reserves that path and everything beneath it, so it conflicts with `src/a.py` too; a
 shared bare name is just that one path.
 Overlap is decided conservatively: when in doubt (character classes) two patterns are reported as overlapping.
+
+`make_claim_table()` is the one place the scheduler obtains its table. `SWARM_CLAIMS_ENGINE=rust` opts in to `NativeClaimTable`, the same
+interface over `swarm._native.ClaimTable` (crate gsd-sched-core); the default stays this module's Python `ClaimTable`, the oracle.
 """
 from __future__ import annotations
 
+import logging
+import os
 import re
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, Protocol
+
+from ._native_loader import load_native, pure_python_requested
 
 EXCLUSIVE = "exclusive"
 SHARED = "shared"
@@ -237,3 +245,164 @@ class ClaimTable:
         """Snapshot of owner -> claims; later table changes do not alter it."""
         with self._lock:
             return {owner: tuple(claims) for owner, claims in self._held.items()}
+
+
+class ClaimStore(Protocol):
+    """What the scheduler needs of a claim table: the Python `ClaimTable` and `NativeClaimTable` both provide it."""
+
+    def acquire(self, owner: str, claims: list[Claim] | tuple[Claim, ...]) -> ClaimResult: ...
+
+    def release(self, owner: str) -> int: ...
+
+    def held(self) -> dict[str, tuple[Claim, ...]]: ...
+
+
+# Opt-in Rust claim table (`swarm._native.ClaimTable`, crate gsd-sched-core). The Python `ClaimTable` above is the oracle and the default;
+# `SWARM_CLAIMS_ENGINE=rust` only swaps who decides conflicts. A configuration typo, a missing or stale extension and a native error all
+# end with the Python table (the last one in the middle of a run, with the claims held so far), each reason reported once per process.
+_ENGINE_ENV = "SWARM_CLAIMS_ENGINE"
+_engine_log = logging.getLogger("swarm.claims")
+# Reasons already reported this process. The two extension reasons double as a negative cache (no import retry per table); tests reset it
+# with `monkeypatch.setattr(claims, "_ENGINE_WARNED", set())`.
+_ENGINE_WARNED: set[str] = set()
+_engine_warn_lock = threading.Lock()
+
+
+def _engine_warn_once(reason: str, message: str) -> None:
+    with _engine_warn_lock:
+        if reason in _ENGINE_WARNED:
+            return
+        _ENGINE_WARNED.add(reason)
+    _engine_log.warning("%s: %s; using the Python claim table", _ENGINE_ENV, message)
+
+
+class NativeClaimTable:
+    """`ClaimTable` semantics over `swarm._native.ClaimTable`: same results, held view, owner identity, first conflict owner and idempotent
+    release, so the scheduler cannot tell them apart.
+
+    Threads. The native class is `frozen` (not `unsendable`): it may be created in one thread and used from any other, and its own mutex
+    serialises calls. This adapter adds one re-entrant lock, like the Python table's, because it also keeps a journal of what the native
+    table holds (`Claim` objects per owner in acquisition order): the journal is what maps a native conflict back to the modes of the two
+    claims, and what the Python table is rebuilt from when the native one fails, so journal and native table must change in one order.
+
+    A native failure (any exception, including an adapter/journal disagreement) is never raised to the caller: the table is rebuilt as a
+    Python `ClaimTable` holding the journal's claims, the failed call is answered by it, and every later call goes to it.
+    """
+
+    def __init__(self, native_table: Any) -> None:
+        self._lock = threading.RLock()
+        self._native: Any = native_table
+        self._python: ClaimTable | None = None
+        self._journal: dict[str, dict[Claim, None]] = {}
+
+    def acquire(self, owner: str, claims: list[Claim] | tuple[Claim, ...]) -> ClaimResult:
+        """As `ClaimTable.acquire`; the conflicts name the same holders, held and requested claims in the same order."""
+        requested = list(claims)
+        pairs = [(claim.pattern, claim.mode) for claim in requested]
+        with self._lock:
+            if self._python is not None:
+                return self._python.acquire(owner, requested)
+            try:
+                ok, raw = self._native.acquire(owner, pairs)
+                if not ok:
+                    return ClaimResult(False, self._map_conflicts(requested, raw))
+                if requested:
+                    self._journal.setdefault(owner, {}).update(dict.fromkeys(requested))
+                return ClaimResult(True, ())
+            except Exception as exc:  # noqa: BLE001 - any native failure must degrade to the oracle, never propagate
+                return self._fall_back(exc).acquire(owner, requested)
+
+    def release(self, owner: str) -> int:
+        """As `ClaimTable.release`: drops everything `owner` holds, idempotent, returns how many claims that was."""
+        with self._lock:
+            if self._python is not None:
+                return self._python.release(owner)
+            try:
+                count = int(self._native.release(owner))
+                self._journal.pop(owner, None)
+                return count
+            except Exception as exc:  # noqa: BLE001 - see acquire
+                return self._fall_back(exc).release(owner)
+
+    def held(self) -> dict[str, tuple[Claim, ...]]:
+        """As `ClaimTable.held`: a snapshot of owner -> claims in acquisition order."""
+        with self._lock:
+            if self._python is not None:
+                return self._python.held()
+            try:
+                return {owner: tuple(Claim(pattern, mode) for pattern, mode in claims) for owner, claims in self._native.held().items()}
+            except Exception as exc:  # noqa: BLE001 - see acquire
+                return self._fall_back(exc).held()
+
+    def _map_conflicts(self, requested: list[Claim], raw: list[tuple[str, str, str]]) -> tuple[ClaimConflict, ...]:
+        """The native `(holder, held_pattern, requested_pattern)` triples as `ClaimConflict`s.
+
+        A triple does not say which claims were meant: `a` may be held, or requested, in both modes, and a bare-name exclusive claim reaches
+        under its name while a shared one does not, so the modes decide whether two patterns collide. The native table lists one triple
+        per conflicting (requested claim, held claim) pair: requested claims in order, then holders, and each holder's claims, in
+        acquisition order. So the n-th triple of a key is the n-th conflicting pair of that key in the same order; a key with a single
+        candidate pair needs no check (the native table said it conflicts), a key with several keeps those that `_conflicts` accepts.
+        """
+        wants: dict[str, list[Claim]] = {}
+        for want in requested:
+            wants.setdefault(want.pattern, []).append(want)
+        replay: dict[tuple[str, str, str], Iterator[tuple[Claim, Claim]]] = {}
+        conflicts: list[ClaimConflict] = []
+        for holder, held_pattern, want_pattern in raw:
+            key = (holder, held_pattern, want_pattern)
+            pairs = replay.get(key)
+            if pairs is None:
+                held_claims = self._journal[holder]
+                helds = [claim for claim in (Claim(held_pattern, EXCLUSIVE), Claim(held_pattern, SHARED)) if claim in held_claims]
+                if len(helds) == 2:  # both modes held: acquisition order decides which comes first
+                    helds = [claim for claim in held_claims if claim.pattern == held_pattern]
+                candidates = [(want, held) for want in wants[want_pattern] for held in helds]
+                pairs = iter(candidates if len(candidates) < 2 else [pair for pair in candidates if _conflicts(*pair)])
+                replay[key] = pairs
+            want, held = next(pairs)
+            conflicts.append(ClaimConflict(holder, held, want))
+        return tuple(conflicts)
+
+    def _fall_back(self, exc: Exception) -> ClaimTable:
+        """Replaces the native table by a Python `ClaimTable` holding the journal's claims; the caller repeats the failed call on it."""
+        _engine_warn_once("native-error", f"swarm._native.ClaimTable failed ({type(exc).__name__}: {str(exc)[:200]})")
+        table = ClaimTable()
+        table._held = {owner: list(claims) for owner, claims in self._journal.items()}
+        self._python, self._native, self._journal = table, None, {}
+        return table
+
+
+def _rust_engine_selected() -> bool:
+    """True when `SWARM_CLAIMS_ENGINE=rust` is set and not overridden. Unset, empty or `python` is the default; `SWARM_PURE_PYTHON=1`
+    always wins over `rust`; any other value warns once and selects Python."""
+    engine = os.environ.get(_ENGINE_ENV, "")
+    if engine in ("", "python"):
+        return False
+    if engine != "rust":
+        _engine_warn_once("unknown-engine", f"unknown value {engine!r} (expected 'python' or 'rust')")
+        return False
+    if pure_python_requested():
+        _engine_warn_once("pure-python", "'rust' requested but SWARM_PURE_PYTHON=1 is set")
+        return False
+    return True
+
+
+def make_claim_table() -> ClaimStore:
+    """A new, empty claim table for one scheduler: the Python `ClaimTable`, or a `NativeClaimTable` when `SWARM_CLAIMS_ENGINE=rust` is
+    selected and `swarm._native` provides `ClaimTable`. Reads the environment on every call."""
+    if not _rust_engine_selected() or "missing-extension" in _ENGINE_WARNED or "stale-extension" in _ENGINE_WARNED:
+        return ClaimTable()
+    try:
+        native = load_native()
+    except ImportError as exc:
+        _engine_warn_once("missing-extension", f"swarm._native is unavailable ({exc})")
+        return ClaimTable()
+    native_class = getattr(native, "ClaimTable", None)
+    if native_class is None:
+        _engine_warn_once("stale-extension", "swarm._native has no ClaimTable (stale build: reinstall with `pip install .`)")
+        return ClaimTable()
+    try:
+        return NativeClaimTable(native_class())
+    except Exception as exc:  # noqa: BLE001 - any native failure must degrade to the oracle, never propagate
+        _engine_warn_once("native-error", f"swarm._native.ClaimTable failed ({type(exc).__name__}: {str(exc)[:200]})")
+        return ClaimTable()
