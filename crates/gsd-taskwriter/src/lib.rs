@@ -12,13 +12,17 @@
 //! returns an [`Applied`]. Failures are [`ApplyError`]s that keep Python's code, message and details.
 //!
 //! The `fault-injection` feature adds named pause points ([`fault::PausePoint`]) so a test can hold a transaction between the
-//! state `UPDATE` and the audit `INSERT`. It is off by default and must never be enabled in the shipped binary.
+//! state `UPDATE` and the audit `INSERT`, or between two ops of an op list. It is off by default and must never be enabled in the shipped binary.
+//!
+//! [`TaskStoreWriter::apply_ops`] applies an ordered list of [`WriterOp`]s (the other `TaskStore` writes: notes, artifacts,
+//! feedback, `create`, dependencies, and transitions of a decided plan) in one `BEGIN IMMEDIATE` transaction: every op or none.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod apply;
 mod error;
+mod ops;
 mod plan;
 mod store;
 
@@ -26,9 +30,11 @@ pub use apply::{
     Applied, AppliedAudit, ApplyCause, ApplyError, Decider, HostDecider, TaskStoreWriter,
 };
 pub use error::{ErrorKind, WriteState, WriterError};
+pub use ops::{NewTask, OpsApplied, OpsAudit, OpsCause, OpsError, WriterOp};
 pub use plan::{PlanValidator, PlanViolation, ValidatedPlan};
 #[cfg(feature = "fault-injection")]
 pub use store::fault;
 pub use store::{
-    open_for_write, NewArtifact, NewVerdict, PlanColumn, StateChange, Tx, WriteStore, WriterConfig,
+    open_for_write, NewArtifact, NewTaskRow, NewVerdict, PlanColumn, StateChange, TextColumn, Tx,
+    WriteStore, WriterConfig,
 };

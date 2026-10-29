@@ -338,13 +338,73 @@ pub struct NewArtifact<'a> {
     pub ts: f64,
 }
 
+/// A text column of `tasks` that an op rewrites as a whole, as `TaskStore.update` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextColumn {
+    /// `notes`, the JSON text of the notes object.
+    Notes,
+    /// `outputs`, the JSON text of the outputs list.
+    Outputs,
+    /// `depends_on`, the JSON text of the dependency list.
+    DependsOn,
+}
+
+impl TextColumn {
+    /// The SQL column name; the only identifiers that ever reach the `UPDATE` text.
+    fn column(self) -> &'static str {
+        match self {
+            TextColumn::Notes => "notes",
+            TextColumn::Outputs => "outputs",
+            TextColumn::DependsOn => "depends_on",
+        }
+    }
+}
+
+/// A `tasks` row to insert, as `TaskStore.create` binds it. The JSON columns are already the text Python's `json.dumps` prints.
+/// `state` is `CREATED`; `outputs`, `attempt`, `rework_loops` and `assigned_to` keep their column defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NewTaskRow<'a> {
+    /// `task_id`
+    pub task_id: &'a str,
+    /// `correlation_id`
+    pub correlation_id: &'a str,
+    /// `parent_id`
+    pub parent_id: Option<&'a str>,
+    /// `dag_depth`
+    pub dag_depth: i64,
+    /// `capability`
+    pub capability: &'a str,
+    /// `agent_id`
+    pub agent_id: Option<&'a str>,
+    /// `title`
+    pub title: &'a str,
+    /// `inputs`, JSON text.
+    pub inputs: &'a str,
+    /// `acceptance`, JSON text.
+    pub acceptance: &'a str,
+    /// `budget`, JSON text.
+    pub budget: &'a str,
+    /// `risk_class`
+    pub risk_class: &'a str,
+    /// `priority`
+    pub priority: &'a str,
+    /// `depends_on`, JSON text.
+    pub depends_on: &'a str,
+    /// `max_attempts`
+    pub max_attempts: i64,
+    /// `notes`, JSON text.
+    pub notes: &'a str,
+    /// `created_at`, `updated_at` and the `ts` of the `NULL -> CREATED` audit row.
+    pub now: f64,
+}
+
 /// A `BEGIN IMMEDIATE` transaction. Dropping it without [`Tx::commit`] rolls it back.
 #[derive(Debug)]
 pub struct Tx {
     tx: Transaction<'static, Sqlite>,
     wrote: bool,
     #[cfg(feature = "fault-injection")]
-    faults: Arc<Faults>,
+    pub(crate) faults: Arc<Faults>,
 }
 
 /// A failure of a statement: not started until the transaction issued its first write, final from then on.
@@ -501,6 +561,90 @@ impl Tx {
         Ok(())
     }
 
+    /// `TaskStore.update` of one text column: `UPDATE tasks SET <column>=?, updated_at=? WHERE task_id=?`.
+    ///
+    /// The row must exist (the caller checked inside this transaction); a statement that matches no row is a final error.
+    pub async fn update_text(
+        &mut self,
+        task_id: &str,
+        column: TextColumn,
+        text: &str,
+        updated_at: f64,
+    ) -> Result<(), WriterError> {
+        self.wrote = true;
+        let sql = format!(
+            "UPDATE tasks SET {}=?, updated_at=? WHERE task_id=?",
+            column.column()
+        );
+        let done = sqlx::query(&sql)
+            .bind(text)
+            .bind(updated_at)
+            .bind(task_id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(|error| {
+                failure(
+                    true,
+                    ErrorKind::Database,
+                    format!("task store update of {}: {error}", column.column()),
+                )
+            })?;
+        if done.rows_affected() != 1 {
+            return Err(WriterError::final_error(
+                ErrorKind::Database,
+                ErrorCode::Internal,
+                format!("task {task_id} vanished inside its own transaction"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `TaskStore.create`: the `tasks` `INSERT` and its `NULL -> CREATED` audit row (`system`, `created`).
+    ///
+    /// A duplicate `task_id` is the caller's to refuse beforehand; the primary key makes it a final database error here.
+    pub async fn insert_task(&mut self, row: &NewTaskRow<'_>) -> Result<(), WriterError> {
+        self.wrote = true;
+        sqlx::query(
+            "INSERT INTO tasks (task_id, correlation_id, parent_id, dag_depth, capability, agent_id, title, \
+             inputs, acceptance, budget, risk_class, priority, state, depends_on, max_attempts, \
+             notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(row.task_id)
+        .bind(row.correlation_id)
+        .bind(row.parent_id)
+        .bind(row.dag_depth)
+        .bind(row.capability)
+        .bind(row.agent_id)
+        .bind(row.title)
+        .bind(row.inputs)
+        .bind(row.acceptance)
+        .bind(row.budget)
+        .bind(row.risk_class)
+        .bind(row.priority)
+        .bind("CREATED")
+        .bind(row.depends_on)
+        .bind(row.max_attempts)
+        .bind(row.notes)
+        .bind(row.now)
+        .bind(row.now)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(|error| failure(true, ErrorKind::Database, format!("task store task insert: {error}")))?;
+        sqlx::query(
+            "INSERT INTO transitions (task_id, from_state, to_state, actor, reason, ts) VALUES (?,?,?,?,?,?)",
+        )
+        .bind(row.task_id)
+        .bind(None::<&str>)
+        .bind("CREATED")
+        .bind("system")
+        .bind("created")
+        .bind(row.now)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(|error| failure(true, ErrorKind::Database, format!("task store audit insert: {error}")))?;
+        Ok(())
+    }
+
     /// Commits. A failure here is final: whether the commit landed is not known, so nothing is re-run.
     pub async fn commit(self) -> Result<(), WriterError> {
         #[cfg(feature = "fault-injection")]
@@ -617,6 +761,9 @@ pub mod fault {
         AfterStateUpdate,
         /// At the top of [`crate::Tx::commit`], before `COMMIT`.
         BeforeCommit,
+        /// Between two ops of [`crate::TaskStoreWriter::apply_ops`]: the earlier ops are written, the later ones are not, and
+        /// nothing is committed.
+        BetweenOps,
     }
 
     #[derive(Debug)]

@@ -30,7 +30,7 @@ use gsd_route::transition_plan::{
 use gsd_route::{jstr, Fields, Json, SeamError};
 
 use crate::error::{ErrorKind, WriteState, WriterError};
-use crate::plan::{PlanValidator, PlanViolation};
+use crate::plan::{PlanValidator, PlanViolation, ValidatedPlan};
 use crate::store::{PlanColumn, StateChange, Tx, WriteStore};
 
 /// The JSON text columns of `tasks`. [`Facts`] holds them as stored (text); the store's Python-shaped row has them parsed.
@@ -283,32 +283,9 @@ async fn decide_and_apply(
         .validate(&plan, row.as_ref())
         .map_err(|violation| ApplyError::invalid_plan(violation, task_id))?;
 
-    let mut columns = Vec::new();
-    if let Some(attempt) = validated.attempt {
-        columns.push(PlanColumn::Attempt(attempt));
-    }
-    if let Some(loops) = validated.rework_loops {
-        columns.push(PlanColumn::ReworkLoops(loops));
-    }
-    if let Some(notes) = &validated.notes {
-        columns.push(PlanColumn::Notes(notes));
-    }
-    // Python's `_apply` per audited step: the first step of an auto-escalation sets only its state, the last sets the columns.
-    for (index, step) in validated.audit.iter().enumerate() {
-        let last = index + 1 == validated.audit.len();
-        tx.apply_state(&StateChange {
-            task_id,
-            from: &step.from,
-            to: &step.to,
-            columns: if last { &columns } else { &[] },
-            actor: &step.actor,
-            reason: &step.reason,
-            updated_at: now,
-            ts: now,
-        })
+    write_validated(tx, task_id, &validated, now)
         .await
         .map_err(store_error)?;
-    }
     let after = tx
         .task(task_id)
         .await
@@ -335,6 +312,43 @@ async fn decide_and_apply(
             .collect(),
         effects: validated.effects.to_vec(),
     })
+}
+
+/// Python's `_apply` for a validated plan: one conditional `UPDATE` and one audit `INSERT` per audit step, in order.
+///
+/// The first step of an auto-escalation sets only its state, the last sets the plan's columns. Shared with
+/// [`TaskStoreWriter::apply_ops`](crate::TaskStoreWriter::apply_ops), so a transition inside an op list is written by the same code.
+pub(crate) async fn write_validated(
+    tx: &mut Tx,
+    task_id: &str,
+    validated: &ValidatedPlan<'_>,
+    now: f64,
+) -> Result<(), WriterError> {
+    let mut columns = Vec::new();
+    if let Some(attempt) = validated.attempt {
+        columns.push(PlanColumn::Attempt(attempt));
+    }
+    if let Some(loops) = validated.rework_loops {
+        columns.push(PlanColumn::ReworkLoops(loops));
+    }
+    if let Some(notes) = &validated.notes {
+        columns.push(PlanColumn::Notes(notes));
+    }
+    for (index, step) in validated.audit.iter().enumerate() {
+        let last = index + 1 == validated.audit.len();
+        tx.apply_state(&StateChange {
+            task_id,
+            from: &step.from,
+            to: &step.to,
+            columns: if last { &columns } else { &[] },
+            actor: &step.actor,
+            reason: &step.reason,
+            updated_at: now,
+            ts: now,
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 /// The row as [`Facts`] holds it: `dict(sqlite3.Row)`, so the JSON columns are text again and `notes_json` is gone.

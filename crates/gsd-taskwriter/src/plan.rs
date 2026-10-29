@@ -298,7 +298,7 @@ impl<'a> PlanValidator<'a> {
 }
 
 /// True when a float anywhere inside `value` is `NaN` or infinite.
-fn has_non_finite(value: &Json) -> bool {
+pub(crate) fn has_non_finite(value: &Json) -> bool {
     match value {
         Json::Float(number) => !number.is_finite(),
         Json::Arr(items) => items.iter().any(has_non_finite),
