@@ -106,7 +106,7 @@ from swarm.tools.shared_runtime import cancel_flag_path  # noqa: E402  # one pat
 # SWARM_TASK_ID and SWARM_CORRELATION_ID are the runner's own defaults for script flags. A child that
 # inherits them binds its gate scripts to the parent's task (T-06-19).
 AGENT_SESSION_STRIPPED = (
-    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
     "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
 )
 

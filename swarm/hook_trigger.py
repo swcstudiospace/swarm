@@ -29,9 +29,9 @@ from .observability import emit_hook_fired
 from .subagent_lifecycle import SubagentLifecycleManager, get_manager  # for subagent lifecycle on trigger spawn (unique ID + ts log; prior init/trigger integration)
 # Non-empty values mean this process is a cloud agent and must not detach a runner.
 CLOUD_AGENT_MARKERS = ("CURSOR_AGENT", "CURSOR_CLOUD_AGENT", "CLOUD_AGENT")
-# Same names scripts/swarm_run.py strips (AGENT_SESSION_STRIPPED). Follow-on model sessions get no signing material.
+# Same names scripts/swarm_run.py strips (AGENT_SESSION_STRIPPED). Follow-on model sessions get no signing material and no dev-key opt-in.
 SIGNING_ENV_STRIPPED = (
-    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
     "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
 )
 
