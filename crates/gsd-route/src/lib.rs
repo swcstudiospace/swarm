@@ -1223,6 +1223,8 @@ pub use invoke::core_invoke;
 #[cfg(feature = "write-routes-2")]
 pub mod gate_facts;
 #[cfg(feature = "write-routes-2")]
+pub mod ingest_plan;
+#[cfg(feature = "write-routes-2")]
 pub mod reconcile_plan;
 #[cfg(feature = "write-routes-2")]
 pub mod result_parse;
