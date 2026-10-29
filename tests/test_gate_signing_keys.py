@@ -3,7 +3,8 @@
 The Rust side is `crates/gsd-taskwriter/examples/gate_issue_apply.rs` (a thin driver of `TaskStoreWriter::issue_gate`, which reads the keys from
 its process environment with `gsd_envelope::KeyMaterial::from_env`). Build it with
 `cargo build -p gsd-taskwriter --example gate_issue_apply --offline`, or name a binary with `GATE_ISSUE_APPLY_BIN` (a named binary that
-is missing fails the test; with none named and none built the tests skip).
+is missing fails the test; with none named and none built the tests skip, EXCEPT under CI in a job that names the engine binary
+(`GSD_ENGINE_BIN`) or the build (`GSD_ENGINE_BUILD`) it tests: there a missing example FAILS, the rule of tests/test_keys_never_in_guest.py).
 
 - Cross-check: a store made by the real `TaskStore`, rows written by the Rust signer with a `secrets.token_hex(32)` key, then Python's own
   `swarm.envelope.verify_envelope`, `TaskStore.latest_verdicts` and `TaskStore.missing_gate_reasons` accept them (HMAC, Ed25519, both).
@@ -39,6 +40,11 @@ MAJOR = {"id": "F-1", "severity": "major", "kind": "functional", "summary": "mis
          "owner_suggestion": None, "location": None}
 
 
+def binary_required() -> bool:
+    """Under CI a job that names the binary (`GSD_ENGINE_BIN`) or the build (`GSD_ENGINE_BUILD`) it tests has promised one."""
+    return bool(os.environ.get("CI")) and bool(os.environ.get("GSD_ENGINE_BIN") or os.environ.get("GSD_ENGINE_BUILD"))
+
+
 def _binary() -> Path:
     named = os.environ.get("GATE_ISSUE_APPLY_BIN")
     if named:
@@ -47,7 +53,10 @@ def _binary() -> Path:
         return path
     built = REPO / "target" / "debug" / "examples" / "gate_issue_apply"
     if not built.is_file():
-        pytest.skip("gate_issue_apply is not built: cargo build -p gsd-taskwriter --example gate_issue_apply --offline")
+        reason = "gate_issue_apply is not built: cargo build -p gsd-taskwriter --example gate_issue_apply --offline"
+        if binary_required():
+            pytest.fail(f"{reason}. CI is set and this job names its binary or build: these tests must run, not skip")
+        pytest.skip(reason)
     return built
 
 
@@ -214,3 +223,31 @@ def test_no_canary_reaches_any_output_of_any_branch(apply_bin: Path, tmp_path: P
             assert _leaks(forms, blob) == [], f"a canary is in {channel} of {name}"
         signed += b'"sig": "hmac:' in done.stdout or b'"sig": "ed25519:' in done.stdout
     assert signed >= 4
+
+
+# ---- the skip rule -------------------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("ci", "engine_bin", "build", "outcome"),
+    [
+        ("true", None, None, pytest.skip.Exception),  # the `test` job: CI set, nothing named, no cargo build
+        ("true", "/engine", None, pytest.fail.Exception),
+        ("true", None, "default", pytest.fail.Exception),  # the `rust` job names its build: the example must have been built
+        (None, None, "default", pytest.skip.Exception),  # a developer without the example skips
+        (None, "/engine", None, pytest.skip.Exception),
+        (None, None, None, pytest.skip.Exception),
+    ],
+)
+def test_a_missing_example_fails_where_a_job_promised_a_binary_and_skips_otherwise(
+    ci: str | None, engine_bin: str | None, build: str | None, outcome: type[BaseException], monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("GATE_ISSUE_APPLY_BIN", raising=False)
+    monkeypatch.setitem(globals(), "REPO", tmp_path)  # no target/debug/examples/gate_issue_apply below it
+    for name, value in (("CI", ci), ("GSD_ENGINE_BIN", engine_bin), ("GSD_ENGINE_BUILD", build)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(BaseException) as caught:  # a skip is a BaseException too: it must not pass for a failure
+        _binary()
+    assert caught.type is outcome

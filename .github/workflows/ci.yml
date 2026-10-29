@@ -97,6 +97,20 @@ jobs:
         run: |
           cp -p target/debug/gsd_engine "$RUNNER_TEMP/gsd_engine-default"
           GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/test_keys_never_in_guest.py -p no:cacheprovider --junitxml="$RUNNER_TEMP/keys-default.xml"
+      # The transition matrix and the signed APPROVED cells (phase 14.5, unit U3.4d) run the real binary through the selector and alone and
+      # compare every byte with the Python script. Under CI a job that names its binary or build makes them FAIL instead of skipping. The
+      # selector legs run the Python body without SWARM_PURE_PYTHON, so `swarm._native` must import: it is built here, the way
+      # scripts/ci_parity_rust.sh builds it, only when it does not.
+      - name: parity cells - swarm._native
+        run: |
+          if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
+            "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
+            VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
+          fi
+      - name: transition and signed parity cells (default build, host backend)
+        env:
+          GSD_ENGINE_BUILD: default
+        run: GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/parity/test_write_parity.py -p no:cacheprovider
       # The write guest embedded in the sandbox crate imports nothing (the check derives the manifest from the bytes: no pin needed).
       - name: guest imports (write guest)
         run: cargo test -p gsd-sandbox --features write-routes --test guest_imports --locked
@@ -109,6 +123,21 @@ jobs:
           cargo build -p gsd-adapter --bin gsd_engine --features sandbox-write --locked
           cp -p target/debug/gsd_engine "$RUNNER_TEMP/gsd_engine-write"
           GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-write" python3 -m pytest tests/test_keys_never_in_guest.py -p no:cacheprovider --junitxml="$RUNNER_TEMP/keys-write.xml"
+      # The same cells on the sandbox backend: only this build serves them in the guest, every other build refuses and Python answers.
+      - name: transition and signed parity cells (sandbox-write build, sandbox backend)
+        env:
+          GSD_ENGINE_BUILD: sandbox-write
+          GSD_PARITY_BACKEND: sandbox
+        run: GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-write" python3 -m pytest tests/parity/test_write_parity.py -p no:cacheprovider
+      # What the Rust gate-issue tail signs verifies in Python, and no key reaches an output (unit U3.6a). The example is built here;
+      # GSD_ENGINE_BUILD names the job's build so that a missing example FAILS under CI instead of skipping.
+      - name: gate signing keys (gate_issue_apply example)
+        env:
+          SWARM_PURE_PYTHON: "1"
+          GSD_ENGINE_BUILD: default
+        run: |
+          cargo build -p gsd-taskwriter --example gate_issue_apply --locked
+          python3 -m pytest tests/test_gate_signing_keys.py -p no:cacheprovider
       - name: upload the key test reports (they record the build under test)
         if: always()
         uses: actions/upload-artifact@v4
