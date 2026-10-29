@@ -221,7 +221,7 @@ impl Error for RunError {
 /// One dispatchable task as the Python `dispatchable` returns it, reduced to what the pass needs.
 ///
 /// Rust orders rows with the Python `order_ready` rule (priority rank with an unknown or missing priority ranked as `P2`, then
-/// `dag_depth` descending, then `created_at` ascending, stable) and filters them by `retry_after` and the internal-failure count.
+/// `dag_depth` ascending, then `created_at` ascending, stable) and filters them by `retry_after` and the internal-failure count.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadyRow {
     /// The task id. Unique among the rows of one pass.

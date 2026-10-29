@@ -25,7 +25,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::claim_pattern::{claims_conflict, footprints, ClaimError, ClaimMode, PathClaim};
+use crate::claim_pattern::{claims_conflict, ClaimError, ClaimMode, PathClaim};
 
 /// A requested claim that collides with a claim another owner holds: the three-tuple Python reports as
 /// `(owner, held.pattern, requested.pattern)`.
@@ -101,8 +101,7 @@ pub struct ClaimTable {
 /// [`ClaimError`] for an empty, absolute (`/x`), drive-qualified (`C:x`), `~`-prefixed or `..`-containing pattern.
 pub fn normalize_pattern(pattern: &str) -> Result<String, ClaimError> {
     let claim = PathClaim::new(pattern, ClaimMode::Exclusive)?;
-    // `footprints` always lists the claim's own segments first, so index 0 exists and is the normalized pattern.
-    Ok(footprints(&claim)[0].join("/"))
+    Ok(claim.pattern())
 }
 
 impl ClaimTable {
@@ -131,8 +130,7 @@ impl ClaimTable {
             let claim =
                 PathClaim::new(pattern.as_ref(), *mode).map_err(AcquireError::InvalidPattern)?;
             wanted.push(HeldClaim {
-                // see `normalize_pattern`: index 0 of `footprints` is the claim's own pattern
-                pattern: footprints(&claim)[0].join("/"),
+                pattern: claim.pattern(),
                 mode: *mode,
                 claim,
             });
@@ -252,7 +250,7 @@ pub(crate) mod vectors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claim_pattern::claims_overlap;
+    use crate::claim_pattern::{claims_overlap, footprints};
     use crate::jsonlite::Value;
 
     use ClaimMode::{Exclusive as Excl, Shared};

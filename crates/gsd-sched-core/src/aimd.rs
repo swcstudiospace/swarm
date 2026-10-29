@@ -6,7 +6,7 @@
 //!
 //! Rules:
 //! - Every rate-limit signal halves the limit (floor `min`) and holds growth for the cooldown.
-//!   The once-per-burst dedupe is the dispatch runner's (`RateLimitGate`), not the limiter's.
+//!   The once-per-burst dedupe is [`RateLimitGate`]'s, which sits in front of the limiter.
 //! - A success after the cooldown has elapsed adds one back (ceiling `max`). A success always
 //!   resets the failure streak and re-arms the circuit.
 //! - Non-rate-limit failures of distinct tasks form a streak. When the streak reaches
@@ -156,6 +156,45 @@ impl AimdLimiter {
     }
 }
 
+/// Once-per-burst gate for rate-limit signals. Port of the dedupe in `scripts/swarm_run.py` `_backpressure`: a hit from a session
+/// submitted before the last decrease belongs to the same provider burst and changes nothing, because one burst hits every session
+/// that was already running and must count as one decrease, not as many. The limiter itself halves on every call it receives.
+///
+/// Threads and blocking: plain data like [`AimdLimiter`]; the caller owns the synchronisation. Never blocks.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitGate {
+    last_decrease: Option<Instant>,
+}
+
+impl RateLimitGate {
+    /// A gate that has seen no decrease yet: the first hit always reaches the limiter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one rate-limit signal from a session submitted at `submitted_at`, observed at `now`. Returns whether the limit dropped.
+    ///
+    /// A hit with `submitted_at` strictly before the last decrease returns `false` without calling the limiter. Any other hit goes to
+    /// [`AimdLimiter::on_rate_limit`], and the decrease time is recorded only when the limit dropped, so a hit at the floor neither
+    /// drops nor starts a new burst.
+    pub fn on_rate_limit(
+        &mut self,
+        limiter: &mut AimdLimiter,
+        submitted_at: Instant,
+        now: Instant,
+        retry_after: Option<Duration>,
+    ) -> bool {
+        if self.last_decrease.is_some_and(|last| submitted_at < last) {
+            return false;
+        }
+        let dropped = limiter.on_rate_limit(now, retry_after);
+        if dropped {
+            self.last_decrease = Some(now);
+        }
+        dropped
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +326,65 @@ mod tests {
             assert_eq!(error, LimiterError { min, max });
             assert_eq!(error.to_string(), text);
         }
+    }
+
+    fn secs(t0: Instant, s: u64) -> Instant {
+        t0 + Duration::from_secs(s)
+    }
+
+    #[test]
+    fn a_hit_from_a_session_older_than_the_last_decrease_is_the_same_burst() {
+        let t0 = Instant::now();
+        let mut l = limiter(16);
+        let mut gate = RateLimitGate::new();
+        assert!(gate.on_rate_limit(&mut l, secs(t0, 0), secs(t0, 10), None));
+        assert_eq!(l.current(), 8);
+        // submitted before the decrease at t0+10: the same burst, no second halving
+        assert!(!gate.on_rate_limit(&mut l, secs(t0, 9), secs(t0, 11), None));
+        assert_eq!(l.current(), 8);
+        // a session submitted after the decrease sees a new burst
+        assert!(gate.on_rate_limit(&mut l, secs(t0, 12), secs(t0, 13), None));
+        assert_eq!(l.current(), 4);
+    }
+
+    #[test]
+    fn a_session_submitted_at_the_instant_of_the_decrease_is_a_new_burst() {
+        let t0 = Instant::now();
+        let mut l = limiter(16);
+        let mut gate = RateLimitGate::new();
+        assert!(gate.on_rate_limit(&mut l, t0, secs(t0, 10), None));
+        assert!(gate.on_rate_limit(&mut l, secs(t0, 10), secs(t0, 11), None));
+        assert_eq!(l.current(), 4);
+    }
+
+    #[test]
+    fn a_deduplicated_hit_does_not_extend_the_cooldown() {
+        let t0 = Instant::now();
+        let mut l = limiter(16);
+        let mut gate = RateLimitGate::new();
+        gate.on_rate_limit(&mut l, t0, secs(t0, 10), None);
+        assert!(!gate.on_rate_limit(
+            &mut l,
+            secs(t0, 5),
+            secs(t0, 15),
+            Some(Duration::from_secs(100))
+        ));
+        // the cooldown still ends at t0+20: a success then adds one back
+        assert!(l.on_success(secs(t0, 20)));
+    }
+
+    #[test]
+    fn a_hit_at_the_floor_does_not_start_a_new_burst() {
+        let t0 = Instant::now();
+        let mut l = AimdLimiter::new(4, 2, Duration::from_secs(10)).expect("valid bounds");
+        let mut gate = RateLimitGate::new();
+        assert!(gate.on_rate_limit(&mut l, secs(t0, 0), secs(t0, 0), None));
+        assert_eq!(l.current(), 2);
+        // at the floor: no drop, and the decrease time stays t0
+        assert!(!gate.on_rate_limit(&mut l, secs(t0, 15), secs(t0, 20), None));
+        // submitted at t0+5, after the real decrease: reaches the limiter and holds growth until t0+40
+        assert!(!gate.on_rate_limit(&mut l, secs(t0, 5), secs(t0, 30), None));
+        assert!(!l.on_success(secs(t0, 35)));
+        assert!(l.on_success(secs(t0, 40)));
     }
 }

@@ -20,3 +20,4 @@ gsd-codes = { path = "../gsd-codes" }
 gsd-failure = { path = "../gsd-failure" }
 gsd-route = { path = "../gsd-route" }
 gsd-redact = { path = "../gsd-redact" }
+gsd-sched-core = { path = "../gsd-sched-core" }
