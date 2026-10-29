@@ -11,10 +11,8 @@ use std::collections::HashMap;
 
 use gsd_codes::ErrorCode;
 
-pub mod gate_facts;
 mod orch_status_wire;
 pub mod pydumps;
-pub mod result_parse;
 pub mod transition_plan;
 
 pub use orch_status_wire::{decode_reply_wire, orch_status_invoke, orch_status_reply};
@@ -1211,21 +1209,25 @@ pub fn history_fields(
     ])
 }
 
-// Declared after the code above so that no line the default guest's panic locations name moves; the feature keeps this code out
-// of that guest altogether (see `Cargo.toml`).
+// Everything below is declared after the code above so that no line the default guest's panic locations name moves, and each
+// group sits behind its own feature (see `Cargo.toml`): the guest of the first batch turns on `write-routes` only, so the
+// planners of the second batch and the host-only route code do not move its digest while they change.
 #[cfg(feature = "write-routes")]
 pub mod invoke;
 #[cfg(feature = "write-routes")]
 pub mod transition_wire;
 
-// Host-only planner; declared here for the same reason as the lines above.
-pub mod reconcile_plan;
-
 #[cfg(feature = "write-routes")]
 pub use invoke::core_invoke;
 
-// The argv grammar of the host `--transition` route; host-only like the modules above, so the default guest does not carry it.
-#[cfg(feature = "write-routes")]
+#[cfg(feature = "write-routes-2")]
+pub mod gate_facts;
+#[cfg(feature = "write-routes-2")]
+pub mod reconcile_plan;
+#[cfg(feature = "write-routes-2")]
+pub mod result_parse;
+
+#[cfg(feature = "host-routes")]
 pub mod transition_args;
 
 #[cfg(test)]
