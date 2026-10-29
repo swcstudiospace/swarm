@@ -138,6 +138,7 @@ type at runtime is skipped, never downgraded to `note`. The exact swarm type alw
 | `gate.findings.unattributed` | `swarm_run` | `warning` | Findings named no known gate target. |
 | `task.result.rejected` | `results.reject`, `orch_status` | `warning` | A result failed validation; the task is failed or left as is. |
 | `task.result.deduplicated` | `results.apply_result` | `note` | An ingest replay was skipped because its result was already applied; nothing was written. |
+| `orch_status.effects_lost` | `orch_status` | `warning` | A transition served by the Rust engine committed, but its effects manifest was missing, broken or could not be replayed; the answer was printed and nothing was run again. |
 | `escalation.request` | `results.reconcile`, `swarm_run` | `warning` | Rework/attempts exhausted; a human is needed. (`handoff` is the substrate's own kind for `coord_handoff` packets, which the server writes; the swarm never emits it.) |
 | `security.dev_key` | `swarm.envelope` | `warning` | An envelope was signed with the development key. |
 | `lease.denied` | `substrate_lease` (runner) | `note` | Another session holds the task's node; the task waits. |
