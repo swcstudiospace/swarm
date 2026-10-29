@@ -267,60 +267,146 @@ python3 scripts/swarm_run.py --repo /path/to/codebase --swarm-timeout 3600   # c
 
 ## Select the engine for `orch_status` reads
 
-The read routes `orch_status` list and `orch_status --history TASK_ID` can run on the Rust engine (`gsd_engine`). The default is `python`; no route is flipped by default. `--transition` and `--ingest` never run on Rust: the binary refuses them with `E-DEP` and Python answers. The evidence and open items are in [tests/parity/flip_record.md](../tests/parity/flip_record.md).
+The read routes `orch_status` list and `orch_status --history TASK_ID` can run on the Rust engine (`gsd_engine`). **Today the default is still `python`: no route is flipped.** The three constants the flip changes are `DEFAULT_ENGINE = "python"` (`scripts/orch_status.py`), `ORCH_STATUS_READ_DEFAULT = Engine::Python` (`crates/gsd-adapter/src/route_table.rs`) and `DEFAULT_BACKEND = Backend::Host` (`crates/gsd-adapter/src/bin/gsd_engine.rs`); nothing else changes the default. `--transition` and `--ingest` never run on Rust: the binary refuses them with `E-DEP` and Python answers. The evidence, the decisions on the recorded divergences and the open items are in [tests/parity/flip_record.md](../tests/parity/flip_record.md).
 
 Writes stay in Python by design (OD-13; `.planning/phases/12-port-units-and-strangler-flips/12-PLAN.md:15`). A mutating argv reaching the binary (`--transition` or `--ingest`) is refused with `E-DEP` before any store read, and `E-DEP` is a fallback code, so the Python body runs the call once. The binary applies no transition and no ingest, so a fallback never applies a write twice. Its read path does run the idempotent schema statements in `open_store` (`crates/gsd-adapter/src/strangler_seam.rs`): they create the Swarm state directory and `tasks.db` when missing, and add the verdict envelope columns when absent.
 
-`scripts/orch_status.py` reads three variables:
+### Resolution order
 
-- `GSD_ENGINE`: unset, empty or `python` runs the Python body. `rust` asks the binary first. Any other value exits 2 with `E-INPUT` and does not echo the value.
-- `GSD_ENGINE_BIN`: the built `gsd_engine` binary. Required with `GSD_ENGINE=rust`. Missing or not startable: exit 2 with `E-DEP`, no Python fallback.
-- `GSD_RUST_BACKEND`: `host` (or unset) runs host Rust. `sandbox` runs the Wasm guest first. Read only when `GSD_ENGINE=rust`; any other value exits 2 with `E-INPUT`, no Python fallback. `sandbox` stays opt-in until the sign-offs below are recorded.
+`scripts/orch_status.py` (`select_engine`) decides the engine for one call in this order; the first rule that applies wins:
 
-Fallback order for one call under `GSD_ENGINE=rust`:
+1. `SWARM_PURE_PYTHON=1` (exactly `1`): the Python body answers. Nothing else is read, so a bad `GSD_ENGINE` is not reported.
+2. `GSD_ENGINE=python`: the Python body answers. `GSD_ENGINE_BIN` and `GSD_RUST_BACKEND` are ignored.
+3. `GSD_ENGINE=rust`: explicit. Every call goes to the binary, the pre-filter below is not applied, and a missing binary is an error.
+4. `GSD_ENGINE` unset or empty: `DEFAULT_ENGINE`, which is `"python"` today, so the Python body answers and the binary is never looked for. Once the default is `"rust"`, a default call goes to the binary only when a binary is found **and** `rust_serves(argv)` holds; otherwise the Python body answers, silently.
+5. Any other value: exit 2 with `E-INPUT` ("GSD_ENGINE must be 'python' or 'rust'"), and the value is not echoed.
 
-1. The selector checks `GSD_RUST_BACKEND`, then starts `GSD_ENGINE_BIN` with one stdin object `{agent, script, argv, root, env}`.
-2. With `sandbox`, a guest fault other than a timeout is answered by host Rust from the same snapshot, inside the binary (GA3). A reply the guest itself reports as an error passes through. A memory refusal (`E-CAPACITY`), a module that fails to load or pin-check (`E-DEP`) and any other trap that is not a deadline (`E-INTERNAL`) all fail over. Fuel exhaustion does not: the read route always sets an epoch deadline, so `classify` (`crates/gsd-sandbox/src/wasmtime_limits.rs`) maps fuel exhaustion to `E-TIMEOUT`, and the binary returns that error with no fallback. `E-TIMEOUT` never fails over.
-3. Exit 0 or 1: the binary's stdout and exit code are printed.
-4. Exit 2 with `E-INTERNAL`, `E-DEP`, `E-CAPACITY`, `E-CONTRACT`, `E-INPUT`, or no code: the Python body runs and prints its own bytes, which are text unless the caller passed `--json`. A memory refusal on the sandbox path fails over in step 2 and does not reach this step.
-5. Exit 2 with any other code, `E-TIMEOUT` included: the binary's reply is printed and the exit is 2. Python does not run.
-6. Any other exit code, or stdout that is not one JSON object (for example a crashed binary): the Python body runs.
+Variables:
 
-`E-TIMEOUT` is never retried (D-P5-21: `invoke` never retries) and never falls back (`is_timeout` in `crates/gsd-adapter/src/sandbox_engine.rs`). Do not wrap the call in a retry loop. To get the Python answer, run the same call with `GSD_ENGINE` unset; the selector does not do that itself.
+- `GSD_ENGINE`: as above.
+- `GSD_ENGINE_BIN`: the built `gsd_engine` binary. When it is set it is the only candidate (a path that is not an executable file is not replaced by the release binary).
+- `GSD_RUST_BACKEND`: `host` runs host Rust, `sandbox` runs the Wasm guest first; unset or empty is the binary's `DEFAULT_BACKEND` (`host` today). Any other value exits 2 with `E-INPUT` and no Python fallback. The selector checks it whenever it is about to use the binary (explicit `rust`, or a default call that reaches the binary), before it reports a missing binary; it ignores the variable when the Python body answers without the binary. The binary rejects an unknown value itself with the same code. `sandbox` stays opt-in.
+- `GSD_RUST_TIMEOUT_S`: see Timeouts.
+- `SWARM_PURE_PYTHON`: see rule 1.
 
-Build the binary, then run the read routes on it:
+### Finding the binary
+
+`GSD_ENGINE_BIN` if it is set and not empty; otherwise `<repo>/target/release/gsd_engine` if that is an executable file; otherwise none. A default call with no usable binary (none found, a file that is not executable, or one that cannot be started) runs the Python body with no error and no message. Explicit `rust` with no binary exits 2 with `E-DEP` ("GSD_ENGINE=rust needs GSD_ENGINE_BIN set to the gsd_engine binary"); with a named binary that cannot be started it exits 2 with `E-DEP` ("could not be started") and does not fall back. The wheel does not ship the binary.
+
+### The pre-filter `rust_serves`
+
+`rust_serves(argv)` is true exactly for the argv the binary serves: the read grammar of `parse_orch_status_read` plus `--json`. Accepted: `--json` and `--dry-run` (neither with an inline `=value`); `--root`, `--repo`, `--correlation-id`, `--task-id` and `--history` with a value, as `--flag=value` or `--flag value` (a separate value must not start with `-`); and `--json` at least once. Refused, so the Python body answers without starting the binary: a positional argument, an unknown or abbreviated flag, `--transition`, `--ingest`, `--advisory`, `--reason`, a missing value, and any argv without `--json` (the binary does **not** append `--json` itself; the SDK bridge and the parity harness do). The parity harness checks this function against the binary's own routing on a corpus of argv. The pre-filter applies to default-resolved calls only, so it has no effect while `DEFAULT_ENGINE` is `"python"`.
+
+### Failover notice
+
+With `GSD_RUST_BACKEND=sandbox`, a guest fault other than a timeout is answered by host Rust inside the binary, and the binary prints exactly one line to its stderr:
 
 ```
-cargo build -p gsd-adapter --bin gsd_engine
-GSD_ENGINE=rust GSD_ENGINE_BIN="$PWD/target/debug/gsd_engine" python3 scripts/orch_status.py --correlation-id <id>
-GSD_ENGINE=rust GSD_RUST_BACKEND=sandbox GSD_ENGINE_BIN="$PWD/target/debug/gsd_engine" python3 scripts/orch_status.py --history <task_id>
+gsd_engine: sandbox fault <CODE>; answered by host Rust
 ```
 
-Parity harness, Python leg and Rust leg:
+`<CODE>` is the wire code of the fault (for example `E-DEP` or `E-INTERNAL`); the line carries no path, message or environment value. Stdout and the exit code are unchanged. The selector does not capture the binary's stderr, so the line reaches the caller's stderr. A guest answer (an error it reports included) and `E-TIMEOUT` print no notice. The harness records a failover as `fallback:<CODE>`.
+
+### Timeouts
+
+The binary applies a 600 s per-call deadline (`crates/gsd-adapter/src/bin/gsd_engine.rs`); it does not cover the binary's start-up or its stdin read. The selector therefore bounds the whole subprocess at 660 s (`RUST_CALL_TIMEOUT_S`). `GSD_RUST_TIMEOUT_S`, a positive integer number of seconds in ASCII digits, overrides the 660 s; any other value (empty, `0`, negative, decimal, text) is ignored. When the bound passes, Python kills the binary and the selector prints `E-TIMEOUT` (exit 2, "the gsd_engine binary did not answer within the call deadline"). `E-TIMEOUT` is never retried (D-P5-21: `invoke` never retries) and never falls back, explicit or not, and the selector writes no run-log record for it. Do not wrap the call in a retry loop. To get the Python answer, run the same call with `GSD_ENGINE=python`; the selector does not do that itself.
+
+### Fallback table
+
+What the selector (`run_rust`) does with one binary run. The binary's own sandbox failover (GA3) happens before this: a guest fault other than a timeout is answered by host Rust from the same snapshot (`E-CAPACITY` for a memory refusal, `E-DEP` for a module that fails to load or pin-check, `E-INTERNAL` for any other trap that is not a deadline). A reply the guest itself reports as an error passes through. Fuel exhaustion does not fail over: the read route always sets an epoch deadline, so `classify` (`crates/gsd-sandbox/src/wasmtime_limits.rs`) maps it to `E-TIMEOUT`.
+
+| The binary | The selector | Final? |
+|---|---|---|
+| Exit 0 or 1, stdout is one JSON object | Writes the run-log record (below), then prints the binary's stdout and returns its exit code | Yes |
+| Exit 0 or 1, and the run-log record cannot be written | The Python body answers, on its own rules | Python answers |
+| Exit 2, `error.code` is `E-INTERNAL`, `E-DEP`, `E-CAPACITY`, `E-CONTRACT` or `E-INPUT` | The Python body answers (this includes every refusal of a mutating or non-JSON argv, a verdict row with a signed envelope, an unknown task and a malformed id) | Python answers |
+| Exit 2 with a JSON object that has no typed `error.code` | The Python body answers | Python answers |
+| Exit 2, `error.code` is any other code (`E-TIMEOUT`, `E-POLICY`) | Writes a `script.orch_status.error` record, prints the binary's reply, exit 2. Python does not run | Yes |
+| Stdout is not a JSON object (crash, garbage, empty), or the exit code is not 0, 1 or 2 | The Python body answers | Python answers |
+| The binary cannot be started (missing, not executable) | Default call: the Python body answers. Explicit `rust`: `E-DEP`, exit 2 | Explicit: yes |
+| The binary does not answer within the bound | Kills it, prints `E-TIMEOUT`, exit 2, writes no record | Yes |
+| An argument cannot be encoded as UTF-8 for the request | The Python body answers without starting the binary | Python answers |
+
+The Python body prints its own bytes, which are text unless the caller passed `--json`; a default call always carries `--json` (the pre-filter), so only explicit `rust` can print text.
+
+### Run-log record (D1)
+
+The Python path writes one `script.orch_status` record to `$SWARM_DIR/events.jsonl` for every result (`script.orch_status.error` for exit 2), and the substrate tee and `scripts/receipt_export.py` read it. The binary writes none. After a Rust answer the selector calls `AgentScript.record_external_reply` (`swarm/script_base.py`), which builds the same record through the same `emit` path, with `tee` off for `--dry-run`, before it prints. Every call therefore appends exactly one record, whichever engine answered. The selector's own refusals (`E-TIMEOUT`, `E-DEP` for a missing binary, `E-INPUT` for a bad `GSD_ENGINE` or `GSD_RUST_BACKEND`) write none.
+
+### Build and run
+
+Build the binary, then run the read routes on it (`--json` is needed for the binary to serve the call):
+
+```
+cargo build -p gsd-adapter --bin gsd_engine --release --locked
+GSD_ENGINE=rust GSD_ENGINE_BIN="$PWD/target/release/gsd_engine" python3 scripts/orch_status.py --repo <repo> --correlation-id <id> --json
+GSD_ENGINE=rust GSD_RUST_BACKEND=sandbox GSD_ENGINE_BIN="$PWD/target/release/gsd_engine" python3 scripts/orch_status.py --repo <repo> --history <task_id> --json
+```
+
+Parity harness, Python leg and Rust legs:
 
 ```
 python3 tests/parity/harness.py
-GSD_ENGINE_BIN="$PWD/target/debug/gsd_engine" python3 tests/parity/harness.py --rust
+GSD_ENGINE_BIN="$PWD/target/release/gsd_engine" python3 tests/parity/harness.py --rust [--backend host|sandbox] [--json-out out.json]
+tests/parity/record_parity.sh "$PWD/target/release/gsd_engine" <output directory>
 ```
 
-Each exits 0 only when all 11 cases pass. `--rust` exits 1 when `GSD_ENGINE_BIN` is unset, not executable or cannot start; it never skips. A byte mismatch writes `tests/parity/fixtures/<case>-<digest>.json` and fails the case.
+Each harness run exits 0 only when all 11 cases pass. `--rust` exits 1 when `GSD_ENGINE_BIN` is unset, not executable or cannot start; it never skips. A byte mismatch writes `tests/parity/fixtures/<case>-<digest>.json` and fails the case. Every check records who answered (`rust`, `fallback:<CODE>` or `python`); `--json-out` writes the per-check results and the counts, which are per check and not per route call. `record_parity.sh` runs five legs (Python, Rust host, Rust sandbox, and the Python and Rust host legs with `SWARM_TASKSTORE_WAL=1`) and keeps the outputs with the binary's sha256, the git head and the load.
 
-Known differences from the Python route. They are recorded here, not fixed:
+### Rollback drill
 
-- The binary's own answer is always JSON, because it appends `--json` to argv itself.
-- A fallback to the Python body (steps 4 and 6) runs `scripts/orch_status.py` with the caller's argv and no added `--json`, so it prints text unless the caller passed `--json`. Under `GSD_ENGINE=rust` the output form depends on which side answers.
-- The Rust list path writes no run-log event. The Python path emits `script.orch_status`.
-- The binary applies a 600 s per-call deadline (`crates/gsd-adapter/src/bin/gsd_engine.rs`). The selector sets no timeout on the subprocess.
-- The binary reads stdin without a size cap.
-- Under `GSD_ENGINE=rust`, a misspelt `GSD_RUST_BACKEND` fails closed with `E-INPUT` and exit 2, with no Python fallback. The variable is read only under `GSD_ENGINE=rust`; otherwise it is ignored.
-- The default route is `python`. `parse_engine(None)` stays `Python`.
+The rollback is one switch: `GSD_ENGINE=python` (and `SWARM_PURE_PYTHON=1`, which also forces pure Python). Run this drill on a copy of a real `.swarm/` store after any change to the engine default, to see that the opt-outs answer with Python's bytes, leave the store alone and write one record per call. Run it from the repository checkout, with the signing environment the real runs use (the key is never printed), `REPO` the workspace root and `TASK` a task id of the store. It works on copies, so the live store is not touched. The list reply carries an `events` count, so every call starts from a fresh copy of the same state; otherwise the bytes differ by that count.
 
-Open sign-offs:
+```
+export REPO=/path/to/workspace TASK=T-0001        # TASK: any task id from the store
+export SWARM_DIR=$REPO/.swarm                     # the store under test, as the real runs resolve it
+LIVE="$SWARM_DIR"; DRILL=$(mktemp -d)
+cp -a "$LIVE" "$DRILL/start"
+export SWARM_DIR="$DRILL/run"
+count() { grep -c '"type": "script.orch_status"' "$SWARM_DIR/events.jsonl" 2>/dev/null || true; }
+db()    { sha256sum "$SWARM_DIR/tasks.db" | cut -d' ' -f1; }
+call() {   # call NAME [VAR=value ...] command ...
+  name=$1; shift
+  rm -rf "$SWARM_DIR"; cp -a "$DRILL/start" "$SWARM_DIR"
+  before_db=$(db); before_n=$(count); before_n=${before_n:-0}
+  env -u GSD_ENGINE -u SWARM_PURE_PYTHON "$@" > "$DRILL/$name.out" 2> "$DRILL/$name.err"; code=$?
+  echo "$name exit=$code records_added=$(( $(count) - before_n )) db_unchanged=$([ "$before_db" = "$(db)" ] && echo yes || echo NO) stderr_bytes=$(wc -c < "$DRILL/$name.err")"
+}
+for kind in list history; do
+  if [ $kind = list ]; then extra=(); else extra=(--history "$TASK"); fi
+  run=(python3 scripts/orch_status.py --repo "$REPO" "${extra[@]}" --json)
+  call $kind.python  GSD_ENGINE=python    "${run[@]}"
+  call $kind.pure    SWARM_PURE_PYTHON=1  "${run[@]}"
+  call $kind.default                      "${run[@]}"
+  for leg in pure default; do
+    cmp "$DRILL/$kind.python.out" "$DRILL/$kind.$leg.out" && echo "$kind.$leg: bytes equal GSD_ENGINE=python"
+  done
+done
+```
 
-- A10 runtime sign-off: open (`plan/wasmer-spike.md:654`).
-- A11 approval of the pin change: open (`plan/wasmer-spike.md:55`, `:572`).
-- A2 quiet-host performance baseline: waived (`.planning/ROADMAP.md:82`) and not measured. A default flip needs it.
-- `GSD_RUST_BACKEND=sandbox` stays opt-in until the A10 and A11 items are recorded.
+Pass criteria, for each of the six calls: `exit=0`, `records_added=1`, `db_unchanged=yes`, and for both calls that are not `GSD_ENGINE=python`, the `bytes equal` line. `GSD_ENGINE=python` and `SWARM_PURE_PYTHON=1` must never start the binary; to see that, add `GSD_ENGINE_BIN=<a script that appends to a marker file and answers differently>` to the `call` lines and check the marker (`tests/test_orch_status_rollback.py` does this). While the default is `python` all three legs are the Python body. After a flip the `default` leg may be answered by the binary (the `list` call always can; `history` on a task with a signed verdict is answered by Python after a failed Rust attempt, divergence D2); the criteria are the same, and a `default` leg that differs from `GSD_ENGINE=python` is a parity failure. The drill assumes the default rollback-journal mode: with `SWARM_TASKSTORE_WAL=1` the database file can change on open, so compare the replies and the record count only. Delete `$DRILL` when done.
+
+The same drill is pinned by `tests/test_orch_status_rollback.py` on a throwaway signed store: opt-outs never start a fake binary and print Python's bytes; a missing, non-executable, crashing, garbage-printing, `E-DEP`-answering or hanging binary under the default gives Python's bytes (a hang is `E-TIMEOUT` once the default is `rust`); rolling back after a served call leaves the store and the earlier record alone.
+
+### Known differences from the Python route
+
+Recorded here, not fixed:
+
+- The binary does not append `--json`. It passes argv through and serves only argv that contains `--json`; the SDK bridge and the harness append it. A fallback to the Python body runs `scripts/orch_status.py` with the caller's argv, so it prints text unless the caller passed `--json` (possible under explicit `rust` only).
+- The Rust list path used to write no run-log event. Through the selector it now does (above); the binary run directly writes none.
+- The selector bounds the subprocess at 660 s (`GSD_RUST_TIMEOUT_S` overrides); the binary's own deadline is 600 s.
+- The binary reads stdin without a size cap. The 100 000-byte cap applies to `--input` only.
+- A misspelt `GSD_RUST_BACKEND` fails closed with `E-INPUT`, exit 2, no Python fallback, whenever the selector is about to use the binary; otherwise it is ignored.
+- Rust's error envelope has `details: {}` and no `trace`; Python's `trace` exists only for untyped exceptions (divergence D3, accepted).
+- A history call on a task with a signed gate verdict, and a list that has an `IN_REVIEW` task with a signed row, is refused `E-DEP` by Rust and answered by Python (divergence D2, accepted): such a call pays one failed Rust attempt.
+- The default route is `python`. `parse_engine(None)` stays `Python`; the per-route table (`default_engine` in `route_table.rs`) decides for an unset or empty `GSD_ENGINE`, and every route except the `orch_status` read route is Python.
+
+### Open sign-offs and blockers
+
+- A10 runtime sign-off and A11 pin approval: given by the user in chat on 2026-10-26 ("for ship"); scope as recorded on 2026-10-28: the wasmtime runtime and the guest digest `ffa7b28a7879da7ea99a20c83999d0b79e757bd084878909dcce0054fe66cade`, with two accepted exceptions (the pin landed inside the combined commit `eb7a2b9`; `ci.yml` has no guest-digest step because a Rust test asserts the digest). Details: `tests/parity/flip_record.md`, "Sign-off record".
+- The default guest pin test is red (decision D-P25): the guest changed with the `gsd-route` edits since `f87dab7`, so the tree no longer builds the approved digest. The re-pin is folded into the Phase 14.5 pin and needs its own A11 approval. See `tests/parity/flip_record.md`, "Known open item".
+- A2 quiet-host performance baseline: not measured (1-minute load below 1.5 for ten minutes is required; `tests/perf/watch_quiet.sh` waits for it). A default flip needs it.
+- The user's approval of the flip. Until then the engine default is Python and `GSD_RUST_BACKEND=sandbox` stays opt-in.
 
 ## Rust redaction engine (opt-in)
 
