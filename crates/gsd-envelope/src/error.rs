@@ -12,6 +12,10 @@ pub enum Declined {
     KeyFileReference,
     /// No raw key variable is set and the conventional `signing-key.hex` file exists, so Python would load it.
     ConventionalKeyFile,
+    /// No raw key variable is set and the conventional `signing-key.hex` path cannot be classified the way Python's walk does: a
+    /// relative `XDG_CONFIG_HOME` or `HOME`, a symlinked or non-directory ancestor, an ancestor that cannot be opened, or an `lstat`
+    /// error other than "not found". Python reports a configuration error there and refuses even the dev key.
+    ConventionalKeyPath,
     /// A signing-related environment variable holds bytes that are not valid UTF-8; Python's handling of those is not reproduced.
     NonUnicodeEnvironment,
     /// The envelope is not a JSON object; Python's `_canonical` raises on it.
@@ -35,6 +39,9 @@ impl fmt::Display for Declined {
             }
             Declined::ConventionalKeyFile => {
                 "the conventional signing key file exists; only the Python engine opens key files"
+            }
+            Declined::ConventionalKeyPath => {
+                "the conventional signing key path is relative, behind a symlink or unreadable; only the Python engine decides"
             }
             Declined::NonUnicodeEnvironment => "a signing environment variable is not valid UTF-8",
             Declined::NotAnObject => "the envelope is not a JSON object",

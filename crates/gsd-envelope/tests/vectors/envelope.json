@@ -5668,6 +5668,3803 @@
    "text": "{\"type\":\"x\",\"payload\":{\"s\":\"\\ud83d\\u0041\"}}"
   }
  ],
+ "conventional": [
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "clean_no_config_dir/dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "clean_no_config_dir/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "clean_no_config_dir/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "clean_no_config_dir/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "clean_no_config_dir/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "clean_no_config_dir/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "clean_empty_agent_swarm_dir/dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "clean_empty_agent_swarm_dir/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "clean_empty_agent_swarm_dir/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "clean_empty_agent_swarm_dir/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "clean_empty_agent_swarm_dir/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "clean_empty_agent_swarm_dir/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg/agent-swarm"
+    ]
+   ],
+   "name": "clean_xdg_base/dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg/agent-swarm"
+    ]
+   ],
+   "name": "clean_xdg_base/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg/agent-swarm"
+    ]
+   ],
+   "name": "clean_xdg_base/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg/agent-swarm"
+    ]
+   ],
+   "name": "clean_xdg_base/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg/agent-swarm"
+    ]
+   ],
+   "name": "clean_xdg_base/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg/agent-swarm"
+    ]
+   ],
+   "name": "clean_xdg_base/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [],
+   "name": "unset_home_and_xdg/dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [],
+   "name": "unset_home_and_xdg/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [],
+   "name": "unset_home_and_xdg/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [],
+   "name": "unset_home_and_xdg/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "absent",
+   "layout": [],
+   "name": "unset_home_and_xdg/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [],
+   "name": "unset_home_and_xdg/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "empty_xdg_falls_back_to_home/dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "empty_xdg_falls_back_to_home/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "empty_xdg_falls_back_to_home/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "empty_xdg_falls_back_to_home/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "empty_xdg_falls_back_to_home/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "empty_xdg_falls_back_to_home/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg"
+    ]
+   ],
+   "name": "relative_home_beside_absolute_xdg/dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg"
+    ]
+   ],
+   "name": "relative_home_beside_absolute_xdg/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg"
+    ]
+   ],
+   "name": "relative_home_beside_absolute_xdg/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg"
+    ]
+   ],
+   "name": "relative_home_beside_absolute_xdg/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg"
+    ]
+   ],
+   "name": "relative_home_beside_absolute_xdg/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "absent",
+   "layout": [
+    [
+     "dir",
+     "xdg"
+    ]
+   ],
+   "name": "relative_home_beside_absolute_xdg/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_regular_file/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_regular_file/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_regular_file/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private signing references are unavailable in agent sessions",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_regular_file/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private signing references are unavailable in agent sessions",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_regular_file/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_regular_file/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "dir",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_directory/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "dir",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_directory/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "dir",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_directory/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private signing references are unavailable in agent sessions",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "dir",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_directory/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private signing references are unavailable in agent sessions",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "dir",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_directory/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "dir",
+     "home/.config/agent-swarm/signing-key.hex"
+    ]
+   ],
+   "name": "present_directory/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm/signing-key.hex",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "present_dangling_symlink/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm/signing-key.hex",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "present_dangling_symlink/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyFile",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm/signing-key.hex",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "present_dangling_symlink/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private signing references are unavailable in agent sessions",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm/signing-key.hex",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "present_dangling_symlink/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private signing references are unavailable in agent sessions",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm/signing-key.hex",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "present_dangling_symlink/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "present",
+   "layout": [
+    [
+     "dir",
+     "home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm/signing-key.hex",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "present_dangling_symlink/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "symlinked_config_dir_dangling/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "symlinked_config_dir_dangling/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "symlinked_config_dir_dangling/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "symlinked_config_dir_dangling/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "symlinked_config_dir_dangling/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/nowhere"
+    ]
+   ],
+   "name": "symlinked_config_dir_dangling/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config/agent-swarm"
+    ],
+    [
+     "file",
+     "real-config/agent-swarm/signing-key.hex"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir_holding_a_file/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config/agent-swarm"
+    ],
+    [
+     "file",
+     "real-config/agent-swarm/signing-key.hex"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir_holding_a_file/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config/agent-swarm"
+    ],
+    [
+     "file",
+     "real-config/agent-swarm/signing-key.hex"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir_holding_a_file/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private signing references are unavailable in agent sessions",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config/agent-swarm"
+    ],
+    [
+     "file",
+     "real-config/agent-swarm/signing-key.hex"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir_holding_a_file/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: private signing references are unavailable in agent sessions",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config/agent-swarm"
+    ],
+    [
+     "file",
+     "real-config/agent-swarm/signing-key.hex"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir_holding_a_file/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "dir",
+     "real-config/agent-swarm"
+    ],
+    [
+     "file",
+     "real-config/agent-swarm/signing-key.hex"
+    ],
+    [
+     "symlink",
+     "home/.config",
+     "{root}/real-config"
+    ]
+   ],
+   "name": "symlinked_config_dir_holding_a_file/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home",
+     "{root}/real-home"
+    ]
+   ],
+   "name": "symlinked_home/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home",
+     "{root}/real-home"
+    ]
+   ],
+   "name": "symlinked_home/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home",
+     "{root}/real-home"
+    ]
+   ],
+   "name": "symlinked_home/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home",
+     "{root}/real-home"
+    ]
+   ],
+   "name": "symlinked_home/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home",
+     "{root}/real-home"
+    ]
+   ],
+   "name": "symlinked_home/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-home/.config/agent-swarm"
+    ],
+    [
+     "symlink",
+     "home",
+     "{root}/real-home"
+    ]
+   ],
+   "name": "symlinked_home/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": null,
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-xdg/agent-swarm"
+    ],
+    [
+     "symlink",
+     "xdg",
+     "{root}/real-xdg"
+    ]
+   ],
+   "name": "symlinked_xdg_base/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": null,
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-xdg/agent-swarm"
+    ],
+    [
+     "symlink",
+     "xdg",
+     "{root}/real-xdg"
+    ]
+   ],
+   "name": "symlinked_xdg_base/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": null,
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-xdg/agent-swarm"
+    ],
+    [
+     "symlink",
+     "xdg",
+     "{root}/real-xdg"
+    ]
+   ],
+   "name": "symlinked_xdg_base/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": null,
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-xdg/agent-swarm"
+    ],
+    [
+     "symlink",
+     "xdg",
+     "{root}/real-xdg"
+    ]
+   ],
+   "name": "symlinked_xdg_base/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-xdg/agent-swarm"
+    ],
+    [
+     "symlink",
+     "xdg",
+     "{root}/real-xdg"
+    ]
+   ],
+   "name": "symlinked_xdg_base/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": null,
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "{root}/xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "real-xdg/agent-swarm"
+    ],
+    [
+     "symlink",
+     "xdg",
+     "{root}/real-xdg"
+    ]
+   ],
+   "name": "symlinked_xdg_base/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "dir",
+     "real-agent"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm",
+     "{root}/real-agent"
+    ]
+   ],
+   "name": "symlinked_agent_swarm_dir/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "dir",
+     "real-agent"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm",
+     "{root}/real-agent"
+    ]
+   ],
+   "name": "symlinked_agent_swarm_dir/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "dir",
+     "real-agent"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm",
+     "{root}/real-agent"
+    ]
+   ],
+   "name": "symlinked_agent_swarm_dir/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "dir",
+     "real-agent"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm",
+     "{root}/real-agent"
+    ]
+   ],
+   "name": "symlinked_agent_swarm_dir/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "dir",
+     "real-agent"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm",
+     "{root}/real-agent"
+    ]
+   ],
+   "name": "symlinked_agent_swarm_dir/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "dir",
+     "real-agent"
+    ],
+    [
+     "symlink",
+     "home/.config/agent-swarm",
+     "{root}/real-agent"
+    ]
+   ],
+   "name": "symlinked_agent_swarm_dir/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "file",
+     "home/.config"
+    ]
+   ],
+   "name": "regular_file_for_config_dir/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "file",
+     "home/.config"
+    ]
+   ],
+   "name": "regular_file_for_config_dir/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "file",
+     "home/.config"
+    ]
+   ],
+   "name": "regular_file_for_config_dir/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "file",
+     "home/.config"
+    ]
+   ],
+   "name": "regular_file_for_config_dir/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "file",
+     "home/.config"
+    ]
+   ],
+   "name": "regular_file_for_config_dir/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ],
+    [
+     "file",
+     "home/.config"
+    ]
+   ],
+   "name": "regular_file_for_config_dir/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "regular_file_for_agent_swarm_dir/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "regular_file_for_agent_swarm_dir/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference cannot be loaded safely",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "regular_file_for_agent_swarm_dir/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "regular_file_for_agent_swarm_dir/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "regular_file_for_agent_swarm_dir/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home/.config"
+    ],
+    [
+     "file",
+     "home/.config/agent-swarm"
+    ]
+   ],
+   "name": "regular_file_for_agent_swarm_dir/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "relative-xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "relative_xdg_config_home/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": "relative-xdg"
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference must be an absolute path",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "relative_xdg_config_home/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference must be an absolute path",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "XDG_CONFIG_HOME": "relative-xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "relative_xdg_config_home/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": "relative-xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "relative_xdg_config_home/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": "relative-xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "relative_xdg_config_home/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "{root}/home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": "relative-xdg"
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [
+    [
+     "dir",
+     "home"
+    ]
+   ],
+   "name": "relative_xdg_config_home/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference must be an absolute path",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference must be an absolute path",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": ".",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "dot_home/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": ".",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference must be an absolute path",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "dot_home/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference must be an absolute path",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": ".",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "dot_home/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": ".",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "dot_home/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": ".",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "dot_home/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": ".",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": null
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "dot_home/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home_with_empty_xdg/dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_REQUIRE_KEY": "1",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": "fail-closed: private Ed25519 signing reference must be an absolute path",
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home_with_empty_xdg/require",
+   "python": {
+    "error": "E-POLICY: fail-closed: private Ed25519 signing reference must be an absolute path",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home_with_empty_xdg/no_key",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "decline",
+   "declined_as": "ConventionalKeyPath",
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY_FILE": "",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home_with_empty_xdg/agent_session_empty_reference_dev_opt_in",
+   "python": {
+    "error": "E-POLICY: fail-closed: no signing key configured",
+    "ok": false
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home_with_empty_xdg/hmac_hides_the_path",
+   "python": {
+    "dev_key_audit": false,
+    "ok": true,
+    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+   }
+  },
+  {
+   "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
+   "class": "exact",
+   "declined_as": null,
+   "env": {
+    "HOME": "relative-home",
+    "SWARM_AGENT_SESSION": "1",
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "XDG_CONFIG_HOME": ""
+   },
+   "key_state": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   },
+   "kind": "unclear",
+   "layout": [],
+   "name": "relative_home_with_empty_xdg/agent_session_dev_opt_in",
+   "python": {
+    "dev_key_audit": true,
+    "ok": true,
+    "sig": "hmac:Kk6Ajh2ySgOK+ZH9KeZB3rRL7IOocJuiLbPMsNc2w94="
+   }
+  }
+ ],
  "dev_key": "dev-insecure-key",
  "dev_key_sha256": "0c324e01315f4b0cec3ac05a605b9463fb3550d2e1a95b707091328c56cf4ea7",
  "ed25519_public_keys": {
@@ -5676,6 +9473,603 @@
  },
  "key_notation": "@label[|transform...] is sha256(key_phrase + label) in hex; see the generator for the transforms; @dev is dev_key",
  "key_phrase": "agent-swarm gsd-envelope test vectors: derived key phrase, not a secret: ",
+ "key_state": [
+  {
+   "env": {},
+   "name": "no_seed/no_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_REQUIRE_KEY": "1"
+   },
+   "name": "no_seed/no_secret/no_opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1"
+   },
+   "name": "no_seed/no_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_REQUIRE_KEY": "1"
+   },
+   "name": "no_seed/no_secret/opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "no_seed/real_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "no_seed/real_secret/no_opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "no_seed/real_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "no_seed/real_secret/opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "no_seed/dev_value_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "no_seed/dev_value_secret/no_opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "no_seed/dev_value_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "no_seed/dev_value_secret/opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "no_seed/empty_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "no_seed/empty_secret/no_opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "no_seed/empty_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": true,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "no_seed/empty_secret/opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "name": "valid_seed/no_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1"
+   },
+   "name": "valid_seed/no_secret/no_opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "name": "valid_seed/no_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1"
+   },
+   "name": "valid_seed/no_secret/opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "valid_seed/real_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "valid_seed/real_secret/no_opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "valid_seed/real_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "valid_seed/real_secret/opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "valid_seed/dev_value_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "valid_seed/dev_value_secret/no_opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "valid_seed/dev_value_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "valid_seed/dev_value_secret/opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "valid_seed/empty_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "valid_seed/empty_secret/no_opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "valid_seed/empty_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "valid_seed/empty_secret/opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc"
+   },
+   "name": "bad_seed/no_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1"
+   },
+   "name": "bad_seed/no_secret/no_opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc"
+   },
+   "name": "bad_seed/no_secret/opt_in/no_require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1"
+   },
+   "name": "bad_seed/no_secret/opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "bad_seed/real_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "bad_seed/real_secret/no_opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "bad_seed/real_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "name": "bad_seed/real_secret/opt_in/require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": true
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "bad_seed/dev_value_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "bad_seed/dev_value_secret/no_opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "bad_seed/dev_value_secret/opt_in/no_require",
+   "python": {
+    "config_error": null,
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": "@dev"
+   },
+   "name": "bad_seed/dev_value_secret/opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "bad_seed/empty_secret/no_opt_in/no_require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "bad_seed/empty_secret/no_opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "bad_seed/empty_secret/opt_in/no_require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  },
+  {
+   "env": {
+    "SWARM_ALLOW_INSECURE_DEV_KEY": "1",
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_REQUIRE_KEY": "1",
+    "SWARM_SIGNING_KEY": ""
+   },
+   "name": "bad_seed/empty_secret/opt_in/require",
+   "python": {
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "dev_key_active": false,
+    "real_key_configured": false
+   }
+  }
+ ],
  "sign": [
   {
    "body_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}}",
@@ -8934,6 +13328,269 @@
    },
    "envelope_text": "1",
    "name": "non_object/number",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/small_order_r_identity",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:7P///////////////////////////////////////3/6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/small_order_r_order_two",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/small_order_r_order_four",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:xxdqcD1N2E+6PAt2DRBnDyogU/osOczGTsf9d5KsA3r6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/small_order_r_order_eight",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:7v///////////////////////////////////////3/6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/non_canonical_r_identity_as_p_plus_one",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:7f///////////////////////////////////////3/6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/non_canonical_r_order_four_as_p",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAID6uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "ed25519_edge/non_canonical_r_identity_with_sign_bit",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}",
+   "name": "ed25519_edge/small_order_r_identity_with_zero_s",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}",
+   "name": "ed25519_edge/real_r_with_zero_s",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCwA=\"}",
+   "name": "ed25519_edge/trailing_byte",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3a\"}",
+   "name": "ed25519_edge/one_byte_short",
+   "python": false,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCx==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_01",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCy==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_02",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCz==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_03",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC0==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_04",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC1==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_05",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC2==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_06",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC3==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_07",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC4==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_08",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC5==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_09",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC6==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_10",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC7==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_11",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC8==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_12",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC9==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_13",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC+==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_14",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aC/==\"}",
+   "name": "ed25519_edge/extra_trailing_bits_15",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0=\"}",
+   "name": "f5_parity/hmac_signature_beside_an_ed25519_signer",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_ED25519_KEY": "@ed-a|trunc",
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0=\"}",
+   "name": "f5_parity/hmac_signature_beside_a_malformed_ed25519_seed",
+   "python": true,
+   "rust": "match"
+  },
+  {
+   "env": {
+    "SWARM_SIGNING_KEY": "@hmac-a"
+   },
+   "envelope_text": "{\"msg_id\": \"00000000-0000-7000-8000-000000000001\", \"correlation_id\": \"corr-1\", \"trace_id\": \"trace-1\", \"causation_id\": null, \"source\": \"a08-qa\", \"target\": \"a01-orchestrator\", \"type\": \"gate.verdict\", \"schema\": \"swarm.v1.gate.verdict\", \"ts\": \"2026-10-28T00:00:00.000Z\", \"ttl_s\": 300, \"priority\": \"P2\", \"risk_class\": \"low\", \"payload\": {\"gate\": \"qa\", \"task_id\": \"T-1\", \"verdict\": \"APPROVED\", \"issued_at\": 1782604800.25, \"dry_run\": false}, \"sig\": \"ed25519:2jCXOAzAbJ78NsuKbWGz/RJu5q/3aH6Uv7ld5y4wlc76uSod2/ycLumtR5POzVvbu2kzemnCDYRfgprbmO3aCw==\"}",
+   "name": "f5_parity/ed25519_signature_is_not_downgraded_to_hmac",
    "python": false,
    "rust": "match"
   }

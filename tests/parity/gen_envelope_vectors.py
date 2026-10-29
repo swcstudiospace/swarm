@@ -161,8 +161,11 @@ def key_value(spec: str, dev_key: str) -> str:
 
 
 @contextlib.contextmanager
-def environment(values: Mapping[str, str]) -> Iterator[None]:
-    """Runs with exactly `values` in the signing-related environment; HOME and XDG point at an empty directory unless given."""
+def environment(values: Mapping[str, str | None]) -> Iterator[None]:
+    """Runs with exactly `values` in the signing-related environment; HOME and XDG point at an empty directory unless given.
+
+    A value of None removes the variable (after the defaults), so a layout vector can leave `HOME` or `XDG_CONFIG_HOME` unset.
+    """
     saved = {name: os.environ.get(name) for name in ENV_NAMES}
     with tempfile.TemporaryDirectory(prefix="gsd-envelope-vectors-") as empty:
         try:
@@ -170,7 +173,11 @@ def environment(values: Mapping[str, str]) -> Iterator[None]:
                 os.environ.pop(name, None)
             os.environ["HOME"] = empty
             os.environ["XDG_CONFIG_HOME"] = empty
-            os.environ.update(values)
+            for name, value in values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
             yield
         finally:
             for name, value in saved.items():
@@ -192,6 +199,11 @@ def resolve_env(spec: Mapping[str, str], dev_key: str) -> dict[str, str]:
     return {name: key_value(value, dev_key) for name, value in spec.items()}
 
 
+def resolve_layout_env(spec: Mapping[str, str | None], root: str, dev_key: str) -> dict[str, str | None]:
+    """Like `resolve_env` for a layout vector: `{root}` becomes the layout's directory and None leaves the variable unset."""
+    return {name: None if value is None else key_value(value.replace("{root}", root), dev_key) for name, value in spec.items()}
+
+
 def canonical_of(text: str) -> str | None:
     """The oracle's canonical bytes as text, or None when the oracle raises (a lone surrogate cannot be encoded)."""
     try:
@@ -200,10 +212,10 @@ def canonical_of(text: str) -> str | None:
         return None
 
 
-def oracle_sign(spec: Mapping[str, str], text: str, dev_key: str) -> dict[str, Any]:
+def oracle_sign(spec: Mapping[str, str | None], text: str, dev_key: str, root: str = "") -> dict[str, Any]:
     """`sign_envelope` of the body under the environment `spec`: the signature and the dev-key audit flag, or the error text."""
     body = json.loads(text)
-    with environment(resolve_env(spec, dev_key)):
+    with environment(resolve_layout_env(spec, root, dev_key)):
         try:
             ed_signer = oracle._ed25519_key()
             material = oracle._signing_hmac()
@@ -216,8 +228,19 @@ def oracle_sign(spec: Mapping[str, str], text: str, dev_key: str) -> dict[str, A
     return {"ok": True, "sig": body["sig"], "dev_key_audit": bool(audit)}
 
 
-def oracle_verify(spec: Mapping[str, str], envelope: dict[str, object], dev_key: str) -> bool | str:
-    with environment(resolve_env(spec, dev_key)):
+def oracle_key_state(spec: Mapping[str, str | None], dev_key: str, root: str = "") -> dict[str, Any]:
+    """The oracle's three key-state answers under `spec`: `real_key_configured()`, whether `insecure_dev_key()` returns the dev
+    key, and `signing_config_error()`."""
+    with environment(resolve_layout_env(spec, root, dev_key)):
+        return {
+            "real_key_configured": oracle.real_key_configured(),
+            "dev_key_active": oracle.insecure_dev_key() is not None,
+            "config_error": oracle.signing_config_error(),
+        }
+
+
+def oracle_verify(spec: Mapping[str, str | None], envelope: dict[str, object], dev_key: str) -> bool | str:
+    with environment(resolve_layout_env(spec, "", dev_key)):
         try:
             return oracle.verify_envelope(envelope)
         except UnicodeEncodeError:
@@ -289,6 +312,241 @@ SIGN_ENVS: list[tuple[str, Env, bool]] = [
 # Body names signed under every environment above (the rest of the bodies use the first four environments).
 SIGN_BODIES_ALL_ENVS = ("plain", "unicode")
 CORE_ENVS = ("hmac", "ed25519")
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# F-1: the conventional key-file path. Python walks `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` with O_NOFOLLOW and
+# treats every failure but "not found", a symlinked ancestor and a relative base as a configuration error, which refuses even the dev
+# key; the Rust crate must answer exactly where its `lstat` walk agrees and decline everywhere else. Each layout is built in a fresh
+# temporary directory (`{root}` in an environment value is that directory) by this generator and by the Rust test harness, from the
+# operations recorded in the vector file:
+#   ["dir", path]             make the directory and its parents
+#   ["file", path]            write a regular file with placeholder text (never a key)
+#   ["symlink", path, target] a symbolic link `path` -> `target` (`{root}` substituted in the target)
+# As root a `chmod 000` ancestor does not block `lstat` or `open`, so EACCES cannot be produced here; the Rust unit tests inject it.
+# ---------------------------------------------------------------------------------------------------------------------------------
+
+Layout = list[list[str]]
+LayoutEnv = dict[str, str | None]
+KEY_FILE_PATH = "home/.config/agent-swarm/signing-key.hex"
+REAL_TREE: Layout = [["dir", "home/.config/agent-swarm"]]
+HOME_ONLY: LayoutEnv = {"HOME": "{root}/home", "XDG_CONFIG_HOME": None}
+XDG_ONLY: LayoutEnv = {"HOME": None, "XDG_CONFIG_HOME": "{root}/xdg"}
+LAYOUT_PLACEHOLDER = "placeholder text, not a key\n"
+
+# (name, what Python's walk finds, operations, HOME/XDG environment). Kinds: absent (cleanly), present, unclear (a configuration error).
+LAYOUTS: list[tuple[str, str, Layout, LayoutEnv]] = [
+    ("clean_no_config_dir", "absent", [["dir", "home"]], HOME_ONLY),
+    ("clean_empty_agent_swarm_dir", "absent", REAL_TREE, HOME_ONLY),
+    ("clean_xdg_base", "absent", [["dir", "xdg/agent-swarm"]], XDG_ONLY),
+    ("unset_home_and_xdg", "absent", [], {"HOME": None, "XDG_CONFIG_HOME": None}),
+    ("empty_xdg_falls_back_to_home", "absent", REAL_TREE, {"HOME": "{root}/home", "XDG_CONFIG_HOME": ""}),
+    ("relative_home_beside_absolute_xdg", "absent", [["dir", "xdg"]], {"HOME": "relative-home", "XDG_CONFIG_HOME": "{root}/xdg"}),
+    ("present_regular_file", "present", [*REAL_TREE, ["file", KEY_FILE_PATH]], HOME_ONLY),
+    ("present_directory", "present", [*REAL_TREE, ["dir", KEY_FILE_PATH]], HOME_ONLY),
+    ("present_dangling_symlink", "present", [*REAL_TREE, ["symlink", KEY_FILE_PATH, "{root}/nowhere"]], HOME_ONLY),
+    (
+        "symlinked_config_dir",
+        "unclear",
+        [["dir", "home"], ["dir", "real-config"], ["symlink", "home/.config", "{root}/real-config"]],
+        HOME_ONLY,
+    ),
+    ("symlinked_config_dir_dangling", "unclear", [["dir", "home"], ["symlink", "home/.config", "{root}/nowhere"]], HOME_ONLY),
+    (
+        "symlinked_config_dir_holding_a_file",
+        "unclear",
+        [
+            ["dir", "home"],
+            ["dir", "real-config/agent-swarm"],
+            ["file", "real-config/agent-swarm/signing-key.hex"],
+            ["symlink", "home/.config", "{root}/real-config"],
+        ],
+        HOME_ONLY,
+    ),
+    ("symlinked_home", "unclear", [["dir", "real-home/.config/agent-swarm"], ["symlink", "home", "{root}/real-home"]], HOME_ONLY),
+    ("symlinked_xdg_base", "unclear", [["dir", "real-xdg/agent-swarm"], ["symlink", "xdg", "{root}/real-xdg"]], XDG_ONLY),
+    (
+        "symlinked_agent_swarm_dir",
+        "unclear",
+        [["dir", "home/.config"], ["dir", "real-agent"], ["symlink", "home/.config/agent-swarm", "{root}/real-agent"]],
+        HOME_ONLY,
+    ),
+    ("regular_file_for_config_dir", "unclear", [["dir", "home"], ["file", "home/.config"]], HOME_ONLY),
+    ("regular_file_for_agent_swarm_dir", "unclear", [["dir", "home/.config"], ["file", "home/.config/agent-swarm"]], HOME_ONLY),
+    ("relative_xdg_config_home", "unclear", [["dir", "home"]], {"HOME": "{root}/home", "XDG_CONFIG_HOME": "relative-xdg"}),
+    ("relative_home", "unclear", [], {"HOME": "relative-home", "XDG_CONFIG_HOME": None}),
+    ("dot_home", "unclear", [], {"HOME": ".", "XDG_CONFIG_HOME": None}),
+    ("relative_home_with_empty_xdg", "unclear", [], {"HOME": "relative-home", "XDG_CONFIG_HOME": ""}),
+]
+# (name, signing-related environment). The first three need the path to decide; the others show where Python never reaches it.
+LAYOUT_MODES: list[tuple[str, Env]] = [
+    ("dev_opt_in", DEV),
+    ("require", {"SWARM_REQUIRE_KEY": "1"}),
+    ("no_key", {}),
+    ("agent_session_empty_reference_dev_opt_in", {"SWARM_AGENT_SESSION": "1", "SWARM_ED25519_KEY_FILE": "", **DEV}),
+    ("hmac_hides_the_path", {**DEV, **HMAC_A}),
+    ("agent_session_dev_opt_in", {"SWARM_AGENT_SESSION": "1", **DEV}),
+]
+PATH_DECIDES = ("dev_opt_in", "require", "no_key")
+
+
+def layout_class(kind: str, mode: str) -> tuple[str, str | None]:
+    """How Rust must answer a layout vector: ("exact", None), or ("decline", the `Declined` variant it must return).
+
+    A present file is declined by every mode that reaches the path, and an agent session with an empty reference only asks whether
+    the file is present (Rust answers a present one exactly and declines an unclear path). An unclear path is declined by every mode
+    that reaches it. A clean absence never declines.
+    """
+    if kind == "absent":
+        return "exact", None
+    if kind == "present":
+        return ("decline", "ConventionalKeyFile") if mode in PATH_DECIDES else ("exact", None)
+    return ("decline", "ConventionalKeyPath") if mode in (*PATH_DECIDES, "agent_session_empty_reference_dev_opt_in") else ("exact", None)
+
+
+def build_layout(root: Path, operations: Layout) -> None:
+    for operation in operations:
+        target = root / operation[1]
+        if operation[0] == "dir":
+            target.mkdir(parents=True, exist_ok=True)
+        elif operation[0] == "file":
+            target.write_text(LAYOUT_PLACEHOLDER, encoding="ascii")
+        elif operation[0] == "symlink":
+            target.symlink_to(operation[2].replace("{root}", str(root)))
+        else:
+            raise ValueError(f"unknown layout operation {operation[0]}")
+
+
+def _check_layout_answer(name: str, kind: str, mode: str, answer: Mapping[str, Any]) -> None:
+    """The facts the vector documents, checked against the oracle's real answer."""
+    if kind == "absent" and mode == "dev_opt_in" and not (answer["ok"] and answer["dev_key_audit"]):
+        raise RuntimeError(f"{name}: the oracle must sign with the dev key on a clean absence")
+    if kind != "absent" and mode in PATH_DECIDES and answer["ok"]:
+        raise RuntimeError(f"{name}: the oracle must refuse where the path is {kind}")
+    if kind != "absent" and mode == "require" and not str(answer["error"]).startswith("E-POLICY: fail-closed: private Ed25519 signing reference"):
+        raise RuntimeError(f"{name}: the oracle must report the reference error under REQUIRE_KEY")
+
+
+def _layout_vectors(dev_key: str) -> list[dict[str, Any]]:
+    body = ALL_BODIES["plain"]
+    cases: list[dict[str, Any]] = []
+    for layout_name, kind, operations, base_env in LAYOUTS:
+        for mode, mode_env in LAYOUT_MODES:
+            name = f"{layout_name}/{mode}"
+            spec: LayoutEnv = {**base_env, **mode_env}
+            with tempfile.TemporaryDirectory(prefix="gsd-envelope-layout-") as tmp:
+                root = Path(tmp).resolve()
+                build_layout(root, operations)
+                answer = oracle_sign(spec, body, dev_key, str(root))
+                state = oracle_key_state(spec, dev_key, str(root))
+            _check_layout_answer(name, kind, mode, answer)
+            rust_class, declined_as = layout_class(kind, mode)
+            cases.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "layout": operations,
+                    "env": spec,
+                    "body_text": body,
+                    "python": answer,
+                    "key_state": state,
+                    "class": rust_class,
+                    "declined_as": declined_as,
+                }
+            )
+    return cases
+
+
+def _key_state_vectors(dev_key: str) -> list[dict[str, Any]]:
+    """`real_key_configured`, `insecure_dev_key() is not None` and `signing_config_error` for every combination of Ed25519 seed,
+    HMAC secret, dev-key opt-in and `SWARM_REQUIRE_KEY` (no key file anywhere: HOME and XDG name an empty directory)."""
+    seeds = [("no_seed", None), ("valid_seed", "@ed-a"), ("bad_seed", "@ed-a|trunc")]
+    secrets = [("no_secret", None), ("real_secret", "@hmac-a"), ("dev_value_secret", "@dev"), ("empty_secret", "")]
+    cases: list[dict[str, Any]] = []
+    for (seed_name, seed), (secret_name, secret), opt_in, require in itertools.product(seeds, secrets, (False, True), (False, True)):
+        spec: Env = {}
+        if seed is not None:
+            spec["SWARM_ED25519_KEY"] = seed
+        if secret is not None:
+            spec["SWARM_SIGNING_KEY"] = secret
+        if opt_in:
+            spec["SWARM_ALLOW_INSECURE_DEV_KEY"] = "1"
+        if require:
+            spec["SWARM_REQUIRE_KEY"] = "1"
+        name = f"{seed_name}/{secret_name}/{'opt_in' if opt_in else 'no_opt_in'}/{'require' if require else 'no_require'}"
+        cases.append({"name": name, "env": spec, "python": oracle_key_state(spec, dev_key)})
+    return cases
+
+
+# Compressed Edwards points a signature's R must not be: small order, and non-canonical spellings of the same points.
+SMALL_ORDER_R = {
+    "identity": bytes([1]) + bytes(31),
+    "order_two": bytes.fromhex("ec" + "ff" * 30 + "7f"),
+    "order_four": bytes(32),
+    "order_eight": bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+}
+NON_CANONICAL_R = {
+    "identity_as_p_plus_one": bytes.fromhex("ee" + "ff" * 30 + "7f"),
+    "order_four_as_p": bytes.fromhex("ed" + "ff" * 30 + "7f"),
+    "identity_with_sign_bit": bytes([1]) + bytes(30) + bytes([0x80]),
+}
+
+
+def _ed25519_edge_vectors(dev_key: str) -> list[dict[str, Any]]:
+    """Verify vectors for crafted Ed25519 signatures under `ED_A`: a small-order or non-canonical R, wrong lengths, and a last
+    base64 character with different unused bits (which Python's decoder ignores)."""
+    signed = _signed(ED_A, ALL_BODIES["plain"], dev_key)
+    sig = str(signed["sig"])
+    raw = base64.b64decode(sig.split(":", 1)[1])
+    r, s = raw[:32], raw[32:]
+    crafted: dict[str, str] = {}
+    for label, point in {**{f"small_order_r_{k}": v for k, v in SMALL_ORDER_R.items()}, **{f"non_canonical_r_{k}": v for k, v in NON_CANONICAL_R.items()}}.items():
+        crafted[label] = "ed25519:" + base64.b64encode(point + s).decode()
+    crafted["small_order_r_identity_with_zero_s"] = "ed25519:" + base64.b64encode(SMALL_ORDER_R["identity"] + bytes(32)).decode()
+    crafted["real_r_with_zero_s"] = "ed25519:" + base64.b64encode(r + bytes(32)).decode()
+    crafted["trailing_byte"] = "ed25519:" + base64.b64encode(raw + b"\x00").decode()
+    crafted["one_byte_short"] = "ed25519:" + base64.b64encode(raw[:-1]).decode()
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    data = sig.split(":", 1)[1].rstrip("=")
+    last = alphabet.index(data[-1])
+    for bits in range(16):
+        if bits != last & 15:
+            crafted[f"extra_trailing_bits_{bits:02d}"] = "ed25519:" + data[:-1] + alphabet[(last & ~15) | bits] + "=="
+    cases = []
+    for label, forged in crafted.items():
+        envelope = {**signed, "sig": forged}
+        cases.append(
+            {
+                "name": f"ed25519_edge/{label}",
+                "env": ED_A,
+                "envelope_text": json.dumps(envelope, ensure_ascii=False),
+                "python": oracle_verify(ED_A, envelope, dev_key),
+                "rust": "match",
+            }
+        )
+    return cases
+
+
+def _f5_vectors(dev_key: str) -> list[dict[str, Any]]:
+    """F-5 of the security review, pinned as Python's current behaviour kept for parity: an `hmac:` signature verifies while an
+    Ed25519 signer is configured (also when its seed is malformed), and an `ed25519:` signature is never downgraded to HMAC."""
+    hmac_signed = _signed(HMAC_A, ALL_BODIES["plain"], dev_key)
+    ed_signed = _signed(ED_A, ALL_BODIES["plain"], dev_key)
+    rows: list[tuple[str, Env, dict[str, Any]]] = [
+        ("hmac_signature_beside_an_ed25519_signer", {**HMAC_A, **ED_A}, hmac_signed),
+        ("hmac_signature_beside_a_malformed_ed25519_seed", {**HMAC_A, "SWARM_ED25519_KEY": "@ed-a|trunc"}, hmac_signed),
+        ("ed25519_signature_is_not_downgraded_to_hmac", HMAC_A, ed_signed),
+    ]
+    return [
+        {
+            "name": f"f5_parity/{label}",
+            "env": env,
+            "envelope_text": json.dumps(envelope, ensure_ascii=False),
+            "python": oracle_verify(env, envelope, dev_key),
+            "rust": "match",
+        }
+        for label, env, envelope in rows
+    ]
 
 
 def _mutate(env: dict[str, Any], mutation: str) -> dict[str, Any]:
@@ -537,6 +795,9 @@ def build_vectors() -> str:
             }
         )
 
+    verify.extend(_ed25519_edge_vectors(dev_key))
+    verify.extend(_f5_vectors(dev_key))
+
     base64_cases = []
     for text in _b64_inputs():
         decoded = oracle._b64(text)
@@ -553,6 +814,8 @@ def build_vectors() -> str:
         "sign": sign,
         "verify": verify,
         "base64": base64_cases,
+        "key_state": _key_state_vectors(dev_key),
+        "conventional": _layout_vectors(dev_key),
     }
     return json.dumps(vectors, indent=1, sort_keys=True, ensure_ascii=True) + "\n"
 

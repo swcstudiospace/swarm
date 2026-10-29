@@ -12,13 +12,77 @@ use crate::Declined;
 /// Hex digits for the `\u00XX` escape of a C0 control character.
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// An envelope that [`parse_envelope`] produced: the only input type of [`crate::sign_envelope`], [`crate::verify_envelope`] and
+/// [`canonical_bytes`].
+///
+/// `gsd_route::parse_json` silently turns a lone surrogate escape into U+FFFD where Python keeps the surrogate, so the signed
+/// bytes would differ without any error. A [`ParsedEnvelope`] can only come from [`parse_envelope`], which declines that text
+/// (and an integer outside `i64`, and `NaN`/`Infinity`), so no caller can reach signing or verification with a value parsed some
+/// other way.
+///
+/// Neither signing nor verifying accepts a value that did not come from [`parse_envelope`]. The first example is the working
+/// twin of the next two: the same set-up with a parsed envelope compiles and runs.
+///
+/// ```
+/// use gsd_envelope::{parse_envelope, sign_envelope, verify_envelope, KeyFilePresence, KeyMaterial};
+/// let keys = KeyMaterial::from_lookup(|_| None, |_| KeyFilePresence::Absent).unwrap();
+/// let mut parsed = parse_envelope("{}").unwrap();
+/// assert!(!verify_envelope(&parsed, &keys));
+/// assert!(sign_envelope(&mut parsed, &keys).is_err(), "no key is configured");
+/// ```
+///
+/// ```compile_fail,E0308
+/// use gsd_envelope::{verify_envelope, KeyFilePresence, KeyMaterial};
+/// let keys = KeyMaterial::from_lookup(|_| None, |_| KeyFilePresence::Absent).unwrap();
+/// let loose = gsd_route::parse_json("{}").unwrap();
+/// verify_envelope(&loose, &keys);
+/// ```
+///
+/// ```compile_fail,E0308
+/// use gsd_envelope::{sign_envelope, KeyFilePresence, KeyMaterial};
+/// let keys = KeyMaterial::from_lookup(|_| None, |_| KeyFilePresence::Absent).unwrap();
+/// let mut loose = gsd_route::parse_json("{}").unwrap();
+/// sign_envelope(&mut loose, &keys).ok();
+/// ```
+///
+/// ```compile_fail,E0451
+/// let forged = gsd_envelope::ParsedEnvelope { json: gsd_route::Json::Null };
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedEnvelope {
+    json: Json,
+}
+
+impl ParsedEnvelope {
+    /// The parsed value, for printing or inspection. It cannot be turned back into a [`ParsedEnvelope`].
+    pub fn as_json(&self) -> &Json {
+        &self.json
+    }
+
+    /// Sets the top-level `sig` member of an object (replacing it in place, or appending it) and leaves any other value alone.
+    pub(crate) fn set_sig(&mut self, signature: String) {
+        if let Json::Obj(fields) = &mut self.json {
+            match fields.iter_mut().find(|(name, _)| name == "sig") {
+                Some(slot) => slot.1 = Json::Str(signature),
+                None => fields.push(("sig".to_string(), Json::Str(signature))),
+            }
+        }
+    }
+
+    /// Test-only mutable access, so tests can tamper with a parsed envelope.
+    #[cfg(test)]
+    pub(crate) fn json_mut(&mut self) -> &mut Json {
+        &mut self.json
+    }
+}
+
 /// The bytes that are signed: the canonical form of `env` without its top-level `sig`.
 ///
 /// # Errors
 ///
 /// [`Declined::NotAnObject`] when `env` is not a JSON object.
-pub fn canonical_bytes(env: &Json) -> Result<Vec<u8>, Declined> {
-    let Json::Obj(fields) = env else {
+pub fn canonical_bytes(env: &ParsedEnvelope) -> Result<Vec<u8>, Declined> {
+    let Json::Obj(fields) = &env.json else {
         return Err(Declined::NotAnObject);
     };
     let mut out = String::new();
@@ -44,11 +108,13 @@ pub fn compact_json(value: &Json) -> Vec<u8> {
 /// # Errors
 ///
 /// [`Declined::LoneSurrogate`] or [`Declined::InvalidJson`]; in both cases Python answers.
-pub fn parse_envelope(text: &str) -> Result<Json, Declined> {
+pub fn parse_envelope(text: &str) -> Result<ParsedEnvelope, Declined> {
     if has_lone_surrogate_escape(text.as_bytes()) {
         return Err(Declined::LoneSurrogate);
     }
-    parse_json(text).map_err(|_| Declined::InvalidJson)
+    parse_json(text)
+        .map(|json| ParsedEnvelope { json })
+        .map_err(|_| Declined::InvalidJson)
 }
 
 fn write_value(value: &Json, out: &mut String) {
@@ -226,20 +292,21 @@ mod tests {
     #[test]
     fn compact_json_keeps_the_signature_member() -> TestResult {
         let env = parse_envelope(r#"{"b":1,"sig":"x","a":2}"#).map_err(|e| e.to_string())?;
-        assert_eq!(compact_json(&env), br#"{"a":2,"b":1,"sig":"x"}"#);
+        assert_eq!(compact_json(env.as_json()), br#"{"a":2,"b":1,"sig":"x"}"#);
         Ok(())
     }
 
     #[test]
-    fn canonical_bytes_declines_a_non_object() {
-        for value in [
-            Json::Null,
-            Json::Int(1),
-            Json::Arr(Vec::new()),
-            Json::Str("x".to_string()),
-        ] {
-            assert_eq!(canonical_bytes(&value), Err(Declined::NotAnObject));
+    fn canonical_bytes_declines_a_non_object() -> TestResult {
+        for text in ["null", "1", "[]", r#""x""#] {
+            let value = parse_envelope(text).map_err(|e| e.to_string())?;
+            assert_eq!(
+                canonical_bytes(&value),
+                Err(Declined::NotAnObject),
+                "{text}"
+            );
         }
+        Ok(())
     }
 
     #[test]

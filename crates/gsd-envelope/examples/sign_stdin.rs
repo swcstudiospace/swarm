@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     };
     match sign_envelope(&mut envelope, &keys) {
         Ok(_) => {
-            let mut line = compact_json(&envelope);
+            let mut line = compact_json(envelope.as_json());
             line.push(b'\n');
             if std::io::stdout().write_all(&line).is_err() {
                 return ExitCode::from(2);

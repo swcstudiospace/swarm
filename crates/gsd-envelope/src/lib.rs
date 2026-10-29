@@ -9,8 +9,12 @@
 //! with a [`Declined`] so the caller lets Python answer:
 //!
 //! * a key *file* reference (`SWARM_ED25519_KEY_FILE`, or the conventional `signing-key.hex` when it exists) is never opened here;
+//! * a conventional key-file path that Python's `O_NOFOLLOW` walk would reject (a relative `XDG_CONFIG_HOME` or `HOME`, a symlinked
+//!   or non-directory ancestor, any `lstat` failure other than "not found") is declined, because Python then refuses even the
+//!   dev key; the path is classified with `lstat` only ([`conventional_key_file_presence`]);
 //! * an envelope text Python's `json.loads` accepts but this crate's JSON layer cannot represent exactly (an integer outside `i64`,
-//!   the `NaN` and `Infinity` literals, a lone surrogate escape) is declined by [`parse_envelope`];
+//!   the `NaN` and `Infinity` literals, a lone surrogate escape) is declined by [`parse_envelope`], and only a [`ParsedEnvelope`],
+//!   which [`parse_envelope`] alone produces, can be signed or verified;
 //! * an environment value that is not valid Unicode is declined.
 //!
 //! Differences that are deliberate and documented: the Python `cryptography` package is optional and Python fails closed without
@@ -26,7 +30,7 @@ mod envelope;
 mod error;
 mod keys;
 
-pub use canonical::{canonical_bytes, compact_json, parse_envelope};
+pub use canonical::{canonical_bytes, compact_json, parse_envelope, ParsedEnvelope};
 pub use envelope::{sign_envelope, verify_envelope, SignOutcome};
 pub use error::{Declined, SignError};
-pub use keys::KeyMaterial;
+pub use keys::{conventional_key_file_presence, KeyFilePresence, KeyMaterial};

@@ -11,7 +11,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::keys::{HmacKey, KeyMaterial, NO_SIGNING_KEY};
-use crate::{base64, canonical_bytes, Declined, SignError};
+use crate::{base64, canonical_bytes, Declined, ParsedEnvelope, SignError};
 
 /// What a successful [`sign_envelope`] reports besides the signed envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,10 @@ fn hmac_sha256(key: &HmacKey, data: &[u8]) -> Option<Vec<u8>> {
 ///
 /// [`SignError::Policy`] with Python's `E-POLICY` text for a key misconfiguration or when no key may sign;
 /// [`SignError::Declined`] when `env` is not an object.
-pub fn sign_envelope(env: &mut Json, keys: &KeyMaterial) -> Result<SignOutcome, SignError> {
+pub fn sign_envelope(
+    env: &mut ParsedEnvelope,
+    keys: &KeyMaterial,
+) -> Result<SignOutcome, SignError> {
     if let Some(message) = keys.config_error {
         return Err(SignError::Policy(SeamError::new(
             ErrorCode::Policy,
@@ -61,19 +64,17 @@ pub fn sign_envelope(env: &mut Json, keys: &KeyMaterial) -> Result<SignOutcome, 
             NO_SIGNING_KEY,
         )));
     };
-    if let Json::Obj(fields) = env {
-        match fields.iter_mut().find(|(name, _)| name == "sig") {
-            Some(slot) => slot.1 = Json::Str(signature),
-            None => fields.push(("sig".to_string(), Json::Str(signature))),
-        }
-    }
+    env.set_sig(signature);
     Ok(SignOutcome { dev_key_audit })
 }
 
 /// Verifies the top-level `sig` of `env` against the configured keys. `false` for anything that is not a valid signature,
 /// including a missing or non-string `sig`, an unknown prefix, bad base64, a missing key and a non-object `env`.
-pub fn verify_envelope(env: &Json, keys: &KeyMaterial) -> bool {
-    let Json::Obj(fields) = env else {
+///
+/// An `hmac:` signature verifies under any configured HMAC secret, also beside an Ed25519 signer; that is Python's behaviour and
+/// is kept for parity. Whether to refuse `hmac:` once an Ed25519 signer is loaded is a decision for the user, not for this crate.
+pub fn verify_envelope(env: &ParsedEnvelope, keys: &KeyMaterial) -> bool {
+    let Json::Obj(fields) = env.as_json() else {
         return false;
     };
     let Some(Json::Str(sig)) = obj_get(fields, "sig") else {
@@ -118,7 +119,7 @@ mod tests {
     use sha2::Digest;
 
     use super::*;
-    use crate::parse_envelope;
+    use crate::{parse_envelope, KeyFilePresence};
 
     type TestResult = Result<(), String>;
 
@@ -142,17 +143,17 @@ mod tests {
                 )
             })
             .collect();
-        KeyMaterial::from_lookup(|name| map.get(name).cloned(), |_| false)
+        KeyMaterial::from_lookup(|name| map.get(name).cloned(), |_| KeyFilePresence::Absent)
             .map_err(|e| e.to_string())
     }
 
-    fn body() -> Result<Json, String> {
+    fn body() -> Result<ParsedEnvelope, String> {
         parse_envelope(r#"{"msg_id":"m1","type":"gate.verdict","ttl_s":300,"score":0.5,"payload":{"verdict":"APPROVED","n":[1,2.5,"\u00e9"]}}"#)
             .map_err(|e| e.to_string())
     }
 
-    fn sig_of(env: &Json) -> Option<String> {
-        match env {
+    fn sig_of(env: &ParsedEnvelope) -> Option<String> {
+        match env.as_json() {
             Json::Obj(fields) => match obj_get(fields, "sig") {
                 Some(Json::Str(sig)) => Some(sig.clone()),
                 _ => None,
@@ -208,7 +209,7 @@ mod tests {
                 !verify_envelope(&env, &keys(&[])?),
                 "{prefix} fails without a key"
             );
-            let Json::Obj(fields) = &mut env else {
+            let Json::Obj(fields) = env.json_mut() else {
                 return Err("not an object".to_string());
             };
             fields[0].1 = Json::Str("m2".to_string());
@@ -251,7 +252,7 @@ mod tests {
         sign_envelope(&mut env, &keys).map_err(|e| e.to_string())?;
         sign_envelope(&mut plain, &keys).map_err(|e| e.to_string())?;
         assert_eq!(sig_of(&env), sig_of(&plain));
-        let Json::Obj(fields) = &env else {
+        let Json::Obj(fields) = env.as_json() else {
             return Err("not an object".to_string());
         };
         assert_eq!(
@@ -294,16 +295,17 @@ mod tests {
         ];
         for sig in bad_sigs {
             let mut candidate = body()?;
-            if let Json::Obj(fields) = &mut candidate {
+            if let Json::Obj(fields) = candidate.json_mut() {
                 fields.push(("sig".to_string(), sig.clone()));
             }
             assert!(!verify_envelope(&candidate, &keys), "{sig:?}");
         }
-        for not_an_object in [Json::Null, Json::Arr(Vec::new()), Json::Str(good.clone())] {
-            assert!(!verify_envelope(&not_an_object, &keys));
+        for text in ["null".to_string(), "[]".to_string(), format!("\"{good}\"")] {
+            let not_an_object = parse_envelope(&text).map_err(|e| e.to_string())?;
+            assert!(!verify_envelope(&not_an_object, &keys), "{text}");
         }
         let mut without_sig = body()?;
-        if let Json::Obj(fields) = &mut without_sig {
+        if let Json::Obj(fields) = without_sig.json_mut() {
             fields.retain(|(name, _)| name != "sig");
         }
         assert!(!verify_envelope(&without_sig, &keys));
@@ -327,7 +329,7 @@ mod tests {
         let variant = alphabet[(index & !3) | ((index + 1) & 3)];
         let respelled = format!("{head}{}=", char::from(variant));
         assert_ne!(respelled, sig);
-        let Json::Obj(fields) = &mut env else {
+        let Json::Obj(fields) = env.json_mut() else {
             return Err("not an object".to_string());
         };
         fields.retain(|(name, _)| name != "sig");
@@ -359,7 +361,7 @@ mod tests {
             carry = sum >> 8;
         }
         assert_eq!(carry, 0, "S + L must still fit in 32 bytes");
-        let Json::Obj(fields) = &mut env else {
+        let Json::Obj(fields) = env.json_mut() else {
             return Err("not an object".to_string());
         };
         fields.retain(|(name, _)| name != "sig");
@@ -402,7 +404,7 @@ mod tests {
 
     #[test]
     fn sign_declines_a_non_object_only_after_the_key_checks() -> TestResult {
-        let mut not_object = Json::Arr(Vec::new());
+        let mut not_object = parse_envelope("[]").map_err(|e| e.to_string())?;
         assert_eq!(
             sign_envelope(&mut not_object, &keys(&[("SWARM_SIGNING_KEY", "@hmac")])?),
             Err(SignError::Declined(Declined::NotAnObject))
@@ -480,7 +482,7 @@ mod tests {
             match sign_envelope(&mut env, &material) {
                 Ok(outcome) => texts.push(format!(
                     "{outcome:?} {}",
-                    String::from_utf8_lossy(&crate::compact_json(&env))
+                    String::from_utf8_lossy(&crate::compact_json(env.as_json()))
                 )),
                 Err(error) => texts.push(format!("{error} {error:?}")),
             }
@@ -488,6 +490,40 @@ mod tests {
         for text in texts {
             assert!(!text.contains(secret) && !text.contains(bad_seed), "{text}");
         }
+        Ok(())
+    }
+
+    /// F-5 of the U3.4 security review. With an Ed25519 signer AND an HMAC secret configured, an `hmac:` envelope still verifies,
+    /// so a holder of only the shared HMAC secret can forge a verdict that passes; and a malformed `SWARM_ED25519_KEY` beside a
+    /// set `SWARM_SIGNING_KEY` silently downgrades signing to HMAC with no configuration error. Both are PYTHON'S behaviour today
+    /// (`verify_envelope` dispatches on the prefix and `_signing_hmac()` ignores the Ed25519 signer; `signing_config_error`
+    /// stays quiet when both raw variables are set) and are kept here for parity. Tightening either changes what Python accepts
+    /// and needs a user decision: do not "fix" this test or the code behind it without one.
+    #[test]
+    fn hmac_verifies_beside_an_ed25519_signer_because_python_does_parity_kept_pending_a_user_decision(
+    ) -> TestResult {
+        let both = keys(&[("SWARM_SIGNING_KEY", "@hmac"), ("SWARM_ED25519_KEY", "@ed")])?;
+        let mut forged = body()?;
+        sign_envelope(&mut forged, &keys(&[("SWARM_SIGNING_KEY", "@hmac")])?)
+            .map_err(|e| e.to_string())?;
+        assert!(sig_of(&forged).is_some_and(|sig| sig.starts_with("hmac:")));
+        assert!(
+            verify_envelope(&forged, &both),
+            "an hmac: envelope made with the shared secret alone verifies while an Ed25519 signer is configured"
+        );
+
+        let downgraded = keys(&[("SWARM_SIGNING_KEY", "@hmac"), ("SWARM_ED25519_KEY", "zz")])?;
+        assert_eq!(
+            downgraded.config_error(),
+            None,
+            "no configuration error is raised"
+        );
+        let mut env = body()?;
+        sign_envelope(&mut env, &downgraded).map_err(|e| e.to_string())?;
+        assert!(
+            sig_of(&env).is_some_and(|sig| sig.starts_with("hmac:")),
+            "a malformed Ed25519 seed beside an HMAC secret signs with HMAC"
+        );
         Ok(())
     }
 }

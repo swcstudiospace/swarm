@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -138,3 +139,30 @@ def test_rust_refuses_where_python_refuses(sign_bin: str, mode: str) -> None:
 def test_rust_declines_bodies_it_cannot_represent_exactly(sign_bin: str, body_name: str) -> None:
     done = run_sign(sign_bin, gen.HMAC_A, gen.RUST_DECLINES[body_name])
     assert done.returncode == 3 and done.stdout == "", done.stderr
+
+
+@pytest.mark.parametrize("mode", [name for name, _env in gen.LAYOUT_MODES])
+@pytest.mark.parametrize("layout_name", [layout[0] for layout in gen.LAYOUTS])
+def test_rust_signer_follows_python_on_conventional_key_paths(sign_bin: str, layout_name: str, mode: str) -> None:
+    """F-1: where Python's O_NOFOLLOW walk refuses (even the dev key), the Rust signer must decline (exit 3, nothing printed) and
+    never sign; where its `lstat` walk agrees with Python it must answer exactly as Python does."""
+    _name, kind, operations, base_env = next(layout for layout in gen.LAYOUTS if layout[0] == layout_name)
+    spec: gen.LayoutEnv = {**base_env, **dict(gen.LAYOUT_MODES)[mode]}
+    rust_class, _declined_as = gen.layout_class(kind, mode)
+    dev_key = gen.public_dev_key()
+    with tempfile.TemporaryDirectory(prefix="gsd-envelope-layout-test-") as tmp:
+        root = Path(tmp).resolve()
+        gen.build_layout(root, operations)
+        answer = gen.oracle_sign(spec, gen.BODIES["plain"], dev_key, str(root))
+        env = {"PATH": os.environ.get("PATH", "")}
+        env.update({name: value for name, value in gen.resolve_layout_env(spec, str(root), dev_key).items() if value is not None})
+        done = subprocess.run([sign_bin], input=gen.BODIES["plain"], capture_output=True, text=True, env=env, timeout=RUN_TIMEOUT_S, check=False)
+    if rust_class == "decline":
+        assert answer["ok"] is False, "a declined layout is one where Python refuses"
+        assert done.returncode == 3 and done.stdout == "" and "declined" in done.stderr, (done.returncode, done.stderr)
+    elif answer["ok"]:
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout)["sig"] == answer["sig"]
+    else:
+        assert done.returncode == 1 and done.stdout == "", (done.returncode, done.stderr)
+        assert done.stderr.strip() == answer["error"]

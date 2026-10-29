@@ -2,6 +2,7 @@
 name = "gsd-envelope"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Host-side swarm envelope canonical form, signing and verification (HMAC-SHA256 and Ed25519) with Python's key precedence; the only GSD-Core crate that reads signing keys"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/swcstudiospace/agent-swarm"

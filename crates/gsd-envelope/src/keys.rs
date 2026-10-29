@@ -9,7 +9,8 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
@@ -29,6 +30,80 @@ const REQUIRE_WITHOUT_KEY: &str = "fail-closed: SWARM_REQUIRE_KEY=1 but no signi
 /// The message of the refusal to sign when no key may sign (Python `sign_envelope`, `E-POLICY`).
 pub(crate) const NO_SIGNING_KEY: &str = "fail-closed: no signing key configured";
 
+/// What the conventional key-file path holds, decided without opening the file. The rules are those of the path walk in
+/// `swarm/envelope.py` (`_private_seed`): that walk opens every directory with `O_NOFOLLOW`, treats a missing component as "no
+/// file" and every other failure as a configuration error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFilePresence {
+    /// The first missing component is reached through real directories only: Python finds no file and stays keyless.
+    Absent,
+    /// Every ancestor is a real directory and the last component exists (whatever it is): Python would try to load it.
+    Present,
+    /// The path cannot be classified the way Python's walk would: a relative path, a symlinked or non-directory ancestor, an
+    /// ancestor that cannot be opened, or any error other than "not found". Python reports a configuration error here, so a
+    /// caller must not answer for it.
+    Unclear,
+}
+
+/// What one path component is, by `lstat` (no link is followed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// `lstat` of `path`; a directory must also be openable for reading, as Python opens each ancestor with `O_RDONLY`.
+fn lstat_entry(path: &Path) -> io::Result<EntryKind> {
+    let file_type = std::fs::symlink_metadata(path)?.file_type();
+    if file_type.is_symlink() {
+        Ok(EntryKind::Symlink)
+    } else if file_type.is_dir() {
+        std::fs::read_dir(path).map(|_| EntryKind::Directory)
+    } else {
+        Ok(EntryKind::Other)
+    }
+}
+
+/// Classifies the conventional key-file `path` on the real file system, without opening the file.
+///
+/// A relative path is [`KeyFilePresence::Unclear`] (Python refuses it as a configuration error). Otherwise each component is
+/// inspected with `lstat`, from the root down: the result is [`KeyFilePresence::Absent`] only when the first missing component
+/// fails with "not found" and every component before it is a real directory (not a symlink) that can be read;
+/// [`KeyFilePresence::Present`] when all ancestors are such directories and the last component exists; anything else is
+/// [`KeyFilePresence::Unclear`].
+pub fn conventional_key_file_presence(path: &Path) -> KeyFilePresence {
+    classify_path(path, lstat_entry)
+}
+
+/// The walk of [`conventional_key_file_presence`] over an injectable `lstat`.
+fn classify_path(path: &Path, lstat: impl Fn(&Path) -> io::Result<EntryKind>) -> KeyFilePresence {
+    if !path.is_absolute() {
+        return KeyFilePresence::Unclear;
+    }
+    let mut seen = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        if !matches!(
+            component,
+            Component::RootDir | Component::Normal(_) | Component::ParentDir
+        ) {
+            return KeyFilePresence::Unclear;
+        }
+        seen.push(component);
+        match lstat(&seen) {
+            Ok(_) if components.peek().is_none() => return KeyFilePresence::Present,
+            Ok(EntryKind::Directory) => {}
+            Ok(EntryKind::Symlink | EntryKind::Other) => return KeyFilePresence::Unclear,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return KeyFilePresence::Absent
+            }
+            Err(_) => return KeyFilePresence::Unclear,
+        }
+    }
+    KeyFilePresence::Unclear
+}
+
 /// The HMAC secret that signs and verifies `hmac:` signatures.
 pub(crate) struct HmacKey {
     /// Secret bytes (`SWARM_SIGNING_KEY` as UTF-8, or the public dev key).
@@ -38,10 +113,16 @@ pub(crate) struct HmacKey {
 }
 
 /// The signing keys the process environment configures, with the outcome of Python's fail-closed checks.
+///
+/// Callers decide "is a real key configured" and "is the dev key in play" only through [`KeyMaterial::real_key_configured`] and
+/// [`KeyMaterial::dev_key_active`], never from whether an HMAC secret is present: that secret can be the public dev key, and a
+/// configured real secret can coexist with an active dev-key opt-in.
 pub struct KeyMaterial {
     pub(crate) ed25519: Option<SigningKey>,
     pub(crate) hmac: Option<HmacKey>,
     pub(crate) config_error: Option<&'static str>,
+    real_key: bool,
+    dev_key_allowed: bool,
 }
 
 /// The signing-related environment, read once. Empty strings count as unset except for the key file reference.
@@ -116,20 +197,23 @@ fn seed_from_hex(raw: &str) -> Option<Zeroizing<[u8; 32]>> {
 }
 
 impl KeyMaterial {
-    /// Resolves the keys from the process environment and the real file system (existence of the conventional key file only).
+    /// Resolves the keys from the process environment and the real file system (the conventional key file is classified with
+    /// `lstat` and never opened).
     ///
     /// # Errors
     ///
-    /// [`Declined`] when a key file reference would be consulted or an environment value is not UTF-8; Python answers then.
+    /// [`Declined`] when a key file reference would be consulted, the conventional key-file path cannot be classified, or an
+    /// environment value is not UTF-8; Python answers then.
     pub fn from_env() -> Result<Self, Declined> {
         Self::from_lookup(
             |name| std::env::var_os(name),
-            |path| path.symlink_metadata().is_ok(),
+            conventional_key_file_presence,
         )
     }
 
-    /// Resolves the keys from an arbitrary environment. `get` looks a variable up; `conventional_exists` says whether a path
-    /// exists (Python `os.path.lexists`). The file is never opened.
+    /// Resolves the keys from an arbitrary environment. `get` looks a variable up; `presence` classifies the conventional
+    /// key-file path (see [`conventional_key_file_presence`]) and is called only when Python's answer depends on the file. The
+    /// file is never opened.
     ///
     /// The variables read are `SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY`, `SWARM_ED25519_KEY_FILE`, `SWARM_AGENT_SESSION`,
     /// `SWARM_ALLOW_INSECURE_DEV_KEY`, `SWARM_REQUIRE_KEY`, `XDG_CONFIG_HOME` and `HOME`.
@@ -138,15 +222,18 @@ impl KeyMaterial {
     ///
     /// [`Declined::NonUnicodeEnvironment`] for a non-UTF-8 value; [`Declined::KeyFileReference`] when `SWARM_ED25519_KEY_FILE` is
     /// set and Python would reach it (no raw key variable set, not an agent session); [`Declined::ConventionalKeyFile`] when the
-    /// same holds for an existing conventional file.
+    /// same holds for an existing conventional file; [`Declined::ConventionalKeyPath`] when the same holds for a conventional
+    /// path that is [`KeyFilePresence::Unclear`] (Python then reports a configuration error and refuses even the dev key), or
+    /// when an agent session with an empty `SWARM_ED25519_KEY_FILE` would have its `supplied` decision made by such a path.
     pub fn from_lookup(
         get: impl Fn(&str) -> Option<OsString>,
-        conventional_exists: impl Fn(&Path) -> bool,
+        presence: impl Fn(&Path) -> KeyFilePresence,
     ) -> Result<Self, Declined> {
         let env = Environment::read(&get)?;
-        let conventional_present = env
-            .conventional_reference()
-            .is_some_and(|path| conventional_exists(&path));
+        let conventional = || {
+            env.conventional_reference()
+                .map_or(KeyFilePresence::Absent, |path| presence(&path))
+        };
 
         // `_ed25519_material`: (signer, error). The raw seed wins, then a raw HMAC key hides every file reference.
         let (ed25519, ed25519_error) = match (&env.ed25519_key, &env.signing_key) {
@@ -159,8 +246,11 @@ impl KeyMaterial {
                 (None, env.key_file.as_ref().map(|_| AGENT_SESSION_REFERENCE))
             }
             (None, None) if env.key_file.is_some() => return Err(Declined::KeyFileReference),
-            (None, None) if conventional_present => return Err(Declined::ConventionalKeyFile),
-            (None, None) => (None, None),
+            (None, None) => match conventional() {
+                KeyFilePresence::Absent => (None, None),
+                KeyFilePresence::Present => return Err(Declined::ConventionalKeyFile),
+                KeyFilePresence::Unclear => return Err(Declined::ConventionalKeyPath),
+            },
         };
 
         // `insecure_dev_key` then `_signing_hmac`: a configured secret that is not the public dev value always wins.
@@ -178,13 +268,19 @@ impl KeyMaterial {
             _ => None,
         };
 
-        // `signing_config_error`.
+        // `signing_config_error`. Python's `_signing_key_supplied` also counts an existing conventional file; that only decides
+        // anything when no variable supplies a key and the material carries an error, which is the agent-session case above.
         let key_file_named = env.key_file.as_deref().is_some_and(|file| !file.is_empty());
         let supplied = env.signing_key.is_some()
             || env.ed25519_key.is_some()
             || key_file_named
             || env.require_key
-            || conventional_present;
+            || (ed25519_error.is_some()
+                && match conventional() {
+                    KeyFilePresence::Absent => false,
+                    KeyFilePresence::Present => true,
+                    KeyFilePresence::Unclear => return Err(Declined::ConventionalKeyPath),
+                });
         let real_key =
             ed25519.is_some() || env.signing_key.as_deref().is_some_and(|key| key != DEV_KEY);
         let both_raw_set = env.signing_key.is_some() && env.ed25519_key.is_some();
@@ -199,12 +295,31 @@ impl KeyMaterial {
             ed25519,
             hmac,
             config_error,
+            real_key,
+            dev_key_allowed,
         })
     }
 
     /// Why a signature made now could never verify (Python `signing_config_error`), or `None`. A message is a fixed string.
     pub fn config_error(&self) -> Option<&'static str> {
         self.config_error
+    }
+
+    /// Python's `real_key_configured()`: true when a loadable Ed25519 seed or a non-dev `SWARM_SIGNING_KEY` is configured.
+    ///
+    /// This is the only way to ask. An HMAC secret being present proves nothing: it can be the public dev key.
+    pub fn real_key_configured(&self) -> bool {
+        self.real_key
+    }
+
+    /// Whether Python's `insecure_dev_key()` returns the dev key: `SWARM_ALLOW_INSECURE_DEV_KEY=1`, no Ed25519 signer, no
+    /// Ed25519 loading error and `SWARM_REQUIRE_KEY` not `1`.
+    ///
+    /// This is the only way to ask. It stays true beside a real `SWARM_SIGNING_KEY` (Python then still returns the dev key from
+    /// `insecure_dev_key()`, though the real secret signs), and an HMAC secret being present does not imply it. A caller that
+    /// refuses unless "a real key is configured or the dev key is active" must test both accessors.
+    pub fn dev_key_active(&self) -> bool {
+        self.dev_key_allowed
     }
 
     /// The Ed25519 public key (never the seed) of the configured signer, if one loaded.
@@ -226,6 +341,8 @@ impl fmt::Debug for KeyMaterial {
                 &self.hmac.as_ref().is_some_and(|key| key.implicit_dev),
             )
             .field("config_error", &self.config_error)
+            .field("real_key_configured", &self.real_key)
+            .field("dev_key_active", &self.dev_key_allowed)
             .finish()
     }
 }
@@ -254,6 +371,19 @@ mod tests {
     }
 
     fn resolve(vars: Vars, exists: bool) -> Result<KeyMaterial, Declined> {
+        let presence = if exists {
+            KeyFilePresence::Present
+        } else {
+            KeyFilePresence::Absent
+        };
+        resolve_with(vars, presence).0
+    }
+
+    /// Resolves under a fixed classification of the conventional path, and counts how often the classification was asked for.
+    fn resolve_with(
+        vars: Vars,
+        presence: KeyFilePresence,
+    ) -> (Result<KeyMaterial, Declined>, usize) {
         let map: HashMap<String, OsString> = vars
             .iter()
             .map(|(k, v)| {
@@ -267,7 +397,15 @@ mod tests {
                 )
             })
             .collect();
-        KeyMaterial::from_lookup(|name| map.get(name).cloned(), |_| exists)
+        let asked = std::cell::Cell::new(0);
+        let keys = KeyMaterial::from_lookup(
+            |name| map.get(name).cloned(),
+            |_| {
+                asked.set(asked.get() + 1);
+                presence
+            },
+        );
+        (keys, asked.get())
     }
 
     #[test]
@@ -568,7 +706,7 @@ mod tests {
                 |name| map.get(name).cloned(),
                 |path| {
                     seen.borrow_mut().push(path.to_path_buf());
-                    false
+                    KeyFilePresence::Absent
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -584,7 +722,7 @@ mod tests {
         let value = OsString::from_vec(vec![0x66, 0xff, 0x6f]);
         let outcome = KeyMaterial::from_lookup(
             |name| (name == "SWARM_SIGNING_KEY").then(|| value.clone()),
-            |_| false,
+            |_| KeyFilePresence::Absent,
         );
         assert_eq!(outcome.err(), Some(Declined::NonUnicodeEnvironment));
     }
@@ -616,6 +754,358 @@ mod tests {
         assert!(shown.contains("present"));
         Ok(())
     }
+
+    type Entries<'a> = &'a [(&'a str, Result<EntryKind, io::ErrorKind>)];
+
+    /// Runs `classify_path` over a fake file system: a listed path answers as given and every other path is "not found".
+    /// Returns the verdict and every path that was looked at, in order.
+    fn classify_fake(path: &str, entries: Entries) -> (KeyFilePresence, Vec<String>) {
+        let seen = std::cell::RefCell::new(Vec::<String>::new());
+        let verdict = classify_path(Path::new(path), |probed| {
+            seen.borrow_mut().push(probed.display().to_string());
+            entries
+                .iter()
+                .find(|(listed, _)| Path::new(listed) == probed)
+                .map_or(Err(io::ErrorKind::NotFound), |(_, answer)| *answer)
+                .map_err(io::Error::from)
+        });
+        (verdict, seen.into_inner())
+    }
+
+    /// The conventional path walk of Python's `_private_seed`, row by row. EACCES cannot be produced by a file system test as
+    /// root (an unreadable ancestor does not block `lstat` or `open` there), so permission failures are injected.
+    #[test]
+    fn classification_follows_pythons_path_walk() {
+        const KEY: &str = "/h/.config/agent-swarm/signing-key.hex";
+        const DIR: Result<EntryKind, io::ErrorKind> = Ok(EntryKind::Directory);
+        const DENIED: Result<EntryKind, io::ErrorKind> = Err(io::ErrorKind::PermissionDenied);
+        type Row<'a> = (
+            &'a str,
+            &'a str,
+            Entries<'a>,
+            KeyFilePresence,
+            &'a [&'a str],
+        );
+        let rows: [Row; 17] = [
+            (
+                "clean absence: every ancestor a real directory, the file missing",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", DIR),
+                    ("/h/.config/agent-swarm", DIR),
+                ],
+                KeyFilePresence::Absent,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm", KEY],
+            ),
+            (
+                "first missing component ends the walk (.config)",
+                KEY,
+                &[("/", DIR), ("/h", DIR)],
+                KeyFilePresence::Absent,
+                &["/", "/h", "/h/.config"],
+            ),
+            (
+                "first missing component ends the walk (agent-swarm)",
+                KEY,
+                &[("/", DIR), ("/h", DIR), ("/h/.config", DIR)],
+                KeyFilePresence::Absent,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm"],
+            ),
+            (
+                "a regular file at the end is present",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", DIR),
+                    ("/h/.config/agent-swarm", DIR),
+                    (KEY, Ok(EntryKind::Other)),
+                ],
+                KeyFilePresence::Present,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm", KEY],
+            ),
+            (
+                "a symlink at the end is present (Python then fails to open it)",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", DIR),
+                    ("/h/.config/agent-swarm", DIR),
+                    (KEY, Ok(EntryKind::Symlink)),
+                ],
+                KeyFilePresence::Present,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm", KEY],
+            ),
+            (
+                "a directory at the end is present",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", DIR),
+                    ("/h/.config/agent-swarm", DIR),
+                    (KEY, DIR),
+                ],
+                KeyFilePresence::Present,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm", KEY],
+            ),
+            (
+                "a symlinked .config is unclear and the walk stops there",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", Ok(EntryKind::Symlink)),
+                ],
+                KeyFilePresence::Unclear,
+                &["/", "/h", "/h/.config"],
+            ),
+            (
+                "a symlinked HOME is unclear",
+                KEY,
+                &[("/", DIR), ("/h", Ok(EntryKind::Symlink))],
+                KeyFilePresence::Unclear,
+                &["/", "/h"],
+            ),
+            (
+                "a regular file where a directory is expected is unclear",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", DIR),
+                    ("/h/.config/agent-swarm", Ok(EntryKind::Other)),
+                ],
+                KeyFilePresence::Unclear,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm"],
+            ),
+            (
+                "an ancestor that cannot be opened (EACCES injected) is unclear",
+                KEY,
+                &[("/", DIR), ("/h", DENIED)],
+                KeyFilePresence::Unclear,
+                &["/", "/h"],
+            ),
+            (
+                "an unreadable root is unclear",
+                KEY,
+                &[("/", DENIED)],
+                KeyFilePresence::Unclear,
+                &["/"],
+            ),
+            (
+                "any other error on an ancestor is unclear",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", Err(io::ErrorKind::Other)),
+                ],
+                KeyFilePresence::Unclear,
+                &["/", "/h", "/h/.config"],
+            ),
+            (
+                "an error other than not-found on the last component is unclear",
+                KEY,
+                &[
+                    ("/", DIR),
+                    ("/h", DIR),
+                    ("/h/.config", DIR),
+                    ("/h/.config/agent-swarm", DIR),
+                    (KEY, DENIED),
+                ],
+                KeyFilePresence::Unclear,
+                &["/", "/h", "/h/.config", "/h/.config/agent-swarm", KEY],
+            ),
+            (
+                "a relative path is unclear and is never looked at",
+                "h/.config/agent-swarm/signing-key.hex",
+                &[("h", DIR)],
+                KeyFilePresence::Unclear,
+                &[],
+            ),
+            (
+                "a leading dot is relative too",
+                "./h/signing-key.hex",
+                &[],
+                KeyFilePresence::Unclear,
+                &[],
+            ),
+            (
+                "a parent-directory component is walked like any directory",
+                "/h/../x/signing-key.hex",
+                &[("/", DIR), ("/h", DIR), ("/h/..", DIR), ("/h/../x", DIR)],
+                KeyFilePresence::Absent,
+                &["/", "/h", "/h/..", "/h/../x", "/h/../x/signing-key.hex"],
+            ),
+            (
+                "a symlink above a missing file hides the absence",
+                KEY,
+                &[("/", Ok(EntryKind::Symlink))],
+                KeyFilePresence::Unclear,
+                &["/"],
+            ),
+        ];
+        for (label, path, entries, verdict, looked_at) in rows {
+            let (got, seen) = classify_fake(path, entries);
+            assert_eq!(got, verdict, "{label}");
+            assert_eq!(seen, looked_at, "{label}: paths looked at");
+        }
+    }
+
+    /// Where Python reaches the conventional path, an unclear one is declined, whatever the dev-key opt-in says; where Python
+    /// never reaches it (a raw key, an agent session without a file reference, no base directory) nothing is asked and nothing
+    /// is declined.
+    #[test]
+    fn an_unclear_conventional_path_is_declined_exactly_where_python_consults_it() {
+        type Row = (Vars<'static>, Result<Option<&'static str>, Declined>, usize);
+        let rows: [Row; 12] = [
+            (&[("HOME", "/h")], Err(Declined::ConventionalKeyPath), 1),
+            (
+                &[("HOME", "/h"), ("SWARM_ALLOW_INSECURE_DEV_KEY", "1")],
+                Err(Declined::ConventionalKeyPath),
+                1,
+            ),
+            (
+                &[("HOME", "/h"), ("SWARM_REQUIRE_KEY", "1")],
+                Err(Declined::ConventionalKeyPath),
+                1,
+            ),
+            (&[], Ok(None), 0),
+            (&[("HOME", "/h"), ("SWARM_SIGNING_KEY", "k")], Ok(None), 0),
+            (
+                &[("HOME", "/h"), ("SWARM_ED25519_KEY", "zz")],
+                Ok(Some(ED25519_UNLOADABLE)),
+                0,
+            ),
+            (
+                &[("HOME", "/h"), ("SWARM_ED25519_KEY_FILE", "/k")],
+                Err(Declined::KeyFileReference),
+                0,
+            ),
+            (&[("HOME", "/h"), ("SWARM_AGENT_SESSION", "1")], Ok(None), 0),
+            (
+                &[
+                    ("HOME", "/h"),
+                    ("SWARM_AGENT_SESSION", "1"),
+                    ("SWARM_ED25519_KEY_FILE", "/k"),
+                ],
+                Ok(Some(AGENT_SESSION_REFERENCE)),
+                0,
+            ),
+            (
+                &[
+                    ("HOME", "/h"),
+                    ("SWARM_AGENT_SESSION", "1"),
+                    ("SWARM_ED25519_KEY_FILE", ""),
+                ],
+                Err(Declined::ConventionalKeyPath),
+                1,
+            ),
+            (
+                &[
+                    ("HOME", "/h"),
+                    ("SWARM_AGENT_SESSION", "1"),
+                    ("SWARM_ED25519_KEY_FILE", ""),
+                    ("SWARM_REQUIRE_KEY", "1"),
+                ],
+                Ok(Some(AGENT_SESSION_REFERENCE)),
+                0,
+            ),
+            (
+                &[("XDG_CONFIG_HOME", "relative"), ("SWARM_SIGNING_KEY", "k")],
+                Ok(None),
+                0,
+            ),
+        ];
+        for (vars, expected, asked) in rows {
+            let (keys, calls) = resolve_with(vars, KeyFilePresence::Unclear);
+            assert_eq!(keys.map(|keys| keys.config_error()), expected, "{vars:?}");
+            assert_eq!(calls, asked, "{vars:?}: times the path was classified");
+        }
+    }
+
+    /// `real_key_configured` and `dev_key_active` for every combination of Ed25519 seed, HMAC secret, opt-in and
+    /// `SWARM_REQUIRE_KEY`. The expected values restate Python's `real_key_configured()` and `insecure_dev_key() is not None`;
+    /// the committed vectors compare them with the real module.
+    #[test]
+    fn real_key_and_dev_key_answers_cover_every_combination() -> TestResult {
+        let seeds: [(&str, Option<&str>); 3] = [
+            ("none", None),
+            ("valid", Some(SEED_HEX)),
+            ("invalid", Some("zz")),
+        ];
+        let secrets: [(&str, Option<&str>); 4] = [
+            ("none", None),
+            ("real", Some("k")),
+            ("the public dev value", Some(DEV_KEY)),
+            ("empty", Some("")),
+        ];
+        let mut checked = 0;
+        for (seed_name, seed) in seeds {
+            for (secret_name, secret) in secrets {
+                for opt_in in [false, true] {
+                    for require in [false, true] {
+                        let mut vars: Vec<(&str, &str)> = Vec::new();
+                        vars.extend(seed.map(|value| ("SWARM_ED25519_KEY", value)));
+                        vars.extend(secret.map(|value| ("SWARM_SIGNING_KEY", value)));
+                        vars.extend(opt_in.then_some(("SWARM_ALLOW_INSECURE_DEV_KEY", "1")));
+                        vars.extend(require.then_some(("SWARM_REQUIRE_KEY", "1")));
+                        let keys = resolve(&vars, false).map_err(|e| format!("{vars:?}: {e}"))?;
+                        let real = seed == Some(SEED_HEX)
+                            || secret.is_some_and(|value| !value.is_empty() && value != DEV_KEY);
+                        let dev = opt_in && seed.is_none() && !require;
+                        let label = format!(
+                            "seed {seed_name}, secret {secret_name}, opt-in {opt_in}, require {require}"
+                        );
+                        assert_eq!(keys.real_key_configured(), real, "{label}: real key");
+                        assert_eq!(keys.dev_key_active(), dev, "{label}: dev key");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 48);
+        Ok(())
+    }
+
+    /// The two answers are independent of whether an HMAC secret is present, which is why callers must not infer them from it.
+    #[test]
+    fn an_hmac_secret_does_not_imply_either_answer() -> TestResult {
+        let cases: [(Vars, bool, bool, bool); 4] = [
+            // (variables, HMAC secret present, real key configured, dev key active)
+            (&[("SWARM_ALLOW_INSECURE_DEV_KEY", "1")], true, false, true),
+            (
+                &[
+                    ("SWARM_ALLOW_INSECURE_DEV_KEY", "1"),
+                    ("SWARM_SIGNING_KEY", DEV_KEY),
+                ],
+                true,
+                false,
+                true,
+            ),
+            (
+                &[
+                    ("SWARM_ALLOW_INSECURE_DEV_KEY", "1"),
+                    ("SWARM_SIGNING_KEY", "k"),
+                ],
+                true,
+                true,
+                true,
+            ),
+            (&[("SWARM_SIGNING_KEY", DEV_KEY)], false, false, false),
+        ];
+        for (vars, hmac, real, dev) in cases {
+            let keys = resolve(vars, false).map_err(|e| format!("{vars:?}: {e}"))?;
+            assert_eq!(keys.hmac.is_some(), hmac, "{vars:?}: HMAC secret");
+            assert_eq!(keys.real_key_configured(), real, "{vars:?}: real key");
+            assert_eq!(keys.dev_key_active(), dev, "{vars:?}: dev key");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -645,11 +1135,13 @@ mod env_tests {
             .iter()
             .map(|name| (*name, std::env::var_os(name)))
             .collect();
-        let root =
+        let created =
             std::env::temp_dir().join(format!("gsd-envelope-from-env-{}", std::process::id()));
+        fs::create_dir_all(created.join("agent-swarm")).map_err(|e| e.to_string())?;
+        // A temp dir that itself sits behind a symlink would make every ancestor walk unclear; walk from the real path.
+        let root = fs::canonicalize(&created).map_err(|e| e.to_string())?;
         let key_dir = root.join("agent-swarm");
         let key_path = key_dir.join("signing-key.hex");
-        fs::create_dir_all(&key_dir).map_err(|e| e.to_string())?;
 
         let mut observed: Vec<String> = Vec::new();
         for name in NAMES {
@@ -674,6 +1166,19 @@ mod env_tests {
             "dangling link: {:?}",
             KeyMaterial::from_env().err()
         ));
+        fs::remove_file(&key_path).map_err(|e| e.to_string())?;
+        let linked_base = root.join("linked-base");
+        symlink(&root, &linked_base).map_err(|e| e.to_string())?;
+        std::env::set_var("XDG_CONFIG_HOME", &linked_base);
+        observed.push(format!(
+            "symlinked base: {:?}",
+            KeyMaterial::from_env().err()
+        ));
+        std::env::set_var("XDG_CONFIG_HOME", "relative/base");
+        observed.push(format!(
+            "relative base: {:?}",
+            KeyMaterial::from_env().err()
+        ));
 
         for (name, value) in saved {
             match value {
@@ -689,6 +1194,8 @@ mod env_tests {
                 "regular file: Some(ConventionalKeyFile)",
                 "hidden by a raw key: Ok(true)",
                 "dangling link: Some(ConventionalKeyFile)",
+                "symlinked base: Some(ConventionalKeyPath)",
+                "relative base: Some(ConventionalKeyPath)",
             ]
         );
         Ok(())
