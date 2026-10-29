@@ -81,6 +81,43 @@ jobs:
         run: scripts/ci_rust_toolchain.sh
       - name: Build (locked)
         run: cargo build --workspace --locked
+      # The signing-key tests (phase 14.5, unit U3.4e) run the real debug binary, so they run here and not in the `test` job, which
+      # has no cargo build. Under CI a missing binary or one older than the Rust sources FAILS the tests instead of skipping them.
+      # Python comes as in the `test` job: a venv beside the interpreter, because the pool's tool cache is read-only.
+      - name: key tests - Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install pytest pyyaml cryptography
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      # The default build: the sandbox write legs check the named E-DEP refusal and report "not covered", never a pass.
+      - name: key tests (default build)
+        env:
+          SWARM_PURE_PYTHON: "1"
+          GSD_ENGINE_BUILD: default
+        run: |
+          cp -p target/debug/gsd_engine "$RUNNER_TEMP/gsd_engine-default"
+          GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/test_keys_never_in_guest.py -p no:cacheprovider --junitxml="$RUNNER_TEMP/keys-default.xml"
+      # The write guest embedded in the sandbox crate imports nothing (the check derives the manifest from the bytes: no pin needed).
+      - name: guest imports (write guest)
+        run: cargo test -p gsd-sandbox --features write-routes --test guest_imports --locked
+      # The sandbox-write build: the guest serves the transition (no failover notice), which the default build cannot show.
+      - name: key tests (sandbox-write build)
+        env:
+          SWARM_PURE_PYTHON: "1"
+          GSD_ENGINE_BUILD: sandbox-write
+        run: |
+          cargo build -p gsd-adapter --bin gsd_engine --features sandbox-write --locked
+          cp -p target/debug/gsd_engine "$RUNNER_TEMP/gsd_engine-write"
+          GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-write" python3 -m pytest tests/test_keys_never_in_guest.py -p no:cacheprovider --junitxml="$RUNNER_TEMP/keys-write.xml"
+      - name: upload the key test reports (they record the build under test)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: key-test-reports
+          path: |
+            ${{ runner.temp }}/keys-default.xml
+            ${{ runner.temp }}/keys-write.xml
+          if-no-files-found: ignore
       - name: Test (locked)
         run: cargo test --workspace --locked --no-fail-fast
   clippy:

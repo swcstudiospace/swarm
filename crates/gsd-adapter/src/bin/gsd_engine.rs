@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn env_pairs_keeps_only_the_three_selector_keys() -> Result<(), String> {
-        let text = r#"{"env": {"SWARM_DIR": "/s", "SWARM_TASK_ID": "", "PATH": "/bin", "SWARM_CORRELATION_ID": "C1", "HOME": 7}}"#;
+        let text = r#"{"env": {"SWARM_DIR": "/s", "SWARM_SIGNING_KEY": "k", "SWARM_TASK_ID": "", "PATH": "/bin", "SWARM_ED25519_KEY_FILE": "/f", "SWARM_CORRELATION_ID": "C1", "HOME": 7}}"#;
         let Json::Obj(fields) = parse_json(text).map_err(|e| e.message().to_string())? else {
             return Err("fixture is not an object".to_string());
         };
@@ -271,6 +271,19 @@ mod tests {
                 ("SWARM_CORRELATION_ID".to_string(), "C1".to_string()),
             ]
         );
+        Ok(())
+    }
+
+    /// A request that names any other `SWARM_` variable, a signing key above all, has it dropped unread: the filter is the exact list
+    /// of selector keys, not the `SWARM_` prefix (a key variable must never reach the call and from it the guest or a child).
+    #[test]
+    fn env_pairs_drops_every_signing_variable_and_any_other_swarm_name() -> Result<(), String> {
+        let text = r#"{"env": {"SWARM_SIGNING_KEY": "k1", "SWARM_ED25519_KEY": "k2", "SWARM_ED25519_KEY_FILE": "/f", "SWARM_ALLOW_INSECURE_DEV_KEY": "1", "SWARM_REQUIRE_KEY": "1", "SWARM_AGENT_SESSION": "1", "SWARM_HMAC_SECRET": "s", "SWARM_ANY": "x", "XDG_CONFIG_HOME": "/c", "HOME": "/h", "SWARM_DIR": "/s"}}"#;
+        let Json::Obj(fields) = parse_json(text).map_err(|e| e.message().to_string())? else {
+            return Err("fixture is not an object".to_string());
+        };
+        let kept = env_pairs(&fields).map_err(|e| e.message().to_string())?;
+        assert_eq!(kept, vec![("SWARM_DIR".to_string(), "/s".to_string())]);
         Ok(())
     }
 
