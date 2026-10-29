@@ -8,13 +8,25 @@
 //! code ([`SandboxEngine::failover`], [`failover_notice`]) so the binary can say so on stderr. A guest
 //! answer, including the error it reports, is final, and so is a timeout. Every other entrypoint
 //! refuses with `E-DEP`.
+//!
+//! The write route `orch_status --transition` (phase 14.5, unit U3.3b) runs on the write-enabled guest behind the `sandbox-write`
+//! feature: [`SandboxDecider`] is the decide step of the host's [`TaskStoreWriter`](gsd_taskwriter::TaskStoreWriter), inside the
+//! write transaction. The guest is a verified shadow of the host decision (D-P29): the host computes its own decision on the same
+//! facts and uses the guest's only when it is exactly equal; any difference or fault before the apply step is answered by the host
+//! decision (and recorded, so the binary can say so on stderr). The module is loaded before the transaction opens; the guest gets
+//! the budget less a reserve for apply and commit; only a spent deadline is `E-TIMEOUT`, with the transaction rolled back and no
+//! failover; after the commit nothing is decided again. Without the feature the call is refused before any write, naming the
+//! feature.
 
-use std::cell::{Cell, OnceCell};
 use std::fmt::Display;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use gsd_failure::ErrorCode;
 use gsd_pool::PoolError;
+use gsd_route::transition_args::{parse_transition_args, TransitionArgs};
+use gsd_route::transition_plan::{Facts, Request, TransitionError, TransitionPlan, WriteState};
+use gsd_route::transition_wire::{decode_reply, encode_request, Decision};
 use gsd_route::{
     decode_reply_wire, orch_status_reply, to_python_json, Json, ReadArgs, Reply, SeamError,
 };
@@ -23,12 +35,14 @@ use gsd_sandbox::wasmtime_module_build::{MODULE_NAME, MODULE_TARGET};
 use gsd_sandbox::{
     GuestInvokeError, GuestLoader, Limits, LoadError, LoadedGuest, ModuleManifest, GUEST_MODULE,
 };
+use gsd_taskwriter::{Decider, HostDecider};
 
 use crate::route_table::is_read_only_route;
 use crate::strangler_seam::{
     empty_snapshot, no_route, read_args, read_snapshot, single_thread_runtime, within_deadline,
     CoreBackend, Entrypoint, Invocation,
 };
+use crate::write_route::transition_reply;
 
 /// Guest fuel per call (OD-6).
 const FUEL: u64 = 1_000_000_000;
@@ -44,9 +58,9 @@ pub struct SandboxEngine {
     module: &'static [u8],
     pin: &'static str,
     /// The module after its first successful identity check and compile; later calls reuse it.
-    loaded: OnceCell<LoadedGuest>,
-    /// The code of the sandbox fault the latest read failed over on; None when it did not fail over.
-    failover: Cell<Option<ErrorCode>>,
+    loaded: OnceLock<LoadedGuest>,
+    /// The code of the sandbox fault the latest call failed over on; None when it did not fail over.
+    failover: Mutex<Option<ErrorCode>>,
 }
 
 /// One guest call: what the guest or the wire answered, or a fault of the sandbox itself.
@@ -71,8 +85,8 @@ impl SandboxEngine {
             loader,
             module,
             pin,
-            loaded: OnceCell::new(),
-            failover: Cell::new(None),
+            loaded: OnceLock::new(),
+            failover: Mutex::new(None),
         })
     }
 
@@ -102,11 +116,17 @@ impl SandboxEngine {
         }
     }
 
-    /// The code of the sandbox fault the latest read failed over on, answered by host Rust, or None
-    /// when that read was answered by the guest (its error included), timed out, or was refused.
-    /// Each read resets it. It carries the wire code only, never a path or a message.
+    /// The code of the sandbox fault the latest call failed over on, answered by host Rust, or None
+    /// when that call was answered by the guest (its error included), timed out, or was refused.
+    /// Each call resets it. It carries the wire code only, never a path or a message. A write that
+    /// failed over before its apply step reports it the same way.
     pub fn failover(&self) -> Option<ErrorCode> {
-        self.failover.get()
+        *self.failover.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces the failover record: the code of the fault a call is answered on, or None.
+    fn record_failover(&self, code: Option<ErrorCode>) {
+        *self.failover.lock().unwrap_or_else(PoisonError::into_inner) = code;
     }
 
     /// Verifies the module bytes against the pin and compiles them.
@@ -122,13 +142,11 @@ impl SandboxEngine {
     }
 
     /// The verified guest, loaded on first use. A failed load is not cached, so it is retried.
-    fn loaded_guest(&self) -> Result<&LoadedGuest, PoolError> {
+    fn loaded_guest(&self) -> Result<&LoadedGuest, LoadError> {
         if let Some(loaded) = self.loaded.get() {
             return Ok(loaded);
         }
-        let loaded = self
-            .load()
-            .map_err(|error| fault(error.error_code(), error))?;
+        let loaded = self.load()?;
         Ok(self.loaded.get_or_init(|| loaded))
     }
 
@@ -136,17 +154,28 @@ impl SandboxEngine {
     fn answer(&self, request: &[u8], limits: &Limits) -> GuestCall {
         match self.loaded_guest() {
             Ok(loaded) => self.run(loaded, request, limits),
-            Err(error) => GuestCall::Faulted(error),
+            Err(error) => GuestCall::Faulted(fault(error.error_code(), error)),
         }
     }
 
-    /// Instantiates `loaded` under `limits` and invokes it with `request`.
+    /// Instantiates `loaded` under `limits` and invokes it with `request`: the reply bytes, or how the call failed. An instantiation
+    /// failure keeps the guest from answering as a trap does, so it is reported as one, with its code.
+    fn invoke(
+        &self,
+        loaded: &LoadedGuest,
+        request: &[u8],
+        limits: &Limits,
+    ) -> Result<Vec<u8>, GuestInvokeError> {
+        let mut instance = self
+            .loader
+            .instantiate(loaded, limits)
+            .map_err(|error| GuestInvokeError::Trap(error.error_code()))?;
+        instance.invoke(request)
+    }
+
+    /// Invokes `loaded` with `request` under `limits` and classifies what comes back.
     fn run(&self, loaded: &LoadedGuest, request: &[u8], limits: &Limits) -> GuestCall {
-        let mut instance = match self.loader.instantiate(loaded, limits) {
-            Ok(instance) => instance,
-            Err(error) => return GuestCall::Faulted(fault(error.error_code(), error)),
-        };
-        match instance.invoke(request) {
+        match self.invoke(loaded, request, limits) {
             Ok(bytes) => GuestCall::Answered(decode_reply_wire(&bytes).map_err(sandbox_answer)),
             Err(GuestInvokeError::Guest { code, message }) => {
                 GuestCall::Answered(Err(PoolError::Sandbox { code, message }))
@@ -174,7 +203,6 @@ impl SandboxEngine {
         call: &Invocation,
         make_limits: impl Fn(Duration) -> Limits,
     ) -> Result<Reply, SeamError> {
-        self.failover.set(None);
         let started = Instant::now();
         let request = read_snapshot(args, call).await?;
         let budget = budget_after(call.deadline, started.elapsed())?;
@@ -182,7 +210,7 @@ impl SandboxEngine {
         let outcome = self.answer(&wire, &make_limits(budget));
         // The guest call is synchronous: a result that lands past the deadline is not reported.
         budget_after(call.deadline, started.elapsed())?;
-        self.failover.set(failover_code(&outcome));
+        self.record_failover(failover_code(&outcome));
         settle(outcome, &request)
     }
 }
@@ -284,7 +312,10 @@ impl CoreBackend for SandboxEngine {
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.failover.set(None);
+        self.record_failover(None);
+        if let Some(args) = parse_transition_args(&call.argv) {
+            return self.orch_status_transition(&args, call);
+        }
         if !is_read_only_route(Entrypoint::OrchStatus, &call.argv) {
             return Err(no_route(&call.script));
         }
@@ -322,6 +353,255 @@ impl CoreBackend for SandboxEngine {
 
     fn lane_verb(&self, call: &Invocation) -> Result<Reply, SeamError> {
         Err(no_route(&call.script))
+    }
+}
+
+/// Largest reply the host reads back from the write guest. A plan is a few hundred bytes plus the task's `notes`; a larger reply is a
+/// fault of the guest, answered by the host decision, which gives the plan the guest should have given. Public for the boundary test
+/// only.
+#[doc(hidden)]
+pub const WRITE_REPLY_CAP_BYTES: usize = 1024 * 1024;
+
+/// The most of a write's budget [`SandboxDecider`] keeps back from the guest for what follows the decision: the apply step, the
+/// `COMMIT`, closing the store and the manifest. That is milliseconds of work on a healthy host and seconds on a saturated one.
+const WRITE_RESERVE_CAP: Duration = Duration::from_secs(2);
+
+/// The reserve is one tenth of the deadline when that is below [`WRITE_RESERVE_CAP`], so a short deadline keeps nine tenths of its
+/// budget for the guest and a long one gives up two seconds.
+const WRITE_RESERVE_DIVISOR: u32 = 10;
+
+/// The write guest as [`SandboxDecider`] sees it: one request in, reply bytes or a fault out.
+///
+/// [`SandboxEngine`] is the production guest: it checks the module against its pin, instantiates it with an empty linker under the
+/// call's [`Limits`] and invokes it. A test stands in a scripted guest to show how the decider treats one that misbehaves.
+pub trait WriteGuest: Sync {
+    /// Makes the guest ready to be called: for [`SandboxEngine`], the identity check against the pin and the compile of the module.
+    /// [`SandboxDecider::new`] calls it once, before the write transaction opens, so that work never runs under the write lock. An
+    /// `Err` is remembered and the decider answers from the host without calling the guest; `E-TIMEOUT` is not a code of a load and
+    /// is read as `E-INTERNAL`. A guest with nothing to prepare keeps the default.
+    fn prepare(&self) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    /// Sends `request` under `limits`. `Err` carries the taxonomy code of the fault that kept the guest from answering. `E-TIMEOUT`
+    /// means the sandbox stopped the guest: its epoch deadline, or its fuel under a deadline. The decider tells the two apart by the
+    /// host clock (the epoch deadline cannot trap before the budget it was given is spent). Any other code is a fault the decider
+    /// answers from the host.
+    fn call(&self, request: &[u8], limits: &Limits) -> Result<Vec<u8>, ErrorCode>;
+}
+
+impl WriteGuest for SandboxEngine {
+    fn prepare(&self) -> Result<(), ErrorCode> {
+        self.loaded_guest()
+            .map(drop)
+            .map_err(|error| error.error_code())
+    }
+
+    fn call(&self, request: &[u8], limits: &Limits) -> Result<Vec<u8>, ErrorCode> {
+        let loaded = self.loaded_guest().map_err(|error| error.error_code())?;
+        self.invoke(loaded, request, limits).map_err(fault_of)
+    }
+}
+
+/// The code of a failed guest invoke. The deadline is the sandbox's to declare: a guest that claims `E-TIMEOUT` in an error of its
+/// own is an ordinary fault, answered by the host decision, and never a reason to end the call.
+fn fault_of(error: GuestInvokeError) -> ErrorCode {
+    match error {
+        GuestInvokeError::Trap(code) => code,
+        GuestInvokeError::Guest {
+            code: ErrorCode::Timeout,
+            ..
+        } => ErrorCode::Internal,
+        GuestInvokeError::Guest { code, .. } => code,
+    }
+}
+
+/// The decide step of a write on the sandbox: the guest as a VERIFIED SHADOW of the host decision (the GA3 amendment of phase 14.5,
+/// decision D-P29).
+///
+/// [`TaskStoreWriter::transition`](gsd_taskwriter::TaskStoreWriter::transition) calls [`Decider::decide`] once, inside its
+/// `BEGIN IMMEDIATE` transaction, on the row it read there, and validates, applies and commits what comes back without ever calling
+/// a decider again. The failover is therefore reachable only here, before the first write, and never after a commit: there is no
+/// second decision to make once the first has been written. The plan validator checks the shape and the legality of a plan, not its
+/// values, so a well-formed plan that is wrong (an approval without the facts, a gate task moved by hand, a skipped `max_attempts`,
+/// any counter or `notes`, any `reason`, extra effects) would be written. The guest is therefore never taken at its word. In this
+/// order:
+///
+/// 0. [`Self::new`] asks the guest to prepare (for the engine, the pin check and the compile), outside the transaction. A failure
+///    is remembered; step 3 answers it;
+/// 1. the host computes its own decision on the same facts, request and `now` with [`HostDecider`] (pure and cheap);
+/// 2. the budget left before the guest's deadline (the call deadline less a reserve, see [`WRITE_RESERVE_CAP`]) is spent:
+///    `E-TIMEOUT`, nothing written, no failover (OD-5: a guest that burns the deadline would burn the host's);
+/// 3. the guest could not be prepared: failover, the guest is not called;
+/// 4. the request is encoded with [`encode_request`] and the guest invoked under fuel, memory and an epoch deadline derived from
+///    the budget of step 2; the reply is read back with [`decode_reply`];
+/// 5. a call that ends past the call deadline, or whose guest the sandbox stopped (`E-TIMEOUT`) when the host clock shows the guest's
+///    budget spent, ends the call as `E-TIMEOUT`, no failover. An `E-TIMEOUT` while budget remains can only be the fuel (the epoch
+///    deadline cannot trap before its budget is spent, see `deadline_ticks_for`): it is a fault of the guest, step 6;
+/// 6. any other fault answers with the host decision, after recording its code ([`Self::failover`]): a trap, fuel or memory
+///    exhausted, a pin or instantiation failure, an `invoke-error`, a reply that is too large or not a reply, and any reply whose
+///    plan or refusal is not EXACTLY the host decision (`E-CONTRACT`);
+/// 7. a reply equal to the host decision is the answer, and what is returned is the host's own value. Python's refusals (illegal
+///    transition, the manual-transition `E-POLICY`, `max_attempts`, `not_started`) are decisions like any other.
+///
+/// The writer then validates, applies and commits the host's decision, so nothing the guest says is ever written or printed.
+pub struct SandboxDecider<'g> {
+    guest: &'g dyn WriteGuest,
+    started: Instant,
+    /// The call deadline: nothing the guest returns after it is used.
+    deadline: Duration,
+    /// `deadline` less the reserve, counted from `started`: the guest's epoch deadline is made from the time left before it.
+    guest_deadline: Duration,
+    make_limits: fn(Duration) -> Limits,
+    /// What [`WriteGuest::prepare`] answered.
+    prepared: Result<(), ErrorCode>,
+    failover: Mutex<Option<ErrorCode>>,
+}
+
+impl<'g> SandboxDecider<'g> {
+    /// A decider over `guest` for a call that started at `started` and must end within `deadline`, under the production limits
+    /// (OD-6: fuel 1e9, 16 MiB, an epoch deadline from the budget left less the reserve for apply and commit). Prepares the guest
+    /// now: call it before the write transaction opens.
+    pub fn new(guest: &'g dyn WriteGuest, started: Instant, deadline: Duration) -> Self {
+        let reserve = (deadline / WRITE_RESERVE_DIVISOR).min(WRITE_RESERVE_CAP);
+        let prepared = match guest.prepare() {
+            Err(ErrorCode::Timeout) => Err(ErrorCode::Internal),
+            other => other,
+        };
+        Self {
+            guest,
+            started,
+            deadline,
+            guest_deadline: deadline - reserve,
+            make_limits: limits,
+            prepared,
+            failover: Mutex::new(None),
+        }
+    }
+
+    /// The code of the guest fault the decision was answered on, by the host decision; None when the guest answered, the deadline
+    /// was spent, or nothing was decided.
+    pub fn failover(&self) -> Option<ErrorCode> {
+        *self.failover.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Asks the guest to decide `facts` and holds its answer against `host`, the host's own decision on the same facts: `Ok` only
+    /// when the guest answered with exactly that decision, else the code of the fault that kept it from deciding (`E-TIMEOUT`
+    /// when the deadline is spent, see the type documentation).
+    fn verify_guest(
+        &self,
+        facts: &Facts,
+        request: &Request,
+        now: f64,
+        host: &Decision,
+    ) -> Result<(), ErrorCode> {
+        let spent = |_| ErrorCode::Timeout;
+        let budget = budget_after(self.guest_deadline, self.started.elapsed()).map_err(spent)?;
+        self.prepared?;
+        let wire = encode_request(facts, request, now);
+        let outcome = self
+            .guest
+            .call(wire.as_bytes(), &(self.make_limits)(budget));
+        let elapsed = self.started.elapsed();
+        // The guest call is synchronous: whatever it returns after the deadline is not used.
+        budget_after(self.deadline, elapsed).map_err(spent)?;
+        let bytes = match outcome {
+            // The epoch deadline cannot trap before the budget it was made from is spent, so an `E-TIMEOUT` before that is fuel.
+            Err(ErrorCode::Timeout) if elapsed < self.guest_deadline => {
+                return Err(ErrorCode::Internal);
+            }
+            other => other?,
+        };
+        if bytes.len() > WRITE_REPLY_CAP_BYTES {
+            return Err(ErrorCode::Capacity);
+        }
+        let decision = decode_reply(&bytes).map_err(|error| error.code())?;
+        if decision == *host {
+            Ok(())
+        } else {
+            Err(ErrorCode::Contract)
+        }
+    }
+}
+
+impl Decider for SandboxDecider<'_> {
+    fn decide(
+        &self,
+        facts: &Facts,
+        request: &Request,
+        now: f64,
+    ) -> Result<TransitionPlan, TransitionError> {
+        let host = HostDecider.decide(facts, request, now);
+        match self.verify_guest(facts, request, now, &host) {
+            Ok(()) => host,
+            Err(ErrorCode::Timeout) => Err(TransitionError {
+                code: ErrorCode::Timeout,
+                message: format!(
+                    "{}: guest call exceeded {} s",
+                    ErrorCode::Timeout.as_str(),
+                    self.deadline.as_secs()
+                ),
+                details: Vec::new(),
+                write_state: WriteState::Final,
+            }),
+            Err(code) => {
+                *self.failover.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+                host
+            }
+        }
+    }
+}
+
+impl SandboxEngine {
+    /// The `--transition` route with `guest` standing in for the engine's own guest and `make_limits` giving the guest's limits
+    /// from the budget left of the call deadline. [`CoreBackend::orch_status`] calls it with the engine itself and the production
+    /// limits; a test calls it with a scripted guest. The guest is prepared here, before the writer opens its transaction. Records
+    /// the failover code for [`Self::failover`]. Public for the integration tests only.
+    #[doc(hidden)]
+    pub fn transition_via(
+        &self,
+        guest: &dyn WriteGuest,
+        make_limits: fn(Duration) -> Limits,
+        args: &TransitionArgs,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        let mut decider = SandboxDecider::new(guest, Instant::now(), call.deadline);
+        decider.make_limits = make_limits;
+        let reply = self.runtime.block_on(within_deadline(
+            call.deadline,
+            &call.script,
+            transition_reply(args, call, &decider),
+        ));
+        self.record_failover(decider.failover());
+        reply
+    }
+
+    /// The `--transition` route on the write guest the binary embeds.
+    #[cfg(feature = "sandbox-write")]
+    fn orch_status_transition(
+        &self,
+        args: &TransitionArgs,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        self.transition_via(self, limits, args, call)
+    }
+
+    /// Without the `sandbox-write` feature the embedded guest has no write mode: the call is refused before any write, naming the
+    /// missing feature, and the caller falls back.
+    #[cfg(not(feature = "sandbox-write"))]
+    fn orch_status_transition(
+        &self,
+        _args: &TransitionArgs,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        Err(crate::strangler_seam::before_any_write(SeamError::new(
+            ErrorCode::Dep,
+            format!(
+                "the rust engine has no route for {}: the sandbox backend has no write guest in this build \
+                 (rebuild gsd-adapter with the sandbox-write feature, or use GSD_RUST_BACKEND=host); use GSD_ENGINE=python",
+                call.script
+            ),
+        )))
     }
 }
 
@@ -545,9 +825,16 @@ mod tests {
         block(seed(&swarm, 1))??;
         let sandbox = engine()?;
 
-        let transition = ["--transition", "T-0000", "DONE", "--json"];
         let ingest = ["--ingest", "result.json", "--json"];
-        for argv in [&transition[..], &ingest[..]] {
+        // With the `sandbox-write` feature the write guest serves a transition: that path is tested in
+        // tests/write_route_sandbox_faults.rs and tests/write_route.rs.
+        #[cfg(not(feature = "sandbox-write"))]
+        let transition = ["--transition", "T-0000", "DONE", "--json"];
+        #[cfg(not(feature = "sandbox-write"))]
+        let mutating_argvs = [&transition[..], &ingest[..]];
+        #[cfg(feature = "sandbox-write")]
+        let mutating_argvs = [&ingest[..]];
+        for argv in mutating_argvs {
             let mutating = call(root.path(), &swarm, argv);
             assert!(!is_read_only_route(Entrypoint::OrchStatus, &mutating.argv));
             let refusal = sandbox
@@ -572,17 +859,22 @@ mod tests {
         assert!(matches!(guest_call(&broken, &read)?, GuestCall::Faulted(_)));
         assert_eq!(broken.orch_status(&read), host.orch_status(&read));
 
-        let mutating = call(
-            root.path(),
-            &swarm,
-            &["--transition", "T-0000", "DONE", "--json"],
-        );
-        let refusal = broken
-            .orch_status(&mutating)
-            .err()
-            .ok_or("mutating argv answered")?;
-        assert_eq!(refusal.code(), ErrorCode::Dep);
-        assert!(refusal.message().contains("no route"));
+        // Without the `sandbox-write` feature a write on the sandbox backend is refused before any write; with it the write guest
+        // answers, and a faulted guest is answered by the host decision (tests/write_route_sandbox_faults.rs).
+        #[cfg(not(feature = "sandbox-write"))]
+        {
+            let mutating = call(
+                root.path(),
+                &swarm,
+                &["--transition", "T-0000", "DONE", "--json"],
+            );
+            let refusal = broken
+                .orch_status(&mutating)
+                .err()
+                .ok_or("mutating argv answered")?;
+            assert_eq!(refusal.code(), ErrorCode::Dep);
+            assert!(refusal.message().contains("no route"));
+        }
         Ok(())
     }
 
@@ -606,6 +898,114 @@ mod tests {
     #[test]
     fn verified_guest_passes_health() -> TestResult {
         engine()?.health(Duration::from_secs(30)).map_err(message)
+    }
+
+    #[test]
+    fn a_guest_cannot_claim_the_deadline_in_an_error_of_its_own() {
+        let guest = |code| GuestInvokeError::Guest {
+            code,
+            message: "from the guest".to_string(),
+        };
+        let cases = [
+            (
+                GuestInvokeError::Trap(ErrorCode::Timeout),
+                ErrorCode::Timeout,
+            ),
+            (
+                GuestInvokeError::Trap(ErrorCode::Capacity),
+                ErrorCode::Capacity,
+            ),
+            (
+                GuestInvokeError::Trap(ErrorCode::Internal),
+                ErrorCode::Internal,
+            ),
+            (guest(ErrorCode::Timeout), ErrorCode::Internal),
+            (guest(ErrorCode::Input), ErrorCode::Input),
+            (guest(ErrorCode::Dep), ErrorCode::Dep),
+        ];
+        for (error, wanted) in cases {
+            assert_eq!(fault_of(error.clone()), wanted, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_pin_mismatch_is_a_dep_fault_of_the_write_guest_before_it_runs() -> TestResult {
+        let broken = SandboxEngine::with_module(GUEST_MODULE.0, WRONG_PIN).map_err(message)?;
+        assert_eq!(
+            WriteGuest::call(&broken, b"{}", &limits(Duration::from_secs(30))),
+            Err(ErrorCode::Dep)
+        );
+        Ok(())
+    }
+
+    /// The engine prepares the write guest with the identity check and the compile: a pin mismatch is `E-DEP` before anything runs.
+    #[test]
+    fn a_pin_mismatch_is_a_dep_failure_to_prepare_the_write_guest() -> TestResult {
+        let broken = SandboxEngine::with_module(GUEST_MODULE.0, WRONG_PIN).map_err(message)?;
+        assert_eq!(WriteGuest::prepare(&broken), Err(ErrorCode::Dep));
+        Ok(())
+    }
+
+    /// A write on an engine whose module fails its pin is answered by the host decision, here the host's own refusal of an illegal
+    /// transition (T-0000 is DONE), byte for byte as the host backend answers on a twin store, with the pin failure recorded.
+    #[test]
+    fn a_pin_mismatch_on_a_write_is_answered_by_the_host_and_recorded() -> TestResult {
+        let argv = ["--transition", "T-0000", "CREATED", "--json"];
+        let (sandbox_root, host_root) = (
+            TempDir::new().map_err(|e| e.to_string())?,
+            TempDir::new().map_err(|e| e.to_string())?,
+        );
+        let mut answers = Vec::new();
+        for root in [&sandbox_root, &host_root] {
+            let swarm = root.path().join(".swarm");
+            block(seed(&swarm, 1))??;
+            let mut write = call(root.path(), &swarm, &argv);
+            write.effects_path = Some(root.path().join("effects.json"));
+            answers.push(write);
+        }
+        let broken = SandboxEngine::with_module(GUEST_MODULE.0, WRONG_PIN).map_err(message)?;
+        let args = parse_transition_args(&answers[0].argv).ok_or("not a transition argv")?;
+        let sandbox = broken.transition_via(&broken, limits, &args, &answers[0]);
+        let host = host()?.orch_status(&answers[1]);
+        assert_eq!(sandbox, host);
+        let refusal = sandbox.err().ok_or("an illegal transition was answered")?;
+        assert_eq!(refusal.code(), ErrorCode::Contract);
+        assert_eq!(broken.failover(), Some(ErrorCode::Dep));
+        Ok(())
+    }
+
+    /// The guest's deadline is the call deadline less a reserve for apply and commit: a tenth of it (whole nanoseconds, rounded down),
+    /// at most two seconds. Checked at zero, below ten nanoseconds, and each side of the point where the cap starts.
+    #[test]
+    fn the_reserve_is_a_tenth_of_the_deadline_and_at_most_two_seconds() {
+        struct Idle;
+        impl WriteGuest for Idle {
+            fn call(&self, _: &[u8], _: &Limits) -> Result<Vec<u8>, ErrorCode> {
+                Err(ErrorCode::Internal)
+            }
+        }
+        let nanos = Duration::from_nanos;
+        let millis = Duration::from_millis;
+        let secs = Duration::from_secs;
+        let cases = [
+            (Duration::ZERO, Duration::ZERO),
+            (nanos(9), Duration::ZERO),
+            (nanos(10), nanos(1)),
+            (millis(100), millis(10)),
+            (secs(1), millis(100)),
+            (millis(19_990), millis(1_999)),
+            (secs(20), secs(2)),
+            (secs(20) + nanos(10), secs(2)),
+            (secs(600), secs(2)),
+        ];
+        for (deadline, reserve) in cases {
+            let decider = SandboxDecider::new(&Idle, Instant::now(), deadline);
+            assert_eq!(
+                deadline - decider.guest_deadline,
+                reserve,
+                "the reserve of {deadline:?}"
+            );
+        }
     }
 
     #[test]
@@ -748,8 +1148,8 @@ mod tests {
         block(seed(&swarm, 3))??;
         let broken = SandboxEngine::with_module(GUEST_MODULE.0, WRONG_PIN).map_err(message)?;
         let fault_code = match broken.loaded_guest() {
-            Err(PoolError::Sandbox { code, .. }) => code,
-            _ => return Err("the pin mismatch did not fault the guest".to_string()),
+            Err(error) => error.error_code(),
+            Ok(_) => return Err("the pin mismatch did not fault the guest".to_string()),
         };
         let read = call(root.path(), &swarm, &["--json"]);
         assert_eq!(broken.failover(), None, "nothing is recorded before a read");

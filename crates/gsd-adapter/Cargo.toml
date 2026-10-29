@@ -8,6 +8,12 @@ repository = "https://github.com/swcstudiospace/agent-swarm"
 categories = ["development-tools", "migration", "adapter"]
 keywords = ["adapter", "migration", "legacy", "subagent"]
 
+[features]
+# The sandbox backend serves `orch_status --transition` from the write-enabled guest (phase 14.5, pin P1): the nested guest is built
+# with its `write-routes` feature and the binary embeds it. Off until the pin commit; off, a write call on the sandbox backend is
+# refused before any write (E-DEP, write_state not_started) and the guest bytes and their pin are the default ones.
+sandbox-write = ["gsd-sandbox/write-routes"]
+
 [dependencies]
 gsd-proto = { path = "../gsd-proto" }
 gsd-runtime = { path = "../gsd-runtime" }

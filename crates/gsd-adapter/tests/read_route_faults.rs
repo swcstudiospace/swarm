@@ -77,6 +77,8 @@ fn reads_match_host_rust_on_an_empty_store() -> TestResult {
     Ok(())
 }
 
+/// Without the `sandbox-write` feature the sandbox has no write route: a transition is refused before any read.
+#[cfg(not(feature = "sandbox-write"))]
 #[test]
 fn a_mutating_argv_is_refused_before_any_read() -> TestResult {
     let root = TempDir::new().map_err(|e| e.to_string())?;
@@ -116,6 +118,38 @@ fn a_mutating_argv_is_refused_before_any_read() -> TestResult {
         .err()
         .ok_or("a read over a file store was answered")?;
     assert_ne!(read_error, refused);
+
+    let reply = invoke(&sandbox, &over_file);
+    assert_eq!(reply.exit_code, 2);
+    assert!(reply.stdout.contains("E-DEP"), "{}", reply.stdout);
+    Ok(())
+}
+
+/// With the `sandbox-write` feature a transition runs the write path, which opens the store itself (tests/write_route_sandbox_faults.rs);
+/// an `--ingest` has no sandbox route yet and is still refused before any read, whatever the store or the root.
+#[cfg(feature = "sandbox-write")]
+#[test]
+fn an_ingest_argv_is_refused_before_any_read_with_the_write_guest_built_in() -> TestResult {
+    let root = TempDir::new().map_err(|e| e.to_string())?;
+    let file_store = root.path().join("store-is-a-file");
+    fs::write(&file_store, b"not a directory").map_err(|e| e.to_string())?;
+    let empty = TempDir::new().map_err(|e| e.to_string())?;
+    let empty_store = empty.path().join(".swarm");
+    let sandbox = engine()?;
+
+    let ingest = ["--ingest", "result.json", "--json"];
+    let over_file = call(root.path(), &file_store, &ingest, DEADLINE);
+    let over_empty = call(empty.path(), &empty_store, &ingest, DEADLINE);
+    let refused = sandbox
+        .orch_status(&over_file)
+        .err()
+        .ok_or("an --ingest argv was answered")?;
+    assert_eq!(refused.code(), ErrorCode::Dep);
+    let refused_elsewhere = sandbox
+        .orch_status(&over_empty)
+        .err()
+        .ok_or("an --ingest argv was answered")?;
+    assert_eq!(refused_elsewhere, refused);
 
     let reply = invoke(&sandbox, &over_file);
     assert_eq!(reply.exit_code, 2);

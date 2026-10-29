@@ -888,6 +888,9 @@ fn what_rust_cannot_prove_is_refused_before_the_first_write() {
     }
 }
 
+/// Without the `sandbox-write` feature the sandbox backend has no write guest: the write is refused before it starts, and the message
+/// names the missing feature. With the feature the guest serves it (tests/write_route_sandbox_faults.rs).
+#[cfg(not(feature = "sandbox-write"))]
 #[test]
 fn the_sandbox_backend_does_not_serve_a_write_until_its_own_unit() {
     let world = World::new(&[row_in("CREATED", "T-sb")]);
@@ -899,6 +902,13 @@ fn the_sandbox_backend_does_not_serve_a_write_until_its_own_unit() {
     assert_eq!(run.code, 2, "{}", run.stdout);
     assert_eq!(run.error_code().as_deref(), Some("E-DEP"));
     assert_eq!(run.write_state().as_deref(), Some("not_started"));
+    assert!(
+        run.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("sandbox-write")),
+        "{}",
+        run.stdout
+    );
     assert_eq!(world.db_bytes(), before);
     assert_eq!(world.manifest(), "");
 }

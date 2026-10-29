@@ -13,8 +13,10 @@
 //!    not-started refusal, because Python's `TaskStore(root=...)` would create or migrate it first. An unreadable
 //!    `latest_correlation` file (Python reads it before the transition) is the same;
 //! 3. `--dry-run`: the canned reply, nothing written;
-//! 4. [`TaskStoreWriter::transition`] with the host decider and `check_manual_transition` (`manual: true`), actor `A01`, reason
-//!    `--reason` or `manual`: one `BEGIN IMMEDIATE` transaction from the read of the row to the `COMMIT`;
+//! 4. [`TaskStoreWriter::transition`] with the decider of the backend (the host decision on the host backend; on the sandbox backend
+//!    the guest as a verified shadow of it, which the host decision replaces on any fault or difference before the apply step) and
+//!    `check_manual_transition` (`manual: true`), actor `A01`, reason `--reason` or `manual`: one `BEGIN IMMEDIATE` transaction from
+//!    the read of the row to the `COMMIT`;
 //! 5. after the `COMMIT`: the effects manifest is written to `Invocation::effects_path` (atomically: a temporary file in the same
 //!    directory, then a rename) and the reply is built from the committed row.
 //!
@@ -39,7 +41,7 @@ use gsd_route::transition_args::TransitionArgs;
 use gsd_route::transition_plan::{PlanEffect, Request};
 use gsd_route::{check_safe_id, finish, jstr, obj_get, Fields, Json, Reply, SeamError};
 use gsd_taskwriter::{
-    open_for_write, Applied, ApplyCause, ApplyError, ErrorKind, HostDecider, TaskStoreWriter,
+    open_for_write, Applied, ApplyCause, ApplyError, Decider, ErrorKind, TaskStoreWriter,
     WriteState, WriterConfig, WriterError,
 };
 
@@ -53,12 +55,16 @@ const ACTOR: &str = "A01";
 /// The audit reason of a transition whose `--reason` is empty (`args.reason or "manual"`).
 const DEFAULT_REASON: &str = "manual";
 
-/// Answers one `--transition` call that [`TransitionArgs`] parsed: the reply Python prints, or the refusal.
+/// Answers one `--transition` call that [`TransitionArgs`] parsed, with the decide step named by the caller: the reply Python
+/// prints, or the refusal. The host backend passes [`HostDecider`](gsd_taskwriter::HostDecider); the sandbox backend passes its guest
+/// decider ([`SandboxDecider`](crate::sandbox_engine::SandboxDecider)). Everything else, the checks before the write and the
+/// manifest and reply after the commit, is the same code, so the two backends differ only in who decided.
 ///
 /// Every `Err` is a final reply: its `details` say whether anything was written (`write_state`, see the module documentation).
 pub(crate) async fn transition_reply(
     args: &TransitionArgs,
     call: &Invocation,
+    decider: &dyn Decider,
 ) -> Result<Reply, SeamError> {
     let context_task = match &args.context_task_id {
         Some(value) => Some(value.as_str()),
@@ -133,7 +139,7 @@ pub(crate) async fn transition_reply(
         })?
         .as_secs_f64();
     let writer = TaskStoreWriter::new(store);
-    let outcome = writer.transition(&request, now, &HostDecider).await;
+    let outcome = writer.transition(&request, now, decider).await;
     writer.close().await;
     let applied = outcome.map_err(|error| apply_refusal(&error))?;
 

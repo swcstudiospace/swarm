@@ -6,10 +6,12 @@
 //! unchanged (the SDK runner appends `--json` to the child), and answers through [`invoke_routed`].
 //! `GSD_RUST_BACKEND` names the backend: `host` is host Rust, `sandbox` is [`SandboxEngine`] (OD-5),
 //! and unset or empty is [`DEFAULT_BACKEND`]; any other value is `E-INPUT`. Stdout is the reply and
-//! the exit code is the reply's exit code. When the sandbox fails over to host Rust, stderr gets one
-//! fixed line with the wire error code only (`failover_notice`); stdout and the exit code do not
-//! change. Whether a refusal or fault falls back to the Python body is the caller's decision, not
-//! this binary's.
+//! the exit code is the reply's exit code. When the sandbox fails over to host Rust (a read, or a write
+//! whose guest faulted before its apply step), stderr gets one fixed line with the wire error code only
+//! (`failover_notice`); stdout and the exit code do not change. A write call on the sandbox backend is
+//! served by the write guest when the binary is built with the `sandbox-write` feature and refused before
+//! any write (`E-DEP`, `write_state` `not_started`) otherwise. Whether a refusal or fault falls back to
+//! the Python body is the caller's decision, not this binary's.
 
 use std::env;
 use std::io::{self, Read, Write};

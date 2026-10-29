@@ -524,7 +524,7 @@ impl RustEngine {
         self.runtime.block_on(within_deadline(
             call.deadline,
             &call.script,
-            transition_reply(args, call),
+            transition_reply(args, call, &gsd_taskwriter::HostDecider),
         ))
     }
 }
