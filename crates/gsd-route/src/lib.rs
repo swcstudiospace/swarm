@@ -1225,6 +1225,8 @@ pub mod gate_facts;
 #[cfg(feature = "write-routes-2")]
 pub mod ingest_plan;
 #[cfg(feature = "write-routes-2")]
+pub mod plan_derive;
+#[cfg(feature = "write-routes-2")]
 pub mod reconcile_plan;
 #[cfg(feature = "write-routes-2")]
 pub mod result_parse;
