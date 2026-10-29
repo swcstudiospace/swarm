@@ -1,15 +1,20 @@
 //! Per-invocation engine routing for the strangler seam (U4.2).
 //!
 //! `GSD_ENGINE` is read on every call. An unset or empty value resolves through the per-route default
-//! table ([`default_engine`]); `python` is explicit Python. `rust` applies to one route class only:
-//! the read-only `orch_status --json` listing and history. Every other `rust` request is refused with
-//! `E-DEP`, so nothing past read-only flips (G-strangler-order). An unknown value is rejected with
-//! `E-INPUT`. Today every row of the table is Python; a route's row changes in the phase that flips it.
+//! table ([`default_engine`]); `python` is explicit Python. `rust` applies to two route classes only:
+//! the read-only `orch_status --json` listing and history, and the host `orch_status --transition --json`
+//! write route (opt-in: its default row stays Python until the flip unit). Every other `rust` request is
+//! refused with `E-DEP` and `write_state = "not_started"`, so nothing else flips (G-strangler-order). An
+//! unknown value is rejected with `E-INPUT`. Today every row of the table is Python; a route's row changes
+//! in the phase that flips it.
 
 use gsd_failure::ErrorCode;
 
 use crate::join_affinity_guard::Engine;
-use crate::strangler_seam::{error_reply, invoke, CoreBackend, Entrypoint, Invocation};
+use crate::strangler_seam::{
+    before_any_write, error_reply, invoke, CoreBackend, Entrypoint, Invocation,
+};
+use gsd_route::transition_args::parse_transition_args;
 use gsd_route::{parse_orch_status_read, Reply, SeamError};
 
 /// Environment variable that selects the engine for each invocation.
@@ -35,25 +40,41 @@ pub fn is_read_only_route(entry: Entrypoint, argv: &[String]) -> bool {
         && parse_orch_status_read(argv).is_some_and(|args| args.json)
 }
 
+/// Returns true when the call is the host write route: `orch_status --transition TASK_ID STATE --json` inside the grammar of
+/// [`parse_transition_args`], the same set the selector's `rust_serves_write` serves.
+pub fn is_transition_route(entry: Entrypoint, argv: &[String]) -> bool {
+    matches!(entry, Entrypoint::OrchStatus) && parse_transition_args(argv).is_some()
+}
+
 /// The engine the `orch_status` read route runs on when `GSD_ENGINE` is unset or empty.
 ///
 /// Python until the flip unit (R12 of Phase 14.3) sets it, after parity evidence and the user's
 /// approval. Setting it to `Engine::Rust` is the whole flip for this route.
 pub const ORCH_STATUS_READ_DEFAULT: Engine = Engine::Python;
 
+/// The engine the `orch_status --transition` write route runs on when `GSD_ENGINE` is unset or empty.
+///
+/// Python until the write flip unit (U3.8c of Phase 14.5) sets it, after parity and fault evidence, a quiet-host baseline and
+/// the user's approval. `GSD_ENGINE=rust` reaches the route whatever this row says.
+pub const ORCH_STATUS_TRANSITION_DEFAULT: Engine = Engine::Python;
+
 /// The per-route default engine: the engine that answers a call when `GSD_ENGINE` is unset or empty.
 ///
-/// The `orch_status` read route resolves to [`ORCH_STATUS_READ_DEFAULT`]; every other route is Python
-/// until its own phase adds a row. An explicit `GSD_ENGINE` never goes through this table.
+/// The `orch_status` read route resolves to [`ORCH_STATUS_READ_DEFAULT`] and the `--transition` route to
+/// [`ORCH_STATUS_TRANSITION_DEFAULT`]; every other route is Python until its own phase adds a row. An explicit `GSD_ENGINE`
+/// never goes through this table.
 pub fn default_engine(entry: Entrypoint, argv: &[String]) -> Engine {
     if is_read_only_route(entry, argv) {
         ORCH_STATUS_READ_DEFAULT
+    } else if is_transition_route(entry, argv) {
+        ORCH_STATUS_TRANSITION_DEFAULT
     } else {
         Engine::Python
     }
 }
 
-/// Applies the requested engine to one call. `rust` on any route outside the read-only set is `E-DEP`.
+/// Applies the requested engine to one call. `rust` on any route outside the read-only and transition sets is `E-DEP`,
+/// marked `write_state = "not_started"` because nothing was written.
 pub fn route_for_call(
     requested: Engine,
     entry: Entrypoint,
@@ -61,11 +82,13 @@ pub fn route_for_call(
 ) -> Result<Engine, SeamError> {
     match requested {
         Engine::Python => Ok(Engine::Python),
-        Engine::Rust if is_read_only_route(entry, argv) => Ok(Engine::Rust),
-        Engine::Rust => Err(SeamError::new(
+        Engine::Rust if is_read_only_route(entry, argv) || is_transition_route(entry, argv) => {
+            Ok(Engine::Rust)
+        }
+        Engine::Rust => Err(before_any_write(SeamError::new(
             ErrorCode::Dep,
-            "no rust route for this entrypoint and flags; only read-only orch_status --json is served; unset GSD_ENGINE or use python",
-        )),
+            "no rust route for this entrypoint and flags; only orch_status --json (read) and orch_status --transition --json are served; unset GSD_ENGINE or use python",
+        ))),
     }
 }
 
@@ -179,11 +202,12 @@ mod tests {
             ),
             Ok(Engine::Rust)
         ));
+        // A transition outside the write route's grammar (here: no `--json`) is still refused.
         assert_eq!(
             code_of(route_for_call(
                 Engine::Rust,
                 Entrypoint::OrchStatus,
-                &argv(&["--transition", "T", "DONE", "--json"])
+                &argv(&["--transition", "T", "DONE"])
             )),
             Some(ErrorCode::Dep)
         );
@@ -230,6 +254,7 @@ mod tests {
             root: root.to_path_buf(),
             env: Vec::new(),
             deadline: Duration::from_secs(5),
+            effects_path: None,
         }
     }
 
@@ -242,16 +267,16 @@ mod tests {
             Some("rust"),
             &python,
             &rust,
-            &call_for(
-                "orch_status",
-                &["--transition", "T", "DONE", "--json"],
-                &root,
-            ),
+            &call_for("orch_status", &["--transition", "T", "DONE"], &root),
         );
         assert_eq!(refused.exit_code, 2);
         let value: serde_json::Value =
             serde_json::from_str(&refused.stdout).map_err(|e| e.to_string())?;
         assert_eq!(value["error"]["code"].as_str(), Some("E-DEP"));
+        assert_eq!(
+            value["error"]["details"]["write_state"].as_str(),
+            Some("not_started")
+        );
         assert_eq!(value["status"].as_str(), Some("error"));
         assert_eq!(value["agent"].as_str(), Some("A01"));
         Ok(())
@@ -356,7 +381,16 @@ mod tests {
             Some(Engine::Rust)
         );
         assert_eq!(
-            code_of(select_engine(Some("rust"), Entrypoint::OrchStatus, &write)),
+            select_engine(Some("rust"), Entrypoint::OrchStatus, &write).ok(),
+            Some(Engine::Rust)
+        );
+        let outside_the_grammar = argv(&["--transition", "T", "DONE"]);
+        assert_eq!(
+            code_of(select_engine(
+                Some("rust"),
+                Entrypoint::OrchStatus,
+                &outside_the_grammar
+            )),
             Some(ErrorCode::Dep)
         );
         assert_eq!(
@@ -364,6 +398,87 @@ mod tests {
             Some(ErrorCode::Dep)
         );
         Ok(())
+    }
+
+    #[test]
+    fn the_transition_route_is_exactly_the_write_grammar_on_orch_status() {
+        let cases: [(Entrypoint, &[&str], bool); 8] = [
+            (
+                Entrypoint::OrchStatus,
+                &["--transition", "T", "DONE", "--json"],
+                true,
+            ),
+            (
+                Entrypoint::OrchStatus,
+                &[
+                    "--json",
+                    "--dry-run",
+                    "--reason",
+                    "r",
+                    "--transition",
+                    "T",
+                    "DONE",
+                ],
+                true,
+            ),
+            (
+                Entrypoint::OrchStatus,
+                &["--transition", "T", "DONE"],
+                false,
+            ),
+            (
+                Entrypoint::OrchStatus,
+                &["--trans", "T", "DONE", "--json"],
+                false,
+            ),
+            (
+                Entrypoint::OrchStatus,
+                &["--transition", "T", "DONE", "--json", "--ingest", "p"],
+                false,
+            ),
+            (Entrypoint::OrchStatus, &["--json"], false),
+            (
+                Entrypoint::OrchPlan,
+                &["--transition", "T", "DONE", "--json"],
+                false,
+            ),
+            (
+                Entrypoint::LaneVerb,
+                &["--transition", "T", "DONE", "--json"],
+                false,
+            ),
+        ];
+        for (entry, flags, expected) in cases {
+            assert_eq!(
+                is_transition_route(entry, &argv(flags)),
+                expected,
+                "{flags:?}"
+            );
+        }
+        // A call is one route or the other, never both.
+        assert!(!is_read_only_route(
+            Entrypoint::OrchStatus,
+            &argv(&["--transition", "T", "DONE", "--json"])
+        ));
+    }
+
+    #[test]
+    fn the_transition_row_resolves_through_its_own_constant() -> TestResult {
+        let write = argv(&["--transition", "T", "DONE", "--json"]);
+        for value in [None, Some("")] {
+            let chosen = select_engine(value, Entrypoint::OrchStatus, &write)
+                .map_err(|e| e.message().to_string())?;
+            assert_eq!(chosen, ORCH_STATUS_TRANSITION_DEFAULT);
+            assert_eq!(chosen, default_engine(Entrypoint::OrchStatus, &write));
+        }
+        Ok(())
+    }
+
+    /// The one default-asserting test of the write-route row: the flip unit (U3.8c of Phase 14.5) edits this test, and only
+    /// this test, when it sets `ORCH_STATUS_TRANSITION_DEFAULT`.
+    #[test]
+    fn transition_route_default_is_python_until_the_flip() {
+        assert_eq!(ORCH_STATUS_TRANSITION_DEFAULT, Engine::Python);
     }
 
     /// The one default-asserting test of the read-route row: the flip unit (R12 of Phase 14.3) edits

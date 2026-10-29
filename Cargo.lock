@@ -1475,6 +1475,7 @@ dependencies = [
  "gsd-sdk",
  "gsd-serde",
  "gsd-state",
+ "gsd-taskwriter",
  "proptest",
  "serde",
  "serde_json",

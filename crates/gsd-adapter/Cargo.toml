@@ -20,6 +20,7 @@ gsd-governor = { path = "../gsd-governor" }
 gsd-route = { path = "../gsd-route" }
 gsd-sandbox = { path = "../gsd-sandbox" }
 gsd-sdk = { path = "../gsd-sdk" }
+gsd-taskwriter = { path = "../gsd-taskwriter" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

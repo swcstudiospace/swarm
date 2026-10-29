@@ -42,6 +42,7 @@ fn call(root: &Path, swarm: &Path, argv: &[&str], deadline: Duration) -> Invocat
         root: root.to_path_buf(),
         env: vec![("SWARM_DIR".to_string(), swarm.display().to_string())],
         deadline,
+        effects_path: None,
     }
 }
 

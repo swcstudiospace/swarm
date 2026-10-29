@@ -1,7 +1,8 @@
 //! The `gsd_engine` binary: the Rust answer to `scripts/orch_status.py` under `GSD_ENGINE=rust`
 //! (U12.6).
 //!
-//! It reads one JSON object from stdin, `{agent, script, argv, root, env}`, passes `argv` through
+//! It reads one JSON object from stdin, `{agent, script, argv, root, env}` plus, for a write call, the
+//! `effects_path` of the manifest the caller replays after the commit, passes `argv` through
 //! unchanged (the SDK runner appends `--json` to the child), and answers through [`invoke_routed`].
 //! `GSD_RUST_BACKEND` names the backend: `host` is host Rust, `sandbox` is [`SandboxEngine`] (OD-5),
 //! and unset or empty is [`DEFAULT_BACKEND`]; any other value is `E-INPUT`. Stdout is the reply and
@@ -149,11 +150,21 @@ fn read_invocation() -> Result<Invocation, SeamError> {
     io::stdin()
         .read_to_end(&mut raw)
         .map_err(|_| input_error())?;
-    let text = String::from_utf8(raw).map_err(|_| input_error())?;
-    let Json::Obj(fields) = parse_json(&text).map_err(|_| input_error())? else {
+    invocation_from(&String::from_utf8(raw).map_err(|_| input_error())?)
+}
+
+/// The invocation the stdin object `text` describes: `agent`, `script`, `argv`, `root` and `env`, plus the optional
+/// `effects_path` of a write call (a non-empty string; the selector owns the file).
+fn invocation_from(text: &str) -> Result<Invocation, SeamError> {
+    let Json::Obj(fields) = parse_json(text).map_err(|_| input_error())? else {
         return Err(input_error());
     };
     let argv = string_list(&fields, "argv")?;
+    let effects_path = match obj_get(&fields, "effects_path") {
+        None | Some(Json::Null) => None,
+        Some(Json::Str(path)) if !path.is_empty() => Some(PathBuf::from(path)),
+        Some(_) => return Err(input_error()),
+    };
     Ok(Invocation {
         agent: text_field(&fields, "agent")?,
         script: text_field(&fields, "script")?,
@@ -161,6 +172,7 @@ fn read_invocation() -> Result<Invocation, SeamError> {
         root: PathBuf::from(text_field(&fields, "root")?),
         env: env_pairs(&fields)?,
         deadline: DEADLINE,
+        effects_path,
     })
 }
 
@@ -222,6 +234,26 @@ fn env_pairs(fields: &[(String, Json)]) -> Result<Vec<(String, String)>, SeamErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effects_path_is_an_optional_non_empty_string() -> Result<(), String> {
+        let call = |extra: &str| {
+            invocation_from(&format!(
+                r#"{{"agent": "A01", "script": "orch_status", "argv": ["--json"], "root": "/r", "env": {{}}{extra}}}"#
+            ))
+            .map_err(|e| e.message().to_string())
+        };
+        assert_eq!(call("")?.effects_path, None);
+        assert_eq!(call(r#", "effects_path": null"#)?.effects_path, None);
+        assert_eq!(
+            call(r#", "effects_path": "/tmp/m.json""#)?.effects_path,
+            Some(PathBuf::from("/tmp/m.json"))
+        );
+        for bad in [r#", "effects_path": """#, r#", "effects_path": 7"#] {
+            assert!(call(bad).is_err(), "{bad}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn env_pairs_keeps_only_the_three_selector_keys() -> Result<(), String> {
@@ -351,6 +383,7 @@ mod tests {
             root: root.path().to_path_buf(),
             env: vec![("SWARM_DIR".to_string(), swarm.display().to_string())],
             deadline: Duration::from_secs(30),
+            effects_path: None,
         };
         let host = answer_with(RustEngine::new(), &call, |_| None);
         assert_eq!(host.reply.exit_code, 0);

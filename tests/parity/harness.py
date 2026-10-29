@@ -809,7 +809,8 @@ def _default_mirror_checks(sandbox: Sandbox, selector: Any) -> list[Check]:
         sandbox.pending.append("rust_serves matches the binary's routing on the argv corpus: "
                                "scripts/orch_status.py has no rust_serves() yet")
     elif sandbox.rust_bin is not None:
-        checks.extend(_routing_checks(sandbox, rust_serves))
+        rust_serves_write = getattr(selector, "rust_serves_write", None)
+        checks.extend(_routing_checks(sandbox, lambda argv: bool(rust_serves(argv) or (rust_serves_write is not None and rust_serves_write(argv)))))
     return checks
 
 

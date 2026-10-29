@@ -365,6 +365,7 @@ mod tests {
             root: root.to_path_buf(),
             env: vec![("SWARM_DIR".to_string(), swarm.display().to_string())],
             deadline: Duration::from_secs(30),
+            effects_path: None,
         }
     }
 
@@ -847,6 +848,7 @@ mod read_route_faults {
             root: root.to_path_buf(),
             env: vec![("SWARM_DIR".to_string(), swarm.display().to_string())],
             deadline: CALL_DEADLINE,
+            effects_path: None,
         }
     }
 

@@ -1224,6 +1224,10 @@ pub mod reconcile_plan;
 #[cfg(feature = "write-routes")]
 pub use invoke::core_invoke;
 
+// The argv grammar of the host `--transition` route; host-only like the modules above, so the default guest does not carry it.
+#[cfg(feature = "write-routes")]
+pub mod transition_args;
+
 #[cfg(test)]
 mod tests {
     use super::*;

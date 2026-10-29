@@ -5,8 +5,9 @@
 //! contracts of `plan/rust-wasmer-omp-options.md` §1.2 hold whichever engine runs.
 //! [`invoke`] enforces the 100 KB `--input` cap and the 0/1/2 exit contract at the seam.
 //!
-//! The Rust engine serves only the read-only `orch_status` route, against the SQLite Task Store
-//! (`swarm/taskstore.py`). Every other entrypoint refuses with `E-DEP` until its route flips.
+//! The Rust engine serves two `orch_status` routes against the SQLite Task Store (`swarm/taskstore.py`): the read-only listing
+//! and history, and the host `--transition` write route (`crate::write_route`). Every other entrypoint refuses with `E-DEP`
+//! and `error.details.write_state = "not_started"`, so the Python body answers it, until its route flips.
 
 use std::fs;
 use std::future::{pending, Future};
@@ -16,6 +17,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use gsd_failure::{error_code_from_python, ErrorCode};
+use gsd_route::transition_args::{parse_transition_args, TransitionArgs};
 use gsd_route::{
     check_safe_id, jstr, obj_get, orch_status_reply, parse_json, run_log_counts, to_python_json,
     Fields, Json, ReadArgs, Task,
@@ -25,6 +27,8 @@ use gsd_sdk::omp_bridge_pins::{AbortKind, BridgeError, StopReason};
 use gsd_sdk::omp_bridge_runner::{InvokeRequest, OmpBridge};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
+
+use crate::write_route::transition_reply;
 
 /// Largest `--input` payload accepted at the seam, in UTF-8 bytes (`scripts/swarm_tool.py` `MAX_INPUT_BYTES`).
 pub const INPUT_CAP_BYTES: usize = 100_000;
@@ -47,6 +51,9 @@ pub struct Invocation {
     pub env: Vec<(String, String)>,
     /// Deadline after which the call fails with `E-TIMEOUT`.
     pub deadline: Duration,
+    /// File the call writes its post-commit effects manifest to (`crate::write_route`); the selector creates and owns it.
+    /// Only the write routes read it.
+    pub effects_path: Option<PathBuf>,
 }
 
 /// The frozen entrypoints, one per [`CoreBackend`] method.
@@ -274,7 +281,7 @@ fn invoke_checked<B: CoreBackend + ?Sized>(
 /// Canonicalises `path`. When it does not exist, the longest existing ancestor is canonicalised
 /// and the missing tail is appended after `.` and `..` are removed lexically, as
 /// `Path(base, value).resolve()` does in `swarm/paths.py`.
-fn canonical_or(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or(path: &Path) -> PathBuf {
     if let Ok(done) = fs::canonicalize(path) {
         return done;
     }
@@ -333,7 +340,15 @@ pub fn resolve_swarm_dir(root: &Path, env_swarm_dir: Option<&str>) -> PathBuf {
 }
 
 fn git_toplevel(base: &Path) -> Option<String> {
-    let output = Command::new("git")
+    // A child that needs nothing from the caller's environment gets nothing: no signing key or other secret rides along.
+    let mut git = Command::new("git");
+    git.env_clear();
+    for name in ["PATH", "HOME"] {
+        if let Some(value) = std::env::var_os(name) {
+            git.env(name, value);
+        }
+    }
+    let output = git
         .arg("-C")
         .arg(base)
         .args(["rev-parse", "--show-toplevel"])
@@ -499,14 +514,35 @@ impl RustEngine {
             host_orch_status(&args, call),
         ))
     }
+
+    /// The host `--transition` route: the caller has checked that the argv is inside its grammar.
+    fn orch_status_transition(
+        &self,
+        args: &TransitionArgs,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        self.runtime.block_on(within_deadline(
+            call.deadline,
+            &call.script,
+            transition_reply(args, call),
+        ))
+    }
 }
 
-/// The `E-DEP` refusal for a script or argv this engine does not serve.
+/// Marks a refusal that happened before the first write: `error.details.write_state = "not_started"`, the reply on which a caller
+/// may let the Python body answer. The details the error already has stay first.
+pub(crate) fn before_any_write(error: SeamError) -> SeamError {
+    let mut details = error.details().to_vec();
+    details.push(("write_state".to_string(), jstr("not_started")));
+    error.with_details(details)
+}
+
+/// The `E-DEP` refusal for a script or argv this engine does not serve; nothing was written.
 pub(crate) fn no_route(script: &str) -> SeamError {
-    SeamError::new(
+    before_any_write(SeamError::new(
         ErrorCode::Dep,
         format!("the rust engine has no route for {script}; use GSD_ENGINE=python"),
-    )
+    ))
 }
 
 /// Builds the single-threaded tokio runtime the engines block on.
@@ -556,7 +592,10 @@ impl CoreBackend for RustEngine {
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.orch_status_read(call)
+        match parse_transition_args(&call.argv) {
+            Some(args) => self.orch_status_transition(&args, call),
+            None => self.orch_status_read(call),
+        }
     }
 
     fn orch_assign(&self, call: &Invocation) -> Result<Reply, SeamError> {
@@ -1005,6 +1044,7 @@ mod tests {
             root: root.to_path_buf(),
             env: vec![("SWARM_DIR".to_string(), swarm.display().to_string())],
             deadline: Duration::from_secs(30),
+            effects_path: None,
         }
     }
 
@@ -1525,6 +1565,7 @@ mod tests {
             root: root.to_path_buf(),
             env,
             deadline,
+            effects_path: None,
         }
     }
 
