@@ -69,10 +69,16 @@ def _repo_state_mirrors_are_untouched(monkeypatch, tmp_path):
 @pytest.fixture()
 def swarm_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
-    # reload modules that cache SWARM_DIR at import time
-    for m in [m for m in list(sys.modules) if m.startswith("swarm")]:
-        del sys.modules[m]
-    return tmp_path / ".swarm"
+    # Every swarm* module is imported afresh inside the test. The modules the test files imported at collection time come back
+    # afterwards: a later test that patches its own module-level reference (telemetry, substrate_tee, script_base) must patch the
+    # object the code under test reaches through sys.modules, and a purge that outlived the test left the two apart.
+    original = {name: module for name, module in sys.modules.items() if name.startswith("swarm")}
+    for name in original:
+        del sys.modules[name]
+    yield tmp_path / ".swarm"
+    for name in [name for name in sys.modules if name.startswith("swarm")]:
+        del sys.modules[name]
+    sys.modules.update(original)
 
 
 @pytest.fixture()
