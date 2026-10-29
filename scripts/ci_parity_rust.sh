@@ -38,7 +38,8 @@ cargo build -p gsd-adapter --bin gsd_engine --locked
 target_dir="$(cargo metadata --format-version 1 --no-deps --locked | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
 export GSD_ENGINE_BIN="$target_dir/debug/gsd_engine"
 
-# A harness that exits 0 but prints no case line (or fewer cases than the eleven) must not pass.
+# A harness that exits 0 but prints no case line (or fewer cases than MIN_CASES, the eleven read cases that were the whole harness
+# before its twelfth, transition_matrix) must not pass.
 require_cases() {
   local file="$1" counts
   counts="$(grep -Eo '^[0-9]+/[0-9]+ cases pass$' "$file" | tail -n 1 | cut -d' ' -f1 || true)"

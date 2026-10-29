@@ -333,6 +333,8 @@ The Python body prints its own bytes, which are text unless the caller passed `-
 
 The Python path writes one `script.orch_status` record to `$SWARM_DIR/events.jsonl` for every result (`script.orch_status.error` for exit 2), and the substrate tee and `scripts/receipt_export.py` read it. The binary writes none. After a Rust answer the selector calls `AgentScript.record_external_reply` (`swarm/script_base.py`), which builds the same record through the same `emit` path, with `tee` off for `--dry-run`, before it prints. Every call therefore appends exactly one record, whichever engine answered. The selector's own refusals (`E-TIMEOUT`, `E-DEP` for a missing binary, `E-INPUT` for a bad `GSD_ENGINE` or `GSD_RUST_BACKEND`) write none.
 
+For a committed `--transition` the binary prints the task row it committed, before the lease settlement the selector replays after it (`notes.lease` released, completed or unsettled, as `substrate_lease.settle_mirrored` leaves it). Python prints and records the row after the settlement, so when the row read after the replay differs from the reply's `task`, the selector replaces that `task` (the key order of the reply is kept) and prints and records the reply as `AgentScript._print` renders `--json`; when the rows are equal, or there is no row to read (a dry run, a lost manifest, a failed replay), the binary's bytes are printed untouched.
+
 ### Build and run
 
 Build the binary, then run the read routes on it (`--json` is needed for the binary to serve the call):
@@ -351,7 +353,7 @@ GSD_ENGINE_BIN="$PWD/target/release/gsd_engine" python3 tests/parity/harness.py 
 tests/parity/record_parity.sh "$PWD/target/release/gsd_engine" <output directory>
 ```
 
-Each harness run exits 0 only when all 11 cases pass. `--rust` exits 1 when `GSD_ENGINE_BIN` is unset, not executable or cannot start; it never skips. A byte mismatch writes `tests/parity/fixtures/<case>-<digest>.json` and fails the case. Every check records who answered (`rust`, `fallback:<CODE>` or `python`); `--json-out` writes the per-check results and the counts, which are per check and not per route call. `record_parity.sh` runs five legs (Python, Rust host, Rust sandbox, and the Python and Rust host legs with `SWARM_TASKSTORE_WAL=1`) and keeps the outputs with the binary's sha256, the git head and the load.
+Each harness run exits 0 only when all 12 cases pass. `--rust` exits 1 when `GSD_ENGINE_BIN` is unset, not executable or cannot start; it never skips. A byte mismatch writes `tests/parity/fixtures/<case>-<digest>.json` and fails the case. Every check records who answered (`rust`, `fallback:<CODE>` or `python`); `--json-out` writes the per-check results and the counts, which are per check and not per route call. `record_parity.sh` runs five legs (Python, Rust host, Rust sandbox, and the Python and Rust host legs with `SWARM_TASKSTORE_WAL=1`) and keeps the outputs with the binary's sha256, the git head and the load.
 
 ### Rollback drill
 

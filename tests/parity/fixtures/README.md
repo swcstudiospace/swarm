@@ -1,6 +1,6 @@
 # Parity fixtures
 
-One JSON file per recorded invocation, named `<case>.<nn>.json`. `<case>` is one of the eleven case names in
+One JSON file per recorded invocation, named `<case>.<nn>.json`. `<case>` is one of the twelve case names in
 `tests/parity/harness.py`. `<nn>` is a two-digit index starting at `00` within that case. A case that makes several
 invocations therefore has several files.
 

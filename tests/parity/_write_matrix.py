@@ -260,15 +260,15 @@ def _extra_cells(base: Row) -> list[Cell]:
         cell("reason-starts-with-dash", "grammar", ("--transition", "T-x-created", "CANCELLED", "--reason", "-dash"), created, outside),
         cell("repo-flag-beside-root", "grammar", ("--transition", "T-x-created", "CANCELLED", "--repo", "{root}"), created, outside),
         cell("lease-cancelled-releases", "lease", ("--transition", "T-x-lease-cancel", "CANCELLED", "--reason", "stop"),
-             _held_row(base, "T-x-lease-cancel", "IN_PROGRESS"), lease=SETTLES, known="D-1", settle="graph_release"),
+             _held_row(base, "T-x-lease-cancel", "IN_PROGRESS"), lease=SETTLES, settle="graph_release"),
         cell("lease-failed-releases", "lease", ("--transition", "T-x-lease-fail", "FAILED", "--reason", "broke"),
-             _held_row(base, "T-x-lease-fail", "IN_PROGRESS"), lease=SETTLES, known="D-1", settle="graph_release"),
+             _held_row(base, "T-x-lease-fail", "IN_PROGRESS"), lease=SETTLES, settle="graph_release"),
         cell("lease-done-completes", "lease", ("--transition", "T-x-lease-done", "DONE", "--reason", "shipped"),
-             _held_row(base, "T-x-lease-done", "APPROVED"), lease=SETTLES, known="D-1", settle="graph_complete"),
+             _held_row(base, "T-x-lease-done", "APPROVED"), lease=SETTLES, settle="graph_complete"),
         cell("lease-rework-releases", "lease", ("--transition", "T-x-lease-rework", "CHANGES_REQUESTED", "--reason", "again"),
-             _held_row(base, "T-x-lease-rework", "IN_REVIEW", result={"summary": "s"}), lease=SETTLES, known="D-1", settle="graph_release"),
+             _held_row(base, "T-x-lease-rework", "IN_REVIEW", result={"summary": "s"}), lease=SETTLES, settle="graph_release"),
         cell("lease-release-refused", "lease", ("--transition", "T-x-lease-refused", "CANCELLED", "--reason", "stop"),
-             _held_row(base, "T-x-lease-refused", "IN_PROGRESS"), lease=REFUSES_RELEASE, known="D-1", settle="graph_release"),
+             _held_row(base, "T-x-lease-refused", "IN_PROGRESS"), lease=REFUSES_RELEASE, settle="graph_release"),
         cell("lease-running-defers", "lease", ("--transition", "T-x-lease-running", "FAILED", "--reason", "runner owns it"),
              _held_row(base, "T-x-lease-running", "IN_PROGRESS", running={"run_id": "R-1"}), lease=SETTLES),
         cell("lease-kept-while-holding", "lease", ("--transition", "T-x-lease-kept", "IN_PROGRESS", "--reason", "go"),
@@ -349,8 +349,6 @@ def task_state(db: Path, task_id: str) -> tuple[Optional[Row], list[Row]]:
 # one passes only while its Rust-path answer differs from Python's in exactly that way (the scrub below removes just that difference) and
 # FAILS the day the answers are equal, so a fix has to delete the entry.
 KNOWN_DIVERGENCES = {
-    "D-1": "the reply's `task` is the committed row, read before the lease settlement the selector replays; Python returns the row after "
-           "`settle_mirrored` (notes.lease says released/completed/unsettled), in stdout and in the `script.orch_status` run-log record",
     "D-2": "with `--task-id X` the replayed `task.transition` record carries the target's task id (the manifest names it); Python's "
            "`Ctx.emit` gives the context's id X precedence over the payload's",
 }
@@ -361,8 +359,6 @@ def scrub(known: Optional[str], value: Any) -> Any:
     if known is None:
         return value
     if isinstance(value, dict):
-        if known == "D-1" and "notes" in value and "notes_json" in value:
-            value = {**value, "notes": "<lease settled>", "notes_json": "<lease settled>"}
         if known == "D-2" and value.get("type") == "task.transition":
             value = {key: item for key, item in value.items() if key != "task_id"}
         return {key: scrub(known, item) for key, item in value.items()}

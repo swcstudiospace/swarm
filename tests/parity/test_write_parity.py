@@ -60,8 +60,7 @@ def test_lease_cells_cover_every_terminal_state_and_the_skipped_settle() -> None
 def test_known_divergences_name_cells_and_every_entry_is_used() -> None:
     named = {cell.known for cell in CELLS if cell.known is not None}
     assert named == set(matrix.KNOWN_DIVERGENCES)
-    assert {cell.cell_id for cell in CELLS if cell.known == "D-1"} == {
-        f"extra-lease-{name}" for name in ("cancelled-releases", "failed-releases", "done-completes", "rework-releases", "release-refused")}
+    assert all(cell.known is None for cell in CELLS if cell.group == "lease")  # D-1 is fixed: no lease cell may name a divergence
     assert {cell.cell_id for cell in CELLS if cell.known == "D-2"} == {"extra-ids-reach-the-run-log"}
     assert all(cell.known is None for cell in CELLS if cell.fallback is not None)  # a cell Python answers cannot diverge
 

@@ -418,10 +418,11 @@ def _call_ctx(call: WriteCall) -> Ctx:
     return Ctx("A01", "orch_status", call.task_id, call.correlation_id, call.dry_run, Path(call.root).resolve())
 
 
-def _replay(call: WriteCall, manifest: Manifest, before: str | None) -> None:
+def _replay(call: WriteCall, manifest: Manifest, before: str | None) -> dict[str, Any]:
     """Runs the effects of a transition the binary committed, in the order of the Python path: the live.json refresh that
     TaskStore's observer makes inside `transition`, then `finish_transition` (lease settlement, inline run events, the manifest's
-    events). `before` is the state read before the binary started; the manifest's own `from` stands in when none could be read."""
+    events). `before` is the state read before the binary started; the manifest's own `from` stands in when none could be read.
+    Returns the task row after the lease settlement, the row Python's own answer carries."""
     ctx = _call_ctx(call)
     store = TaskStore(root=ctx.root)
     try:
@@ -429,25 +430,25 @@ def _replay(call: WriteCall, manifest: Manifest, before: str | None) -> None:
         telemetry.refresh_live(db_path=store.path)
     except Exception:  # noqa: BLE001 - the observer never fails a committed transition
         logging.getLogger("swarm.telemetry").warning("live.json refresh failed", exc_info=True)
-    finish_transition(store, ctx, call.target, before=manifest.inline_from if before is None else before, reason=manifest.inline_reason,
-                      events=lambda _row: list(manifest.effects))
+    return finish_transition(store, ctx, call.target, before=manifest.inline_from if before is None else before,
+                             reason=manifest.inline_reason, events=lambda _row: list(manifest.effects))
 
 
-def _run_effects(call: WriteCall | None, before: str | None, effects_path: str) -> str | None:
-    """Runs the effects of a committed write from the manifest at `effects_path`. Returns why they were not all run, else None.
+def _run_effects(call: WriteCall | None, before: str | None, effects_path: str) -> tuple[str | None, dict[str, Any] | None]:
+    """Runs the effects of a committed write from the manifest at `effects_path`. Returns why they were not all run (else None) and
+    the task row after the lease settlement (None when no replay ran to its end).
     A dry run has none; an argv outside the write grammar has no task to replay them for."""
     if call is None:
-        return "argv outside the write grammar"
+        return "argv outside the write grammar", None
     if call.dry_run:
-        return None
+        return None, None
     manifest = _read_manifest(effects_path, call.target)
     if manifest is None:
-        return "effects manifest missing or unparsable"
+        return "effects manifest missing or unparsable", None
     try:
-        _replay(call, manifest, before)
+        return None, _replay(call, manifest, before)
     except Exception as exc:  # noqa: BLE001 - the transition is committed: say what was lost, never run it again
-        return f"replay failed: {type(exc).__name__}"
-    return None
+        return f"replay failed: {type(exc).__name__}", None
 
 
 def _warn(message: str) -> None:
@@ -480,6 +481,22 @@ def _record_effects_lost(call: WriteCall | None, why: str) -> None:
         _warn(f"effects of a committed transition were lost: {why}; the event could not be recorded ({type(exc).__name__})")
 
 
+def _settled_reply(reply: dict[str, Any], stdout: bytes, row: dict[str, Any] | None) -> tuple[dict[str, Any], bytes]:
+    """The reply to record and the bytes to print once the lease settlement has run. Python answers with the row it read after
+    `settle_mirrored` (its `task.notes` and `notes_json.lease` say released, completed or unsettled), while the binary answered with
+    the row it committed, before. When `row` (what `_replay` read) differs from the reply's `task`, that `task` is replaced in place,
+    so the reply keeps the key order the binary printed, and the bytes are rendered as `AgentScript._print` renders `--json`. When
+    the rows are equal, or there is no row (a dry run, a lost manifest, a failed replay) or no `task` object, the binary's `stdout`
+    is returned untouched."""
+    if row is None or not isinstance(reply.get("task"), dict):
+        return reply, stdout
+    settled = json.loads(json.dumps(row, default=str))  # the row as the reply carries it: JSON values, as `_print` would write them
+    if settled == reply["task"]:
+        return reply, stdout
+    reply["task"] = settled
+    return reply, (json.dumps(reply, indent=2, default=str) + "\n").encode("utf-8")
+
+
 def _error_details(reply: dict[str, Any]) -> dict[str, Any]:
     error = reply.get("error")
     details = error.get("details") if isinstance(error, dict) else None
@@ -493,8 +510,9 @@ def run_rust_write(argv: list[str], binary: str, *, explicit: bool) -> int | Non
     its COMMIT. Outcome table (Design 7), by what the binary did:
 
     * exit 0 or 1 with a JSON object: committed (or a dry run). The manifest is replayed in Python's order, the answer is
-      recorded (D1) and printed. A missing or broken manifest, or a replay that fails, writes the run-log event
-      `orch_status.effects_lost`; the answer is still printed and nothing is run again.
+      recorded (D1) and printed, with the task row read after the lease settlement in place of the binary's own `task` when the two
+      differ (`_settled_reply`: Python prints that row). A missing or broken manifest, or a replay that fails, writes the run-log
+      event `orch_status.effects_lost`; the answer is still printed as the binary wrote it and nothing is run again.
     * exit 2 with `error.details.write_state == "not_started"`: nothing was written; the Python body answers.
     * exit 2 with write_state `final`, or absent on any code but E-INTERNAL (E-CONTRACT, E-POLICY, E-INPUT of an unknown task or
       of an invalid id, Python's `max_attempts exceeded` E-TIMEOUT that names its task, ...): the binary's own refusal, with
@@ -544,6 +562,7 @@ def _answer_write(argv: list[str], binary: str, explicit: bool, call: WriteCall 
     reply = _reply_object(done.stdout)
     if reply is None:
         return _unknown_outcome(argv, call, "the gsd_engine binary printed no JSON object")
+    stdout = done.stdout
     if code == AgentScript.EXIT_ERROR:
         error_code, details = _error_code(reply), _error_details(reply)
         state = details.get("write_state")
@@ -555,14 +574,15 @@ def _answer_write(argv: list[str], binary: str, explicit: bool, call: WriteCall 
         if error_code is None or state not in (None, "final") or (state is None and error_code == ErrorCode.E_INTERNAL.value):
             return _unknown_outcome(argv, call, "the gsd_engine binary refused without saying that nothing was written")
     else:
-        lost = _run_effects(call, before, effects_path)
+        lost, row = _run_effects(call, before, effects_path)
         if lost is not None:
             _record_effects_lost(call, lost)
+        reply, stdout = _settled_reply(reply, stdout, row)
     try:
         SCRIPT.record_external_reply(argv, reply, code)
     except Exception as exc:  # noqa: BLE001 - a write is never handed to Python once the binary has answered
         _warn(f"the run-log record of the binary's answer failed ({type(exc).__name__}); the answer stands and was not repeated")
-    sys.stdout.buffer.write(done.stdout)
+    sys.stdout.buffer.write(stdout)
     sys.stdout.flush()
     return code
 

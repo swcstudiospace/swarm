@@ -9,6 +9,7 @@ import io
 import json
 import os
 import random
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -47,6 +48,15 @@ def _rendered(reply: dict[str, Any]) -> str:
     return json.dumps(reply, indent=2) + "\n"
 
 
+def _committed(tmp_path: Path, reply: dict[str, Any] = OK_REPLY) -> dict[str, Any]:
+    """`reply` with the task row a binary that had just committed T-1 → CANCELLED prints: the row as the store holds it (the fake's
+    COMMIT changes the state only), the row the selector reads after the replay, which Python would print when nothing settles."""
+    committed = TaskStore(root=tmp_path)
+    row = committed.get("T-1")
+    committed.conn.close()
+    return {**reply, "task": {**row, "state": "CANCELLED"}}
+
+
 def _error_reply(code: str, write_state: str | None = None, **details: Any) -> dict[str, Any]:
     details = details if write_state is None else {**details, "write_state": write_state}
     return {"agent": "A01", "script": "orch_status", "status": "error",
@@ -81,8 +91,9 @@ present = bool(effects) and os.path.exists(effects)
 seen = {{"exists": present, "size": os.path.getsize(effects) if present else None, "mode": oct(os.stat(effects).st_mode & 0o777) if present else None}}
 json.dump(seen, open(os.path.join(folder, "effects.json"), "w"))
 if cfg["set_state"]:
+    tid, state, *stamp = cfg["set_state"]  # an optional third value is the row's updated_at, as a committing binary stamps it
     conn = sqlite3.connect(os.path.join(os.environ["SWARM_DIR"], "tasks.db"))
-    conn.execute("UPDATE tasks SET state=? WHERE task_id=?", (cfg["set_state"][1], cfg["set_state"][0]))
+    conn.execute("UPDATE tasks SET state=?" + (", updated_at=?" if stamp else "") + " WHERE task_id=?", (state, *stamp, tid))
     conn.commit()
 if cfg["manifest"] is not None and effects:
     text = cfg["manifest"] if isinstance(cfg["manifest"], str) else json.dumps(cfg["manifest"])
@@ -634,10 +645,11 @@ def test_the_unknown_outcome_message_names_the_signal(mod: ModuleType, fake_bina
 def test_a_committed_answer_is_replayed_recorded_and_printed(
         exit_code: int, explicit: bool, mod: ModuleType, fake_binary: Callable[..., Fake], store: None, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch, answer: Callable[[list[str]], tuple[int, str]]) -> None:
-    fake = fake_binary(stdout=_rendered(OK_REPLY), exit=exit_code, manifest=MANIFEST, set_state=("T-1", "CANCELLED"))
+    reply = _committed(tmp_path)
+    fake = fake_binary(stdout=_rendered(reply), exit=exit_code, manifest=MANIFEST, set_state=("T-1", "CANCELLED"))
     _use(monkeypatch, mod, fake, explicit=explicit)
 
-    assert answer(WRITE) == (exit_code, _rendered(OK_REPLY))
+    assert answer(WRITE) == (exit_code, _rendered(reply))
 
     assert (fake.starts, _state(tmp_path)) == (1, "CANCELLED")
     assert _types(tmp_path) == COMMITTED_TYPES
@@ -675,10 +687,12 @@ def test_the_replay_writes_the_run_log_the_python_path_writes(mod: ModuleType, f
         return [{key: value for key, value in event.items() if key not in VOLATILE} for event in _events(tmp_path, directory)]
 
     seed("python-state")
+    shutil.copytree(tmp_path / "python-state", tmp_path / "rust-state")  # the same store, created_at included, before either call
     monkeypatch.setenv("GSD_ENGINE", "python")
     python_exit, python_out = answer(WRITE)
-    seed("rust-state")
-    fake = fake_binary(stdout=python_out, manifest=MANIFEST, set_state=("T-1", "CANCELLED"))
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / "rust-state"))
+    # the binary stamps the commit as Python did, so the row it printed is the row the selector reads: Python's own reply stands
+    fake = fake_binary(stdout=python_out, manifest=MANIFEST, set_state=("T-1", "CANCELLED", json.loads(python_out)["task"]["updated_at"]))
     monkeypatch.setenv("GSD_ENGINE", "rust")
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
     rust_exit, rust_out = answer(WRITE)
