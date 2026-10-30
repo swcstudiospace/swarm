@@ -552,6 +552,24 @@ def test_gsd_line_goes_only_to_an_existing_state_file(tmp_path: Path, monkeypatc
     assert mirror.read_text().endswith("swarm: bare\n")
 
 
+def test_gsd_mirror_is_off_when_the_variable_is_unset_or_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # the run-from-the-repository-root hazard: a `.planning/STATE.md` under the root must not receive `swarm:` lines by default
+    store, _, _ = _store(tmp_path, monkeypatch)
+    planning = tmp_path / ".planning"
+    planning.mkdir()
+    state_md = planning / "STATE.md"
+    state_md.write_text("head\n")
+    monkeypatch.delenv("SWARM_GSD_STATE_FILE", raising=False)  # unset
+    store.append_gsd_line("RUNNING", root=tmp_path, state="RUNNING")
+    assert state_md.read_text() == "head\n"
+    monkeypatch.setenv("SWARM_GSD_STATE_FILE", "")  # empty
+    store.append_gsd_line("IN_PROGRESS", root=tmp_path, state="IN_PROGRESS")
+    assert state_md.read_text() == "head\n"
+    monkeypatch.setenv("SWARM_GSD_STATE_FILE", str(state_md))  # a real path writes again, as before
+    store.append_gsd_line("COMPLETE", root=tmp_path, state="COMPLETE")
+    assert state_md.read_text() == "head\nswarm: COMPLETE state=COMPLETE\n"
+
+
 # ---- the streams built on them ----------------------------------------------------------------------------------------------------------
 
 

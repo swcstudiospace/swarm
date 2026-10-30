@@ -27,11 +27,9 @@ def claude_state_dir(default: Path) -> Path:
     return Path(override) if override else default
 
 
-def gsd_state_path(base: Path) -> Path | None:
-    """STATE.md mirror under base. SWARM_GSD_STATE_FILE replaces it (read per call); empty disables the mirror."""
+def gsd_state_path() -> Path | None:
+    """GSD STATE.md mirror target. Off unless SWARM_GSD_STATE_FILE names a file: unset and empty both mean off."""
     override = os.environ.get("SWARM_GSD_STATE_FILE")
-    if override is None:
-        return base / ".planning" / "STATE.md"
     return Path(override) if override else None
 
 
@@ -174,8 +172,7 @@ class SwarmStateStore:
 
     def append_gsd_line(self, line: str, *, root: str | Path | None = None, state: str | None = None) -> None:
         try:
-            base = Path(root) if root else self.root
-            state_md = gsd_state_path(base)
+            state_md = gsd_state_path()
             if state_md is not None and state_md.exists():
                 with state_md.open("a") as f:
                     suffix = f" state={state}" if state else ""
