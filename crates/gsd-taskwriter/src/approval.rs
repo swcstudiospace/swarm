@@ -141,6 +141,21 @@ impl ApprovalKeys {
     fn verify_text(&self, text: &str) -> Result<bool, Declined> {
         Ok(verify_envelope(&parse_signed(text)?, &self.material))
     }
+
+    /// The host's signature answer for one verdict row, by the rule [`gather`] applies to the rows it reads: a row with no envelope
+    /// text, or whose envelope is not a valid `gate.verdict` shape, is `false` without a verification; any other row is verified
+    /// with this call's keys. Used by the ingest snapshot, which verifies the rows the planner may read (`TaskStoreWriter::ingest`).
+    ///
+    /// # Errors
+    ///
+    /// A not-started [`WriterError`] when the envelope text is one Python's `json` reads but this crate cannot represent exactly
+    /// ([`Declined`]): the whole call is declined, never read as `false`.
+    pub(crate) fn row_sig_ok(&self, entry: &VerdictFacts) -> Result<bool, WriterError> {
+        match (&entry.envelope, entry.row.envelope_json.as_deref()) {
+            (EnvelopeState::Invalid, _) | (_, None | Some("")) => Ok(false),
+            (_, Some(text)) => self.verify_text(text).map_err(declined),
+        }
+    }
 }
 
 impl fmt::Debug for ApprovalKeys {

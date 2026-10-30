@@ -20,6 +20,11 @@
 //! [`TaskStoreWriter::issue_gate`] (module [`gate_issue`], U3.6a) is the gate-issue tail of `swarm/verdicts.py::issue_gate`: it signs the
 //! verdict envelopes with `gsd-envelope`, derives the verdict file, the events and the refusals as data ([`GatePlan`]) and writes the verdict
 //! rows and the `notes.feedback` rewrites of a `fail` in one `BEGIN IMMEDIATE` transaction.
+//!
+//! [`TaskStoreWriter::ingest`] (module [`ingest`], U3.5e part 1) is `orch_status --ingest` after the result file was read: it reads every
+//! fact the pure ingest planner needs from one snapshot inside one `BEGIN IMMEDIATE` transaction, verifies the verdict rows with the
+//! host's keys, applies the planner's op list and returns the events to replay. A transition to `APPROVED` is never applied on the
+//! planner's word: [`TaskStoreWriter::apply_ops`] refuses it and [`TaskStoreWriter::apply_ops_approving`] attests it first (see `ops`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,6 +33,7 @@ mod apply;
 pub mod approval;
 mod error;
 pub mod gate_issue;
+pub mod ingest;
 mod ops;
 mod plan;
 mod store;
@@ -41,6 +47,7 @@ pub use gate_issue::{
     derive_gate_issue, Decline, EnvelopeIds, GateEvent, GateFile, GateIssueRequest, GatePlan,
     GateWrite, StoreFacts, SystemIds, TaskFacts,
 };
+pub use ingest::{IngestApplied, IngestCause, IngestError, IngestRequest};
 pub use ops::{NewTask, OpsApplied, OpsAudit, OpsCause, OpsError, WriterOp};
 pub use plan::{PlanValidator, PlanViolation, ValidatedPlan};
 #[cfg(feature = "fault-injection")]

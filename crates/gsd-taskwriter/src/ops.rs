@@ -43,18 +43,41 @@
 //!   that is not a JSON list (`TypeError`); a `notes.feedback` that is not a list (`AttributeError`); a stored row Rust cannot read
 //!   ([`crate::Tx::task`]).
 //! * A transition plan that fails [`PlanValidator`] is `E-INTERNAL`, not started ([`OpsCause::InvalidPlan`]).
+//! * A transition to `APPROVED` is [`OpsCause::ApprovalRefused`], not started, unless the host attested it (next section).
 //! * A database failure during phase two is final, with the transaction rolled back.
 //!
 //! [`OpsError::op_index`] names the op that failed.
+//!
+//! # APPROVED is never applied on the caller's word (security review F-7)
+//!
+//! [`PlanValidator`] checks the shape and the legality of a plan, not the facts behind it: a plan to `APPROVED` needs no key, no
+//! passing gate and no accepted issuer to be valid. So the guarantee is structural, inside the one function every list goes through
+//! (`resolve_and_write`):
+//!
+//! * [`TaskStoreWriter::apply_ops`] has no approval context: a list with a plan that ends in, or passes through, `APPROVED` is
+//!   refused in phase one, before the first write.
+//! * [`TaskStoreWriter::apply_ops_approving`] and [`TaskStoreWriter::ingest`] hand the function an `ApprovalGuard` built from an
+//!   [`ApprovalSource`](crate::ApprovalSource): keys read once before the transaction, the facts of
+//!   [`crate::approval`] read inside it. Immediately before each APPROVED step is written (so after the earlier steps of the same list
+//!   are, which is what a reconcile that approves a task whose gate task the list has just moved to IN_REVIEW needs) the writer reads
+//!   the task row and the gate facts, runs `decide_transition` on them and requires the result to equal the step's plan. Anything else
+//!   rolls the whole list back.
+//!
+//! There is no way to reach `write_step` for an APPROVED plan without passing one of the two branches, and no constructor of the
+//! guard outside this crate. The test `an_approved_plan_is_never_applied_without_the_hosts_facts` (tests/ingest.rs) fails if the
+//! check is removed.
 
 use std::fmt;
 
 use gsd_codes::ErrorCode;
 use gsd_route::pydumps::to_python_dumps;
-use gsd_route::transition_plan::{AuditRow, PlanEffect, TransitionPlan};
+use gsd_route::transition_plan::{
+    decide_transition, AuditRow, Facts, PlanEffect, Request, TransitionPlan,
+};
 use gsd_route::{is_safe_id, jstr, obj_get, Fields, Json};
 
 use crate::apply::write_validated;
+use crate::approval::{self, gather, ApprovalKeys, ApprovalSource};
 use crate::error::{ErrorKind, WriteState, WriterError};
 use crate::plan::{has_non_finite, PlanValidator, PlanViolation, ValidatedPlan};
 use crate::store::{NewArtifact, NewTaskRow, TextColumn, Tx};
@@ -188,6 +211,9 @@ pub enum OpsCause {
     UnknownTask,
     /// A transition plan failed validation. Nothing was written.
     InvalidPlan(PlanViolation),
+    /// A transition to `APPROVED` that the host's own gate facts do not allow, or that came without them. Nothing is committed (the
+    /// transaction is rolled back, whatever the earlier ops of the list had written inside it), and Python answers.
+    ApprovalRefused,
     /// An op or a stored value Rust cannot prove byte-identical to Python ([`ErrorKind::Unsupported`], not started), or a store
     /// failure (see [`ErrorKind`]).
     Failed(ErrorKind),
@@ -238,6 +264,19 @@ impl OpsError {
             write_state: WriteState::NotStarted,
             op_index: None,
             cause: OpsCause::InvalidPlan(violation),
+        }
+    }
+
+    /// An APPROVED the host's approval check refused: `E-DEP`, [`WriteState::NotStarted`] (nothing is committed), Python answers.
+    /// `why` is fixed text or the policy message of the refusal (task id and gate names): never a key, a signature or an envelope.
+    fn approval_refused(task_id: &str, why: &str) -> Self {
+        Self {
+            cause: OpsCause::ApprovalRefused,
+            op_index: None,
+            code: ErrorCode::Dep,
+            message: format!("approval: {why} (task {task_id})").into_boxed_str(),
+            details: Box::default(),
+            write_state: WriteState::NotStarted,
         }
     }
 
@@ -343,18 +382,57 @@ impl TaskStoreWriter {
     /// transaction is rolled back; an error whose [`OpsError::write_state`] is [`WriteState::NotStarted`] left the store
     /// byte-identical.
     pub async fn apply_ops(&self, ops: &[WriterOp], now: f64) -> Result<OpsApplied, OpsError> {
+        self.apply_list(ops, now, None).await
+    }
+
+    /// [`TaskStoreWriter::apply_ops`] for a list that may move tasks to `APPROVED` (the ingest and reconcile of F-7).
+    ///
+    /// `apply_ops` refuses such a list in phase one, before the first write: `PlanValidator` checks the shape and the legality of a
+    /// plan, not the facts behind an approval, so a plan to APPROVED must never be applied on the word of its caller. Here the host
+    /// proves it itself. The keys come from `source` ONCE, before the transaction opens, and only when the list has an APPROVED step
+    /// (a [`gsd_envelope::Declined`] key shape refuses there, not started). Inside the transaction, immediately before each APPROVED
+    /// step is written, the writer reads the approval facts as `TaskStore.transition` does ([`crate::approval`]: the key policy, the
+    /// missing and unaccepted gates, the verdict rows with their signature answers, one clock reading after the lock) against the rows
+    /// the earlier steps of the list have left, runs [`decide_transition`] on them and requires the result to be the step's own plan.
+    /// Any difference refuses the whole list ([`OpsCause::ApprovalRefused`]) and rolls it back.
+    pub async fn apply_ops_approving(
+        &self,
+        ops: &[WriterOp],
+        now: f64,
+        source: &dyn ApprovalSource,
+    ) -> Result<OpsApplied, OpsError> {
+        self.apply_list(ops, now, Some(source)).await
+    }
+
+    async fn apply_list(
+        &self,
+        ops: &[WriterOp],
+        now: f64,
+        source: Option<&dyn ApprovalSource>,
+    ) -> Result<OpsApplied, OpsError> {
         if !now.is_finite() {
             return Err(OpsError::unsupported("now is not a finite number"));
         }
         if ops.is_empty() {
             return Ok(OpsApplied::default());
         }
+        let keys = match source {
+            Some(source) if ops.iter().any(WriterOp::reaches_approved) => Some(
+                source
+                    .keys()
+                    .map_err(|declined| OpsError::store(&approval::declined(declined), None))?,
+            ),
+            _ => None,
+        };
         let mut tx = self
             .store()
             .begin()
             .await
             .map_err(|error| OpsError::store(&error, None))?;
-        match resolve_and_write(&mut tx, ops, now).await {
+        let guard = source
+            .zip(keys.as_ref())
+            .map(|(source, keys)| ApprovalGuard::new(source, keys));
+        match resolve_and_write(&mut tx, ops, now, guard.as_ref()).await {
             Ok(applied) => {
                 tx.commit()
                     .await
@@ -407,6 +485,8 @@ enum Step<'a> {
     State {
         task_id: &'a str,
         validated: ValidatedPlan<'a>,
+        /// The plan as given: an APPROVED step is attested against it (see [`ApprovalGuard`]).
+        plan: &'a TransitionPlan,
     },
     /// `UPDATE tasks SET <column>=?, updated_at=?`.
     Text {
@@ -435,6 +515,19 @@ enum Step<'a> {
     },
 }
 
+impl WriterOp {
+    /// Whether the op is a transition whose plan ends in, or passes through, `APPROVED`.
+    fn reaches_approved(&self) -> bool {
+        matches!(self, WriterOp::Transition { plan, .. } if plan_reaches_approved(plan))
+    }
+}
+
+/// A plan reaches APPROVED when it ends there or any of its audit steps enters it (a two-step plan through APPROVED is not a legal
+/// decision, but the check must not depend on `plan.to` alone).
+fn plan_reaches_approved(plan: &TransitionPlan) -> bool {
+    plan.to == "APPROVED" || plan.audit.iter().any(|row| row.to == "APPROVED")
+}
+
 impl Step<'_> {
     fn task_id(&self) -> &str {
         match self {
@@ -444,13 +537,97 @@ impl Step<'_> {
             Step::Create { task, .. } => &task.task_id,
         }
     }
+
+    fn reaches_approved(&self) -> bool {
+        matches!(self, Step::State { plan, .. } if plan_reaches_approved(plan))
+    }
+}
+
+/// The host's approval context of one op list: where the keys and the clock come from, and the keys of this call. Built only inside
+/// this crate, from an [`ApprovalSource`] the caller gave, so a list cannot be attested by anything but the host's own reading.
+pub(crate) struct ApprovalGuard<'a> {
+    source: &'a dyn ApprovalSource,
+    keys: &'a ApprovalKeys,
+}
+
+impl<'a> ApprovalGuard<'a> {
+    /// A guard over the keys read for this call and the source that gave them.
+    pub(crate) fn new(source: &'a dyn ApprovalSource, keys: &'a ApprovalKeys) -> Self {
+        Self { source, keys }
+    }
+}
+
+/// The row as [`Facts`] holds it: `dict(sqlite3.Row)`, so the JSON columns are text again and `notes_json` is gone. (The same
+/// reshaping as `apply.rs` does for a single transition; that module is not this unit's to export from.)
+fn decision_row(row: Fields) -> Fields {
+    const JSON_COLUMNS: [&str; 5] = ["inputs", "outputs", "acceptance", "budget", "depends_on"];
+    row.into_iter()
+        .filter(|(name, _)| name != "notes_json")
+        .map(|(name, value)| {
+            if JSON_COLUMNS.contains(&name.as_str()) {
+                (name, Json::Str(to_python_dumps(&value)))
+            } else {
+                (name, value)
+            }
+        })
+        .collect()
+}
+
+/// F-7: an APPROVED step is written only if the host's own approval facts, read now inside the transaction, give exactly this plan.
+///
+/// The row is read after the earlier steps of the list were written, so a gate task the list has just moved to IN_REVIEW counts as
+/// accepted, and the target's `notes.verdicts_since` is the one the list has left. Nothing is trusted from the planner but the plan.
+async fn attest_approval(
+    tx: &mut Tx,
+    guard: &ApprovalGuard<'_>,
+    task_id: &str,
+    plan: &TransitionPlan,
+    now: f64,
+) -> Result<(), OpsError> {
+    let Some(entering) = plan.audit.iter().find(|row| row.to == "APPROVED") else {
+        return Err(OpsError::approval_refused(
+            task_id,
+            "a plan that ends in APPROVED without an audit step into it",
+        ));
+    };
+    let row = tx
+        .task(task_id)
+        .await
+        .map_err(|error| OpsError::store(&error, None))?
+        .ok_or_else(|| OpsError::unknown_task(task_id))?;
+    let approval = gather(tx, guard.keys, guard.source, &row, now)
+        .await
+        .map_err(|error| OpsError::store(&error, None))?;
+    let facts = Facts {
+        task: Some(decision_row(row)),
+        approval: Some(approval),
+    };
+    let request = Request {
+        task_id: task_id.to_string(),
+        to: "APPROVED".to_string(),
+        actor: entering.actor.clone(),
+        reason: entering.reason.clone(),
+        manual: false,
+    };
+    match decide_transition(&facts, &request, now) {
+        Ok(decided) if decided == *plan => Ok(()),
+        Ok(_) => Err(OpsError::approval_refused(
+            task_id,
+            "the plan is not the host's decision for the rows as they stand",
+        )),
+        Err(refusal) => Err(OpsError::approval_refused(task_id, &refusal.message)),
+    }
 }
 
 /// Phase one for every op, phase two for the resulting steps, then the rows as they stand before the commit.
-async fn resolve_and_write(
+///
+/// `guard` is the host's approval context. Without it a list that moves a task to `APPROVED` is refused in phase one, before the
+/// first write; with it every such step is attested in phase two against the rows the earlier steps left in this transaction.
+pub(crate) async fn resolve_and_write(
     tx: &mut Tx,
     ops: &[WriterOp],
     now: f64,
+    guard: Option<&ApprovalGuard<'_>>,
 ) -> Result<OpsApplied, OpsError> {
     let mut sim = Sim {
         tx,
@@ -458,7 +635,15 @@ async fn resolve_and_write(
     };
     let mut steps = Vec::with_capacity(ops.len());
     for (index, op) in ops.iter().enumerate() {
-        steps.push(resolve(&mut sim, op, now).await.map_err(|e| e.at(index))?);
+        let step = resolve(&mut sim, op, now).await.map_err(|e| e.at(index))?;
+        if guard.is_none() && step.reaches_approved() {
+            return Err(OpsError::approval_refused(
+                step.task_id(),
+                "a transition to APPROVED needs the host's approval facts (apply_ops_approving)",
+            )
+            .at(index));
+        }
+        steps.push(step);
     }
     let tx = sim.tx;
 
@@ -468,6 +653,13 @@ async fn resolve_and_write(
         #[cfg(feature = "fault-injection")]
         if index > 0 {
             tx.faults.hit(PausePoint::BetweenOps).await;
+        }
+        if let (Some(guard), Step::State { task_id, plan, .. }) = (guard, step) {
+            if step.reaches_approved() {
+                attest_approval(tx, guard, task_id, plan, now)
+                    .await
+                    .map_err(|error| error.at(index))?;
+            }
         }
         write_step(tx, step, now)
             .await
@@ -500,7 +692,9 @@ async fn resolve_and_write(
 /// Adds what `step` wrote to the audit rows and effects of the result.
 fn record(applied: &mut OpsApplied, step: &Step<'_>, now: f64) {
     match step {
-        Step::State { task_id, validated } => {
+        Step::State {
+            task_id, validated, ..
+        } => {
             for row in validated.audit {
                 applied.audit.push(OpsAudit {
                     task_id: (*task_id).to_string(),
@@ -528,7 +722,9 @@ fn record(applied: &mut OpsApplied, step: &Step<'_>, now: f64) {
 /// Executes one resolved step.
 async fn write_step(tx: &mut Tx, step: &Step<'_>, now: f64) -> Result<(), WriterError> {
     match step {
-        Step::State { task_id, validated } => write_validated(tx, task_id, validated, now).await,
+        Step::State {
+            task_id, validated, ..
+        } => write_validated(tx, task_id, validated, now).await,
         Step::Text {
             task_id,
             column,
@@ -691,7 +887,11 @@ async fn resolve_transition<'a>(
         set_field(row, "notes", jstr(text));
         set_field(row, "notes_json", object.clone());
     }
-    Ok(Step::State { task_id, validated })
+    Ok(Step::State {
+        task_id,
+        validated,
+        plan,
+    })
 }
 
 /// `set_notes`: the merge of `set` into the notes, in the order Python's `dict.update` gives.

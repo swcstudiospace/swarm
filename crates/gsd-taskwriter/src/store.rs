@@ -745,6 +745,192 @@ impl Tx {
         }
         Ok(out)
     }
+
+    // ---- the reads of the ingest snapshot (`TaskStoreWriter::ingest`, U3.5e part 1) -------------------------------------------
+    //
+    // Read-only, like `verdict_rows`: none of them marks the transaction as written, so a refusal after them leaves the store
+    // byte-identical. Each one reads inside the caller's `BEGIN IMMEDIATE`, so all of them are one snapshot under one write lock.
+
+    /// `correlation_id` of `task_id`; `None` when the task does not exist.
+    pub async fn correlation_of(&mut self, task_id: &str) -> Result<Option<String>, WriterError> {
+        let wrote = self.wrote;
+        sqlx::query_scalar::<_, String>("SELECT correlation_id FROM tasks WHERE task_id=?")
+            .bind(task_id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(|error| {
+                failure(
+                    wrote,
+                    ErrorKind::Database,
+                    format!("task store correlation read of {task_id}: {error}"),
+                )
+            })
+    }
+
+    /// Every `tasks` row of `correlation_id` as `dict(sqlite3.Row)`, in `rowid` order: the columns as stored, the JSON columns still text
+    /// (what `gsd_route::reconcile_plan::ReconcileFacts::tasks` takes, unlike [`Tx::task`], which parses them). A value of a storage
+    /// class this crate does not read (a `BLOB`) is an [`ErrorKind::Unsupported`] error, so Python answers.
+    pub async fn task_rows_of_correlation(
+        &mut self,
+        correlation_id: &str,
+    ) -> Result<Vec<Fields>, WriterError> {
+        let wrote = self.wrote;
+        let rows = sqlx::query("SELECT * FROM tasks WHERE correlation_id=? ORDER BY rowid")
+            .bind(correlation_id)
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(|error| {
+                failure(
+                    wrote,
+                    ErrorKind::Database,
+                    format!("task store read of a correlation: {error}"),
+                )
+            })?;
+        rows.iter()
+            .map(row_fields)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|problem| {
+                failure(
+                    wrote,
+                    ErrorKind::Unsupported,
+                    format!("a task of the correlation: {problem}"),
+                )
+            })
+    }
+
+    /// `(task_id, state)` of every task OUTSIDE `correlation_id`, in `rowid` order: a verdict envelope may name one of them as its gate
+    /// task, and the `tasks` primary key spans correlations (a rerun id must not take an id the store holds).
+    pub async fn task_states_outside(
+        &mut self,
+        correlation_id: &str,
+    ) -> Result<Vec<(String, String)>, WriterError> {
+        let wrote = self.wrote;
+        let rows = sqlx::query(
+            "SELECT task_id, state FROM tasks WHERE correlation_id IS NOT ? ORDER BY rowid",
+        )
+        .bind(correlation_id)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(|error| {
+            failure(
+                wrote,
+                ErrorKind::Database,
+                format!("task store read of the other tasks: {error}"),
+            )
+        })?;
+        rows.iter()
+            .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(|error| {
+                failure(
+                    wrote,
+                    ErrorKind::Unsupported,
+                    format!("a task outside the correlation: {error}"),
+                )
+            })
+    }
+
+    /// The `ts` of every `CLAIMED` audit row of `task_id`, in `id` order (`results._lease_start` reads the last).
+    pub async fn claim_stamps(&mut self, task_id: &str) -> Result<Vec<f64>, WriterError> {
+        let wrote = self.wrote;
+        let rows = sqlx::query(
+            "SELECT ts FROM transitions WHERE task_id=? AND to_state='CLAIMED' ORDER BY id",
+        )
+        .bind(task_id)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(|error| {
+            failure(
+                wrote,
+                ErrorKind::Database,
+                format!("task store claim read of {task_id}: {error}"),
+            )
+        })?;
+        let mut stamps = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let fields = row_fields(row).map_err(|problem| {
+                failure(
+                    wrote,
+                    ErrorKind::Unsupported,
+                    format!("a claim of {task_id}: {problem}"),
+                )
+            })?;
+            match fields.first() {
+                Some((_, Json::Float(value))) => stamps.push(*value),
+                Some((_, Json::Int(value))) => stamps.push(*value as f64),
+                _ => {
+                    return Err(failure(
+                        wrote,
+                        ErrorKind::Unsupported,
+                        format!("a claim of {task_id}: ts is not a number"),
+                    ))
+                }
+            }
+        }
+        Ok(stamps)
+    }
+
+    /// `TaskStore.gate_verdict_value_since`'s query: `SELECT envelope_json FROM verdicts WHERE task_id=? AND gate=? ORDER BY id`, as the
+    /// columns the pure gate facts read. Every row of the pair, whatever its `ts`: the gate check filters by the signed `issued_at`.
+    ///
+    /// Unlike [`Tx::verdict_rows`] it does not read `findings` (Python's query does not select it, so a row with a bad `findings` is
+    /// read like any other). A row whose `task_id`, `gate`, `verdict`, `envelope_json` or `ts` has a storage class this crate cannot
+    /// prove Python reads the same way is an [`ErrorKind::Unsupported`] error.
+    pub async fn gate_verdict_rows(
+        &mut self,
+        task_id: &str,
+        gate: &str,
+    ) -> Result<Vec<VerdictRow>, WriterError> {
+        let wrote = self.wrote;
+        let rows = sqlx::query(
+            "SELECT id, gate, verdict, envelope_json, ts FROM verdicts WHERE task_id=? AND gate=? ORDER BY id",
+        )
+        .bind(task_id)
+        .bind(gate)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(|error| {
+            failure(
+                wrote,
+                ErrorKind::Database,
+                format!("task store gate verdict read of {task_id}: {error}"),
+            )
+        })?;
+        let unsupported = |problem: String| {
+            failure(
+                wrote,
+                ErrorKind::Unsupported,
+                format!("verdicts of {task_id}: {problem}"),
+            )
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let fields = row_fields(row).map_err(unsupported)?;
+            let text = |name: &str| match fields.iter().find(|(column, _)| column == name) {
+                Some((_, Json::Str(value))) => Ok(Some(value.clone())),
+                Some((_, Json::Null)) => Ok(None),
+                _ => Err(format!("column {name} is not text")),
+            };
+            let ts = match fields.iter().find(|(column, _)| column == "ts") {
+                Some((_, Json::Float(value))) => *value,
+                Some((_, Json::Int(value))) => *value as f64,
+                _ => return Err(unsupported("column ts is not a number".to_string())),
+            };
+            let id = match fields.iter().find(|(column, _)| column == "id") {
+                Some((_, Json::Int(value))) => *value,
+                _ => return Err(unsupported("column id is not an integer".to_string())),
+            };
+            out.push(VerdictRow {
+                id,
+                task_id: task_id.to_string(),
+                gate: gate.to_string(),
+                verdict: text("verdict").map_err(unsupported)?,
+                envelope_json: text("envelope_json").map_err(unsupported)?,
+                ts,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// One SQLite row as ordered fields typed by the stored value (Python `dict(row)`).
