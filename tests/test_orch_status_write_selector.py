@@ -4,6 +4,7 @@ the binary is started with, against fake gsd_engine binaries that record their s
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -549,6 +550,7 @@ def test_only_a_real_transition_to_approved_is_handed_the_key_variables(
     fake = fake_binary(stdout=_rendered(_error_reply("E-DEP", "not_started")), exit=2)
     monkeypatch.setenv("GSD_ENGINE", "rust")
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    monkeypatch.setenv("GSD_ENGINE_BIN_SHA256", hashlib.sha256(fake.path.read_bytes()).hexdigest())
     monkeypatch.setenv("SWARM_AGENT_SESSION", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", "/xdg")
     for name in SIGNING_ENV:

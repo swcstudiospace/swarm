@@ -52,6 +52,7 @@ import ast
 import base64
 import copy
 import functools
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -578,12 +579,15 @@ def _environ(world: World, canaries: Canaries) -> dict[str, str]:
 def run_selector(world: World, canaries: Canaries, route: str, backend: str, *, argv: list[str] | None = None) -> Outcome:
     """`scripts/orch_status.py` with GSD_ENGINE=rust, the canaries in its environment, and the launcher as the binary. `argv` replaces
     the route's own (the APPROVED cases of section F2 call the `transition` route with another target)."""
+    launcher = _wrapper(world)
     env = {
         **_environ(world, canaries),
         "SWARM_GSD_STATE_FILE": "",
         "SWARM_CLAUDE_STATE_DIR": str(world.claude),
         "GSD_ENGINE": "rust",
-        "GSD_ENGINE_BIN": str(_wrapper(world)),
+        "GSD_ENGINE_BIN": str(launcher),
+        # the identity check starts a child that holds a key only as the binary it names: the launcher, whose digest is given here
+        "GSD_ENGINE_BIN_SHA256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
         "GSD_RUST_BACKEND": backend,
     }
     done = subprocess.run(
