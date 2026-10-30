@@ -2,11 +2,117 @@
 
 Phase 12, unit U12.10, refreshed in Phase 14.3, unit R13 (2026-10-29). Records the parity, fault and budget evidence for each read route, the state of its default, the decision taken on each recorded divergence, and the sign-off status. **This document describes the state before the flip: every default below is still Python (engine) and host Rust (backend).** Operator steps and the rollback drill are in [docs/operations-runbook.md](../../docs/operations-runbook.md), section "Select the engine for `orch_status` reads".
 
+**Status: NOT FLIPPED (2026-10-30, Phase 14.5 unit U3.8b).** Every route is `python` by default. The write routes (`--transition`, `--ingest`, `qa_gate`, `rel_plan`, `rev_gate`, `sec_gate`, `orch_plan`, `orch_assign`) are opt-in through `GSD_ENGINE=rust`; section "Write routes (Phase 14.5)" below is their evidence pack. The read-route sections below are the Phase 14.3 record. Where they name `ffa7b28a...` as the guest digest, that digest is no longer the default: the default is `91b0970e...` (commit `54fd751`).
+
 Evidence provenance:
 
 - The parity counts below come from the retained **interim** record in `tests/parity/records/14.3/interim-64f5759/` (written by `tests/parity/record_parity.sh`; five legs, each ending `11/11 cases pass`). It is interim because it was taken on 2026-10-28 (23:23 UTC) with a binary built from commit `64f5759`, before the guest-affecting `gsd-route` commits (decision D-P25) and before the flip build, and on a host with a 1-minute load between 25 and 53 on 8 CPUs during the legs (71 at the end of the cargo runs). Parity is a byte comparison and does not depend on load. The evidence for the flip is the same script run on the flip build.
 - The tables of the earlier version of this file (recorded 2026-10-25 from run output that was not retained) are replaced. Fault and budget figures that this unit did not re-measure are marked with their date.
 - This unit ran no cargo command and no harness leg; it read the retained files and the code and reports what they say.
+
+## Write routes (Phase 14.5)
+
+Unit U3.8b, 2026-10-30, HEAD `643987e`, then `d0617a5` for the F1 test commit. This unit changed no product code, pin, default or approval. **Not flipped. No write route is approved for flip.** Evidence provenance per row: "run" means re-run in this unit (outputs in `/root/.cache/gsd-redact-work/U38b/`, outside the repo); "record" means a retained file under `tests/parity/records/`; "STATE" means a decision entry in `.planning/STATE.md` with no retained file.
+
+A route flips only with all of the following (`14.5-CONTEXT.md` criterion 11; `14.5-PLAN.md`, "Flip order and evidence per route"): parity, fault and kill -9 evidence on the flip build; the A10 and A11 records for the guest digest that carries the route; the quiet-host record (U3.8a); the user's approval recorded in STATE; a rollback drill (`GSD_ENGINE=python`, a store last written by Rust and one last written by Python, `.schema` hash equal before and after).
+
+| Requirement | State |
+|---|---|
+| Quiet-host record (U3.8a) | **Pending.** The user answered "Not now" (D-P36). `tests/perf/baseline.md` has no write-route leg |
+| User approval (U3.8c) | **Pending** for every route |
+| Write-route rollback drill | **Not run** |
+| A10 and A11 records for the write guest `50b06310...` | **Missing.** Both records cover the default pin `91b0970e...` only (see below) |
+| kill -9 evidence | Partial, route by route (table below) |
+
+### Pins and sign-offs
+
+| Item | State | Record |
+|---|---|---|
+| Default guest pin `91b0970ebe43fb7a80e5c6df68abcf6516572a766260e9780fd6f3c199b9a175` | `crates/gsd-sandbox/guest-module.sha256` and `web/jco.pin.json` `component_sha256` agree. `built_guest_digest_matches_the_committed_pin` passes at HEAD (run: `cargo test -p gsd-sandbox` in the three-crate run, 49 unit tests and the guest tests passed) | commit `54fd751` (STATE D-P37); record A11 check 1 |
+| Write guest pin `50b06310480fd0dbce7c285ce24191a58eb5cca9bbe86ca28a23e89ea5ba15d4` (P2: `write-routes-2`, `sandbox-write`) | `crates/gsd-sandbox/guest-module-write.sha256`. A10 C5 passes it | commit `54fd751`; record A10 C5 |
+| Previous default `ffa7b28a7879da7ea99a20c83999d0b79e757bd084878909dcce0054fe66cade` | Replaced at `dc46279` by a source change; reproduces from its own commit `eb7a2b9` (A11 section 1) | D-P21 sign-off of 2026-10-26 (see "Sign-off record") |
+| A10 security gate, default pin | **SECURED**, scoped to the default read-only guest. F1 (major: the key canary scan did not cover the P2 request bytes) is closed by `d0617a5` (test-only; see the verification table). F2 (STATE wording) corrected in STATE. F3 (`regex` edge) closed by D-P40. F4 to F8 minor or info | record `tests/parity/records/14.5/A10-guest-pin-91b0970e.md` |
+| A11 reproducibility, default pin | **REPRODUCIBLE**: HEAD and `dc46279` build `91b0970e...`; tracked `web/generated` is byte-identical to a fresh jco 1.39.0 transpile; `scripts/_check_pins.py` exits 0 | record `tests/parity/records/14.5/A11-guest-pin-reproduce.md` |
+| User's answer on the digest | "Accept 91b0970e... and re-sign" (D-P38 item 1) | STATE |
+| A10 and A11 for the write guest `50b06310...` | **None.** The A10 record says it "is not a clearance for flipping the write routes" | — |
+
+### Routes (one row per route)
+
+Units are the commits that carry them (`git log`). Parity counts are per test item in the pytest run of this unit, against `target/release/gsd_engine` (sha256 `4ddff46a...`, mtime 2026-10-30 09:41 UTC; the commit it was built from is not recorded [INFERENCE: built for the D-P37 sandbox leg]). Every parity item below passed.
+
+| Order | Route | Units (commits) | Parity: record, count, result | Default | Quiet-host (U3.8a) | User approval (U3.8c) |
+|---|---|---|---|---|---|---|
+| read | `orch_status` list, `--history` (Phase 14.3) | 14.3 R1 to R6 | **record** `tests/parity/records/14.3/final/R7.md` (`0b63a38`): host leg 12/12; 10 Rust-served checks (happy path 1, empty 1, large 1, classifier mirror 7). That record's sandbox leg served 0 (D-P25) | `python` | Pending | Pending |
+| 1 | `--transition`, target not APPROVED | U3.1a to U3.1d (`gsd-taskwriter` store layer and tests; `f87dab7` U3.1b, `3696b20` U3.1c, `787e9d2` U3.1d), U3.2a to U3.2d (`65c6f78`, `ea9c60e`, `aa7d922`, `8d53ee7`), U3.3a (`3ca17fb`), U3.3b (`5ca0bbd`), U3.3c (no commit identified by message). U3.3d is superseded by the P2 pin (STATE D-P37) | **record** `R7.md`, host leg, `transition_matrix`: 786 checks, 686 Rust, 64 declined, 36 Python, pass. **STATE / scratch** the D-P37 sandbox leg (`--sandbox-write`): `/root/.cache/gsd-redact-work/U37d/sandbox.json` and `host.json` each show 786 checks, 686 Rust, 12/12 cases; not retained in the repo. **run** `tests/parity/test_write_parity.py`: 431 items passed | `python` (`ORCH_STATUS_TRANSITION_DEFAULT`, `DEFAULT_ENGINE_WRITE`) | Pending | Pending |
+| 2 | `--transition` to APPROVED | U3.4b (`53df964`), U3.4c (`53df964`), U3.4d (`3be3b26`), U3.4e tests (`f0b3ab9`; `keys_never_in_guest.rs`; F1 closed by `d0617a5`) | Same matrix: 27 APPROVED cells (54 checks) inside the 786, pass (**record** R7). Fail-closed `E-POLICY` texts: runbook section "The `--transition` route and APPROVED" | `python` | Pending | Pending |
+| 3 | `--ingest` (and reconcile) | U3.5a to U3.5g (`2fa3b5e`, `6ee3959`, `291d484`, `28f8311`; the Q7 replay key `fd278e5`, approved in D-P24 item 3) | **run** `tests/parity/test_ingest_route_parity.py`: 9 items passed. **STATE** oracle equality per mode: ingest 457 and reconcile 210 cases (D-P37; not retained) | `python` (`ORCH_STATUS_INGEST_DEFAULT`, `DEFAULT_ENGINE_INGEST`) | Pending | Pending |
+| 4a | `qa_gate --json` | U3.6a (`d7aed62`), U3.6b (`b772566`) | **run** `tests/parity/test_gate_parity_qa.py`: 1 item passed | `python` (inline `default`) | Pending | Pending |
+| 4b | `rel_plan --json` | U3.6a, U3.6c (`99cfd12`) | **run** `tests/parity/test_gate_parity_rel.py`: 2 items passed | `python` (inline) | Pending | Pending |
+| 5a | `orch_assign --json` (verify) | U3.7a (`81d4832`) | **run** `tests/parity/test_assign_parity.py`: 2 items passed | `python` (inline) | Pending | Pending |
+| 5b | `orch_plan` (derive and create) | U3.7b (`45cf794`, `15f3b02`, `e191507`) | **run** `tests/parity/test_plan_parity.py`: 25 items passed. **STATE** log 6: 17 served, 7 declined | `python` (inline) | Pending | Pending |
+| 6a | `rev_gate --json` | U3.6d (`d64ce2f`, selector `6af9a16`) | **run** `tests/parity/test_gate_parity_rev.py`: 48 items passed. **record** of the corpus split (29 served, 19 declined) is in commit `d64ce2f` and STATE log 6 | `python` (inline) | Pending | Pending |
+| 6b | `sec_gate --json` | U3.6e (`1a09bff`) | **run** `tests/parity/test_gate_parity_sec.py`: 43 items passed. **STATE** log 6: 29 served, 14 declined | `python` (inline) | Pending | Pending |
+| 7 | `swarm_tool catalog` | U3.7c (`ef19f21`, `crates/gsd-route/src/catalog.rs`; guest mode behind `write-routes-2`) | **None.** No parity test file, no route. `GSD_ENGINE=rust` gives `E-DEP` for every `swarm_tool` call (`RustEngine::swarm_tool`, `crates/gsd-adapter/src/strangler_seam.rs`). Not flippable | `python` (no route) | Pending | Pending |
+
+All 561 items of the parity run passed: `rev` 48, `sec` 43, `qa` 1, `rel` 2, `assign` 2, `plan` 25, `ingest` (route) 9, `write` 431 (`GSD_ENGINE_BIN=target/release/gsd_engine python3 -m pytest tests/parity/test_gate_parity_rev.py tests/parity/test_gate_parity_sec.py tests/parity/test_gate_parity_qa.py tests/parity/test_gate_parity_rel.py tests/parity/test_assign_parity.py tests/parity/test_plan_parity.py tests/parity/test_ingest_route_parity.py tests/parity/test_write_parity.py -o addopts= -v -p no:cacheprovider -rs`: exit 0, `561 passed in 147.24s`).
+
+### Faults, kill -9 and effects
+
+Fault and kill tests are counted from the cargo and pytest runs of this unit. The `fault-injection` feature gates the killed-process tests: they ran only in the `gsd-taskwriter --features fault-injection` run.
+
+| Route | Fault tests (run results) | kill -9 evidence | Effects evidence |
+|---|---|---|---|
+| `--transition`, not APPROVED | `gsd-taskwriter` `faults` 11 passed (fault-injection); `gsd-adapter` `write_route_faults` 9 passed; `write_route_sandbox_faults` 19 passed; `write_route` 18 passed (run alone); `tests/test_write_faults.py` (in the selector run) | **Writer:** `faults.rs` `fifty_kills`: 50 SIGKILLed children per journal mode (rollback journal and WAL), both-or-neither, plus a lock-holder kill and a contender. Run: passed. **Binary:** `write_route_faults.rs` SIGKILLs `gsd_engine` after the manifest, while it blocks on a large reply (reply lost after commit). Run: passed. **Selector:** a fake binary is SIGKILLed in `tests/test_write_faults.py`. Run: in the selector run | Effects manifest written after `COMMIT`; the selector replays `script.orch_status`, the inline transition, `live.json` refresh and lease settle in Python's order (`swarm/engine_select.py` `run_write`). Tests: `tests/test_orch_status_write_selector.py` (in the selector run), `tests/test_orch_status_write_settle.py` (exists; not re-run here) |
+| `--transition` to APPROVED | Sandbox fault tests `crates/gsd-adapter/tests/write_route_sandbox_faults2/approval.rs`: **record** A10 C4, 56 passed. **Not run here:** that file needs `--features sandbox-write` (0 tests in the default selection) | **None.** The `fifty_kills` case table has no APPROVED entry (`grep -n APPROVED crates/gsd-taskwriter/tests/faults.rs` finds nothing). **Gap** | Same manifest; the keys are not in it |
+| `--ingest` | `gsd-taskwriter` `ingest_faults` 12 passed (fault-injection); `gsd-adapter` `ingest_faults` 8 passed; `tests/test_ingest_faults.py` (2 tests, in the selector run) | **Writer:** `a_process_killed_between_two_ops_leaves_none_applied_and_the_ingest_then_applies_once`, a SIGKILL between two ops of a claim-and-approve list. Run: passed. **Binary:** SIGKILL after the manifest, in `gsd-adapter` `ingest_faults.rs` (reply lost after commit; replay applies once). Run: passed | Ingest manifest (`inline` transition, events, `live_refresh`); the selector replays it |
+| `qa_gate`, `rel_plan`, `rev_gate`, `sec_gate` | None route-specific. No SIGKILL or kill -9 test in `tests/parity` | **None.** **Gap** | Verdict rows and the verdict file through `issue_gate` (`crates/gsd-taskwriter/src/gate_issue.rs`; `tests/gate_issue.rs`: 6 passed, run) |
+| `orch_plan` | Sandbox fault tests `write_route_sandbox_faults2/plan.rs`: **record** A10 C4 (56 passed). Not run here (feature-gated) | **None** for the one-transaction create. **Gap** | Plan file, `latest_correlation`, `plan.updated` events; `crates/gsd-taskwriter/tests/create_plan.rs` 5 passed (run) |
+| `orch_assign --json` | None route-specific | Not applicable if the verify route writes nothing [INFERENCE: `14.5-PLAN.md` U3.7a says "read-only store"] | None |
+| `swarm_tool catalog` | `write_route_sandbox_faults2/catalog.rs` (record A10 C4, feature-gated). No route | Not applicable (no store) | None. No route |
+
+### Fallback table (write routes)
+
+The selector's outcome table for a write call (`swarm/engine_select.py`, `run_write`). The selector tests (`tests/test_orch_status_write_selector.py`) ran in the selector run with 0 failures.
+
+| Binary outcome | Selector | Final? |
+|---|---|---|
+| exit 0 or 1, JSON object | Commit: effects replayed in Python's order, reply printed and recorded | yes |
+| exit 2, `error.details.write_state` = `not_started` | Python body answers, once. Nothing was written | no |
+| exit 2, `write_state` = `final`, or absent on a code other than `E-INTERNAL` | The binary's refusal is printed as it is, and recorded | yes |
+| call deadline, signal, exit code outside 0 to 2, unparsable reply, `E-INTERNAL` without `write_state`, unknown `write_state` | Typed `E-INTERNAL` ("outcome unknown"); no Python run | yes (unknown) |
+| binary cannot start | Default call: Python. Explicit `rust`: `E-DEP`, `not_started` | depends |
+
+Per-route declines (what `GSD_ENGINE=rust` sends to Python instead) are in the runbook table "Write routes" (`docs/operations-runbook.md`).
+
+### Verification run in this unit
+
+| Check | Command (repo root) | Result |
+|---|---|---|
+| Pins | `SWARM_GSD_STATE_FILE= SWARM_CLAUDE_STATE_DIR=<scratch> python3 scripts/_check_pins.py` | exit 0; `pin check: ok (3f65737caa5d023691a1f0474880f191a9eb588890852ab6ed5ab751256e3b9e)` |
+| Selector, rollback and fault suites (Python) | `python3 -m pytest tests/test_orch_status_write_selector.py tests/test_engine_select.py tests/test_write_faults.py tests/test_ingest_faults.py tests/test_write_argv_mirror.py tests/test_orch_status_rollback.py tests/test_orch_status_default_engine.py -q -p no:cacheprovider` | exit 0; 534 items: 517 passed, 17 skipped, 0 failed (counted from the progress output) |
+| Parity on the release binary | the command under "Routes" above | exit 0; 561 passed, 0 failed, 0 skipped |
+| Taskwriter, route, envelope (default features) | `cargo test -p gsd-taskwriter -p gsd-route -p gsd-envelope --locked --offline --no-fail-fast` | exit 0; 318 passed, 0 failed |
+| Taskwriter, kill -9 | `cargo test -p gsd-taskwriter --locked --offline --features fault-injection --no-fail-fast` | exit 0; every target passes, including `faults` 11 and `ingest_faults` 12 |
+| Keys never in the guest (F1) | in the three-crate run below: `keys_never_in_guest` | 30 passed, 0 failed, at `d0617a5` (F1's test-only commit: canaries over the P2 request bytes and the read request) |
+| Adapter, sandbox, sdk | `cargo test -p gsd-adapter -p gsd-sandbox -p gsd-sdk --locked --offline --no-fail-fast` | **Run 3, at `d0617a5` (HEAD, clean for these crates): exit 0; 424 passed, 0 failed.** Runs 1 and 2 were red and are kept for the record. Run 1 (at `643987e`, while F1's scratch injection shared `target/`): 422 passed, 2 failed (keys, F1) and a doc-test that failed on a missing rlib. Run 2 (after F1's commit): 423 passed, 1 failed, `write_route::the_sandbox_backend_does_not_serve_a_write_until_its_own_unit`; the same test passed when `write_route` ran alone (18 passed) and passes in run 3. Run 2's cause is not isolated [INFERENCE: shared `target/` state] |
+| Keys, sandbox-write binary | `cargo build -p gsd-adapter --bin gsd_engine --features sandbox-write --locked --offline` (exit 0; replaces `target/debug/gsd_engine`); then `GSD_ENGINE_BIN=<copy of that binary> python3 -m pytest tests/test_keys_never_in_guest.py -o addopts= -rs -q` | 250 passed, 0 skipped, exit 0. Record A10 C7 had 249 passed and 1 skipped (CI unset) |
+| Rust-signed envelopes verify in Python | `cargo build -p gsd-envelope --example sign_stdin --locked --offline`; `GSD_ENVELOPE_SIGN_BIN=target/debug/examples/sign_stdin python3 -m pytest tests/test_envelope_rust_signed.py -o addopts= -q` | 298 passed, exit 0. Without the variable the file skips 296 of its items |
+| Vector freshness, signing and keys (12 files, default binary) | `python3 -m pytest` on `tests/test_*_vectors_fresh.py` (catalog, gate facts, gate issue, ingest, ops, plan, pydumps, reconcile, result, transition), `test_envelope_rust_signed.py` and `test_keys_never_in_guest.py` | 312 passed, 313 skipped, exit 0. The skips are the signed-envelope file (no sign binary) and the keys file (no sandbox-write binary); both were then run as above |
+| Ingest dedup and results | `python3 -m pytest tests/test_ingest_dedup.py tests/test_results.py -o addopts= -q` | 38 passed |
+| Browser acceptance | `node tests/acceptance/browser_sab.mjs`; `node tests/acceptance/browser_headers.mjs` (Chrome at `/usr/bin/google-chrome`) | both exit 0; every check reports PASS |
+| Ruff | `ruff check .` | All checks passed |
+| rustfmt | `cargo fmt --all -- --check` | **exit 1.** One diff: `crates/gsd-adapter/src/gates/mod.rs`, `pub mod rel_plan;` is out of order. Not changed by this unit (product code) |
+
+### Gaps, largest first
+
+1. **The write guest has no sign-off.** `50b06310...` (P2) carries every write route and has no A10 or A11 record. A10 covers the default pin only and says so. Every write flip is blocked until both records exist for `50b06310...`.
+2. **Quiet window and approvals.** U3.8a (no latency record) and U3.8c (no user approval) are pending for every route.
+3. **kill -9 gaps.** No kill -9 test for APPROVED, `qa_gate`, `rel_plan`, `rev_gate`, `sec_gate` or `orch_plan`. `orch_assign` verify is said to be a "read-only store" in `14.5-PLAN.md` (U3.7a), so it has no kill case to run [INFERENCE: not checked against `assign.rs`]. `swarm_tool catalog` has no route.
+4. **No retained 14.5 release-build record.** The D-P37 sandbox leg and the parity outputs of this unit are in scratch, outside the repo. Copy them into `tests/parity/records/14.5/` before any flip. The P2 sandbox leg is the only record of the write routes on the sandbox backend.
+5. **Write-route rollback drill** not run (`GSD_ENGINE=python` on a store last written by Rust and the reverse; `.schema` hash).
+6. **Test gating.** `write_route::the_sandbox_backend_does_not_serve_a_write_until_its_own_unit` is gated on the adapter's `sandbox-write` feature. It failed once (run 2) and passed in runs 3 and alone. The cause is not isolated. Left unchanged.
+7. **Stale product text.** `route_for_call` in `crates/gsd-adapter/src/route_table.rs` still names only the read, `--transition` and `--ingest` routes in its `E-DEP` message. Not changed by this unit.
+
 
 ## Status
 
@@ -28,7 +134,7 @@ Counts are per check, taken from `tests/parity/records/14.3/interim-64f5759/rust
 | `orch_status` list (no route flag, for example `--correlation-id`) | 4 list argv in the Rust legs: `rust` 3 (`happy_path`, `empty`, `large`), `fallback:E-INPUT` 1 (`--task-id bad..id`). All four print Python's bytes. The default selector answers each of the four with `python` (binary not started) | `read_route_faults` 4 of 4 passed in the interim run (dev profile); the other tests below were recorded earlier. Detail: Fault detail | Warm invoke median 7.193 ms (latest 2026-10-25 run) and 8.547 ms (earlier), p95 9.742 ms and 14.516 ms (n=300), 500-task snapshot, busy host, no threshold (G-budget). Detail: Budget detail | `python` | A10 runtime and A11 pin: signed off by the user (see Sign-off record). A2 baseline not measured. Flip not approved |
 | `orch_status --history TASK_ID` | 3 history argv in the Rust legs: `rust` 0, `fallback:E-DEP` 2 (`T-gate-pass`, `T-gate-fail`: signed verdict rows, divergence D2), `fallback:E-INPUT` 1 (`T-parity-missing`: unknown task). All three print Python's bytes through the fallback. **No retained check had Rust answer a history call.** The default selector answers each with `python` | 5 tests run the history argv (earlier recorded run) | Not measured. The budget record covers the list snapshot only | `python` | Same as the list route |
 
-Not a route in this record: `--transition` and `--ingest` (mutating). In the Rust legs `transition_legal_illegal` sends two `--transition` argv: both `fallback:E-DEP`, both print Python's bytes (the one legal transition masks the wall-clock `updated_at` on both sides and nothing else). Under a default flip the selector's pre-filter (D5) keeps these calls from starting the binary at all.
+Write routes are not in this section; their rows are in "Write routes (Phase 14.5)". The R7 record (`tests/parity/records/14.3/final/R7.md`, HEAD `0b63a38`) is the first retained release-build record that covers `--transition`: its host leg served 686 of the 786 transition-matrix checks in Rust (64 declined, 36 Python). In the interim record (`53df964`, before D-P25) `transition_legal_illegal` sent two `--transition` argv, both `fallback:E-DEP`, and both printed Python's bytes (the one legal transition masks the wall-clock `updated_at` on both sides and nothing else). Under a default flip the selector's pre-filter (D5) keeps these calls from starting the binary at all.
 
 ## Parity evidence
 
@@ -174,11 +280,11 @@ Corrected in Phase 14.3 R13 against the code. Recorded, not fixed:
 
 - Signer: the user. Date: 2026-10-26, in chat ("A10 runtime sign-off and A11 pin approval accepted by the user for ship"); an agent does not sign for either role. Scope as recorded on 2026-10-28 (the user's answer "Covers digest and runtime"): the wasmtime runtime (A10) and the guest digest `ffa7b28a7879da7ea99a20c83999d0b79e757bd084878909dcce0054fe66cade`, `crates/gsd-sandbox/guest-module.sha256` (A11).
 - Two exceptions accepted by the user on 2026-10-28: the pin landed inside the combined commit `eb7a2b9` instead of its own commit, and `.github/workflows/ci.yml` has no guest-digest step (it runs `scripts/_check_pins.py`; the guest digest is asserted by a Rust test in `crates/gsd-sandbox/src/lib.rs`).
-- The sign-off is valid only while `guest-module.sha256` equals `ffa7b28a…`. This record's interim binary was built before the guest changed (see Known open item). Whether the sign-off also covers making the sandbox the default backend is the flip approval's question; the user's approval of the flip itself has not been given.
+- Superseded as the default pin on 2026-10-30 (D-P38): this sign-off is for `ffa7b28a…`, the previous default pin. The default pin `91b0970e…` has its own records (A10 SECURED, A11 REPRODUCIBLE; see "Write routes (Phase 14.5)"). Whether the sign-off also covers making the sandbox the default backend is the flip approval's question; the user's approval of the flip itself has not been given.
 
 ## Known open item
 
-Decision D-P25 (2026-10-28): the committed default-guest pin test `built_guest_digest_matches_the_committed_pin` (`crates/gsd-sandbox/src/lib.rs`) has been red since commit `f87dab7`. The guest links `gsd-route`; the `py_float` halfway-rounding fix and `SeamError::with_details` in that commit changed the guest bytes, so a clean build of the tree gives digest `7daf6274710afa9076c35de1705c1ce670dd85a87b4bfef0f96d48ea5a841cda` against the approved `ffa7b28a…cade`. No pin file was changed. The re-pin is folded into the P1 pin of Phase 14.5 (one re-pin per batch; it needs its own A11 approval). Until then the test stays red and is listed as a known failure in every gate report, and the ship does not open while it is red. The parity evidence for the flip must be taken on the flip build, and its guest digest recorded with it. This unit did not run the test.
+Decision D-P25 (2026-10-28), closed. The committed default-guest pin test `built_guest_digest_matches_the_committed_pin` (`crates/gsd-sandbox/src/lib.rs`) was red from `f87dab7`: the guest links `gsd-route`, and the `py_float` and `SeamError::with_details` edits changed the guest bytes (a clean build then gave `7daf6274…`, against the approved `ffa7b28a…`). The re-pin to `91b0970e…` landed in `54fd751` (D-P37), so the test matches at HEAD (A11 check 1). The R7 record (`0b63a38`) predates the re-pin and shows the red state: its sandbox leg served no call. The parity evidence for the flip must still be taken on the flip build, with its guest digest recorded with it.
 
 ## Open items
 
@@ -187,7 +293,7 @@ Decision D-P25 (2026-10-28): the committed default-guest pin test `built_guest_d
 - Parity evidence on the flip build: the five legs of `record_parity.sh`, retained under `tests/parity/records/14.3/`.
 - G-budget thresholds: none set. Serde share and thresholds wait for the A2 baseline.
 - `GSD_RUST_BACKEND=sandbox` stays opt-in until the flip approves the default; the A10 runtime and A11 pin sign-offs are recorded (see above) and no longer the blocker.
-- The D-P25 re-pin (see Known open item).
+- The U3.8a quiet-host record: pending. The user answered "Not now" on 2026-10-30 (D-P36).
 
 ## Reproduction
 
