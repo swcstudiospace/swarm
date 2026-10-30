@@ -191,15 +191,39 @@ def add_args(p):
     p.add_argument("--max-lines", type=int, default=800, help="changed-lines threshold per file for a major 'size' finding")
 
 
-# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
-# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+# Engine selector (swarm/engine_select.py). The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::rev_gate`
+# accepts (`--json`, not `--dry-run`) and leaves every other argv to this body. `ENGINE_ROUTES` is the seam a route registers in.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"XDG_CONFIG_HOME", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION"}
+    if route != "rev-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_rev(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
 ENGINE_ROUTES: tuple = ()
 
 
 if __name__ == "__main__":
     script = AgentScript("A09", "rev_gate", run, description=__doc__, add_args=add_args)
     answer = None
-    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
         from swarm import engine_select
-        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_rev, parse=lambda argv: argv if _claims_rev(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "rev-gate",
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
     sys.exit(answer if answer is not None else script.main())
