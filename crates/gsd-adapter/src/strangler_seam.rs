@@ -615,7 +615,8 @@ impl CoreBackend for RustEngine {
     }
 
     fn orch_assign(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        self.runtime.block_on(crate::write_route::assign::answer(call))
+        self.runtime
+            .block_on(crate::write_route::assign::answer(call))
     }
 
     fn qa_gate(&self, call: &Invocation) -> Result<Reply, SeamError> {
