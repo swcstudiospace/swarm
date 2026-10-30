@@ -793,7 +793,7 @@ def test_an_explicit_rust_for_a_script_without_a_route_is_answered_as_an_unserve
 
     fake = build_fake(tmp_path / "fake", stdout=_error("E-DEP", "not_started"), exit_code=2)
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
-    unserved = ["--json", "--not-a-real-flag"] if name == "orch_assign" else DRY
+    unserved = ["--json", "--not-a-real-flag"] if name == "orch_assign" else ["--json", "--dry-run", "--brief-text", "x", "--brief-text", "y"] if name == "orch_plan" else DRY
     monkeypatch.delenv("GSD_ENGINE")
     plain_code, plain, _ = run_entry(name, unserved, monkeypatch, capsys)
     monkeypatch.setenv("GSD_ENGINE", "rust")

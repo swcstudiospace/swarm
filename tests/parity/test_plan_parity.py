@@ -6,8 +6,8 @@ binary called the way the selector calls it (a JSON request on stdin with an `ef
 A served case must be answered by the binary and match Python: the reply (the signed kickoff's ids, clock and signature masked),
 the exit code, the `tasks` and `transitions` rows (the clock columns masked), the plan file bytes and `latest_correlation`. A
 declined case must come back as `E-DEP` with `write_state = "not_started"` and leave the store unchanged, so the selector hands the
-call to Python. The selector's own output for every case is compared with Python's in the last test, which stays an expected failure
-until `scripts/orch_plan.py` carries its selector block (orchestrator-owned). Unset `GSD_ENGINE_BIN` skips.
+call to Python. The selector's own output for every case is compared with Python's in the last test: the stdout bytes of an argparse
+refusal (which prints no JSON) and the JSON reply, the exit code and the store otherwise. Unset `GSD_ENGINE_BIN` skips.
 """
 from __future__ import annotations
 
@@ -212,7 +212,6 @@ def test_each_case_matches_python(case: Case, tmp_path: Path) -> None:
         assert manifest["effects"] == [] and manifest["live_refresh"] is False, "nothing to replay"
 
 
-@pytest.mark.xfail(strict=True, reason="needs scripts/orch_plan.py's selector block (orchestrator-owned); remove the marker then")
 def test_the_selector_output_equals_python_for_every_case(tmp_path: Path) -> None:
     binary = _binary()
     for case in CASES:
@@ -224,5 +223,8 @@ def test_the_selector_output_equals_python_for_every_case(tmp_path: Path) -> Non
         sel = subprocess.run([sys.executable, str(SCRIPT), "--root", str(sel_root), *_argv(case, sel_root), "--json"],
                              capture_output=True, text=True, env=env, cwd=ROOT, timeout=120)
         assert sel.returncode == py.returncode, case.name
-        assert _normal(json.loads(sel.stdout), sel_root) == _normal(json.loads(py.stdout), py_root), case.name
+        if py.stdout.startswith("{"):
+            assert _normal(json.loads(sel.stdout), sel_root) == _normal(json.loads(py.stdout), py_root), case.name
+        else:  # argparse's own refusal prints no JSON: the selector's bytes are Python's
+            assert sel.stdout == py.stdout, case.name
         assert _store(sel_root) == _store(py_root), case.name

@@ -30,6 +30,7 @@
 //! failure at or after the first write that is not Python's is `write_state = "final"`.
 pub(crate) mod assign;
 pub(crate) mod ingest;
+pub(crate) mod plan;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;

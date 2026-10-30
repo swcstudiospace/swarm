@@ -31,6 +31,7 @@
 
 mod apply;
 pub mod approval;
+pub mod create_plan;
 mod error;
 pub mod gate_issue;
 pub mod ingest;

@@ -601,7 +601,8 @@ impl CoreBackend for RustEngine {
     }
 
     fn orch_plan(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        Err(no_route(&call.script))
+        self.runtime
+            .block_on(crate::write_route::plan::answer(call))
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
