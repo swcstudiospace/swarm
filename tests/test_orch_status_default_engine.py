@@ -2,6 +2,7 @@
 record, fallback codes and GSD_RUST_BACKEND validation, against fake gsd_engine binaries that record each start."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -287,6 +288,7 @@ def test_default_call_never_starts_the_binary_for_an_argv_it_does_not_serve(argv
 
     monkeypatch.setenv("GSD_ENGINE", "rust")
     monkeypatch.setenv("GSD_ENGINE_BIN", str(explicit_fake.path))
+    monkeypatch.setenv("GSD_ENGINE_BIN_SHA256", hashlib.sha256(explicit_fake.path.read_bytes()).hexdigest())
     mod.select_engine(argv)
     assert explicit_fake.starts == 1
 

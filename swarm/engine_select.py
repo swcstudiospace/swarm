@@ -8,6 +8,7 @@ A script describes what it serves as DATA plus small hooks (`Route`, `WriteFlow`
 2. The binary is `GSD_ENGINE_BIN` when set (it is then the only candidate), else `target/release/gsd_engine` when executable.
 3. The binary is started with an allowlist of environment names, the route's grant included (the script's `binary_env` hook),
    and the whole call is bounded by `GSD_RUST_TIMEOUT_S` (default `RUST_CALL_TIMEOUT_S`; E-TIMEOUT never falls back).
+   A child that holds a signing key is started only when the binary's sha256 is `GSD_ENGINE_BIN_SHA256` (`identity_refusal`), and with core dumps off (`no_core_dumps`).
 4. A read answer is `run_read`: Python answers whenever the binary says it cannot (`RUST_FALLBACK_CODES`, an unusable reply, a
    binary that cannot start unless explicit). A write answer is `run_write`: a write is never run twice, so the outcome table
    (see its docstring) lets Python answer only when the binary says that nothing was written, and refuses every other doubtful
@@ -32,8 +33,10 @@ and startable (the same `E-INPUT` and `E-DEP` refusals as for a served argv come
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import resource
 import subprocess
 import sys
@@ -52,6 +55,11 @@ RELEASE_BINARY = Path(__file__).resolve().parent.parent / "target" / "release" /
 # one variable the binary reads (GSD_RUST_BACKEND; ids and the swarm directory travel in the request's `env`). Signing material is
 # a per-route grant, which a script's `binary_env` hook adds.
 BINARY_ENV_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GSD_RUST_BACKEND"})
+# The identity check (`identity_refusal`): a child whose environment names one of KEY_ENV_NAMES holds a signing key, so the binary it
+# runs must be the one whose lowercase hex sha256 is GSD_ENGINE_BIN_SHA256. A child without one of them is started as before.
+BINARY_SHA256_ENV = "GSD_ENGINE_BIN_SHA256"
+KEY_ENV_NAMES = frozenset({"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE"})
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 def no_route_env(route: str) -> dict[str, str]:
@@ -94,6 +102,44 @@ def no_core_dumps() -> None:
     the process that holds keys in its environment and heap leaves no core file that carries them. It runs in the child between
     fork and exec and makes one system call (no import, no allocation worth the name: this process may have threads)."""
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def carries_key(env: dict[str, str]) -> bool:
+    """Whether a child started with `env` holds a signing key: one of KEY_ENV_NAMES is among its variables."""
+    return not KEY_ENV_NAMES.isdisjoint(env)
+
+
+def child_guard(env: dict[str, str], hook: Callable[[], None] | None) -> Callable[[], None] | None:
+    """The preexec_fn of a child started with `env`: `no_core_dumps` whenever it holds a signing key, else the route's `hook`."""
+    return no_core_dumps if carries_key(env) else hook
+
+
+def binary_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def identity_refusal(binary: str, env: dict[str, str]) -> str | None:
+    """None when the binary may be started with `env`. A child that holds a signing key may be started only as the binary whose
+    lowercase hex sha256 is GSD_ENGINE_BIN_SHA256; otherwise the message of an E-POLICY refusal that keeps it from starting. That
+    refusal is the binary's own `not_started` answer: nothing ran, so the Python body answers (run_read and run_write return None)."""
+    if not carries_key(env):
+        return None
+    expected = os.environ.get(BINARY_SHA256_ENV, "")
+    if not expected:
+        return f"E-POLICY: a signing key would be handed to the gsd_engine binary, which needs {BINARY_SHA256_ENV} set to its sha256; not started"
+    if _SHA256_HEX.fullmatch(expected) is None:
+        return f"E-POLICY: {BINARY_SHA256_ENV} must be 64 lowercase hex digits; not started"
+    try:
+        actual = binary_sha256(binary)
+    except OSError:
+        return f"E-POLICY: the gsd_engine binary could not be read to check {BINARY_SHA256_ENV}; not started"
+    if actual != expected:
+        return f"E-POLICY: the gsd_engine binary does not match {BINARY_SHA256_ENV}; a signing key is not handed to it; not started"
+    return None
 
 
 def refuse(selector: Selector, code: ErrorCode, message: str) -> int:
@@ -150,9 +196,14 @@ def run_read(selector: Selector, route: Route, argv: list[str], binary: str, *, 
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
         return None  # fallback: an argument the binary cannot take
+    env = selector.binary_env(route.env_route(argv, None))
+    refusal = identity_refusal(binary, env)
+    if refusal is not None:
+        warn(selector, refusal)
+        return None  # not started: the Python body answers, as for the binary's own not_started
     try:
         done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
-                              env=selector.binary_env(route.env_route(argv, None)))
+                              env=env, preexec_fn=child_guard(env, None))
     except subprocess.TimeoutExpired:
         return refuse(selector, ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
     except OSError:
@@ -243,11 +294,16 @@ def _answer_write(selector: Selector, route: Route, argv: list[str], binary: str
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
         return None  # fallback: an argument the binary cannot take
+    env_route = route.env_route(argv, call)
+    env = selector.binary_env(env_route)
+    refusal = identity_refusal(binary, env)
+    if refusal is not None:
+        warn(selector, refusal)
+        return None  # not started: nothing was written, so the Python body answers, as for the binary's own not_started
     try:
         # A child that holds keys is started with core dumps off (a preexec_fn that fails is a start that did not happen).
-        env_route = route.env_route(argv, call)
         done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
-                              env=selector.binary_env(env_route), preexec_fn=route.write.preexec(env_route))
+                              env=env, preexec_fn=child_guard(env, route.write.preexec(env_route)))
     except subprocess.TimeoutExpired:
         return unknown_outcome(selector, route, argv, call, "the gsd_engine binary did not answer within the call deadline")
     except (OSError, subprocess.SubprocessError):
