@@ -347,11 +347,19 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Writes the verdict file and its directory. `issue_gate` commits exactly when a plan has no error and writes rows, so a
-/// failure after such a commit is final: the verdict is recorded and must not be recorded again. Otherwise nothing was
-/// committed and the failure is not_started, so Python answers.
-fn write_plan_file(swarm: &Path, plan: &gsd_taskwriter::GatePlan) -> Result<(), SeamError> {
-    let committed = plan.error.is_none() && !plan.writes.is_empty();
+/// The commit condition of `issue_gate`: a store call (`task_id` given) whose plan has no error and writes rows. The no-task
+/// path derives the plan without a store and commits nothing, so its writes are not recorded.
+fn committed(request: &GateIssueRequest, plan: &gsd_taskwriter::GatePlan) -> bool {
+    request.task_id.is_some() && plan.error.is_none() && !plan.writes.is_empty()
+}
+
+/// Writes the verdict file and its directory. A failure after a commit is final: the verdict is recorded and must not be
+/// recorded again. Otherwise nothing was committed and the failure is not_started, so Python answers.
+fn write_plan_file(
+    swarm: &Path,
+    plan: &gsd_taskwriter::GatePlan,
+    committed: bool,
+) -> Result<(), SeamError> {
     let refuse = |reason: &str| {
         if committed {
             after_commit(SeamError::new(
@@ -593,10 +601,10 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
             })?
     };
     if let Some(error) = &plan.error {
-        write_plan_file(&swarm, &plan)?;
+        write_plan_file(&swarm, &plan, committed(&request, &plan))?;
         return Err(error.clone());
     }
-    write_plan_file(&swarm, &plan)?;
+    write_plan_file(&swarm, &plan, committed(&request, &plan))?;
     let envelope = plan.envelope.clone().unwrap_or(Json::Obj(vec![]));
     let verdict = verdict_of(&envelope, &plan.recorded);
     let mut reported = findings;
@@ -767,10 +775,10 @@ fn load_per_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{count, write_plan_file};
+    use super::{committed, count, write_plan_file};
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
-    use gsd_taskwriter::{GateFile, GatePlan, GateWrite};
+    use gsd_taskwriter::{GateFile, GateIssueRequest, GatePlan, GateWrite};
 
     #[test]
     fn the_count_sums_the_first_digit_group_of_each_match() {
@@ -807,7 +815,7 @@ mod tests {
             text: "{}".into(),
             updated_at: 1.0,
         }]);
-        let error = write_plan_file(dir.path(), &committed).expect_err("the write fails");
+        let error = write_plan_file(dir.path(), &committed, true).expect_err("the write fails");
         assert_eq!(write_state(&error), Some("final"));
         assert_eq!(error.code(), ErrorCode::Internal);
         assert!(
@@ -821,7 +829,43 @@ mod tests {
     fn a_verdict_file_that_fails_without_a_commit_is_not_started() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
-        let error = write_plan_file(dir.path(), &plan(Vec::new())).expect_err("the write fails");
+        let error =
+            write_plan_file(dir.path(), &plan(Vec::new()), false).expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("not_started"));
+        assert_eq!(error.code(), ErrorCode::Dep);
+    }
+
+    fn no_task_request() -> GateIssueRequest {
+        GateIssueRequest {
+            gate: "quality".into(),
+            agent_id: "A08".into(),
+            findings: Vec::new(),
+            runs: Vec::new(),
+            expires_s: 3600,
+            extra: Vec::new(),
+            simulate: false,
+            per_target: Vec::new(),
+            task_id: None,
+            correlation_id: None,
+            session: false,
+            dryrun_fail: String::new(),
+            now: 1_700_000_000.0,
+        }
+    }
+
+    #[test]
+    fn a_no_task_verdict_file_failure_is_not_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `verdicts` is a file, so the verdict file cannot be created under it.
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let derived = plan(vec![GateWrite::Notes {
+            task_id: "T-1".into(),
+            text: "{}".into(),
+            updated_at: 1.0,
+        }]);
+        let commits = committed(&no_task_request(), &derived);
+        assert!(!commits, "the no-task path writes no store rows");
+        let error = write_plan_file(dir.path(), &derived, commits).expect_err("the write fails");
         assert_eq!(write_state(&error), Some("not_started"));
         assert_eq!(error.code(), ErrorCode::Dep);
     }
