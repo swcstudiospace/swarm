@@ -58,6 +58,11 @@ pub fn is_qa_gate_route(entry: Entrypoint, argv: &[String]) -> bool {
     matches!(entry, Entrypoint::QaGate) && crate::gates::qa_gate::served(argv)
 }
 
+/// Returns true when the call is the host release plan: `rel_plan --json` inside the grammar `gates::rel_plan` serves.
+pub fn is_rel_plan_route(entry: Entrypoint, argv: &[String]) -> bool {
+    matches!(entry, Entrypoint::RelPlan) && crate::gates::rel_plan::served(argv)
+}
+
 /// The engine the `orch_status` read route runs on when `GSD_ENGINE` is unset or empty.
 ///
 /// Python until the flip unit (R12 of Phase 14.3) sets it, after parity evidence and the user's
@@ -105,7 +110,8 @@ pub fn route_for_call(
             if is_read_only_route(entry, argv)
                 || is_transition_route(entry, argv)
                 || is_ingest_route(entry, argv)
-                || is_qa_gate_route(entry, argv) =>
+                || is_qa_gate_route(entry, argv)
+                || is_rel_plan_route(entry, argv) =>
         {
             Ok(Engine::Rust)
         }

@@ -167,8 +167,22 @@ def add_args(p):
     p.add_argument("--unfreeze", action="store_true", help="remove an active freeze (declaring authority only)")
 
 
-# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
-# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+# Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves `--json` except `--dry-run`, which stays
+# this body so the inert-route seam in tests/test_engine_select.py still holds.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    if route != "rel-plan":
+        raise KeyError(route)
+    names = set(BINARY_ENV_NAMES) | {"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION",
+                                     "XDG_CONFIG_HOME", "SWARM_DRYRUN_FAIL"}
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_rel(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
 ENGINE_ROUTES: tuple = ()
 
 
@@ -177,5 +191,16 @@ if __name__ == "__main__":
     answer = None
     if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
         from swarm import engine_select
-        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_rel, parse=lambda argv: argv if _claims_rel(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "rel-plan",
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
     sys.exit(answer if answer is not None else script.main())

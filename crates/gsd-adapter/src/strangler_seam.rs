@@ -631,7 +631,7 @@ impl CoreBackend for RustEngine {
     }
 
     fn rel_plan(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        Err(no_route(&call.script))
+        self.runtime.block_on(crate::gates::rel_plan::answer(call))
     }
 
     fn swarm_tool(&self, call: &Invocation) -> Result<Reply, SeamError> {
