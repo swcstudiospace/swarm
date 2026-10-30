@@ -17,7 +17,7 @@ import pytest
 from conftest import ROOT, _scrubbed_base_env, omp_calls, omp_grandchild, run_script, stub_omp
 
 FIXTURE = ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl"
-KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY")
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY")
 RESULT = {"task_id": "T-one", "state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
           "metrics": {"tests": 3}, "summary_md": "ok"}
 ONE_TASK = {"tasks": [{"id": "one", "capability": "code.backend", "agent": "A05", "title": "one", "depends_on": [], "gates": []}]}

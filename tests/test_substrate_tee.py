@@ -663,8 +663,9 @@ def test_surfaces_match_agents_json():
 EVENT_KINDS = {"session.start", "prompt", "claim", "tool.call", "file.edit", "shell", "commit", "pr", "handoff", "session.end",
                "note", "warning"}
 _SOURCES = [*sorted((ROOT / "swarm").glob("*.py")), *sorted((ROOT / "scripts").glob("*.py")), *sorted((ROOT / "hooks").glob("*.py"))]
-# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal
-_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py"})
+# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal.
+# scripts/orch_status.py `_emit_ingest_events` replays event types the ingest manifest already recorded; those types were classified at the writer.
+_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py", "scripts/orch_status.py"})
 
 
 def _emit_type_arg(call: ast.Call) -> ast.expr | None:

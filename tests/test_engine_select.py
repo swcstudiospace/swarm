@@ -681,8 +681,8 @@ def test_orch_status_still_exports_what_tests_the_harness_and_the_docs_import_fr
     assert orch_status.RUST_FALLBACK_CODES is engine_select.RUST_FALLBACK_CODES
     assert orch_status.BINARY_ENV_NAMES is engine_select.BINARY_ENV_NAMES
     assert orch_status.SELECTOR.script is orch_status.SCRIPT
-    assert orch_status.SELECTOR.routes == (orch_status.WRITE_ROUTE, orch_status.READ_ROUTE)
-    assert [route.write is not None for route in orch_status.SELECTOR.routes] == [True, False], "the transition route claims first, the read route is the rest"
+    assert orch_status.SELECTOR.routes == (orch_status.WRITE_ROUTE, orch_status.INGEST_ROUTE, orch_status.READ_ROUTE)
+    assert [route.write is not None for route in orch_status.SELECTOR.routes] == [True, True, False], "transition and ingest write; the read route is the rest"
 
 
 def test_orch_status_resolves_its_default_rows_and_its_release_binary_from_its_own_module_at_call_time(

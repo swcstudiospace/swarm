@@ -455,8 +455,10 @@ def test_a_binary_that_cannot_be_started_is_python_by_default_and_e_dep_when_exp
         assert (code, _state(tmp_path), _cancelled_rows(tmp_path)) == (0, "CANCELLED", 1)
 
 
-def test_an_ingest_keeps_the_read_policy_until_it_has_a_write_route(mod: ModuleType, fake_binary: Callable[..., Fake],
+def test_an_ingest_is_a_write_route_and_a_transition_flip_does_not_start_it(mod: ModuleType, fake_binary: Callable[..., Fake],
                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """U3.5e reversed the old premise (ingest stayed a read until it had a route). It is a write route now:
+    an explicit rust call carries an effects file, and flipping only the transition default does not start it."""
     fake = fake_binary(stdout=_rendered(OK_REPLY))
     monkeypatch.setattr(mod, "DEFAULT_ENGINE_WRITE", "rust")
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
@@ -465,7 +467,7 @@ def test_an_ingest_keeps_the_read_policy_until_it_has_a_write_route(mod: ModuleT
     monkeypatch.setenv("GSD_ENGINE", "rust")
     mod.select_engine(["--json", "--ingest", "f"])
 
-    assert fake.starts == 1 and "effects_path" not in fake.seen("stdin.json")
+    assert fake.starts == 1 and "effects_path" in fake.seen("stdin.json")
 
 
 # --- what the binary is sent ------------------------------------------------------------------------------------------------
