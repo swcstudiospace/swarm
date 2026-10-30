@@ -20,7 +20,7 @@ import stat
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 SLEEP = shutil.which("sleep") or "/bin/sleep"  # an absolute path: audit shims run with PATH set to the shim dir alone
 
