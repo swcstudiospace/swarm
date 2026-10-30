@@ -29,6 +29,7 @@
 //! carry no `write_state`. A refusal that is Rust's own and happened before the first write is `write_state = "not_started"`; a
 //! failure at or after the first write that is not Python's is `write_state = "final"`.
 pub(crate) mod ingest;
+pub(crate) mod assign;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;

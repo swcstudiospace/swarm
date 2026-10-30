@@ -793,8 +793,12 @@ def test_an_explicit_rust_for_a_script_without_a_route_is_answered_as_an_unserve
 
     fake = build_fake(tmp_path / "fake", stdout=_error("E-DEP", "not_started"), exit_code=2)
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
-    code, body, spawned = run_entry(name, DRY, monkeypatch, capsys)
-    assert (code, _gist(body), spawned, fake.starts) == (baseline_code, _gist(baseline), [], 0), "Python answers; the binary is not started"
+    unserved = ["--json", "--not-a-real-flag"] if name == "orch_assign" else DRY
+    monkeypatch.delenv("GSD_ENGINE")
+    plain_code, plain, _ = run_entry(name, unserved, monkeypatch, capsys)
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+    code, body, spawned = run_entry(name, unserved, monkeypatch, capsys)
+    assert (code, _gist(body), spawned, fake.starts) == (plain_code, _gist(plain), [], 0), "Python answers; the binary is not started"
 
     monkeypatch.setenv("GSD_RUST_BACKEND", "gpu")
     code, body, _ = run_entry(name, DRY, monkeypatch, capsys)
