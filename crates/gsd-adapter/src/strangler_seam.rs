@@ -550,6 +550,22 @@ pub(crate) fn before_any_write(error: SeamError) -> SeamError {
     error.with_details(details)
 }
 
+/// Marks a failure after the Task Store commit: `error.details.write_state = "final"`. The verdict is recorded, so the binary's
+/// answer is printed as it is and Python never runs the call again. The details the error already has stay first.
+pub(crate) fn after_commit(error: SeamError) -> SeamError {
+    let mut details = error.details().to_vec();
+    details.push(("write_state".to_string(), jstr("final")));
+    error.with_details(details)
+}
+
+/// Marks an outcome the binary cannot prove either way, such as a commit whose landing is unknown:
+/// `error.details.write_state = "unknown"`. The selector answers it with `E-INTERNAL` and never runs the call again.
+pub(crate) fn outcome_unknown(error: SeamError) -> SeamError {
+    let mut details = error.details().to_vec();
+    details.push(("write_state".to_string(), jstr("unknown")));
+    error.with_details(details)
+}
+
 /// The `E-DEP` refusal for a script or argv this engine does not serve; nothing was written.
 pub(crate) fn no_route(script: &str) -> SeamError {
     before_any_write(SeamError::new(

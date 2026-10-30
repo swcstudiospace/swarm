@@ -39,7 +39,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::strangler_seam::{
-    before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
+    after_commit, before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
 };
 
 const SEVERITIES: &[&str] = &["info", "minor", "major", "critical", "blocker"];
@@ -1401,21 +1401,27 @@ fn now_secs() -> f64 {
 }
 
 fn write_plan_file(swarm: &Path, plan: &gsd_taskwriter::GatePlan) -> Result<(), SeamError> {
-    if plan.ensure_verdicts_dir {
-        fs::create_dir_all(swarm.join("verdicts")).map_err(|_| {
+    let committed = plan.error.is_none() && !plan.writes.is_empty();
+    let refuse = |reason: &str| {
+        if committed {
+            after_commit(SeamError::new(
+                ErrorCode::Internal,
+                format!("the verdict is recorded in the Task Store, but {reason}; the outcome is final and is not run again"),
+            ))
+        } else {
             before_any_write(SeamError::new(
                 ErrorCode::Dep,
-                "the verdicts directory could not be created; Python answers",
+                format!("{reason}; Python answers"),
             ))
-        })?;
+        }
+    };
+    if plan.ensure_verdicts_dir {
+        fs::create_dir_all(swarm.join("verdicts"))
+            .map_err(|_| refuse("the verdicts directory could not be created"))?;
     }
     if let Some(file) = &plan.file {
-        fs::write(swarm.join("verdicts").join(&file.name), &file.bytes).map_err(|_| {
-            before_any_write(SeamError::new(
-                ErrorCode::Dep,
-                "the verdict file could not be written; Python answers",
-            ))
-        })?;
+        fs::write(swarm.join("verdicts").join(&file.name), &file.bytes)
+            .map_err(|_| refuse("the verdict file could not be written"))?;
     }
     Ok(())
 }
@@ -1646,10 +1652,14 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
 
 #[cfg(test)]
 mod tests {
+    use super::write_plan_file;
     use super::{
         civil_from_days, entropy, fid, has_kev_word, parse_iso_date, patterns, py_splitlines,
         py_strip, py_suffix, sha1_hex, yaml_unsafe,
     };
+    use gsd_failure::ErrorCode;
+    use gsd_route::{Json, SeamError};
+    use gsd_taskwriter::{GateFile, GatePlan, GateWrite};
     use serde_json::json;
 
     #[test]
@@ -1738,5 +1748,52 @@ mod tests {
             &json!({"n": 1e5, "ok": true, "s": "kevlar-free"})
         ));
         assert!(!has_kev_word(&json!({"n": 12, "ok": true})));
+    }
+
+    fn write_state(error: &SeamError) -> Option<&str> {
+        error.details().iter().find_map(|(key, value)| match value {
+            Json::Str(state) if key == "write_state" => Some(state.as_str()),
+            _ => None,
+        })
+    }
+
+    fn plan(writes: Vec<GateWrite>) -> GatePlan {
+        GatePlan {
+            file: Some(GateFile {
+                name: "T-1.security.json".into(),
+                bytes: "{}".into(),
+            }),
+            writes,
+            ..GatePlan::default()
+        }
+    }
+
+    #[test]
+    fn a_verdict_file_that_fails_after_the_commit_is_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `verdicts` is a file, so the verdict file cannot be created under it.
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let committed = plan(vec![GateWrite::Notes {
+            task_id: "T-1".into(),
+            text: "{}".into(),
+            updated_at: 1.0,
+        }]);
+        let error = write_plan_file(dir.path(), &committed).expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("final"));
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(
+            error.message().contains("the verdict is recorded"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_verdict_file_that_fails_without_a_commit_is_not_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let error = write_plan_file(dir.path(), &plan(Vec::new())).expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("not_started"));
+        assert_eq!(error.code(), ErrorCode::Dep);
     }
 }

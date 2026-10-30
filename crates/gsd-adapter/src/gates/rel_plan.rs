@@ -12,13 +12,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gsd_envelope::KeyMaterial;
 use gsd_failure::ErrorCode;
 use gsd_route::{is_safe_id, jstr, to_python_json, Json, Reply, SeamError};
-use gsd_taskwriter::{open_for_write, GateIssueRequest, SystemIds, TaskStoreWriter, WriterConfig};
+use gsd_taskwriter::{
+    open_for_write, GateIssueRequest, SystemIds, TaskStoreWriter, WriteState, WriterConfig,
+    WriterError,
+};
 use serde_json::Value;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Row};
 
 use crate::strangler_seam::{
-    before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
+    before_any_write, canonical_or, env_value, outcome_unknown, resolve_swarm_dir, Invocation,
 };
 
 const GATES_LOW: &[&str] = &["review"];
@@ -557,7 +560,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
         TaskStoreWriter::new(store)
             .issue_gate(&request, &keys, &mut id_source)
             .await
-            .map_err(|error| before_any_write(error.to_seam_error()))?
+            .map_err(|error| issue_gate_refusal(&error))?
     };
     if let Some(error) = &plan.error {
         return Err(error.clone());
@@ -653,13 +656,126 @@ fn body_has_blocking(body: &Json) -> bool {
     items.iter().any(|item| matches!(item, Json::Obj(fields) if fields.iter().any(|(name, value)| name == "severity" && matches!(value, Json::Str(text) if matches!(text.as_str(), "major" | "critical" | "blocker")))))
 }
 
+/// The refusal of a failed `issue_gate` call. Before its first write nothing was written and Python answers. A final failure is
+/// a failed write or a failed commit, and the writer does not say which, so the verdict may be recorded: the outcome is unknown
+/// and the call is not run again.
+fn issue_gate_refusal(error: &WriterError) -> SeamError {
+    match error.write_state() {
+        WriteState::NotStarted => before_any_write(error.to_seam_error()),
+        WriteState::Final => outcome_unknown(SeamError::new(
+            ErrorCode::Internal,
+            format!(
+                "the gate verdict may or may not be recorded in the Task Store ({}); the outcome is unknown and the call is not run again",
+                error.message()
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{issue_gate_refusal, parse};
+    use gsd_envelope::{KeyFilePresence, KeyMaterial};
+    use gsd_failure::ErrorCode;
+    use gsd_route::{Json, SeamError};
+    use gsd_taskwriter::{
+        open_for_write, GateIssueRequest, SystemIds, TaskStoreWriter, WriteState, WriterConfig,
+    };
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::ConnectOptions;
+    use sqlx::Connection;
+    use std::ffi::OsString;
 
     #[test]
     fn dry_run_is_left_to_python() {
         let argv = ["--dry-run".into(), "--json".into()];
         assert!(parse(&argv).is_none());
+    }
+
+    fn write_state(error: &SeamError) -> Option<&str> {
+        error.details().iter().find_map(|(key, value)| match value {
+            Json::Str(state) if key == "write_state" => Some(state.as_str()),
+            _ => None,
+        })
+    }
+
+    fn release_request() -> GateIssueRequest {
+        GateIssueRequest {
+            gate: "release".into(),
+            agent_id: "A12".into(),
+            findings: Vec::new(),
+            runs: Vec::new(),
+            expires_s: 3600,
+            extra: Vec::new(),
+            simulate: false,
+            per_target: Vec::new(),
+            task_id: Some("T-G".into()),
+            correlation_id: Some("C-1".into()),
+            session: false,
+            dryrun_fail: String::new(),
+            now: 1_700_000_000.0,
+        }
+    }
+
+    /// A swarm store with a running release gate `T-G` over `T-1`, and a trigger that refuses every verdict insert. The writer's
+    /// insert then fails after its first write, a final failure, as a failed commit would be.
+    async fn store_refusing_verdicts(swarm: &std::path::Path) -> std::path::PathBuf {
+        let pool = crate::strangler_seam::open_store(swarm)
+            .await
+            .expect("schema");
+        pool.close().await;
+        let db = swarm.join("tasks.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&db)
+            .connect()
+            .await
+            .expect("connect");
+        for sql in [
+            "INSERT INTO tasks (task_id, correlation_id, capability, state, notes) VALUES ('T-G', 'C-1', 'release', 'IN_PROGRESS', '{\"gate\": \"release\", \"gate_for\": [\"T-1\"]}')",
+            "INSERT INTO tasks (task_id, correlation_id, capability, state) VALUES ('T-1', 'C-1', 'build', 'DONE')",
+            "CREATE TRIGGER refuse_verdicts BEFORE INSERT ON verdicts BEGIN SELECT RAISE(ABORT, 'refused for the test'); END",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.expect(sql);
+        }
+        conn.close().await.expect("close");
+        db
+    }
+
+    #[tokio::test]
+    async fn a_final_failure_of_the_gate_writer_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = store_refusing_verdicts(dir.path()).await;
+        let keys = KeyMaterial::from_lookup(
+            |name| (name == "SWARM_ALLOW_INSECURE_DEV_KEY").then(|| OsString::from("1")),
+            |_| KeyFilePresence::Absent,
+        )
+        .expect("key material");
+        let mut ids = SystemIds::open().expect("id source");
+        let store = open_for_write(&WriterConfig::new(&db))
+            .await
+            .expect("store");
+        let writer = TaskStoreWriter::new(store);
+        let error = writer
+            .issue_gate(&release_request(), &keys, &mut ids)
+            .await
+            .expect_err("the verdict insert is refused");
+        writer.close().await;
+        assert_eq!(error.write_state(), WriteState::Final);
+        let refusal = issue_gate_refusal(&error);
+        assert_eq!(write_state(&refusal), Some("unknown"));
+        assert_eq!(refusal.code(), ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_before_the_first_write_stays_not_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No store file: the writer refuses before any write, and Python answers.
+        let error = open_for_write(&WriterConfig::new(dir.path().join("tasks.db")))
+            .await
+            .err()
+            .expect("no store");
+        let refusal = issue_gate_refusal(&error);
+        assert_eq!(write_state(&refusal), Some("not_started"));
+        assert_eq!(refusal.code(), ErrorCode::Dep);
     }
 }

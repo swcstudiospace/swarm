@@ -35,7 +35,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Row};
 
 use crate::strangler_seam::{
-    before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
+    after_commit, before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
 };
 
 /// Suffixes that make a changed file a code file (`CODE_EXTS`).
@@ -1167,14 +1167,31 @@ async fn check_per_target_keys(
     Ok(())
 }
 
+/// Writes the verdict file and its directory. `issue_gate` commits exactly when a plan has no error and writes rows, so a
+/// failure after such a commit is final: the verdict is recorded and must not be recorded again. Otherwise nothing was
+/// committed and the failure is not_started, so Python answers.
 fn write_plan_file(swarm: &Path, plan: &gsd_taskwriter::GatePlan) -> Result<(), SeamError> {
+    let committed = plan.error.is_none() && !plan.writes.is_empty();
+    let refuse = |reason: &str| {
+        if committed {
+            after_commit(SeamError::new(
+                ErrorCode::Internal,
+                format!("the verdict is recorded in the Task Store, but {reason}; the outcome is final and is not run again"),
+            ))
+        } else {
+            before_any_write(SeamError::new(
+                ErrorCode::Dep,
+                format!("{reason}; Python answers"),
+            ))
+        }
+    };
     if plan.ensure_verdicts_dir {
         fs::create_dir_all(swarm.join("verdicts"))
-            .map_err(|_| decline("the verdicts directory could not be created; Python answers"))?;
+            .map_err(|_| refuse("the verdicts directory could not be created"))?;
     }
     if let Some(file) = &plan.file {
         fs::write(swarm.join("verdicts").join(&file.name), &file.bytes)
-            .map_err(|_| decline("the verdict file could not be written; Python answers"))?;
+            .map_err(|_| refuse("the verdict file could not be written"))?;
     }
     Ok(())
 }
@@ -1198,6 +1215,17 @@ fn payload_verdict(envelope: &Json) -> Option<String> {
         Some(Json::Str(verdict)) => Some(verdict.clone()),
         _ => None,
     }
+}
+
+/// The verdict of the envelope a committed plan returned. The verdict is already recorded when this runs, so a missing one is
+/// final: the outcome is not run again.
+fn committed_verdict(envelope: &Json) -> Result<String, SeamError> {
+    payload_verdict(envelope).ok_or_else(|| {
+        after_commit(SeamError::new(
+            ErrorCode::Internal,
+            "the verdict is recorded in the Task Store, but the reply could not be built: the envelope carries no verdict; the outcome is final and is not run again",
+        ))
+    })
 }
 
 /// Answers one served `rev_gate` call. A [`SeamError`] of `E-DEP` is not-started: the selector runs Python.
@@ -1370,8 +1398,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
     }
     write_plan_file(&swarm, &plan)?;
     let envelope = plan.envelope.clone().unwrap_or(Json::Obj(vec![]));
-    let verdict = payload_verdict(&envelope)
-        .ok_or_else(|| decline("the envelope carries no verdict; Python answers"))?;
+    let verdict = committed_verdict(&envelope)?;
     let mut recorded: Vec<String> = plan.recorded.iter().map(|(id, _)| id.clone()).collect();
     recorded.sort();
     let summary = format!(
@@ -1421,6 +1448,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gsd_taskwriter::{GateFile, GatePlan, GateWrite};
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -1519,5 +1547,64 @@ mod tests {
     fn hunk_numbers_come_from_the_first_plus_digit_group() {
         assert_eq!(hunk_start("@@ -1,2 +7,3 @@ fn x+9").unwrap(), 7);
         assert_eq!(hunk_start("@@ -1 @@").unwrap(), 0);
+    }
+
+    fn write_state(error: &SeamError) -> Option<&str> {
+        error.details().iter().find_map(|(key, value)| match value {
+            Json::Str(state) if key == "write_state" => Some(state.as_str()),
+            _ => None,
+        })
+    }
+
+    fn plan(writes: Vec<GateWrite>) -> GatePlan {
+        GatePlan {
+            file: Some(GateFile {
+                name: "T-1.review.json".into(),
+                bytes: "{}".into(),
+            }),
+            writes,
+            ..GatePlan::default()
+        }
+    }
+
+    #[test]
+    fn a_verdict_file_that_fails_after_the_commit_is_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `verdicts` is a file, so the verdict file cannot be created under it.
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let committed = plan(vec![GateWrite::Notes {
+            task_id: "T-1".into(),
+            text: "{}".into(),
+            updated_at: 1.0,
+        }]);
+        let error = write_plan_file(dir.path(), &committed).expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("final"));
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(
+            error.message().contains("the verdict is recorded"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_verdict_file_that_fails_without_a_commit_is_not_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let error = write_plan_file(dir.path(), &plan(Vec::new())).expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("not_started"));
+        assert_eq!(error.code(), ErrorCode::Dep);
+    }
+
+    #[test]
+    fn a_missing_verdict_after_the_commit_is_final() {
+        let no_verdict = Json::Obj(vec![("payload".into(), Json::Obj(Vec::new()))]);
+        let error = committed_verdict(&no_verdict).expect_err("no verdict");
+        assert_eq!(write_state(&error), Some("final"));
+        let passed = Json::Obj(vec![(
+            "payload".into(),
+            Json::Obj(vec![("verdict".into(), jstr("pass"))]),
+        )]);
+        assert_eq!(committed_verdict(&passed).expect("verdict"), "pass");
     }
 }
