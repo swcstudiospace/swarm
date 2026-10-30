@@ -595,9 +595,11 @@ async fn attest_approval(
         .await
         .map_err(|error| OpsError::store(&error, None))?
         .ok_or_else(|| OpsError::unknown_task(task_id))?;
+    // The op list has no approval verifier: only the sandboxed transition route checks the gate answer (phase 14.5, pin P2).
     let approval = gather(tx, guard.keys, guard.source, &row, now)
         .await
-        .map_err(|error| OpsError::store(&error, None))?;
+        .map_err(|error| OpsError::store(&error, None))?
+        .facts;
     let facts = Facts {
         task: Some(decision_row(row)),
         approval: Some(approval),

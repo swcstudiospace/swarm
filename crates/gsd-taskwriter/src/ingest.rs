@@ -172,6 +172,8 @@ pub enum IngestCause {
     Ops(OpsCause),
     /// A failure of the store around the transaction (busy, unreadable row, failed commit): see [`ErrorKind`].
     Store(ErrorKind),
+    /// The check of the plan stopped the call (the call deadline ran out on its verification): nothing is committed, the answer is final.
+    Check(ErrorCode),
 }
 
 /// A failed ingest: the answer, whether Python may still answer, and the events Python emitted before it raised.
@@ -184,6 +186,19 @@ pub struct IngestError {
 }
 
 impl IngestError {
+    /// A check that stopped the call: nothing was written, so the store is as it was, and the answer is final.
+    fn checked(code: ErrorCode) -> Self {
+        Self {
+            cause: Box::new(IngestCause::Check(code)),
+            error: Box::new(SeamError::new(
+                code,
+                "the ingest check did not finish within the call deadline",
+            )),
+            write_state: WriteState::Final,
+            events: Vec::new(),
+        }
+    }
+
     fn unproven(why: impl AsRef<str>) -> Self {
         Self {
             cause: Box::new(IngestCause::Unproven),
@@ -285,6 +300,38 @@ impl fmt::Display for IngestError {
 
 impl std::error::Error for IngestError {}
 
+/// The check of an ingest plan before its first write (phase 14.5, pin P2): the verified shadow of the sandbox engine, or nothing.
+///
+/// [`TaskStoreWriter::ingest_with`] calls [`IngestCheck::check`] once per call, inside the write transaction, after the plan is made and
+/// before any write, with the facts the plan was made from, `now` and the answer the writer will use (the plan or the refusal). The check
+/// never changes that answer: `Ok(())` lets the writer use it as it is, and `Err(code)` stops the call before any write. The transaction
+/// is rolled back and the call fails with `code` as a final error. Only `E-TIMEOUT` is returned, for a verification the call deadline
+/// ran out on.
+pub trait IngestCheck: Sync {
+    /// Checks `host`, the answer computed from `facts` and `now`.
+    fn check(
+        &self,
+        facts: &IngestFacts,
+        now: f64,
+        host: &Result<IngestPlan, PlanError>,
+    ) -> Result<(), ErrorCode>;
+}
+
+/// The check of a host with no verifier: every answer stands.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostIngestCheck;
+
+impl IngestCheck for HostIngestCheck {
+    fn check(
+        &self,
+        _facts: &IngestFacts,
+        _now: f64,
+        _host: &Result<IngestPlan, PlanError>,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+}
+
 impl TaskStoreWriter {
     /// `orch_status.ingest` for one result, in one `BEGIN IMMEDIATE` transaction: the auto-claim, the reported transition, the notes,
     /// the artifact rows, the gate-target feedback, the replay key and the whole of `reconcile`, or nothing.
@@ -292,7 +339,7 @@ impl TaskStoreWriter {
     /// `now` is the single clock reading of the call (every `updated_at`, `ts` and `created_at`); it must be finite. `source` gives the
     /// keys once, before the transaction (see the module documentation: for every call), and the clock a verdict's expiry is compared
     /// with, read inside it. On any error the transaction is rolled back; an [`IngestError::write_state`] of
-    /// [`WriteState::NotStarted`] left the store byte-identical.
+    /// [`WriteState::NotStarted`] left the store byte-identical. The plan is not checked: see [`Self::ingest_with`].
     ///
     /// # Errors
     ///
@@ -302,6 +349,23 @@ impl TaskStoreWriter {
         request: &IngestRequest,
         now: f64,
         source: &dyn ApprovalSource,
+    ) -> Result<IngestApplied, IngestError> {
+        self.ingest_with(request, now, source, &HostIngestCheck)
+            .await
+    }
+
+    /// [`Self::ingest`] with `check` run on the plan inside the transaction, after planning and before the first write (see
+    /// [`IngestCheck`]). A check that stops the call rolls the transaction back and leaves the store byte-identical.
+    ///
+    /// # Errors
+    ///
+    /// [`IngestError`]: the answer of [`Self::ingest`], or the code `check` stopped the call with.
+    pub async fn ingest_with(
+        &self,
+        request: &IngestRequest,
+        now: f64,
+        source: &dyn ApprovalSource,
+        check: &dyn IngestCheck,
     ) -> Result<IngestApplied, IngestError> {
         if !now.is_finite() {
             return Err(IngestError::unproven("now is not a finite number"));
@@ -314,7 +378,7 @@ impl TaskStoreWriter {
             .begin()
             .await
             .map_err(|error| IngestError::store(&error))?;
-        match run(&mut tx, request, now, source, &keys).await {
+        match run(&mut tx, request, now, source, &keys, check).await {
             Ok(applied) => {
                 tx.commit()
                     .await
@@ -337,15 +401,21 @@ async fn run(
     now: f64,
     source: &dyn ApprovalSource,
     keys: &ApprovalKeys,
+    check: &dyn IngestCheck,
 ) -> Result<IngestApplied, IngestError> {
     let facts = snapshot(tx, request, keys).await?;
+    let host = plan_ingest(&facts, now);
+    // The answer is checked before the first write: a check that stops the call writes nothing.
+    check
+        .check(&facts, now, &host)
+        .map_err(IngestError::checked)?;
     let IngestPlan {
         ops,
         reply,
         notes_log,
         before,
         after,
-    } = plan_ingest(&facts, now).map_err(IngestError::from_plan)?;
+    } = host.map_err(IngestError::from_plan)?;
     let (writer_ops, events) = writer_ops(ops)?;
     // `--advisory` approves nothing: no guard, so a list that reaches APPROVED is refused before its first write.
     let guard = (!request.advisory).then(|| ApprovalGuard::new(source, keys));

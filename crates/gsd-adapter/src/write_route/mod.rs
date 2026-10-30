@@ -31,6 +31,12 @@
 pub(crate) mod assign;
 pub(crate) mod ingest;
 pub(crate) mod plan;
+#[cfg(feature = "sandbox-write-2")]
+pub mod shadow_approval;
+#[cfg(feature = "sandbox-write-2")]
+pub(crate) mod shadow_ingest;
+#[cfg(feature = "sandbox-write-2")]
+pub(crate) mod shadow_plan;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -44,8 +50,8 @@ use gsd_route::transition_args::TransitionArgs;
 use gsd_route::transition_plan::{PlanEffect, Request};
 use gsd_route::{check_safe_id, finish, jstr, obj_get, Fields, Json, Reply, SeamError};
 use gsd_taskwriter::{
-    open_for_write, Applied, ApplyCause, ApplyError, Decider, EnvApprovalSource, ErrorKind,
-    TaskStoreWriter, WriteState, WriterConfig, WriterError,
+    open_for_write, Applied, ApplyCause, ApplyError, ApprovalVerifier, Decider, EnvApprovalSource,
+    ErrorKind, TaskStoreWriter, WriteState, WriterConfig, WriterError,
 };
 
 use crate::strangler_seam::{
@@ -68,6 +74,17 @@ pub(crate) async fn transition_reply(
     args: &TransitionArgs,
     call: &Invocation,
     decider: &dyn Decider,
+) -> Result<Reply, SeamError> {
+    transition_reply_with(args, call, decider, None).await
+}
+
+/// [`transition_reply`] with the approval verifier of the sandboxed route (phase 14.5, pin P2). For a transition to `APPROVED` the
+/// verifier checks the host's gate answer before the decider runs; `None` is the host route, which checks nothing more.
+pub(crate) async fn transition_reply_with(
+    args: &TransitionArgs,
+    call: &Invocation,
+    decider: &dyn Decider,
+    verifier: Option<&dyn ApprovalVerifier>,
 ) -> Result<Reply, SeamError> {
     let context_task = match &args.context_task_id {
         Some(value) => Some(value.as_str()),
@@ -144,7 +161,9 @@ pub(crate) async fn transition_reply(
     // A transition to APPROVED reads the signing keys from this process's environment, once, before the transaction opens (D-P24);
     // every other target reads none. The route never holds a key itself: it hands the writer a source.
     let writer = TaskStoreWriter::with_approval(store, Arc::new(EnvApprovalSource));
-    let outcome = writer.transition(&request, now, decider).await;
+    let outcome = writer
+        .transition_with_verifier(&request, now, decider, verifier)
+        .await;
     writer.close().await;
     let applied = outcome.map_err(|error| apply_refusal(&error))?;
 

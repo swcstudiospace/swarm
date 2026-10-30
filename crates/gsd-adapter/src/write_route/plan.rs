@@ -17,6 +17,11 @@
 //! The kickoff is signed before the `COMMIT`, so a signing failure is `not_started` and Python answers with no write done. Refusals
 //! that `plan_derive` decides (`E-INPUT`, `E-CONTRACT` prefix collisions) are Python's own and carry no `write_state`.
 //!
+//! On the sandbox path (`sandbox-write-2`) every derivation is checked by [`PlanCheck`] before any write: a dry run, a refusal or a
+//! decline where it is answered, a creation or a reuse inside its transaction, after the derivation and before the first write. The
+//! check is the verified shadow of `shadow_plan`; its only effect on the answer is a spent deadline (`E-TIMEOUT`, rolled back, nothing
+//! written). The host route passes no check. The creation's guest call runs under the write lock, as the transition decider's does.
+//!
 //! Declined, `E-DEP` `not_started` (Python answers): a substrate URL; `--plan` and every blast-radius form (`--slices`,
 //! `--slices-json`, `--pattern custom` and `--pattern parallel`, and a brief with a blast-radii block), because the agent roster is
 //! read by `swarm.manifest` with validation this route does not reproduce; an argv outside the grammar (abbreviations, repeated
@@ -223,7 +228,44 @@ pub fn served(argv: &[String]) -> bool {
 /// dry run and a reuse carry an empty manifest, so the selector can tell "nothing to replay" from "effects lost". A declined call
 /// writes none, because Python answers it and writes its own.
 pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
-    let result = answer_call(call).await;
+    answer_checked(call, &NoCheck).await
+}
+
+/// The check of one derivation's answer before anything is written. The host route passes [`NoCheck`]; the sandbox path passes its
+/// verified shadow (`write_route::shadow_plan`). `Ok` lets the host's answer stand. `Err` ends the call with that error and writes
+/// nothing (a spent deadline: `E-TIMEOUT`). A check never changes the answer. The call runs one check per derivation that answers it:
+/// a dry run, a refusal or a decline is checked where it is answered, a creation or a reuse inside its transaction.
+pub(crate) trait PlanCheck {
+    fn check(
+        &self,
+        facts: &PlanFacts,
+        request: &PlanRequest,
+        now: f64,
+        host: &Result<PlanDerived, PlanError>,
+    ) -> Result<(), SeamError>;
+}
+
+/// The host route's check: none. The host's answer is the answer.
+struct NoCheck;
+
+impl PlanCheck for NoCheck {
+    fn check(
+        &self,
+        _facts: &PlanFacts,
+        _request: &PlanRequest,
+        _now: f64,
+        _host: &Result<PlanDerived, PlanError>,
+    ) -> Result<(), SeamError> {
+        Ok(())
+    }
+}
+
+/// [`answer`] with `check` over every derivation (see [`PlanCheck`]). The sandbox path calls it with its verified shadow.
+pub(crate) async fn answer_checked(
+    call: &Invocation,
+    check: &dyn PlanCheck,
+) -> Result<Reply, SeamError> {
+    let result = answer_call(call, check).await;
     if let Err(error) = &result {
         if error.details().iter().all(|(key, _)| key != "write_state") {
             write_manifest(call, &manifest(&[], None, false)).ok();
@@ -232,7 +274,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
     result
 }
 
-async fn answer_call(call: &Invocation) -> Result<Reply, SeamError> {
+async fn answer_call(call: &Invocation, check: &dyn PlanCheck) -> Result<Reply, SeamError> {
     let Some(args) = parse(&call.argv).filter(|args| !needs_roster(args)) else {
         return Err(decline("orch_plan argv is outside the host grammar"));
     };
@@ -305,7 +347,13 @@ async fn answer_call(call: &Invocation) -> Result<Reply, SeamError> {
         correlation_tasks: Vec::new(),
         plan_files: Vec::new(),
     };
-    let probe = match derive_plan(&base, &request, now) {
+    let probe_result = derive_plan(&base, &request, now);
+    // A derivation that answers here (a dry run, a refusal, a decline) is checked here. One that proceeds to the store is checked inside
+    // its transaction, before the first write, so each answer is checked exactly once.
+    if !matches!(&probe_result, Ok(derived) if derived.outcome == Outcome::Created) {
+        check.check(&base, &request, now, &probe_result)?;
+    }
+    let probe = match probe_result {
         Ok(derived) => derived,
         Err(PlanError::Refused(error)) => return Err(error),
         Err(PlanError::NotStarted(why)) => return Err(decline(&why)),
@@ -349,6 +397,7 @@ async fn answer_call(call: &Invocation) -> Result<Reply, SeamError> {
             swarm: &swarm,
             plans_dir: &plans_dir,
             now,
+            check,
         },
     )
     .await;
@@ -365,6 +414,7 @@ struct Planning<'a> {
     swarm: &'a Path,
     plans_dir: &'a Path,
     now: f64,
+    check: &'a dyn PlanCheck,
 }
 
 /// The `BEGIN IMMEDIATE` part: reads the rows, derives, writes, commits, and then publishes the files and the manifest.
@@ -417,7 +467,16 @@ async fn plan_in_transaction(
         plan_files,
         ..planning.base.clone()
     };
-    let derived = match derive_plan(&facts, request, planning.now) {
+    let derivation = derive_plan(&facts, request, planning.now);
+    // The check runs before the first write: a spent deadline rolls the transaction back and writes nothing.
+    if let Err(error) = planning
+        .check
+        .check(&facts, request, planning.now, &derivation)
+    {
+        tx.rollback().await.ok();
+        return Err(error);
+    }
+    let derived = match derivation {
         Ok(derived) => derived,
         Err(PlanError::Refused(error)) => {
             tx.rollback().await.ok();

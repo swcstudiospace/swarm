@@ -66,13 +66,15 @@ use std::fmt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gsd_codes::ErrorCode;
 use gsd_envelope::{
     conventional_key_file_presence, parse_envelope as parse_signed, verify_envelope, Declined,
     KeyFilePresence, KeyMaterial,
 };
+use gsd_route::approval_wire::{self, Answer, Inputs, Policy, TaskColumns};
 use gsd_route::gate_facts::{
-    latest_rows, missing_gate_reasons, unaccepted_gates, EnvelopeState, GateTask, IssuerState,
-    TaskFacts, Unsupported, VerdictFacts,
+    latest_rows, missing_gate_reasons, EnvelopeState, GateTask, IssuerState, Unsupported,
+    VerdictFacts,
 };
 use gsd_route::transition_plan::ApprovalFacts;
 use gsd_route::{obj_get, Fields, Json};
@@ -185,6 +187,22 @@ pub trait ApprovalSource: Send + Sync + fmt::Debug {
     fn clock(&self, requested_now: f64) -> f64;
 }
 
+/// The host's check of its own approval answer (phase 14.5, pin P2): the sandbox verifies, inside the writer's transaction, the answer
+/// the host computed from the facts it read.
+///
+/// [`TaskStoreWriter::transition_with_verifier`](crate::TaskStoreWriter::transition_with_verifier) calls [`Self::verify`] once per APPROVED
+/// call whose gate facts were read (never for a key-policy refusal, which reads no row), with those facts and the host's answer, before
+/// the decider runs. `Ok` lets the call go on with the host's answer, whatever the verifier found: a fault is the implementation's to
+/// record. `Err(code)` aborts the call before any write with `code`; an implementation returns only `E-TIMEOUT`.
+pub trait ApprovalVerifier: Send + Sync + fmt::Debug {
+    /// Checks `answer`, the host's answer for `inputs`.
+    ///
+    /// # Errors
+    ///
+    /// `E-TIMEOUT` when the verification could not finish within the call's deadline; the writer then rolls back.
+    fn verify(&self, inputs: &Inputs, answer: &Answer) -> Result<(), ErrorCode>;
+}
+
 /// The production source: the process environment and the wall clock, read once per call.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnvApprovalSource;
@@ -272,6 +290,15 @@ fn text_column<'a>(task: &'a Fields, name: &str) -> Result<Option<&'a str>, Writ
     }
 }
 
+/// What the approval read of one APPROVED call produced.
+pub(crate) struct Gathered {
+    /// The facts the decider takes.
+    pub(crate) facts: ApprovalFacts,
+    /// The inputs the gate facts were computed from and the host's answer to them, when the gate facts were read. The verifier checks
+    /// this pair; `None` for a key-policy refusal, which reads no row.
+    pub(crate) witness: Option<(Inputs, Answer)>,
+}
+
 /// Reads the approval facts of `task` inside `tx`, the transaction that will write the transition.
 ///
 /// `task` is the row [`Tx::task`] returned in this transaction; `requested_now` is the call's own clock reading, taken before the
@@ -280,17 +307,20 @@ fn text_column<'a>(task: &'a Fields, name: &str) -> Result<Option<&'a str>, Writ
 /// its lock. When the key policy refuses (steps 1 and 2 of the module documentation) no row is read: the decision refuses with the
 /// policy text first, as Python does, and the refusal does not depend on the rows.
 ///
+/// The gate answer is computed by [`approval_wire::answer`], the pure function the guest runs, on the inputs read here; the inputs and
+/// the answer are returned as [`Gathered::witness`] for the verifier.
+///
 /// # Errors
 ///
 /// A not-started [`WriterError`] when Python must answer: a [`Declined`] row, an [`Unsupported`] input, a column of the wrong
-/// type, or a store read that failed.
+/// type, a verdict row whose timestamp is not finite (the wire cannot carry it), or a store read that failed.
 pub(crate) async fn gather(
     tx: &mut Tx,
     keys: &ApprovalKeys,
     source: &dyn ApprovalSource,
     task: &Fields,
     requested_now: f64,
-) -> Result<ApprovalFacts, WriterError> {
+) -> Result<Gathered, WriterError> {
     let (require_key, real_key, dev_key) = (keys.require_key(), keys.real_key(), keys.dev_key());
     let mut facts = ApprovalFacts {
         require_key,
@@ -300,7 +330,10 @@ pub(crate) async fn gather(
         unaccepted_gates: Vec::new(),
     };
     if (require_key && !real_key) || (!real_key && !dev_key) {
-        return Ok(facts);
+        return Ok(Gathered {
+            facts,
+            witness: None,
+        });
     }
 
     let (Some(task_id), Some(correlation_id)) = (
@@ -312,15 +345,24 @@ pub(crate) async fn gather(
             "approval: the task row has no task_id or correlation_id",
         ));
     };
-    let target = TaskFacts::from_row(
-        task_id,
-        correlation_id,
-        text_column(task, "risk_class")?,
-        text_column(task, "notes")?,
-    )
-    .map_err(unsupported)?;
+    let columns = TaskColumns {
+        task_id: task_id.to_string(),
+        correlation_id: correlation_id.to_string(),
+        risk_class: text_column(task, "risk_class")?.map(str::to_string),
+        notes: text_column(task, "notes")?.map(str::to_string),
+    };
+    let target = columns.facts().map_err(unsupported)?;
 
     let rows = tx.verdict_rows(task_id, target.verdicts_since).await?;
+    if let Some(row) = rows.iter().find(|row| !row.ts.is_finite()) {
+        return Err(WriterError::not_started(
+            ErrorKind::Unsupported,
+            format!(
+                "approval: verdict row {} has a timestamp that is not finite",
+                row.id
+            ),
+        ));
+    }
     let mut rows: Vec<VerdictFacts> = rows
         .into_iter()
         .map(|row| VerdictFacts::new(row, false))
@@ -378,9 +420,23 @@ pub(crate) async fn gather(
             }
         }
     }
-    let unaccepted = unaccepted_gates(&target, &rows, &reasons, &issuers).map_err(unsupported)?;
 
-    facts.missing_gates = reasons.into_iter().map(|(gate, _)| gate).collect();
-    facts.unaccepted_gates = unaccepted;
-    Ok(facts)
+    let inputs = Inputs {
+        now,
+        policy: Policy {
+            require_key,
+            real_key,
+            dev_key,
+        },
+        task: columns,
+        rows,
+        issuers,
+    };
+    let reply = approval_wire::answer(&inputs).map_err(unsupported)?;
+    facts.missing_gates = reply.missing.iter().map(|(gate, _)| gate.clone()).collect();
+    facts.unaccepted_gates = reply.unaccepted.clone();
+    Ok(Gathered {
+        facts,
+        witness: Some((inputs, reply)),
+    })
 }

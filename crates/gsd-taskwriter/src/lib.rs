@@ -42,7 +42,9 @@ mod store;
 pub use apply::{
     Applied, AppliedAudit, ApplyCause, ApplyError, Decider, HostDecider, TaskStoreWriter,
 };
-pub use approval::{ApprovalKeys, ApprovalSource, EnvApprovalSource, FixedApprovalSource};
+pub use approval::{
+    ApprovalKeys, ApprovalSource, ApprovalVerifier, EnvApprovalSource, FixedApprovalSource,
+};
 pub use error::{ErrorKind, WriteState, WriterError};
 pub use gate_issue::{
     derive_gate_issue, Decline, EnvelopeIds, GateEvent, GateFile, GateIssueRequest, GatePlan,

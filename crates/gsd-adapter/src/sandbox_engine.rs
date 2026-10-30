@@ -35,14 +35,25 @@ use gsd_sandbox::wasmtime_module_build::{MODULE_NAME, MODULE_TARGET};
 use gsd_sandbox::{
     GuestInvokeError, GuestLoader, Limits, LoadError, LoadedGuest, ModuleManifest, GUEST_MODULE,
 };
-use gsd_taskwriter::{Decider, HostDecider};
+use gsd_taskwriter::{ApprovalVerifier, Decider, HostDecider};
 
 use crate::route_table::is_read_only_route;
 use crate::strangler_seam::{
     empty_snapshot, no_route, read_args, read_snapshot, single_thread_runtime, within_deadline,
     CoreBackend, Entrypoint, Invocation,
 };
-use crate::write_route::transition_reply;
+#[cfg(feature = "sandbox-write-2")]
+use crate::write_route::ingest::ingest_reply_checked;
+#[cfg(feature = "sandbox-write-2")]
+use crate::write_route::shadow_approval::{PreparedGuest, SandboxApproval};
+#[cfg(feature = "sandbox-write-2")]
+#[doc(hidden)]
+pub use crate::write_route::shadow_ingest::ShadowIngest;
+#[cfg(feature = "sandbox-write-2")]
+use crate::write_route::shadow_plan::PlanShadow;
+use crate::write_route::transition_reply_with;
+#[cfg(feature = "sandbox-write-2")]
+use gsd_route::ingest_args::{parse_ingest_args, IngestArgs};
 
 /// Guest fuel per call (OD-6).
 const FUEL: u64 = 1_000_000_000;
@@ -125,7 +136,7 @@ impl SandboxEngine {
     }
 
     /// Replaces the failover record: the code of the fault a call is answered on, or None.
-    fn record_failover(&self, code: Option<ErrorCode>) {
+    pub(crate) fn record_failover(&self, code: Option<ErrorCode>) {
         *self.failover.lock().unwrap_or_else(PoisonError::into_inner) = code;
     }
 
@@ -216,7 +227,7 @@ impl SandboxEngine {
 }
 
 /// The per-call limits (OD-6): fuel, memory, and an epoch deadline from the call deadline.
-fn limits(deadline: Duration) -> Limits {
+pub(crate) fn limits(deadline: Duration) -> Limits {
     Limits {
         fuel: FUEL,
         memory_bytes: MEMORY_BYTES,
@@ -307,12 +318,27 @@ impl CoreBackend for SandboxEngine {
         Err(no_route(&call.script))
     }
 
+    #[cfg(feature = "sandbox-write-2")]
+    fn orch_plan(&self, call: &Invocation) -> Result<Reply, SeamError> {
+        if !crate::route_table::is_plan_route(Entrypoint::OrchPlan, &call.argv) {
+            self.record_failover(None);
+            return Err(no_route(&call.script));
+        }
+        self.plan_via(self, limits, call)
+    }
+
+    /// Without `sandbox-write-2` the embedded guest has no plan mode: every `orch_plan` call is refused before any write.
+    #[cfg(not(feature = "sandbox-write-2"))]
     fn orch_plan(&self, call: &Invocation) -> Result<Reply, SeamError> {
         Err(no_route(&call.script))
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
         self.record_failover(None);
+        #[cfg(feature = "sandbox-write-2")]
+        if let Some(args) = parse_ingest_args(&call.argv) {
+            return self.orch_status_ingest(&args, call);
+        }
         if let Some(args) = parse_transition_args(&call.argv) {
             return self.orch_status_transition(&args, call);
         }
@@ -565,15 +591,65 @@ impl SandboxEngine {
         args: &TransitionArgs,
         call: &Invocation,
     ) -> Result<Reply, SeamError> {
-        let mut decider = SandboxDecider::new(guest, Instant::now(), call.deadline);
+        let started = Instant::now();
+        let mut decider = SandboxDecider::new(guest, started, call.deadline);
         decider.make_limits = make_limits;
+        // The approval facts of an APPROVED target are verified by the guest as well (pin P2): the check runs inside the write
+        // transaction, before the decider, on the sandbox-write-2 build only. It shares the decider's prepare, so the guest is prepared
+        // once per call.
+        #[cfg(feature = "sandbox-write-2")]
+        let prepared_guest = PreparedGuest::new(guest, decider.prepared);
+        #[cfg(feature = "sandbox-write-2")]
+        let approval = (args.state == "APPROVED")
+            .then(|| SandboxApproval::new(&prepared_guest, make_limits, started, call.deadline));
+        #[cfg(feature = "sandbox-write-2")]
+        let verifier: Option<&dyn ApprovalVerifier> = approval.as_ref().map(|v| v as _);
+        #[cfg(not(feature = "sandbox-write-2"))]
+        let verifier: Option<&dyn ApprovalVerifier> = None;
         let reply = self.runtime.block_on(within_deadline(
             call.deadline,
             &call.script,
-            transition_reply(args, call, &decider),
+            transition_reply_with(args, call, &decider, verifier),
         ));
-        self.record_failover(decider.failover());
+        // The record names the first fault of the call: the approval check runs before the decider.
+        #[cfg(feature = "sandbox-write-2")]
+        let fault = approval
+            .as_ref()
+            .and_then(SandboxApproval::failover)
+            .or_else(|| decider.failover());
+        #[cfg(not(feature = "sandbox-write-2"))]
+        let fault = decider.failover();
+        self.record_failover(fault);
         reply
+    }
+
+    /// The `--ingest` route with `guest` standing in for the engine's own guest, as [`Self::transition_via`]. The host plans the call
+    /// and the reconcile stage; the guest verifies both inside the write transaction, before the first write, and the host's answer
+    /// is what the call returns. A spent deadline is `E-TIMEOUT` with nothing written. Records the failover code for
+    /// [`Self::failover`]. Public for the integration tests only.
+    #[cfg(feature = "sandbox-write-2")]
+    #[doc(hidden)]
+    pub fn ingest_via(
+        &self,
+        guest: &dyn WriteGuest,
+        make_limits: fn(Duration) -> Limits,
+        args: &IngestArgs,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        let check = ShadowIngest::new(guest, make_limits, Instant::now(), call.deadline);
+        let reply = self.runtime.block_on(within_deadline(
+            call.deadline,
+            &call.script,
+            ingest_reply_checked(args, call, &check),
+        ));
+        self.record_failover(check.failover());
+        reply
+    }
+
+    /// The `--ingest` route on the write guest the binary embeds (`sandbox-write-2`).
+    #[cfg(feature = "sandbox-write-2")]
+    fn orch_status_ingest(&self, args: &IngestArgs, call: &Invocation) -> Result<Reply, SeamError> {
+        self.ingest_via(self, limits, args, call)
     }
 
     /// The `--transition` route on the write guest the binary embeds.
@@ -602,6 +678,30 @@ impl SandboxEngine {
                 call.script
             ),
         )))
+    }
+}
+
+#[cfg(feature = "sandbox-write-2")]
+impl SandboxEngine {
+    /// The `orch_plan` route with `guest` standing in for the engine's own guest and `make_limits` giving the guest's limits from the
+    /// budget left of the call deadline. [`CoreBackend::orch_plan`] calls it with the engine itself and the production limits; a test
+    /// calls it with a scripted guest. The verified shadow is prepared before the call reads the store, so the identity check and the
+    /// compile never run under the write lock. The shadow enforces the call deadline at its check, before the first write, so no
+    /// wrapper ends the call after a commit: the host route has none either. Records the failover code for [`Self::failover`]. Public for
+    /// the integration tests only.
+    #[doc(hidden)]
+    pub fn plan_via(
+        &self,
+        guest: &dyn WriteGuest,
+        make_limits: fn(Duration) -> Limits,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        let shadow = PlanShadow::new(guest, make_limits, Instant::now(), call.deadline);
+        let reply = self
+            .runtime
+            .block_on(crate::write_route::plan::answer_checked(call, &shadow));
+        self.record_failover(shadow.failover());
+        reply
     }
 }
 

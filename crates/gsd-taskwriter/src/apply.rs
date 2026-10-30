@@ -30,7 +30,7 @@ use gsd_route::transition_plan::{
 };
 use gsd_route::{jstr, obj_get, Fields, Json, SeamError};
 
-use crate::approval::{self, ApprovalKeys, ApprovalSource};
+use crate::approval::{self, ApprovalKeys, ApprovalSource, ApprovalVerifier};
 use crate::error::{ErrorKind, WriteState, WriterError};
 use crate::plan::{PlanValidator, PlanViolation, ValidatedPlan};
 use crate::store::{PlanColumn, StateChange, Tx, WriteStore};
@@ -80,6 +80,8 @@ pub enum ApplyCause {
     InvalidPlan(PlanViolation),
     /// The store failed (see [`ErrorKind`]).
     Store(ErrorKind),
+    /// The approval verifier did not finish in time: the host's answer was never used and nothing was written.
+    Verification,
 }
 
 /// A failed transition: code, message, `details` and whether anything was written.
@@ -120,6 +122,19 @@ impl ApplyError {
             details: vec![("task_id".to_string(), jstr(task_id))],
             write_state: WriteState::NotStarted,
             cause: ApplyCause::InvalidPlan(violation),
+        }
+    }
+
+    /// The approval verifier did not finish (`E-TIMEOUT`): nothing written, the call ends with `code` and its `write_state` is final.
+    fn verification(code: ErrorCode, task_id: &str) -> Self {
+        Self {
+            cause: ApplyCause::Verification,
+            code,
+            message: format!(
+                "the approval check of {task_id} did not finish within the call deadline"
+            ),
+            details: vec![("task_id".to_string(), jstr(task_id))],
+            write_state: WriteState::Final,
         }
     }
 
@@ -252,6 +267,21 @@ impl TaskStoreWriter {
         now: f64,
         decider: &dyn Decider,
     ) -> Result<Applied, ApplyError> {
+        self.transition_with_verifier(request, now, decider, None)
+            .await
+    }
+
+    /// [`Self::transition`] with the approval verifier of a sandboxed call (phase 14.5, pin P2). `None` is the host path.
+    ///
+    /// The verifier, when given, checks the host's gate answer of an APPROVED call once its facts were read: inside the lock, after the
+    /// rows and before the decider. Its `E-TIMEOUT` ends the call with nothing written, as a decider timeout does.
+    pub async fn transition_with_verifier(
+        &self,
+        request: &Request,
+        now: f64,
+        decider: &dyn Decider,
+        verifier: Option<&dyn ApprovalVerifier>,
+    ) -> Result<Applied, ApplyError> {
         let task_id = request.task_id.as_str();
         if !now.is_finite() {
             return Err(ApplyError::store(
@@ -274,7 +304,7 @@ impl TaskStoreWriter {
             .await
             .map_err(|error| ApplyError::store(&error, task_id))?;
         let approval = self.approval.as_deref().zip(keys.as_ref());
-        match decide_and_apply(&mut tx, request, now, decider, approval).await {
+        match decide_and_apply(&mut tx, request, now, decider, approval, verifier).await {
             Ok(applied) => {
                 tx.commit()
                     .await
@@ -296,13 +326,15 @@ impl TaskStoreWriter {
 /// For a legal transition to `APPROVED` with an approval source and its keys in hand, the approval facts are read here, on `tx`, after
 /// the task row and before the decider: the row, the verdict rows, the clock and the gate tasks are one snapshot under the write lock.
 /// Any other transition, an illegal one included, reads no verdict row and needs no key (the decision refuses an illegal target before
-/// it looks at the facts).
+/// it looks at the facts). When the gate facts were read and a `verifier` is given, it checks the host's answer before the decider runs;
+/// its refusal is final and nothing is written.
 async fn decide_and_apply(
     tx: &mut Tx,
     request: &Request,
     now: f64,
     decider: &dyn Decider,
     approval: Option<(&dyn ApprovalSource, &ApprovalKeys)>,
+    verifier: Option<&dyn ApprovalVerifier>,
 ) -> Result<Applied, ApplyError> {
     let task_id = request.task_id.as_str();
     let store_error = |error: WriterError| ApplyError::store(&error, task_id);
@@ -312,11 +344,15 @@ async fn decide_and_apply(
             if matches!(obj_get(row, "state"), Some(Json::Str(state))
                 if legal_targets(state).is_some_and(|legal| legal.contains(&"APPROVED"))) =>
         {
-            Some(
-                approval::gather(tx, keys, source, row, now)
-                    .await
-                    .map_err(store_error)?,
-            )
+            let gathered = approval::gather(tx, keys, source, row, now)
+                .await
+                .map_err(store_error)?;
+            if let (Some(verifier), Some((inputs, answer))) = (verifier, &gathered.witness) {
+                verifier
+                    .verify(inputs, answer)
+                    .map_err(|code| ApplyError::verification(code, task_id))?;
+            }
+            Some(gathered.facts)
         }
         _ => None,
     };
