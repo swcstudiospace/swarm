@@ -28,7 +28,7 @@ B. CANARY over everything that exists: valid-shaped canary values in `SWARM_SIGN
    anything the run prints or writes, and an APPROVED transition is refused before any write.
 C. SELECTOR. The request the selector writes to the binary's stdin (`RUST_ENV_KEYS`) never carries a key variable. The environment it
    starts the binary with (`_binary_env(route)`) is an explicit allowlist, and only a real transition to APPROVED
-   (`transition-approved`) is handed key material: the five signing variables plus `SWARM_AGENT_SESSION` and `XDG_CONFIG_HOME`, which
+   (`transition-approved`) and an ingest (`ingest`, which verifies verdict rows) are handed key material: the five signing variables plus `SWARM_AGENT_SESSION` and `XDG_CONFIG_HOME`, which
    the binary's key policy reads beside them. `ROUTE_KEY_POLICY` is the one place that says which route may receive which key variable
    (an edit of `_binary_env` and of the table must go together), and a positive pin says the APPROVED route IS handed all seven names.
 D. DRIFT. Every `SWARM_*(KEY|SECRET|TOKEN|SEED|PEM|PRIVATE)` name the key code and the scripts mention is in `SIGNING_KEY_ENV` of
@@ -1781,6 +1781,7 @@ ROUTE_KEY_POLICY: dict[str, frozenset[str]] = {
     "history": frozenset(),
     "transition": frozenset(),
     "transition-approved": frozenset(KEY_VARS),
+    "ingest": frozenset(KEY_VARS),
 }
 PRESENCES: dict[str, tuple[str, ...]] = {
     "none": (),

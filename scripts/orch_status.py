@@ -178,10 +178,11 @@ _rust_timeout_s = engine_select.rust_timeout_s
 # flags of the read grammar that take a value (crates/gsd-route/src/lib.rs `parse_orch_status_read`)
 READ_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id", "--history"})
 DEFAULT_ENGINE_WRITE = "python"  # the engine an unset or empty GSD_ENGINE resolves to for the --transition route; "python" or "rust"
+DEFAULT_ENGINE_INGEST = "python"  # the same, for --ingest; a flip of one route does not flip the other
 # flags of the --transition write grammar that take a value; --repo is --root's alias, so a call names the pair once
 WRITE_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id", "--reason"})
-# Signing material is a per-route grant (ROUTE_KEY_ENV): only a transition to APPROVED verifies signatures, so it alone receives the key
-# policy's variables, and every other route and target receives none.
+# Signing material is a per-route grant (ROUTE_KEY_ENV): a transition to APPROVED and every ingest verify signatures, so
+# those alone receive the key policy's variables, and every other route receives none.
 SIGNING_KEY_ENV = frozenset({"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_ALLOW_INSECURE_DEV_KEY",
                              "SWARM_REQUIRE_KEY"})
 # What `KeyMaterial::from_env` reads (crates/gsd-envelope/src/keys.rs `Environment::read`) beyond HOME: the five signing variables,
@@ -193,6 +194,7 @@ ROUTE_KEY_ENV: dict[str, frozenset[str]] = {
     "history": frozenset(),
     "transition": frozenset(),
     "transition-approved": APPROVED_KEY_ENV,
+    "ingest": APPROVED_KEY_ENV,
 }
 POST_KINDS = frozenset({"live_refresh", "lease_settle", "inline_transition"})
 
@@ -293,6 +295,134 @@ def parse_write_argv(argv: list[str]) -> WriteCall | None:
 def rust_serves_write(argv: list[str]) -> bool:
     """True exactly for the argv `parse_write_argv` accepts: the `--transition` grammar the gsd_engine binary serves."""
     return parse_write_argv(argv) is not None
+
+class IngestCall(NamedTuple):
+    """A served `--ingest`: the path as written, whether `--advisory` was set, and the ids the flags named (env is the binary's)."""
+    path: str
+    advisory: bool
+    root: str
+    task_id: str | None
+    correlation_id: str | None
+
+    @property
+    def target(self) -> str:
+        return self.task_id or "<task>"
+
+    @property
+    def dry_run(self) -> bool:
+        return False
+
+
+def parse_ingest_argv(argv: list[str]) -> IngestCall | None:
+    """The call `argv` makes when it is exactly the `--ingest` grammar the gsd_engine binary serves, else None.
+
+    `--ingest PATH` and `--json` are required. `--advisory`, `--root`/`--repo`, `--task-id` and `--correlation-id` are optional,
+    each at most once. A value in its own element that starts with `-`, a repeated value flag, `--dry-run`, `--transition`,
+    `--history`, `--reason` and anything else are outside the grammar, matching `parse_ingest_args`."""
+    values: dict[str, str] = {}
+    json_seen = advisory = False
+    index = 0
+    while index < len(argv):
+        head, equals, inline = argv[index].partition("=")
+        if head in ("--json", "--advisory"):
+            if equals:
+                return None
+            if head == "--json":
+                json_seen = True
+            else:
+                advisory = True
+        elif head in ("--ingest", "--root", "--repo", "--task-id", "--correlation-id"):
+            if equals:
+                value = inline
+            elif index + 1 >= len(argv) or not argv[index + 1] or argv[index + 1].startswith("-"):
+                return None
+            else:
+                index += 1
+                value = argv[index]
+            slot = "--root" if head == "--repo" else head
+            if not value or slot in values:
+                return None
+            values[slot] = value
+        else:
+            return None
+        index += 1
+    if not json_seen or "--ingest" not in values:
+        return None
+    return IngestCall(values["--ingest"], advisory, values.get("--root", "."),
+                      values.get("--task-id"), values.get("--correlation-id"))
+
+
+def rust_serves_ingest(argv: list[str]) -> bool:
+    """True exactly for the argv `parse_ingest_argv` accepts: the `--ingest` grammar the gsd_engine binary serves."""
+    return parse_ingest_argv(argv) is not None
+
+
+def _ingest_events(path: str) -> list[tuple[str, dict[str, Any], str | None]] | None:
+    """The `effects` of an ingest manifest, or None when the file is missing or not that shape."""
+    try:
+        body = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict) or not isinstance(body.get("effects"), list):
+        return None
+    events = []
+    for item in body["effects"]:
+        if not (isinstance(item, dict) and isinstance(item.get("type"), str) and item["type"] and isinstance(item.get("payload"), dict)
+                and isinstance(item.get("task_id"), (str, type(None)))):
+            return None
+        events.append((item["type"], item["payload"], item.get("task_id")))
+    return events
+
+
+def _emit_ingest_events(call: IngestCall | None, events: list[tuple[str, dict[str, Any], str | None]]) -> None:
+    ctx = Ctx("A01", "orch_status", call.task_id if call is not None else None,
+              call.correlation_id if call is not None else None, False,
+              Path(call.root).resolve() if call is not None else Path.cwd())
+    for event_type, payload, task_id in events:
+        ctx.emit(event_type, payload, task_id=task_id)
+
+
+def _ingest_on_final(call: IngestCall | None, effects_path: str) -> None:
+    """Emits the events of a refused ingest. A missing manifest is a lost event; the refusal itself still stands."""
+    events = _ingest_events(effects_path)
+    if events is None:
+        return
+    try:
+        _emit_ingest_events(call, events)
+    except Exception as exc:  # noqa: BLE001 - the refusal is the answer; say the event was lost
+        engine_select.warn(SELECTOR, f"events of a refused ingest were lost ({type(exc).__name__})")
+
+
+def _ingest_commit(call: IngestCall | None, _before: str | None, effects_path: str, reply: dict[str, Any],
+                   stdout: bytes) -> tuple[dict[str, Any], bytes]:
+    """Replays a committed ingest: its events, the inline transition, then one live refresh when the manifest asks for it."""
+    if call is None:
+        return reply, stdout
+    try:
+        body = json.loads(Path(effects_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _record_effects_lost(call, "effects manifest missing or unparsable")  # type: ignore[arg-type]
+        return reply, stdout
+    events = _ingest_events(effects_path)
+    inline = body.get("inline") if isinstance(body, dict) else None
+    if events is None or not isinstance(inline, dict) or not isinstance(inline.get("task_id"), str) or not isinstance(inline.get("from"), str):
+        _record_effects_lost(call, "effects manifest missing or unparsable")  # type: ignore[arg-type]
+        return reply, stdout
+    try:
+        _emit_ingest_events(call, events)
+        ctx = Ctx("A01", "orch_status", call.task_id, call.correlation_id, False, Path(call.root).resolve())
+        store = TaskStore(root=ctx.root)
+        task = store.get(inline["task_id"])
+        emit_inline_transition(store, task, inline["from"], task["state"], reason=str(inline.get("reason") or f"ingest {Path(call.path).name}"),
+                               root=ctx.root)
+        if body.get("live_refresh") is True:
+            from swarm import telemetry  # lazy, as TaskStore._notify_committed does
+            telemetry.refresh_live(db_path=store.path, conn=store.conn)
+    except Exception as exc:  # noqa: BLE001 - the ingest is committed: say what was lost, never run it again
+        _record_effects_lost(call, f"replay failed: {type(exc).__name__}")  # type: ignore[arg-type]
+    return reply, stdout
+
+
 
 
 def _binary_env(route: str) -> dict[str, str]:
@@ -451,13 +581,26 @@ WRITE_ROUTE = engine_select.Route(
         preexec=lambda route: _no_core_dumps if route == "transition-approved" else None,
     ),
 )
+INGEST_ROUTE = engine_select.Route(
+    claims=lambda argv: any(token == "--ingest" or token.startswith("--ingest=") for token in argv),
+    parse=parse_ingest_argv,
+    default=lambda: DEFAULT_ENGINE_INGEST,
+    env_route=lambda argv, call: "ingest",
+    write=engine_select.WriteFlow(
+        before=lambda call: None,
+        commit=_ingest_commit,
+        unknown=_unknown_hint,
+        preexec=lambda route: _no_core_dumps,
+        on_final=_ingest_on_final,
+    ),
+)
 READ_ROUTE = engine_select.Route(
     claims=lambda argv: True,
     parse=lambda argv: argv if rust_serves(argv) else None,
     default=lambda: DEFAULT_ENGINE,
     env_route=lambda argv, call: "history" if any(token == "--history" or token.startswith("--history=") for token in argv) else "list",
 )
-SELECTOR = engine_select.Selector(SCRIPT, (WRITE_ROUTE, READ_ROUTE), RUST_ENV_KEYS, _binary_env)
+SELECTOR = engine_select.Selector(SCRIPT, (WRITE_ROUTE, INGEST_ROUTE, READ_ROUTE), RUST_ENV_KEYS, _binary_env)
 run_rust = functools.partial(engine_select.run_read, SELECTOR, READ_ROUTE)
 run_rust_write = functools.partial(engine_select.run_write, SELECTOR, WRITE_ROUTE)
 

@@ -1232,6 +1232,8 @@ pub mod reconcile_plan;
 pub mod result_parse;
 
 #[cfg(feature = "host-routes")]
+pub mod ingest_args;
+#[cfg(feature = "host-routes")]
 pub mod transition_args;
 
 #[cfg(test)]

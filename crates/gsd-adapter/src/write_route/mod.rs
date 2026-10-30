@@ -28,7 +28,7 @@
 //! gate task, `E-INPUT` unknown task, `E-TIMEOUT` `max_attempts exceeded`, `E-CONTRACT` concurrent transition); those replies
 //! carry no `write_state`. A refusal that is Rust's own and happened before the first write is `write_state = "not_started"`; a
 //! failure at or after the first write that is not Python's is `write_state = "final"`.
-
+pub(crate) mod ingest;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -241,8 +241,7 @@ fn effects_manifest(args: &TransitionArgs, applied: &Applied) -> Json {
 }
 
 /// Writes `manifest` to the call's `effects_path`, atomically: a private temporary file in the same directory, then a rename over
-/// the path. A call without an `effects_path` writes nothing. The caller owns the file and has created it empty.
-fn write_manifest(call: &Invocation, manifest: &Json) -> Result<(), SeamError> {
+pub(crate) fn write_manifest(call: &Invocation, manifest: &Json) -> Result<(), SeamError> {
     let Some(path) = &call.effects_path else {
         return Ok(());
     };

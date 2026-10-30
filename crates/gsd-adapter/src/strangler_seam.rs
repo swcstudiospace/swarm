@@ -28,7 +28,7 @@ use gsd_sdk::omp_bridge_runner::{InvokeRequest, OmpBridge};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
-use crate::write_route::transition_reply;
+use crate::write_route::{ingest::ingest_reply, transition_reply};
 
 /// Largest `--input` payload accepted at the seam, in UTF-8 bytes (`scripts/swarm_tool.py` `MAX_INPUT_BYTES`).
 pub const INPUT_CAP_BYTES: usize = 100_000;
@@ -527,6 +527,19 @@ impl RustEngine {
             transition_reply(args, call, &gsd_taskwriter::HostDecider),
         ))
     }
+
+    /// The host `--ingest` route: the caller has checked that the argv is inside its grammar.
+    fn orch_status_ingest(
+        &self,
+        args: &gsd_route::ingest_args::IngestArgs,
+        call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        self.runtime.block_on(within_deadline(
+            call.deadline,
+            &call.script,
+            ingest_reply(args, call),
+        ))
+    }
 }
 
 /// Marks a refusal that happened before the first write: `error.details.write_state = "not_started"`, the reply on which a caller
@@ -592,6 +605,9 @@ impl CoreBackend for RustEngine {
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
+        if let Some(args) = gsd_route::ingest_args::parse_ingest_args(&call.argv) {
+            return self.orch_status_ingest(&args, call);
+        }
         match parse_transition_args(&call.argv) {
             Some(args) => self.orch_status_transition(&args, call),
             None => self.orch_status_read(call),
