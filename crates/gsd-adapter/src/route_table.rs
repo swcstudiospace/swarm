@@ -63,6 +63,16 @@ pub fn is_rel_plan_route(entry: Entrypoint, argv: &[String]) -> bool {
     matches!(entry, Entrypoint::RelPlan) && crate::gates::rel_plan::served(argv)
 }
 
+/// Returns true when the call is the host reviewer gate: `rev_gate --json` inside the grammar `gates::rev_gate` serves.
+pub fn is_rev_gate_route(entry: Entrypoint, argv: &[String]) -> bool {
+    matches!(entry, Entrypoint::RevGate) && crate::gates::rev_gate::served(argv)
+}
+
+/// Returns true when the call is the host security gate: `sec_gate --json` inside the grammar `gates::sec_gate` serves.
+pub fn is_sec_gate_route(entry: Entrypoint, argv: &[String]) -> bool {
+    matches!(entry, Entrypoint::SecGate) && crate::gates::sec_gate::served(argv)
+}
+
 /// Returns true when the call is the host assignment verify route.
 pub fn is_assign_route(entry: Entrypoint, argv: &[String]) -> bool {
     matches!(entry, Entrypoint::OrchAssign) && crate::write_route::assign::served(argv)
@@ -122,6 +132,8 @@ pub fn route_for_call(
                 || is_ingest_route(entry, argv)
                 || is_qa_gate_route(entry, argv)
                 || is_rel_plan_route(entry, argv)
+                || is_rev_gate_route(entry, argv)
+                || is_sec_gate_route(entry, argv)
                 || is_plan_route(entry, argv)
                 || is_assign_route(entry, argv) =>
         {
