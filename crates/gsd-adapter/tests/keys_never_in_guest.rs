@@ -14,6 +14,9 @@
 //!   anything an APPROVED transition prints, sends to the guest or writes, and that transition is refused before any write;
 //! - the non-test code of this crate names no linker for the guest (`HostBridge`, `instantiate_with`, `wasmtime_wasi`,
 //!   `add_to_linker`): the guest is started on an empty linker only;
+//! - the second-batch requests (P2) are captured at the `WriteGuest` seam and scanned in every form: `approval` (an APPROVED
+//!   transition), `ingest` with its `reconcile` stage and `plan` (the write modes need `--features sandbox-write`), and `catalog`,
+//!   which has no host route yet, so its request is the one `catalog_wire::encode_request` builds;
 //! - the checks have teeth: an extra key at each level, a canary in each channel and every form of every canary are detected.
 //!
 //! The key-reading path (unit U3.4d, the R2 cases of decision D-P30): `approved_transition_*` run a transition to APPROVED through the
@@ -29,8 +32,9 @@
 //! - the `KeyMaterial` trait check: U3.4d made `gsd-envelope` a dependency of `gsd-taskwriter`, not of this crate (the manifest of this
 //!   crate is the orchestrator's, and an integration test can only name the dependencies of its own package). `KeyMaterial` not being
 //!   `Clone` is checked in `crates/gsd-taskwriter/tests/approval.rs`; the `Serialize` half needs `serde` as a dev-dependency (R11);
-//! - the key sets of the read modes (`list`, `history`) wait for a public seam: the request is built by `read_snapshot` and
-//!   `request_json` in `strangler_seam.rs`, `pub(crate)` and private, and `SandboxEngine::answer` hands it to the guest with no hook.
+//! - the read route's request (`list`, `history`) waits for a public seam: it is built by `read_snapshot` and `request_json` in
+//!   `strangler_seam.rs`, both `pub(crate)` or private, and `SandboxEngine::answer` hands it to the guest with no hook. A
+//!   `#[doc(hidden)] pub` seam like `transition_via` would let the disabled module below run.
 //!
 //! The Task Store is built by the real Python `TaskStore` (the schema is Python's). Canaries are made at run time from the
 //! standard library's randomly keyed hasher; they are never written to a file or printed, and a failed assertion names the variable
@@ -48,10 +52,11 @@ use std::time::Duration;
 use gsd_adapter::sandbox_engine::{SandboxEngine, WriteGuest};
 use gsd_adapter::strangler_seam::{error_reply, Invocation};
 use gsd_failure::ErrorCode;
+use gsd_route::catalog::{CatalogArgs, Kind, Registry, SkillRow};
 use gsd_route::transition_args::parse_transition_args;
 use gsd_route::transition_plan::{ApprovalFacts, Facts, Request};
 use gsd_route::transition_wire::{encode_request, transition_invoke};
-use gsd_route::{obj_get, parse_json, Json};
+use gsd_route::{catalog_wire, obj_get, parse_json, Json};
 use gsd_sandbox::wasmtime_limits::deadline_ticks_for;
 use gsd_sandbox::Limits;
 use tempfile::TempDir;
@@ -439,18 +444,26 @@ struct World {
 impl World {
     /// A scratch repository whose task T-1 is CREATED, or in `state` when one is given.
     fn seeded(state: Option<&str>) -> Self {
+        Self::built_by(SEED_SCRIPT, state.as_slice())
+    }
+
+    /// A scratch repository whose Task Store `script` builds: the database path is its first argument and `args` follow it. Python's
+    /// state stays in the scratch directory.
+    fn built_by(script: &str, args: &[&str]) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().join("work");
         let swarm = root.join(".swarm");
         fs::create_dir_all(&swarm).expect("swarm dir");
         let mut seed = std::process::Command::new("python3");
         seed.arg("-c")
-            .arg(SEED_SCRIPT)
+            .arg(script)
             .arg(swarm.join("tasks.db"))
-            .args(state)
+            .args(args)
             .current_dir(repo_root())
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("SWARM_PURE_PYTHON", "1")
+            .env("SWARM_GSD_STATE_FILE", "")
+            .env("SWARM_CLAUDE_STATE_DIR", dir.path().join("claude"))
             .env_remove("SWARM_TASKSTORE_WAL");
         let output = seed.output().expect("run python3");
         assert!(
@@ -1725,6 +1738,360 @@ fn approved_transition_approves_current_verdicts_with_no_wait() {
         column_of(&run.world, "SELECT state FROM tasks"),
         ["APPROVED"]
     );
+}
+
+// ---- the P2 requests (A10 F1) ---------------------------------------------------------------------------------------------------
+//
+// The second-batch modes (`approval` of an APPROVED transition, `ingest` with its `reconcile` stage, `plan`, `catalog`) send their
+// requests from the host, and the host hands each one to a guest. Each case runs one host path with a guest that records every request
+// it is handed and answers with `gsd_route::core_invoke`, the function the wasm guest runs, so the replies are the honest ones. The
+// canaries are in the process environment while the request is built, and every captured request and reply is scanned for every
+// canary form. Each case first checks which modes the guest was asked, so the scan is known to cover the requests it claims to.
+// The read route's request is not in this list: `read_snapshot` and `request_json` are private (see the disabled module below).
+
+/// What a guest was handed and what it answered, in order.
+struct Captured {
+    requests: Mutex<Vec<Vec<u8>>>,
+    replies: Mutex<Vec<Vec<u8>>>,
+}
+
+impl Captured {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The requests and the replies, in the order the guest saw and gave them.
+    fn into_parts(self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            self.requests
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+            self.replies
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+}
+
+impl WriteGuest for Captured {
+    fn call(&self, request: &[u8], _limits: &Limits) -> Result<Vec<u8>, ErrorCode> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.to_vec());
+        let reply = gsd_route::core_invoke(request).map_err(|error| error.code())?;
+        self.replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(reply.clone());
+        Ok(reply)
+    }
+}
+
+/// The `mode` a request names, or a marker for anything that is not a JSON object with one.
+fn mode_of(request: &[u8]) -> String {
+    match parse_json(&String::from_utf8_lossy(request)) {
+        Ok(Json::Obj(fields)) => match obj_get(&fields, "mode") {
+            Some(Json::Str(mode)) => mode.clone(),
+            _ => "<no mode>".to_string(),
+        },
+        _ => "<not a JSON object>".to_string(),
+    }
+}
+
+/// Fails unless the guest was asked exactly the modes `expected`, in any order.
+fn require_modes(requests: &[Vec<u8>], expected: &[&str], call: &str) {
+    let mut asked: Vec<String> = requests.iter().map(|request| mode_of(request)).collect();
+    asked.sort();
+    let mut wanted: Vec<String> = expected.iter().map(|mode| (*mode).to_string()).collect();
+    wanted.sort();
+    assert_eq!(asked, wanted, "{call}: the modes the guest was asked");
+}
+
+/// Scans every request and reply of one call for every canary form. A failure names the call and the index, never a value.
+fn scan_captured(canaries: &Canaries, requests: &[Vec<u8>], replies: &[Vec<u8>], call: &str) {
+    assert!(!requests.is_empty(), "{call}: the guest was asked");
+    for (index, request) in requests.iter().enumerate() {
+        canaries.require_clean(request, &format!("a guest request of {call} ({index})"));
+    }
+    for (index, reply) in replies.iter().enumerate() {
+        canaries.require_clean(reply, &format!("a guest reply of {call} ({index})"));
+    }
+}
+
+/// Runs `body` with the canaries in the process environment and no other key variable, under the lock the key tests share. The
+/// substrate is switched off for the run, so no route calls out.
+fn under_canaries<T>(canaries: &Canaries, body: impl FnOnce() -> T) -> T {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for name in KEY_ENV {
+        std::env::remove_var(name);
+    }
+    for (name, value) in &canaries.env {
+        std::env::set_var(name, value);
+    }
+    std::env::set_var("SUBSTRATE_DISABLED", "1");
+    std::env::remove_var("SUBSTRATE_URL");
+    body()
+}
+
+/// The catalog arguments of the cases below: the whole catalog, called by A01.
+fn catalog_args() -> CatalogArgs {
+    CatalogArgs {
+        json: true,
+        dry_run: false,
+        caller: Some("A01".to_string()),
+        kind: Kind::All,
+        query: None,
+        task_id: None,
+        correlation_id: None,
+    }
+}
+
+/// The catalog vectors: the registry and the skill rows the host answers from (the corpus of the catalog fault tests).
+const CATALOG_VECTORS: &str = include_str!("../../gsd-route/tests/vectors/catalog.json");
+
+fn catalog_corpus() -> (Registry, Vec<SkillRow>) {
+    let document = parse_json(CATALOG_VECTORS).expect("the vector file parses");
+    let Json::Obj(top) = &document else {
+        panic!("the vector file is an object");
+    };
+    let registry = Registry::from_json(obj_get(top, "registry").expect("registry"))
+        .expect("the registry is the documented shape");
+    let skills = SkillRow::from_json(obj_get(top, "skills").expect("skills"))
+        .expect("the skill rows are the documented shape");
+    (registry, skills)
+}
+
+/// `catalog` has no host route yet: its request is the one `catalog_wire::encode_request` builds, and the guest answers it on
+/// the default build too (`gsd-route` compiles the second batch by default).
+#[test]
+fn p2_catalog_request_and_reply_hold_no_canary() {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let (registry, skills) = catalog_corpus();
+    let args = catalog_args();
+    let expected = catalog_wire::encode_outcome(&catalog_wire::answer(&args, &registry, &skills));
+    let guest = Captured::new();
+    let outcome = under_canaries(&canaries, || {
+        let request = catalog_wire::encode_request(&args, &registry, &skills).into_bytes();
+        guest.call(&request, &production(Duration::from_secs(30)))
+    });
+    let (requests, replies) = guest.into_parts();
+    scan_captured(&canaries, &requests, &replies, "a catalog call");
+    require_modes(&requests, &[catalog_wire::MODE], "a catalog call");
+    assert_eq!(
+        outcome.expect("the honest guest answers"),
+        expected.as_bytes(),
+        "the guest's reply is the host's answer"
+    );
+}
+
+/// The scan of the P2 cases finds a canary planted in a captured request or in a captured reply, and names the channel.
+#[test]
+fn the_p2_scan_finds_a_canary_planted_in_a_captured_request_or_reply() {
+    let probe = TempDir::new().expect("tempdir");
+    let canaries = Canaries::new(probe.path());
+    let (registry, skills) = catalog_corpus();
+    let request = catalog_wire::encode_request(&catalog_args(), &registry, &skills).into_bytes();
+    let reply = gsd_route::core_invoke(&request).expect("the honest reply");
+    let planted = canaries.env[0].1.clone();
+    let mut request_with_canary = request.clone();
+    request_with_canary.extend_from_slice(planted.as_bytes());
+    let mut reply_with_canary = reply.clone();
+    reply_with_canary.extend_from_slice(planted.as_bytes());
+    let cases = [
+        (
+            vec![request_with_canary],
+            vec![reply.clone()],
+            "a guest request of a planted call (0)",
+        ),
+        (
+            vec![request.clone()],
+            vec![reply_with_canary],
+            "a guest reply of a planted call (0)",
+        ),
+    ];
+    for (requests, replies, channel) in cases {
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan_captured(&canaries, &requests, &replies, "a planted call");
+        }));
+        let payload = failure.expect_err("a canary in a captured channel fails the scan");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("SWARM_SIGNING_KEY/utf8"), "{message}");
+        assert!(message.contains(channel), "{message}");
+    }
+}
+
+#[cfg(feature = "sandbox-write")]
+mod p2_writes {
+    //! The write modes on the sandbox: `approval` (an APPROVED transition), `ingest` with `reconcile`, and `plan`. Each runs a real
+    //! host route through `transition_via`, `ingest_via` or `plan_via` with [`Captured`] as the guest.
+
+    use super::*;
+
+    /// The seed of the ingest world: T-1 is IN_PROGRESS, P-1 is PLANNED with no gate. The seed of the ingest fault tests.
+    const INGEST_SEED_SCRIPT: &str = r#"
+import sys
+from swarm.taskstore import TaskStore
+s = TaskStore(sys.argv[1])
+PATH = {"PLANNED": ["VALIDATED", "PLANNED"], "IN_PROGRESS": ["VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"]}
+for tid, state in (("H-1", "IN_PROGRESS"), ("P-1", "PLANNED")):
+    s.create(task_id=tid, correlation_id="C-1", capability="code.backend", title=tid, notes={"gates": []}, agent_id="A05@seed")
+    for step in PATH[state]:
+        s.transition(tid, step, actor="A01", reason="seed")
+s.conn.close()
+"#;
+
+    /// The result `P-1` reports: an advisory heartbeat that moves it to IN_REVIEW with one artifact.
+    const INGEST_RESULT: &str = r#"{"task_id":"P-1","state":"IN_REVIEW","outputs":[{"kind":"code","uri":"file://p","version":"1","digest":"d"}]}"#;
+
+    /// The empty Task Store the plan route writes into (the schema is Python's).
+    const EMPTY_STORE_SCRIPT: &str =
+        "import sys\nfrom swarm.taskstore import TaskStore\nTaskStore(sys.argv[1]).conn.close()\n";
+    const PLAN_BRIEF: &str = "Build the orders service.";
+    const PLAN_CORRELATION: &str = "c0ffee01-aaaa-4bbb-8ccc-0000000000aa";
+
+    /// The reply committed: its `status` is `ok`.
+    fn committed(stdout: &str) -> bool {
+        matches!(
+            parse_json(stdout),
+            Ok(reply) if member(&reply, "status") == &Json::Str("ok".to_string())
+        )
+    }
+
+    #[test]
+    fn an_approved_transition_asks_approval_and_transition_and_holds_no_canary() {
+        let probe = TempDir::new().expect("tempdir");
+        let canaries = Canaries::new(probe.path());
+        let run = given(&canaries, &[SIGNING, ED25519]);
+        let (world, _) = World::signed(PASSING, &run.env);
+        let call = world.call(
+            &["--transition", "T-1", "APPROVED", "--reason", "canary"],
+            &run.env,
+        );
+        let args = parse_transition_args(&call.argv).expect("a transition argv");
+        let engine = SandboxEngine::new().expect("sandbox engine");
+        let guest = Captured::new();
+        let reply = under_canaries(&run, || {
+            engine.transition_via(&guest, production, &args, &call)
+        })
+        .expect("the route answers");
+        let (requests, replies) = guest.into_parts();
+        scan_captured(&run, &requests, &replies, "an APPROVED transition");
+        require_modes(
+            &requests,
+            &[
+                gsd_route::approval_wire::MODE,
+                gsd_route::transition_wire::MODE,
+            ],
+            "an APPROVED transition",
+        );
+        run.require_clean(reply.stdout.as_bytes(), "the reply on stdout (APPROVED)");
+        for (name, bytes) in files_under(world.dir.path()) {
+            run.require_clean(&bytes, &format!("the file {name} (APPROVED)"));
+        }
+        assert!(committed(&reply.stdout), "{}", reply.stdout);
+        assert_eq!(
+            engine.failover(),
+            None,
+            "the honest guest agreed with the host"
+        );
+        assert_eq!(
+            column_of(&world, "SELECT state FROM tasks WHERE task_id='T-1'"),
+            ["APPROVED"]
+        );
+    }
+
+    #[test]
+    fn an_ingest_asks_ingest_and_reconcile_and_holds_no_canary() {
+        let probe = TempDir::new().expect("tempdir");
+        let canaries = Canaries::new(probe.path());
+        let world = World::built_by(INGEST_SEED_SCRIPT, &[]);
+        let result = world.root.join("result.json");
+        fs::write(&result, INGEST_RESULT).expect("result file");
+        let result_arg = result.display().to_string();
+        let call = world.call(
+            &["--ingest", result_arg.as_str(), "--advisory"],
+            &canaries.env,
+        );
+        let args = gsd_route::ingest_args::parse_ingest_args(&call.argv).expect("an ingest argv");
+        let engine = SandboxEngine::new().expect("sandbox engine");
+        let guest = Captured::new();
+        let reply = under_canaries(&canaries, || {
+            engine.ingest_via(&guest, production, &args, &call)
+        })
+        .expect("the route answers");
+        let (requests, replies) = guest.into_parts();
+        scan_captured(&canaries, &requests, &replies, "an ingest");
+        require_modes(
+            &requests,
+            &[
+                gsd_route::ingest_wire::MODE,
+                gsd_route::reconcile_wire::MODE,
+            ],
+            "an ingest",
+        );
+        canaries.require_clean(reply.stdout.as_bytes(), "the reply on stdout (ingest)");
+        for (name, bytes) in files_under(world.dir.path()) {
+            canaries.require_clean(&bytes, &format!("the file {name} (ingest)"));
+        }
+        assert!(committed(&reply.stdout), "{}", reply.stdout);
+        assert_eq!(
+            engine.failover(),
+            None,
+            "the honest guest agreed with the host"
+        );
+        assert_eq!(
+            column_of(&world, "SELECT state FROM tasks WHERE task_id='P-1'"),
+            ["IN_REVIEW"]
+        );
+    }
+
+    #[test]
+    fn a_plan_asks_plan_and_holds_no_canary() {
+        let probe = TempDir::new().expect("tempdir");
+        let canaries = Canaries::new(probe.path());
+        let world = World::built_by(EMPTY_STORE_SCRIPT, &[]);
+        let mut env = vec![("SWARM_DIR".to_string(), world.swarm.display().to_string())];
+        env.extend(canaries.env.iter().cloned());
+        let call = Invocation {
+            agent: "A01".to_string(),
+            script: "orch_plan".to_string(),
+            argv: vec![
+                "--brief-text".to_string(),
+                PLAN_BRIEF.to_string(),
+                "--correlation-id".to_string(),
+                PLAN_CORRELATION.to_string(),
+            ],
+            root: world.root.clone(),
+            env,
+            deadline: Duration::from_secs(60),
+            effects_path: Some(world.effects.clone()),
+        };
+        let engine = SandboxEngine::new().expect("sandbox engine");
+        let guest = Captured::new();
+        let reply = under_canaries(&canaries, || engine.plan_via(&guest, production, &call))
+            .expect("the route answers");
+        let (requests, replies) = guest.into_parts();
+        scan_captured(&canaries, &requests, &replies, "a plan");
+        require_modes(&requests, &[gsd_route::plan_wire::MODE], "a plan");
+        canaries.require_clean(reply.stdout.as_bytes(), "the reply on stdout (plan)");
+        for (name, bytes) in files_under(world.dir.path()) {
+            canaries.require_clean(&bytes, &format!("the file {name} (plan)"));
+        }
+        assert!(committed(&reply.stdout), "{}", reply.stdout);
+        assert_eq!(
+            engine.failover(),
+            None,
+            "the honest guest agreed with the host"
+        );
+    }
 }
 
 // ---- disabled modules, each with the one prerequisite it waits for -------------------------------------------------------------
