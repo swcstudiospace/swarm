@@ -8,7 +8,9 @@ A script describes what it serves as DATA plus small hooks (`Route`, `WriteFlow`
 2. The binary is `GSD_ENGINE_BIN` when set (it is then the only candidate), else `target/release/gsd_engine` when executable.
 3. The binary is started with an allowlist of environment names, the route's grant included (the script's `binary_env` hook),
    and the whole call is bounded by `GSD_RUST_TIMEOUT_S` (default `RUST_CALL_TIMEOUT_S`; E-TIMEOUT never falls back).
-   A child that holds a signing key is started only when the binary's sha256 is `GSD_ENGINE_BIN_SHA256` (`identity_refusal`), and with core dumps off (`no_core_dumps`).
+   A child that holds a signing key is started only when the binary's sha256 is `GSD_ENGINE_BIN_SHA256` (`identity_refusal`; an explicit
+   `rust` call it refuses exits 2 with E-POLICY, a default call answers in Python), with core dumps off (`no_core_dumps`), and with
+   HOME and XDG_CONFIG_HOME set to an empty directory made for the call (`child_home`), so the conventional signing-key file is not read.
 4. A read answer is `run_read`: Python answers whenever the binary says it cannot (`RUST_FALLBACK_CODES`, an unusable reply, a
    binary that cannot start unless explicit). A write answer is `run_write`: a write is never run twice, so the outcome table
    (see its docstring) lets Python answer only when the binary says that nothing was written, and refuses every other doubtful
@@ -33,6 +35,7 @@ and startable (the same `E-INPUT` and `E-DEP` refusals as for a served argv come
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -43,7 +46,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from swarm.errors import ErrorCode
 from swarm.script_base import AgentScript
@@ -59,6 +62,10 @@ BINARY_ENV_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GSD_R
 # runs must be the one whose lowercase hex sha256 is GSD_ENGINE_BIN_SHA256. A child without one of them is started as before.
 BINARY_SHA256_ENV = "GSD_ENGINE_BIN_SHA256"
 KEY_ENV_NAMES = frozenset({"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE"})
+# A child whose environment names one of these gets HOME and XDG_CONFIG_HOME set to an empty directory made for the call (`child_home`):
+# the binary reads its signing key from the conventional file under XDG_CONFIG_HOME or HOME. The names are the key grants and the
+# variables that choose the key policy.
+HOME_ISOLATING_ENV_NAMES = KEY_ENV_NAMES | frozenset({"XDG_CONFIG_HOME", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION"})
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -114,6 +121,23 @@ def child_guard(env: dict[str, str], hook: Callable[[], None] | None) -> Callabl
     return no_core_dumps if carries_key(env) else hook
 
 
+def isolates_home(env: dict[str, str]) -> bool:
+    """Whether a child started with `env` is isolated: one of HOME_ISOLATING_ENV_NAMES is among its variables."""
+    return not HOME_ISOLATING_ENV_NAMES.isdisjoint(env)
+
+
+@contextlib.contextmanager
+def child_home(env: dict[str, str]) -> Iterator[dict[str, str]]:
+    """The environment a child is started with. An isolated child (`isolates_home`) gets a copy of `env` whose HOME and XDG_CONFIG_HOME
+    name an empty directory made for this call and removed when the call ends, so the conventional signing-key file is not readable.
+    Any other child gets `env` itself. An absolute SWARM_ED25519_KEY_FILE is not under that directory and is not affected."""
+    if not isolates_home(env):
+        yield env
+        return
+    with tempfile.TemporaryDirectory(prefix="gsd-child-home-") as home:
+        yield {**env, "HOME": home, "XDG_CONFIG_HOME": home}
+
+
 def binary_sha256(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -124,22 +148,28 @@ def binary_sha256(path: str) -> str:
 
 def identity_refusal(binary: str, env: dict[str, str]) -> str | None:
     """None when the binary may be started with `env`. A child that holds a signing key may be started only as the binary whose
-    lowercase hex sha256 is GSD_ENGINE_BIN_SHA256; otherwise the message of an E-POLICY refusal that keeps it from starting. That
-    refusal is the binary's own `not_started` answer: nothing ran, so the Python body answers (run_read and run_write return None)."""
+    lowercase hex sha256 is GSD_ENGINE_BIN_SHA256; otherwise the reason it is not started (its E-POLICY text, without the code)."""
     if not carries_key(env):
         return None
     expected = os.environ.get(BINARY_SHA256_ENV, "")
     if not expected:
-        return f"E-POLICY: a signing key would be handed to the gsd_engine binary, which needs {BINARY_SHA256_ENV} set to its sha256; not started"
+        return f"a signing key would be handed to the gsd_engine binary, which needs {BINARY_SHA256_ENV} set to its sha256; not started"
     if _SHA256_HEX.fullmatch(expected) is None:
-        return f"E-POLICY: {BINARY_SHA256_ENV} must be 64 lowercase hex digits; not started"
+        return f"{BINARY_SHA256_ENV} must be 64 lowercase hex digits; not started"
     try:
         actual = binary_sha256(binary)
     except OSError:
-        return f"E-POLICY: the gsd_engine binary could not be read to check {BINARY_SHA256_ENV}; not started"
+        return f"the gsd_engine binary could not be read to check {BINARY_SHA256_ENV}; not started"
     if actual != expected:
-        return f"E-POLICY: the gsd_engine binary does not match {BINARY_SHA256_ENV}; a signing key is not handed to it; not started"
+        return f"the gsd_engine binary does not match {BINARY_SHA256_ENV}; a signing key is not handed to it; not started"
     return None
+
+
+def identity_refused(selector: Selector, reason: str, *, explicit: bool) -> int | None:
+    """The answer to an identity refusal: the reason goes to stderr and the binary is not started. An explicit `rust` call is refused
+    with E-POLICY and exit 2, so Python does not run; a default call returns None and the Python body answers, as for not_started."""
+    warn(selector, f"E-POLICY: {reason}")
+    return refuse(selector, ErrorCode.E_POLICY, reason) if explicit else None
 
 
 def refuse(selector: Selector, code: ErrorCode, message: str) -> int:
@@ -187,8 +217,8 @@ def run_read(selector: Selector, route: Route, argv: list[str], binary: str, *, 
     started when the call did not ask for `rust` explicitly (`explicit` False); and a run-log record that cannot be
     written (AgentScript.record_external_reply raised, so the Python body answers and applies its own failure rules).
     A Rust answer is recorded in the run log before it is printed, as the Python path's own `main` does (D1).
-    Refused with exit 2 and never a fallback: a binary that cannot be started when `explicit`, and a binary that
-    did not answer within the call deadline (E-TIMEOUT), explicit or not.
+    Refused with exit 2 and never a fallback: an identity refusal (`identity_refused`, E-POLICY) and a binary that cannot be started,
+    both when `explicit`; and a binary that did not answer within the call deadline (E-TIMEOUT), explicit or not.
     """
     request = {"agent": selector.script.agent_id, "script": selector.script.name, "argv": argv, "root": os.getcwd(),
                "env": {key: os.environ[key] for key in selector.env_keys if os.environ.get(key)}}
@@ -199,11 +229,12 @@ def run_read(selector: Selector, route: Route, argv: list[str], binary: str, *, 
     env = selector.binary_env(route.env_route(argv, None))
     refusal = identity_refusal(binary, env)
     if refusal is not None:
-        warn(selector, refusal)
-        return None  # not started: the Python body answers, as for the binary's own not_started
+        # not started: Python answers, or E-POLICY when explicit
+        return identity_refused(selector, refusal, explicit=explicit)
     try:
-        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
-                              env=env, preexec_fn=child_guard(env, None))
+        with child_home(env) as child_env:
+            done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
+                                  env=child_env, preexec_fn=child_guard(child_env, None))
     except subprocess.TimeoutExpired:
         return refuse(selector, ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
     except OSError:
@@ -266,7 +297,8 @@ def run_write(selector: Selector, route: Route, argv: list[str], binary: str, *,
       the call deadline (the subprocess deadline, or an E-TIMEOUT that names no task), a signal or any exit code outside 0, 1, 2,
       an unparsable reply, E-INTERNAL without a write_state, an unrecognised write_state.
     * not started: a binary that cannot be started is Python's answer under the default engine and E-DEP under `explicit`,
-      as for reads; so is an argument the binary cannot take (not UTF-8 encodable).
+      as for reads; an identity refusal is E-POLICY under `explicit` and Python's answer otherwise; so is an argument the binary
+      cannot take (not UTF-8 encodable).
     """
     assert route.write is not None
     call = route.parse(argv)
@@ -298,12 +330,13 @@ def _answer_write(selector: Selector, route: Route, argv: list[str], binary: str
     env = selector.binary_env(env_route)
     refusal = identity_refusal(binary, env)
     if refusal is not None:
-        warn(selector, refusal)
-        return None  # not started: nothing was written, so the Python body answers, as for the binary's own not_started
+        # not started and nothing written: Python answers, or E-POLICY when explicit
+        return identity_refused(selector, refusal, explicit=explicit)
     try:
         # A child that holds keys is started with core dumps off (a preexec_fn that fails is a start that did not happen).
-        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
-                              env=env, preexec_fn=child_guard(env, route.write.preexec(env_route)))
+        with child_home(env) as child_env:
+            done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
+                                  env=child_env, preexec_fn=child_guard(child_env, route.write.preexec(env_route)))
     except subprocess.TimeoutExpired:
         return unknown_outcome(selector, route, argv, call, "the gsd_engine binary did not answer within the call deadline")
     except (OSError, subprocess.SubprocessError):

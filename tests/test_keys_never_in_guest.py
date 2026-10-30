@@ -633,6 +633,12 @@ def environ_names(raw: bytes) -> list[str]:
     return [entry.split(b"=", 1)[0].decode(errors="replace") for entry in raw.split(b"\0") if entry]
 
 
+def environ_values(raw: bytes) -> dict[str, str]:
+    """Variables of a /proc/<pid>/environ dump, by name."""
+    pairs = (entry.decode(errors="replace").partition("=") for entry in raw.split(b"\0") if entry)
+    return {name: value for name, _, value in pairs}
+
+
 def check_children(world: World, canaries: Canaries, *, spawned: bool) -> None:
     """The `git` children the shim saw got no variable but PATH and HOME, and no canary value."""
     dumps = sorted(world.records.glob("git-env.*"))
@@ -1611,9 +1617,17 @@ def test_approved_transition_with_keys_and_signed_rows_leaks_no_key_and_answers_
     check_children(world, canaries, spawned=False)
     if driver == "selector":
         raw = (world.records / "binary-env").read_bytes()
-        names = set(environ_names(raw))
+        child = environ_values(raw)
         asked = set(R2_CASES[case][1])
-        assert names & set(R2_GRANT) == asked, f"the selector handed {sorted(names & set(R2_GRANT))}, the case sets {sorted(asked)} {where}"
+        handed = set(child) & set(R2_GRANT)
+        # Decision 1 (2026-10-30): a keyed child is started with HOME and XDG_CONFIG_HOME both naming an empty directory made for the
+        # call, so XDG_CONFIG_HOME reaches it whatever the case asks; it must then be that directory, never the caller's value.
+        unisolated = handed - {"XDG_CONFIG_HOME"}
+        assert unisolated == asked - {"XDG_CONFIG_HOME"}, f"the selector handed {sorted(handed)}, the case sets {sorted(asked)} {where}"
+        if "XDG_CONFIG_HOME" in child:
+            assert child["XDG_CONFIG_HOME"] == child.get("HOME"), f"the child's XDG_CONFIG_HOME is not its own home {where}"
+            assert child["HOME"] != os.environ.get("HOME") and child["XDG_CONFIG_HOME"] != os.environ.get("XDG_CONFIG_HOME"), (
+                f"the child was given the caller's home {where}")
         for name in asked & set(SECRET_VARS):
             assert raw.count(canaries.env[name].encode()) == 1, f"the value of {name} is in the environment under another name {where}"
     if not_covered is not None:
