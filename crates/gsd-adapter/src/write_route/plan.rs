@@ -17,7 +17,7 @@
 //! The kickoff is signed before the `COMMIT`, so a signing failure is `not_started` and Python answers with no write done. Refusals
 //! that `plan_derive` decides (`E-INPUT`, `E-CONTRACT` prefix collisions) are Python's own and carry no `write_state`.
 //!
-//! On the sandbox path (`sandbox-write-2`) every derivation is checked by [`PlanCheck`] before any write: a dry run, a refusal or a
+//! On the sandbox path (`sandbox-write`) every derivation is checked by [`PlanCheck`] before any write: a dry run, a refusal or a
 //! decline where it is answered, a creation or a reuse inside its transaction, after the derivation and before the first write. The
 //! check is the verified shadow of `shadow_plan`; its only effect on the answer is a spent deadline (`E-TIMEOUT`, rolled back, nothing
 //! written). The host route passes no check. The creation's guest call runs under the write lock, as the transition decider's does.

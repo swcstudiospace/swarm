@@ -386,6 +386,18 @@ impl Scripted {
 }
 
 /// The reply the real guest function gives for `request`.
+/// Whether `request` is a transition request (its `mode` is the transition mode).
+fn is_transition(request: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(request) else {
+        return false;
+    };
+    matches!(
+        gsd_route::parse_json(text),
+        Ok(gsd_route::Json::Obj(fields))
+            if matches!(gsd_route::obj_get(&fields, "mode"), Some(gsd_route::Json::Str(mode)) if mode == "transition")
+    )
+}
+
 fn faithful(request: &[u8]) -> Decision {
     let bytes = transition_invoke(request).expect("the guest function reads the request");
     decode_reply(&bytes).expect("the guest function's reply decodes")
@@ -404,6 +416,12 @@ impl WriteGuest for Scripted {
     }
 
     fn call(&self, request: &[u8], limits: &Limits) -> Result<Vec<u8>, ErrorCode> {
+        // The second batch asks the same guest for the APPROVED facts before the decision (phase 14.5, pin P2). Those requests are
+        // answered by their own mode, as the real guest answers them, and are not counted: the script only ever rewrites, and counts,
+        // the transition decision.
+        if !is_transition(request) {
+            return gsd_route::core_invoke(request).map_err(|error| error.code());
+        }
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.limits
             .lock()

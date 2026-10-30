@@ -38,9 +38,13 @@ fn asks_for_transition(input: &[u8]) -> bool {
     )
 }
 
+/// The entry point of a second-batch mode: request bytes in, reply bytes or an error out.
+#[cfg(feature = "write-routes-2")]
+type ModeEntry = fn(&[u8]) -> Result<Vec<u8>, SeamError>;
+
 /// The entry of the second-batch mode `input` asks for; None when its `mode` is not one of them.
 #[cfg(feature = "write-routes-2")]
-fn second_batch_route(input: &[u8]) -> Option<fn(&[u8]) -> Result<Vec<u8>, SeamError>> {
+fn second_batch_route(input: &[u8]) -> Option<ModeEntry> {
     let Ok(text) = std::str::from_utf8(input) else {
         return None;
     };

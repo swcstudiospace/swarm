@@ -1299,10 +1299,16 @@ fn approved_case(case: &Approved) {
 
     // The guest request, when the call got that far: `approval` is non-null, has exactly its five keys, and its values are the real
     // facts the host read from the store and the key policy.
+    // An APPROVED target is also asked for its approval facts before the decision (phase 14.5, pin P2). That request is one of the
+    // requests the canary loops below scan; this check is about the decision, the request that carries `approval`.
     if case.expect != Expect::KeyFile {
-        assert_eq!(run.requests.len(), 1, "the guest is asked once");
-        let request =
-            parse_json(std::str::from_utf8(&run.requests[0]).expect("UTF-8")).expect("JSON");
+        let decisions: Vec<&Vec<u8>> = run
+            .requests
+            .iter()
+            .filter(|request| is_transition_request(request))
+            .collect();
+        assert_eq!(decisions.len(), 1, "the decision is asked once");
+        let request = parse_json(std::str::from_utf8(decisions[0]).expect("UTF-8")).expect("JSON");
         assert_eq!(shape_drift(&request), Vec::<String>::new());
         let approval = member(member(&request, "facts"), "approval");
         assert!(
@@ -1321,7 +1327,7 @@ fn approved_case(case: &Approved) {
         let empty = Vec::<String>::new();
         assert_eq!(names_of(approval, "missing_gates"), empty);
         assert_eq!(names_of(approval, "unaccepted_gates"), empty);
-        let wire = String::from_utf8_lossy(&run.requests[0]).into_owned();
+        let wire = String::from_utf8_lossy(decisions[0]).into_owned();
         for forbidden in ["hmac:", "ed25519:", "\"sig\"", "envelope"] {
             assert!(
                 !wire.contains(forbidden),
@@ -1861,4 +1867,16 @@ mod read_requests_have_exactly_the_allowed_keys {
             );
         }
     }
+}
+
+/// Whether `request` is a transition request: its `mode` is the transition mode.
+fn is_transition_request(request: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(request) else {
+        return false;
+    };
+    matches!(
+        parse_json(text),
+        Ok(Json::Obj(fields))
+            if matches!(obj_get(&fields, "mode"), Some(Json::Str(mode)) if mode == "transition")
+    )
 }

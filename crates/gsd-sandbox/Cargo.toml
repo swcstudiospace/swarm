@@ -7,12 +7,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/swcstudiospace/agent-swarm"
 
 [features]
-# Builds the nested guest with its `write-routes` feature (Phase 14.5 pin P1) and pins it with `guest-module-write.sha256`
-# instead of `guest-module.sha256`. Off, nothing about the guest, its digest or its pin changes.
+# Builds the nested guest with its `write-routes-2` feature (the transition decision and the second batch of modes: Phase 14.5 pin
+# P2) and pins it with `guest-module-write.sha256` instead of `guest-module.sha256`. Off, nothing about the guest, its digest or its pin
+# changes.
 write-routes = []
-# Builds the nested guest with its `write-routes-2` feature (Phase 14.5 pin P2): the second batch of modes. Pinned by
-# `guest-module-write.sha256` like `write-routes`. Off, nothing about the guest changes.
-write-routes-2 = ["write-routes"]
 
 [dependencies]
 gsd-failure = { path = "../gsd-failure" }

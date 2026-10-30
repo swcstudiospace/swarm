@@ -9,13 +9,11 @@ categories = ["development-tools", "migration", "adapter"]
 keywords = ["adapter", "migration", "legacy", "subagent"]
 
 [features]
-# The sandbox backend serves `orch_status --transition` from the write-enabled guest (phase 14.5, pin P1): the nested guest is built
-# with its `write-routes` feature and the binary embeds it. Off until the pin commit; off, a write call on the sandbox backend is
-# refused before any write (E-DEP, write_state not_started) and the guest bytes and their pin are the default ones.
+# The sandbox backend serves the write routes (`orch_status --transition`, `--ingest`, `orch_plan`, the APPROVED facts) from the
+# write-enabled guest (phase 14.5, pins P1 and P2): the nested guest is built with its `write-routes-2` feature and the binary embeds
+# it. Off, a write call on the sandbox backend is refused before any write (E-DEP, write_state not_started), and the guest bytes and
+# their pin are the default ones.
 sandbox-write = ["gsd-sandbox/write-routes"]
-# The second batch of write routes on the sandbox (ingest, plan, approval verifiers): the guest is built with `write-routes-2`. Off until
-# the P2 pin commit; off, the sandbox guest and its pins are the P1 ones and these verifiers are not compiled.
-sandbox-write-2 = ["sandbox-write", "gsd-sandbox/write-routes-2"]
 
 [dependencies]
 gsd-proto = { path = "../gsd-proto" }

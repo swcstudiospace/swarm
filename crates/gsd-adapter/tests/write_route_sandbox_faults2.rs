@@ -5,7 +5,7 @@
 //! so the wire and the verification are the real ones and the pin is not needed. The pinned wasm guest is exercised by the sandbox
 //! tests of `gsd-sandbox` and by the parity harness on the release binary.
 
-#![cfg(feature = "sandbox-write-2")]
+#![cfg(feature = "sandbox-write")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

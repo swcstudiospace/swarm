@@ -31,11 +31,11 @@
 pub(crate) mod assign;
 pub(crate) mod ingest;
 pub(crate) mod plan;
-#[cfg(feature = "sandbox-write-2")]
+#[cfg(feature = "sandbox-write")]
 pub mod shadow_approval;
-#[cfg(feature = "sandbox-write-2")]
+#[cfg(feature = "sandbox-write")]
 pub(crate) mod shadow_ingest;
-#[cfg(feature = "sandbox-write-2")]
+#[cfg(feature = "sandbox-write")]
 pub(crate) mod shadow_plan;
 use std::fs::{self, OpenOptions};
 use std::io::Write;

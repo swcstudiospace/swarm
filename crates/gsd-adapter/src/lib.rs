@@ -8,7 +8,7 @@ pub mod join_affinity_guard;
 pub mod legacy_shim_registry;
 pub mod route_table;
 pub mod sandbox_engine;
-#[cfg(feature = "sandbox-write-2")]
+#[cfg(feature = "sandbox-write")]
 pub mod sandbox_shadow;
 pub mod strangler_seam;
 pub mod write_route;
