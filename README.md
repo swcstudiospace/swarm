@@ -131,6 +131,23 @@ Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then 
 
 `swarm_run.py` runs a continuous scheduler: a slot is refilled the moment a session ends, bounded by `--max-parallel` (`SWARM_MAX_PARALLEL`, default 4, ceiling 32) and each agent's own limit, with a lifecycle state machine, cancellation, timeouts, backoff and rate-limit backpressure. One telemetry channel (`.swarm/events.jsonl` and `.swarm/live.json`) feeds the logs, `scripts/swarm_live.py` and the swarm bar of omp (always there, two full-width rows above the editor) that shows every subagent's state and elapsed time and the session's token savings. Agents hand work over with a versioned, validated `swarm.handover.v1` document. Every agent has a shared baseline of tools and skills plus 10 to 15 of its own, found with `swarm_catalog` and called with `swarm_tool_call`. Start at [docs/swarm-command-center.md](docs/swarm-command-center.md) (architecture, how to add an agent, tool or skill, configuration, troubleshooting, security model, known limits) and [docs/swarm-bar.md](docs/swarm-bar.md) (reading the bar).
 
+## Rust core
+
+The Rust engine is opt-in everywhere. Every default below is Python, and no route has been flipped. The crates, the binding, the pins and the CI jobs are in [docs/rust-core.md](docs/rust-core.md).
+
+| Switch | Default | Opt-in |
+|---|---|---|
+| `GSD_ENGINE` | `python` on every route | `rust` sends each claimed call of the routes listed in [docs/rust-core.md](docs/rust-core.md) section 4 to the `gsd_engine` binary |
+| `GSD_RUST_BACKEND` | `host` | `sandbox` runs the Wasm guest first; write calls need a binary built with `sandbox-write` |
+| `SWARM_REDACT_ENGINE` | `python` | `rust` computes the redaction spans in `swarm._native.redact_spans` |
+| `SWARM_CLAIMS_ENGINE` | `python` | `rust` decides claim conflicts in `swarm._native.ClaimTable` |
+| `SWARM_TASKSTORE_WAL` | off | `1` opens `tasks.db` in WAL mode |
+| `SWARM_PURE_PYTHON` | unset | `1` skips the extension import and forces Python on every route |
+
+The PyO3 extension `swarm._native` is required unless `SWARM_PURE_PYTHON=1`. Build it with `pip install .` (maturin, Python 3.12+). The Rust workspace has 22 crates under `crates/`. The `gsd_engine` binary is built from `crates/gsd-adapter`.
+
+The write routes (`orch_status --transition` and `--ingest`, `orch_plan`, `orch_assign`, and the gates `qa_gate`, `rel_plan`, `rev_gate`, `sec_gate`) run through one write flow: a write is never run twice, and a verdict committed before a later failure is final. A child that holds a signing key starts only as the binary whose sha256 is `GSD_ENGINE_BIN_SHA256`, with core dumps off. The open limits (the binary can read the conventional signing-key file; the digest check is not atomic with the exec; an explicit `GSD_ENGINE=rust` refused by the check falls back to Python, which then signs itself) are listed in [docs/rust-core.md](docs/rust-core.md) section 10.
+
 ## Install into a workspace
 
 `build_agents.py --install-workspace` regenerates the agents, copies the Claude/Grok agents, skills and
