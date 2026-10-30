@@ -53,6 +53,11 @@ pub fn is_ingest_route(entry: Entrypoint, argv: &[String]) -> bool {
     matches!(entry, Entrypoint::OrchStatus) && parse_ingest_args(argv).is_some()
 }
 
+/// Returns true when the call is the host quality gate: `qa_gate --json` inside the grammar `gates::qa_gate` serves.
+pub fn is_qa_gate_route(entry: Entrypoint, argv: &[String]) -> bool {
+    matches!(entry, Entrypoint::QaGate) && crate::gates::qa_gate::served(argv)
+}
+
 /// The engine the `orch_status` read route runs on when `GSD_ENGINE` is unset or empty.
 ///
 /// Python until the flip unit (R12 of Phase 14.3) sets it, after parity evidence and the user's
@@ -99,7 +104,8 @@ pub fn route_for_call(
         Engine::Rust
             if is_read_only_route(entry, argv)
                 || is_transition_route(entry, argv)
-                || is_ingest_route(entry, argv) =>
+                || is_ingest_route(entry, argv)
+                || is_qa_gate_route(entry, argv) =>
         {
             Ok(Engine::Rust)
         }

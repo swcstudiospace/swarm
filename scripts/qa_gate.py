@@ -130,15 +130,41 @@ def add_args(p):
                         "gets the script's findings plus only its own (targets it omits get the script's findings only)")
 
 
-# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
-# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+# Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::qa_gate` accepts and
+# leaves every other argv to this body. `GSD_QA_PYTHON` is this interpreter, so runner detection matches `sys.executable`.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"GSD_QA_PYTHON", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION", "XDG_CONFIG_HOME",
+                                     "SWARM_DRYRUN_FAIL"}
+    if route != "qa-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_qa(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
 ENGINE_ROUTES: tuple = ()
 
 
 if __name__ == "__main__":
     script = AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_args)
+    os.environ["GSD_QA_PYTHON"] = sys.executable
     answer = None
-    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
         from swarm import engine_select
-        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_qa, parse=lambda argv: argv if _claims_qa(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "qa-gate",
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
     sys.exit(answer if answer is not None else script.main())

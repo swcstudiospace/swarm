@@ -619,7 +619,7 @@ impl CoreBackend for RustEngine {
     }
 
     fn qa_gate(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        Err(no_route(&call.script))
+        self.runtime.block_on(crate::gates::qa_gate::answer(call))
     }
 
     fn rev_gate(&self, call: &Invocation) -> Result<Reply, SeamError> {
