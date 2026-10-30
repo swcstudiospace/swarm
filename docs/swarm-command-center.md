@@ -120,6 +120,13 @@ survives a SIGKILL of the writer, and records from several threads or processes 
   transition, so an in-session run (A01 driving `orch_status.py` through `swarm_transition`/`swarm_ingest`, no
   scheduler process) feeds the same file. A derived writer never replaces a fresh scheduler document whose pid is
   alive.
+- The derived refresh is cheap enough to run after every committed transition (record: `tests/perf/records/14.4/refresh-cost.txt`).
+  `TaskStore.transition` hands it its own connection (`refresh_live(..., conn=...)`); the task rows come without their JSON
+  columns and the transition history is folded inside SQLite (two statements); row objects are built only for the 64 listed
+  runs (the counters, the ordering and the elapsed span still cover every task); and while `live.json` is still the file this
+  process wrote last (same inode, size and mtime) the next `seq` comes from memory instead of reading the file back. Nothing
+  is debounced, no `fsync` is added or removed, and the bytes written for a given store state are unchanged
+  (`tests/test_telemetry_refresh_cost.py` compares them with a frozen copy of the earlier code).
 - A snapshot older than three heartbeats (`3 x SWARM_HEARTBEAT_S`) is stale. `scripts/swarm_live.py` then derives the
   view instead; the bar shows `live.json stale`.
 

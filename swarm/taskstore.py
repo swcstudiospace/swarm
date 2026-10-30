@@ -304,7 +304,7 @@ class TaskStore:
             return
         try:
             from . import telemetry  # lazy: keeps taskstore import cost unchanged
-            telemetry.refresh_live(db_path=self.path)
+            telemetry.refresh_live(db_path=self.path, conn=self.conn)  # the commit is visible to the connection that made it
         except Exception:  # noqa: BLE001 - observer must never fail a committed transition
             import logging
             logging.getLogger("swarm.telemetry").warning("live.json refresh failed", exc_info=True)
