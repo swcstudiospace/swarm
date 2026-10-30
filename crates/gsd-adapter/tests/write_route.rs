@@ -898,7 +898,12 @@ fn what_rust_cannot_prove_is_refused_before_the_first_write() {
 }
 
 /// Without the `sandbox-write` feature the sandbox backend has no write guest: the write is refused before it starts, and the message
-/// names the missing feature. With the feature the guest serves it (tests/write_route_sandbox_faults.rs).
+/// names the missing feature. With the feature the guest serves it (tests/write_route_sandbox_faults.rs, `real_guest`); this build
+/// refuses, so the premise the name states still holds.
+///
+/// `CARGO_BIN_EXE_gsd_engine` is `target/debug/gsd_engine`: one file in the shared target directory, rewritten by every build of the
+/// binary whatever its features. A `sandbox-write` build that lands after this test binary was built serves the write; the guard
+/// below names that cause rather than a mismatched reply.
 #[cfg(not(feature = "sandbox-write"))]
 #[test]
 fn the_sandbox_backend_does_not_serve_a_write_until_its_own_unit() {
@@ -908,6 +913,12 @@ fn the_sandbox_backend_does_not_serve_a_write_until_its_own_unit() {
     call.extra_process_env
         .push(("GSD_RUST_BACKEND", "sandbox".to_string()));
     let run = call.run();
+    assert!(
+        run.json()["error"].is_object(),
+        "{} served a write: it was rebuilt with `sandbox-write` in the shared target directory after this test binary was built; rebuild and rerun. {}",
+        env!("CARGO_BIN_EXE_gsd_engine"),
+        run.stdout
+    );
     assert_eq!(run.code, 2, "{}", run.stdout);
     assert_eq!(run.error_code().as_deref(), Some("E-DEP"));
     assert_eq!(run.write_state().as_deref(), Some("not_started"));
