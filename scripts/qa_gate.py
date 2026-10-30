@@ -132,6 +132,9 @@ def add_args(p):
 
 # Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::qa_gate` accepts and
 # leaves every other argv to this body. `GSD_QA_PYTHON` is this interpreter, so runner detection matches `sys.executable`.
+# The route writes (the binary records the verdict in issue_gate's transaction), so it is a write route: Python answers only a
+# binary reply that says nothing was written. Known gap: the binary writes the verdict file after its commit and reports a
+# failure of that write as not_started, so Python can record the verdict again (crates/gsd-adapter/src/gates/qa_gate.rs).
 def _binary_env(route: str) -> dict[str, str]:
     from swarm.engine_select import BINARY_ENV_NAMES
     names = set(BINARY_ENV_NAMES) | {"GSD_QA_PYTHON", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
@@ -144,6 +147,11 @@ def _binary_env(route: str) -> dict[str, str]:
 
 def _claims_qa(argv: list[str]) -> bool:
     return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _qa_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
 
 
 ENGINE_ROUTES: tuple = ()
@@ -161,6 +169,12 @@ if __name__ == "__main__":
             route = engine_select.Route(
                 claims=_claims_qa, parse=lambda argv: argv if _claims_qa(argv) else None,
                 default=lambda: "python", env_route=lambda argv, call: "qa-gate",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_qa_commit,
+                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
+                                          "verdicts/ before running the gate again", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
             )
             answer = engine_select.select_engine(
                 engine_select.Selector(script, (route,), binary_env=_binary_env,

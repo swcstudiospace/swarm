@@ -169,6 +169,9 @@ def add_args(p):
 
 # Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves `--json` except `--dry-run`, which stays
 # this body so the inert-route seam in tests/test_engine_select.py still holds.
+# The route writes (the binary records the release gate's verdicts in issue_gate's transaction), so it is a write route: Python
+# answers only a binary reply that says nothing was written. Known gap: the binary reports every failure of issue_gate, its commit
+# included, as not_started (crates/gsd-adapter/src/gates/rel_plan.rs), so Python can record the verdict again after a commit.
 def _binary_env(route: str) -> dict[str, str]:
     from swarm.engine_select import BINARY_ENV_NAMES
     if route != "rel-plan":
@@ -181,6 +184,11 @@ def _binary_env(route: str) -> dict[str, str]:
 
 def _claims_rel(argv: list[str]) -> bool:
     return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _rel_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
 
 
 ENGINE_ROUTES: tuple = ()
@@ -197,6 +205,12 @@ if __name__ == "__main__":
             route = engine_select.Route(
                 claims=_claims_rel, parse=lambda argv: argv if _claims_rel(argv) else None,
                 default=lambda: "python", env_route=lambda argv, call: "rel-plan",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_rel_commit,
+                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
+                                          "verdicts/ before running the gate again", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
             )
             answer = engine_select.select_engine(
                 engine_select.Selector(script, (route,), binary_env=_binary_env,
