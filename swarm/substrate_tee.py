@@ -97,6 +97,7 @@ TYPE_KINDS: dict[str, str] = {
     "task.result.rejected": "warning",         # a task.result failed schema/contract validation
     "task.result.deduplicated": "note",        # a replayed ingest was skipped: its result is already applied (results.apply_result)
     "orch_status.effects_lost": "warning",     # a Rust-served transition committed but its effects were not all replayed (orch_status)
+    "orch_plan.effects_lost": "warning",       # a Rust-served plan committed but its plan.updated replay was lost (orch_plan)
     "escalation.request": "warning",           # rework loops / attempts exhausted: a human is needed
     "security.dev_key": "warning",             # an envelope was signed with the development key
     # the runner's substrate leases (substrate_lease.py); grants, releases and completions are written by the server itself
