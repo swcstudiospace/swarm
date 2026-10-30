@@ -13,15 +13,16 @@ use gsd_envelope::KeyMaterial;
 use gsd_failure::ErrorCode;
 use gsd_route::{is_safe_id, jstr, to_python_json, Json, Reply, SeamError};
 use gsd_taskwriter::{
-    open_for_write, GateIssueRequest, SystemIds, TaskStoreWriter, WriteState, WriterConfig,
-    WriterError,
+    open_for_write, GateIssueRequest, GatePlan, SystemIds, TaskStoreWriter, WriteState,
+    WriterConfig, WriterError,
 };
 use serde_json::Value;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Row};
 
 use crate::strangler_seam::{
-    before_any_write, canonical_or, env_value, outcome_unknown, resolve_swarm_dir, Invocation,
+    after_commit, before_any_write, canonical_or, env_value, outcome_unknown, resolve_swarm_dir,
+    Invocation,
 };
 
 const GATES_LOW: &[&str] = &["review"];
@@ -565,12 +566,6 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
     if let Some(error) = &plan.error {
         return Err(error.clone());
     }
-    if plan.ensure_verdicts_dir {
-        fs::create_dir_all(swarm.join("verdicts")).ok();
-    }
-    if let Some(file) = &plan.file {
-        fs::write(swarm.join("verdicts").join(&file.name), &file.bytes).ok();
-    }
     let envelope = plan.envelope.clone().unwrap_or(Json::Obj(vec![]));
     let verdict = envelope_verdict(&envelope);
     let plan_body = plan_text(
@@ -582,14 +577,13 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
         &created,
         &verdict,
     );
-    fs::create_dir_all(swarm.join("releases")).ok();
-    fs::write(
-        swarm
-            .join("releases")
-            .join(format!("{release_id}.plan.json")),
+    write_files(
+        &swarm,
+        &plan,
+        committed(&request, &plan),
+        &release_id,
         &plan_body,
-    )
-    .ok();
+    )?;
     let summary =
         format!(
         "release gate {} for {release_id} ({} task(s), risk={risk}{}) — canary [5, 25, 50, 100]",
@@ -672,14 +666,64 @@ fn issue_gate_refusal(error: &WriterError) -> SeamError {
     }
 }
 
+/// The commit condition of `issue_gate`: a store call (`task_id` given) whose plan has no error and writes rows. The no-task
+/// path derives the plan without a store and commits nothing, so its writes are not recorded.
+fn committed(request: &GateIssueRequest, plan: &GatePlan) -> bool {
+    request.task_id.is_some() && plan.error.is_none() && !plan.writes.is_empty()
+}
+
+/// Writes the verdict file, its directory and the release plan file. A failure after the commit is final: the verdict is recorded
+/// and must not be recorded again. Otherwise nothing was committed and the failure is not_started, so Python answers.
+fn write_files(
+    swarm: &Path,
+    plan: &GatePlan,
+    committed: bool,
+    release_id: &str,
+    plan_body: &str,
+) -> Result<(), SeamError> {
+    let refuse = |reason: &str| {
+        if committed {
+            after_commit(SeamError::new(
+                ErrorCode::Internal,
+                format!("the verdict is recorded in the Task Store, but {reason}; the outcome is final and is not run again"),
+            ))
+        } else {
+            before_any_write(SeamError::new(
+                ErrorCode::Dep,
+                format!("{reason}; Python answers"),
+            ))
+        }
+    };
+    if plan.ensure_verdicts_dir {
+        fs::create_dir_all(swarm.join("verdicts"))
+            .map_err(|_| refuse("the verdicts directory could not be created"))?;
+    }
+    if let Some(file) = &plan.file {
+        fs::write(swarm.join("verdicts").join(&file.name), &file.bytes)
+            .map_err(|_| refuse("the verdict file could not be written"))?;
+    }
+    fs::create_dir_all(swarm.join("releases"))
+        .map_err(|_| refuse("the releases directory could not be created"))?;
+    fs::write(
+        swarm
+            .join("releases")
+            .join(format!("{release_id}.plan.json")),
+        plan_body,
+    )
+    .map_err(|_| refuse("the release plan file could not be written"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{issue_gate_refusal, parse};
+    use super::{committed, issue_gate_refusal, parse, write_files};
     use gsd_envelope::{KeyFilePresence, KeyMaterial};
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
+    use gsd_taskwriter::gate_issue::VerdictRow;
     use gsd_taskwriter::{
-        open_for_write, GateIssueRequest, SystemIds, TaskStoreWriter, WriteState, WriterConfig,
+        open_for_write, GateFile, GateIssueRequest, GatePlan, GateWrite, SystemIds,
+        TaskStoreWriter, WriteState, WriterConfig,
     };
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::ConnectOptions;
@@ -717,9 +761,8 @@ mod tests {
         }
     }
 
-    /// A swarm store with a running release gate `T-G` over `T-1`, and a trigger that refuses every verdict insert. The writer's
-    /// insert then fails after its first write, a final failure, as a failed commit would be.
-    async fn store_refusing_verdicts(swarm: &std::path::Path) -> std::path::PathBuf {
+    /// A swarm store with a running release gate `T-G` over `T-1`, then the `extra` statements.
+    async fn seeded_store(swarm: &std::path::Path, extra: &[&str]) -> std::path::PathBuf {
         let pool = crate::strangler_seam::open_store(swarm)
             .await
             .expect("schema");
@@ -730,15 +773,25 @@ mod tests {
             .connect()
             .await
             .expect("connect");
-        for sql in [
+        let seed = [
             "INSERT INTO tasks (task_id, correlation_id, capability, state, notes) VALUES ('T-G', 'C-1', 'release', 'IN_PROGRESS', '{\"gate\": \"release\", \"gate_for\": [\"T-1\"]}')",
             "INSERT INTO tasks (task_id, correlation_id, capability, state) VALUES ('T-1', 'C-1', 'build', 'DONE')",
-            "CREATE TRIGGER refuse_verdicts BEFORE INSERT ON verdicts BEGIN SELECT RAISE(ABORT, 'refused for the test'); END",
-        ] {
+        ];
+        for sql in seed.into_iter().chain(extra.iter().copied()) {
             sqlx::query(sql).execute(&mut conn).await.expect(sql);
         }
         conn.close().await.expect("close");
         db
+    }
+
+    /// A swarm store whose verdict inserts are refused: the writer's insert then fails after its first write, a final failure,
+    /// as a failed commit would be.
+    async fn store_refusing_verdicts(swarm: &std::path::Path) -> std::path::PathBuf {
+        seeded_store(
+            swarm,
+            &["CREATE TRIGGER refuse_verdicts BEFORE INSERT ON verdicts BEGIN SELECT RAISE(ABORT, 'refused for the test'); END"],
+        )
+        .await
     }
 
     #[tokio::test]
@@ -777,5 +830,85 @@ mod tests {
         let refusal = issue_gate_refusal(&error);
         assert_eq!(write_state(&refusal), Some("not_started"));
         assert_eq!(refusal.code(), ErrorCode::Dep);
+    }
+
+    #[tokio::test]
+    async fn a_failed_verdict_write_after_the_commit_is_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = seeded_store(dir.path(), &[]).await;
+        let keys = KeyMaterial::from_lookup(
+            |name| (name == "SWARM_ALLOW_INSECURE_DEV_KEY").then(|| OsString::from("1")),
+            |_| KeyFilePresence::Absent,
+        )
+        .expect("key material");
+        let mut ids = SystemIds::open().expect("id source");
+        let store = open_for_write(&WriterConfig::new(&db))
+            .await
+            .expect("store");
+        let writer = TaskStoreWriter::new(store);
+        let request = release_request();
+        let plan = writer
+            .issue_gate(&request, &keys, &mut ids)
+            .await
+            .expect("the verdict commits");
+        writer.close().await;
+        let commits = committed(&request, &plan);
+        assert!(commits, "the store call commits this plan");
+        // A regular file where the verdicts directory should be: the verdict write fails after the commit.
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let error =
+            write_files(dir.path(), &plan, commits, "R-1", "{}").expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("final"));
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(
+            error.message().contains("the verdict is recorded"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_plan_without_a_store_call_commits_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("verdicts"), "not a directory").expect("collide");
+        let mut request = release_request();
+        request.task_id = None;
+        let plan = GatePlan {
+            ensure_verdicts_dir: true,
+            writes: vec![GateWrite::Verdict(VerdictRow {
+                task_id: "T-G".into(),
+                gate: "release".into(),
+                verdict: "pass".into(),
+                agent_id: "A12".into(),
+                findings: "[]".into(),
+                expires_at: 1_700_003_600.0,
+                ts: 1_700_000_000.0,
+                envelope_json: "{}".into(),
+                sig: String::new(),
+            })],
+            ..GatePlan::default()
+        };
+        let commits = committed(&request, &plan);
+        assert!(!commits, "the no-task path writes no store rows");
+        let error =
+            write_files(dir.path(), &plan, commits, "R-1", "{}").expect_err("the write fails");
+        assert_eq!(write_state(&error), Some("not_started"));
+        assert_eq!(error.code(), ErrorCode::Dep);
+    }
+
+    #[test]
+    fn a_verdict_write_that_lands_is_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = GatePlan {
+            ensure_verdicts_dir: true,
+            file: Some(GateFile {
+                name: "T-G.release.json".into(),
+                bytes: "{}".into(),
+            }),
+            ..GatePlan::default()
+        };
+        write_files(dir.path(), &plan, true, "R-1", "{}").expect("both files land");
+        assert!(dir.path().join("verdicts/T-G.release.json").is_file());
+        assert!(dir.path().join("releases/R-1.plan.json").is_file());
     }
 }
