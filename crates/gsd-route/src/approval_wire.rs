@@ -3,8 +3,10 @@
 //! The host reads the task row, the verdict rows and the gate tasks inside its own write transaction (`gsd_taskwriter::approval`),
 //! verifies each row's envelope with its own keys, and encodes what it read with [`encode_request`]. The pure logic is [`answer`]:
 //! the host runs it on the facts it read, the guest runs it on the decoded request, and [`encode_outcome`] renders the answer so the
-//! verified shadow (`gsd_adapter::sandbox_shadow`) can compare the two byte for byte. Nothing here reads a key, a signature, a clock or
-//! the environment: a row's signature is the boolean `sig_ok` the host computed, and `now` is a request field.
+//! verified shadow (`gsd_adapter::sandbox_shadow`) can compare the two byte for byte. Nothing here reads a key, a clock or the
+//! environment. Each row's stored envelope text travels in the request as `envelope_json`: its `sig` field is a signature, not
+//! key material, and the guest parses the text's fields but verifies no signature. A row's signature check is the boolean
+//! `sig_ok` the host computed, and `now` is a request field. No key value, key file path or environment value is carried.
 //!
 //! # Request
 //!
