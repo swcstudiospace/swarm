@@ -194,8 +194,8 @@ def add_args(p):
 # Engine selector (swarm/engine_select.py). The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::rev_gate`
 # accepts (`--json`, not `--dry-run`) and leaves every other argv to this body. `ENGINE_ROUTES` is the seam a route registers in.
 # The route writes (the binary records the review gate's verdict in issue_gate's transaction), so it is a write route: Python
-# answers only a binary reply that says nothing was written. Known gap: the binary writes the verdict file and checks its envelope
-# after its commit and reports a failure there as not_started (crates/gsd-adapter/src/gates/rev_gate.rs), so Python can record again.
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
 def _binary_env(route: str) -> dict[str, str]:
     from swarm.engine_select import BINARY_ENV_NAMES
     names = set(BINARY_ENV_NAMES) | {"XDG_CONFIG_HOME", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",

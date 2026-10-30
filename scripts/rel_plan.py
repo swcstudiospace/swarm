@@ -170,8 +170,8 @@ def add_args(p):
 # Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves `--json` except `--dry-run`, which stays
 # this body so the inert-route seam in tests/test_engine_select.py still holds.
 # The route writes (the binary records the release gate's verdicts in issue_gate's transaction), so it is a write route: Python
-# answers only a binary reply that says nothing was written. Known gap: the binary reports every failure of issue_gate, its commit
-# included, as not_started (crates/gsd-adapter/src/gates/rel_plan.rs), so Python can record the verdict again after a commit.
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
 def _binary_env(route: str) -> dict[str, str]:
     from swarm.engine_select import BINARY_ENV_NAMES
     if route != "rel-plan":

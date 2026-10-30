@@ -133,8 +133,8 @@ def add_args(p):
 # Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::qa_gate` accepts and
 # leaves every other argv to this body. `GSD_QA_PYTHON` is this interpreter, so runner detection matches `sys.executable`.
 # The route writes (the binary records the verdict in issue_gate's transaction), so it is a write route: Python answers only a
-# binary reply that says nothing was written. Known gap: the binary writes the verdict file after its commit and reports a
-# failure of that write as not_started, so Python can record the verdict again (crates/gsd-adapter/src/gates/qa_gate.rs).
+# binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
 def _binary_env(route: str) -> dict[str, str]:
     from swarm.engine_select import BINARY_ENV_NAMES
     names = set(BINARY_ENV_NAMES) | {"GSD_QA_PYTHON", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
