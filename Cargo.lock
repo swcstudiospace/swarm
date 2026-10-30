@@ -1464,6 +1464,7 @@ dependencies = [
 name = "gsd-adapter"
 version = "0.1.0"
 dependencies = [
+ "gsd-envelope",
  "gsd-failure",
  "gsd-governor",
  "gsd-pool",
@@ -1477,6 +1478,7 @@ dependencies = [
  "gsd-state",
  "gsd-taskwriter",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",

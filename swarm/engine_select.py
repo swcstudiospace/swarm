@@ -67,6 +67,7 @@ class WriteFlow:
     commit: Callable[[Any, Any, str, dict[str, Any], bytes], tuple[dict[str, Any], bytes]]  # (call, before, effects_path, reply, stdout)
     unknown: Callable[[Any], tuple[str, dict[str, Any]]]  # (call) -> (hint appended to the message, details added to write_state)
     preexec: Callable[[str], Callable[[], None] | None]  # (env route) -> the child's preexec_fn, None for none
+    on_final: Callable[[Any, str], None] | None = None  # (call, effects_path) after a final refusal, before the reply is printed
 
 
 @dataclass(frozen=True)
@@ -271,6 +272,8 @@ def _answer_write(selector: Selector, route: Route, argv: list[str], binary: str
             return None  # Python answers: the binary wrote nothing
         if failure is None or state not in (None, "final") or (state is None and failure == ErrorCode.E_INTERNAL.value):
             return unknown_outcome(selector, route, argv, call, "the gsd_engine binary refused without saying that nothing was written")
+        if route.write.on_final is not None:
+            route.write.on_final(call, effects_path)
     else:
         reply, stdout = route.write.commit(call, before, effects_path, reply, stdout)
     try:
