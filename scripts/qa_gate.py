@@ -9,6 +9,7 @@ row is recorded on each target in its Task Store notes.gate_for (swarm.verdicts)
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -129,5 +130,15 @@ def add_args(p):
                         "gets the script's findings plus only its own (targets it omits get the script's findings only)")
 
 
+# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
+# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_args)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+    sys.exit(answer if answer is not None else script.main())

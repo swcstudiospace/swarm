@@ -15,6 +15,7 @@ from collections import Counter
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -213,5 +214,15 @@ def add_args(p):
                         "gets the scan's findings plus only its own (targets it omits get the script's findings only)")
 
 
+# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
+# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A10", "sec_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A10", "sec_gate", run, description=__doc__, add_args=add_args)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+    sys.exit(answer if answer is not None else script.main())

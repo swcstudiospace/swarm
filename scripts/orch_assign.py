@@ -153,5 +153,15 @@ class AssignmentScript(AgentScript):
         return self.EXIT_ERROR
 
 
+# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
+# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AssignmentScript("A01", "orch_assign", run, description=__doc__).main())
+    script = AssignmentScript("A01", "orch_assign", run, description=__doc__)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+    sys.exit(answer if answer is not None else script.main())

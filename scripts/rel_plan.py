@@ -14,6 +14,7 @@ exactly that task's notes.gate_for targets, each row from that target's own find
 """
 from __future__ import annotations
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -166,5 +167,15 @@ def add_args(p):
     p.add_argument("--unfreeze", action="store_true", help="remove an active freeze (declaring authority only)")
 
 
+# Engine selector (swarm/engine_select.py): inert while ENGINE_ROUTES is empty. A unit that gives this script a route on the Rust engine
+# registers its `engine_select.Route` here; until then GSD_ENGINE=python (or unset) costs nothing and `rust` is answered as an unserved route.
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A12", "rel_plan", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A12", "rel_plan", run, description=__doc__, add_args=add_args)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+    sys.exit(answer if answer is not None else script.main())

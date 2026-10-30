@@ -9,15 +9,13 @@
 """
 from __future__ import annotations
 import argparse
+import functools
 import json
 import logging
 import os
-import resource
 import shlex
 import sqlite3
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
@@ -30,6 +28,7 @@ from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject, check_manual_transition  # noqa: E402
 from swarm.observability import emit_inline_transition  # noqa: E402
 from swarm import substrate_lease  # noqa: E402
+from swarm import engine_select  # noqa: E402
 
 
 def ingest(store: TaskStore, path: Path, ctx, *, approve: bool = True) -> dict:
@@ -152,35 +151,37 @@ def add_args(p):
     p.add_argument("--history", metavar="TASK_ID")
 
 
-# GSD_ENGINE selector (U12.6, OD-1; Phase 14.3 R5). Resolution order: SWARM_PURE_PYTHON=1 is Python; GSD_ENGINE=python is
-# Python; `rust` is explicit (every call goes to the gsd_engine binary, which is required: E-DEP exit 2 when none is found);
-# unset or empty is DEFAULT_ENGINE; any other value is E-INPUT. A call resolved through DEFAULT_ENGINE reaches the binary only
-# when a binary is found and rust_serves(argv) holds; otherwise Python answers, silently. The body answers whenever
-# run_rust returns None (see its docstring). E-TIMEOUT is never retried and never falls back (D-P5-21).
-# RUST_CALL_TIMEOUT_S bounds the whole call. The binary has its own 600 s deadline, which does not cover its
-# start-up or its stdin read, so this outer bound is 60 s larger. GSD_RUST_TIMEOUT_S, when set to a positive
-# integer (seconds), overrides it; tests use that to keep the timeout short.
+# GSD_ENGINE selector (U12.6, OD-1; Phase 14.3 R5). The flow (resolution order, binary lookup, outer timeout, fallback policy, the
+# write outcome table) is swarm/engine_select.py; this file holds what is specific to orch_status: the two routes below, their default
+# engine rows, the argv grammars the binary serves, the key grants of each environment route and the effects replay of a committed
+# transition. Resolution order: SWARM_PURE_PYTHON=1 is Python; GSD_ENGINE=python is Python; `rust` is explicit (every call goes to the
+# gsd_engine binary, which is required: E-DEP exit 2 when none is found); unset or empty is DEFAULT_ENGINE; any other value is E-INPUT.
+# A call resolved through DEFAULT_ENGINE reaches the binary only when a binary is found and rust_serves(argv) holds; otherwise Python
+# answers, silently. E-TIMEOUT is never retried and never falls back (D-P5-21). The whole call is bounded by RUST_CALL_TIMEOUT_S
+# (660 s: the binary has its own 600 s deadline, which does not cover its start-up or its stdin read); GSD_RUST_TIMEOUT_S, when set to
+# a positive integer (seconds), overrides it; tests use that to keep the timeout short.
 # The `--transition` route is a write (Phase 14.5 U3.2b). It resolves in the same order, but an unset or empty GSD_ENGINE means
 # DEFAULT_ENGINE_WRITE, and a default-resolved call reaches the binary only when rust_serves_write(argv) holds. A write is
-# never run twice: run_rust_write answers from a table (see its docstring) in which Python answers only when the binary
+# never run twice: run_rust_write answers from a table (see engine_select.run_write) in which Python answers only when the binary
 # says that nothing was written, and any answer that leaves the outcome unknown is refused with a typed E-INTERNAL.
 # The binary is started with an explicit allowlist of environment names (BINARY_ENV_NAMES); signing-key variables only for a transition to
 # APPROVED, whose child also starts with core dumps off (RLIMIT_CORE 0, `_no_core_dumps`).
 DEFAULT_ENGINE = "python"  # the engine an unset or empty GSD_ENGINE resolves to for the read routes; "python" or "rust"
-RUST_CALL_TIMEOUT_S = 660
-RUST_FALLBACK_CODES = frozenset({"E-INTERNAL", "E-DEP", "E-CAPACITY", "E-CONTRACT", "E-INPUT"})
 RUST_ENV_KEYS = ("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
-RELEASE_BINARY = Path(__file__).resolve().parent.parent / "target" / "release" / "gsd_engine"
+# The generic parts of the selector, under the names that tests, the parity harness and the docs import from this file.
+RUST_CALL_TIMEOUT_S = engine_select.RUST_CALL_TIMEOUT_S
+RUST_FALLBACK_CODES = engine_select.RUST_FALLBACK_CODES
+BINARY_ENV_NAMES = engine_select.BINARY_ENV_NAMES  # what a process needs plus GSD_RUST_BACKEND (security review F-2, D-P24, design item 13)
+RELEASE_BINARY = engine_select.RELEASE_BINARY
+_no_core_dumps = engine_select.no_core_dumps
+_rust_timeout_s = engine_select.rust_timeout_s
 # flags of the read grammar that take a value (crates/gsd-route/src/lib.rs `parse_orch_status_read`)
 READ_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id", "--history"})
 DEFAULT_ENGINE_WRITE = "python"  # the engine an unset or empty GSD_ENGINE resolves to for the --transition route; "python" or "rust"
 # flags of the --transition write grammar that take a value; --repo is --root's alias, so a call names the pair once
 WRITE_VALUE_FLAGS = frozenset({"--root", "--repo", "--correlation-id", "--task-id", "--reason"})
-# The environment the binary is started with (security review F-2, D-P24, design item 13 of phase 14.5): an explicit allowlist of
-# names, never a prefix. BINARY_ENV_NAMES is what a process needs to run plus the one variable the binary reads (GSD_RUST_BACKEND; the
-# ids and the swarm directory travel in the request's `env`). Signing material is a per-route grant (ROUTE_KEY_ENV): only a transition
-# to APPROVED verifies signatures, so it alone receives the key policy's variables, and every other route and target receives none.
-BINARY_ENV_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GSD_RUST_BACKEND"})
+# Signing material is a per-route grant (ROUTE_KEY_ENV): only a transition to APPROVED verifies signatures, so it alone receives the key
+# policy's variables, and every other route and target receives none.
 SIGNING_KEY_ENV = frozenset({"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_ALLOW_INSECURE_DEV_KEY",
                              "SWARM_REQUIRE_KEY"})
 # What `KeyMaterial::from_env` reads (crates/gsd-envelope/src/keys.rs `Environment::read`) beyond HOME: the five signing variables,
@@ -302,89 +303,6 @@ def _binary_env(route: str) -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key in names}
 
 
-def _no_core_dumps() -> None:
-    """`preexec_fn` of the APPROVED child: `RLIMIT_CORE` 0 (soft and hard, so the child cannot raise it), so a crash of the process that
-    holds the signing keys in its environment and heap leaves no core file that carries them. It runs in the child between fork and exec
-    and makes one system call (no import, no allocation worth the name: this process may have threads), so it sets nothing here."""
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-
-def _refuse(code: ErrorCode, message: str) -> int:
-    """Prints an error reply shaped like the Rust engine's and returns exit 2."""
-    body = {"agent": "A01", "script": "orch_status", "status": "error",
-            "error": {"code": code.value, "message": message, "details": {}, "handling": code.standard_handling}}
-    print(json.dumps(body, indent=2))
-    return AgentScript.EXIT_ERROR
-
-
-def _reply_object(stdout: bytes) -> dict | None:
-    try:
-        body = json.loads(stdout.decode("utf-8"))
-    except ValueError:
-        return None
-    return body if isinstance(body, dict) else None
-
-
-def _error_code(reply: dict) -> str | None:
-    error = reply.get("error")
-    code = error.get("code") if isinstance(error, dict) else None
-    return code if isinstance(code, str) else None
-
-
-def _rust_timeout_s() -> int:
-    """GSD_RUST_TIMEOUT_S when it is a positive integer, otherwise RUST_CALL_TIMEOUT_S."""
-    raw = os.environ.get("GSD_RUST_TIMEOUT_S", "")
-    if raw.isascii() and raw.isdigit() and int(raw) > 0:
-        return int(raw)
-    return RUST_CALL_TIMEOUT_S
-
-
-def run_rust(argv: list[str], binary: str, *, explicit: bool) -> int | None:
-    """Answers the call on the Rust engine at `binary`. None hands the call to the Python body.
-
-    None (fallback) is returned exactly for these triggers: a reply whose error.code is in RUST_FALLBACK_CODES;
-    an argument the binary cannot take (the request is not UTF-8 encodable); an exit-2 reply without a typed
-    error.code; a reply that is not a JSON object; an exit code other than 0, 1 or 2; a binary that cannot be
-    started when the call did not ask for `rust` explicitly (`explicit` False); and a run-log record that cannot be
-    written (AgentScript.record_external_reply raised, so the Python body answers and applies its own failure rules).
-    A Rust answer is recorded in the run log before it is printed, as the Python path's own `main` does (D1).
-    Refused with exit 2 and never a fallback: a binary that cannot be started when `explicit`, and a binary that
-    did not answer within the call deadline (E-TIMEOUT), explicit or not.
-    """
-    request = {"agent": "A01", "script": "orch_status", "argv": argv, "root": os.getcwd(),
-               "env": {key: os.environ[key] for key in RUST_ENV_KEYS if os.environ.get(key)}}
-    try:
-        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    except UnicodeEncodeError:
-        return None  # fallback: an argument the binary cannot take
-    try:
-        route = "history" if any(token == "--history" or token.startswith("--history=") for token in argv) else "list"
-        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s(), env=_binary_env(route))
-    except subprocess.TimeoutExpired:
-        return _refuse(ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
-    except OSError:
-        if not explicit:
-            return None  # fallback: the default engine never turns an unusable binary into an error
-        return _refuse(ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")
-    reply = _reply_object(done.stdout)
-    if reply is None:
-        return None
-    if done.returncode not in (AgentScript.EXIT_OK, AgentScript.EXIT_FAIL, AgentScript.EXIT_ERROR):
-        return None
-    if done.returncode == AgentScript.EXIT_ERROR:
-        code = _error_code(reply)
-        # fallback: an exit-2 reply without a typed error.code, or one whose code the Python body serves
-        if code is None or code in RUST_FALLBACK_CODES:
-            return None
-    try:
-        SCRIPT.record_external_reply(argv, reply, done.returncode)
-    except Exception:  # noqa: BLE001 - any failure to record hands the call to the Python body, which answers on its own rules
-        return None
-    sys.stdout.buffer.write(done.stdout)
-    sys.stdout.flush()
-    return done.returncode
-
-
 class Manifest(NamedTuple):
     """The effects manifest a binary writes after its COMMIT, checked: the run events and the post-commit steps of one transition."""
     effects: tuple[tuple[str, dict[str, Any], str | None], ...]
@@ -474,25 +392,11 @@ def _run_effects(call: WriteCall | None, before: str | None, effects_path: str) 
         return f"replay failed: {type(exc).__name__}", None
 
 
-def _warn(message: str) -> None:
-    print(f"orch_status: {message}", file=sys.stderr)
-
-
-def _unknown_outcome(argv: list[str], call: WriteCall | None, why: str) -> int:
-    """Prints the typed E-INTERNAL for a write whose outcome is unknown, records it, and returns exit 2. The call is not repeated."""
+def _unknown_hint(call: WriteCall | None) -> tuple[str, dict[str, Any]]:
+    """The words and details orch_status adds to the unknown-outcome refusal of a write: the history command that tells whether the transition
+    committed, and the task the refusal is about (none when the argv is outside the write grammar)."""
     target = call.target if call is not None else "<task>"
-    body = {"agent": "A01", "script": "orch_status", "status": "error",
-            "error": {"code": ErrorCode.E_INTERNAL.value,
-                      "message": f"outcome unknown: {why}; the call was NOT repeated. "
-                                 f"Run `orch_status.py --history {shlex.quote(target)}` before retrying",
-                      "details": {"write_state": "unknown", **({"task_id": target} if call is not None else {})},
-                      "handling": ErrorCode.E_INTERNAL.standard_handling}}
-    try:
-        SCRIPT.record_external_reply(argv, body, AgentScript.EXIT_ERROR)
-    except Exception as exc:  # noqa: BLE001 - the refusal is printed whether or not the run log takes it
-        _warn(f"the unknown-outcome refusal could not be recorded ({type(exc).__name__})")
-    print(json.dumps(body, indent=2))
-    return AgentScript.EXIT_ERROR
+    return f"Run `orch_status.py --history {shlex.quote(target)}` before retrying", ({"task_id": target} if call is not None else {})
 
 
 def _record_effects_lost(call: WriteCall | None, why: str) -> None:
@@ -501,7 +405,7 @@ def _record_effects_lost(call: WriteCall | None, why: str) -> None:
         ctx = _call_ctx(call) if call is not None else Ctx("A01", "orch_status", None, None, False, Path.cwd())
         ctx.emit("orch_status.effects_lost", {"task_id": call.target if call is not None else None, "reason": why})
     except Exception as exc:  # noqa: BLE001 - nothing more can be done for a lost event than to say so
-        _warn(f"effects of a committed transition were lost: {why}; the event could not be recorded ({type(exc).__name__})")
+        engine_select.warn(SELECTOR, f"effects of a committed transition were lost: {why}; the event could not be recorded ({type(exc).__name__})")
 
 
 def _settled_reply(reply: dict[str, Any], stdout: bytes, row: dict[str, Any] | None) -> tuple[dict[str, Any], bytes]:
@@ -520,125 +424,47 @@ def _settled_reply(reply: dict[str, Any], stdout: bytes, row: dict[str, Any] | N
     return reply, (json.dumps(reply, indent=2, default=str) + "\n").encode("utf-8")
 
 
-def _error_details(reply: dict[str, Any]) -> dict[str, Any]:
-    error = reply.get("error")
-    details = error.get("details") if isinstance(error, dict) else None
-    return details if isinstance(details, dict) else {}
+def _commit_effects(call: WriteCall | None, before: str | None, effects_path: str, reply: dict[str, Any],
+                    stdout: bytes) -> tuple[dict[str, Any], bytes]:
+    """The `commit` hook of the transition route, run once the binary has committed: the effects of the Python path in its order, the
+    run-log event `orch_status.effects_lost` when they were not all run (the answer is still the binary's and nothing is run again), and
+    the reply with the task row after the lease settlement."""
+    lost, row = _run_effects(call, before, effects_path)
+    if lost is not None:
+        _record_effects_lost(call, lost)
+    return _settled_reply(reply, stdout, row)
 
 
-def run_rust_write(argv: list[str], binary: str, *, explicit: bool) -> int | None:
-    """Answers a `--transition` call on the Rust engine at `binary`. None hands the call to the Python body, once.
-
-    The request is the read request plus `effects_path`, a temp file this selector owns and removes; the binary fills it after
-    its COMMIT. Outcome table (Design 7), by what the binary did:
-
-    * exit 0 or 1 with a JSON object: committed (or a dry run). The manifest is replayed in Python's order, the answer is
-      recorded (D1) and printed, with the task row read after the lease settlement in place of the binary's own `task` when the two
-      differ (`_settled_reply`: Python prints that row). A missing or broken manifest, or a replay that fails, writes the run-log
-      event `orch_status.effects_lost`; the answer is still printed as the binary wrote it and nothing is run again.
-    * exit 2 with `error.details.write_state == "not_started"`: nothing was written; the Python body answers.
-    * exit 2 with write_state `final`, or absent on any code but E-INTERNAL (E-CONTRACT, E-POLICY, E-INPUT of an unknown task or
-      of an invalid id, Python's `max_attempts exceeded` E-TIMEOUT that names its task, ...): the binary's own refusal, with
-      Python's text; recorded and printed as it is.
-    * everything else is an unknown outcome, answered with a typed E-INTERNAL (`_unknown_outcome`), no Python run, no fallback:
-      the call deadline (the subprocess deadline, or an E-TIMEOUT that names no task), a signal or any exit code outside 0, 1, 2,
-      an unparsable reply, E-INTERNAL without a write_state, an unrecognised write_state.
-    * not started: a binary that cannot be started is Python's answer under the default engine and E-DEP under `explicit`,
-      as for reads; so is an argument the binary cannot take (not UTF-8 encodable).
-    """
-    call = parse_write_argv(argv)
-    before = _state_before(call) if call is not None and not call.dry_run else None
-    try:
-        handle, effects_path = tempfile.mkstemp(prefix="gsd-effects-", suffix=".json")
-    except OSError:
-        return None if not explicit else _refuse(ErrorCode.E_DEP, "the effects file for the gsd_engine binary could not be created")
-    os.close(handle)
-    try:
-        return _answer_write(argv, binary, explicit, call, before, effects_path)
-    finally:
-        try:
-            os.unlink(effects_path)
-        except OSError:
-            pass
-
-
-def _answer_write(argv: list[str], binary: str, explicit: bool, call: WriteCall | None, before: str | None,
-                  effects_path: str) -> int | None:
-    request = {"agent": "A01", "script": "orch_status", "argv": argv, "root": os.getcwd(),
-               "env": {key: os.environ[key] for key in RUST_ENV_KEYS if os.environ.get(key)}, "effects_path": effects_path}
-    try:
-        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    except UnicodeEncodeError:
-        return None  # fallback: an argument the binary cannot take
-    try:
-        # Only a real transition to APPROVED verifies signatures: a dry run and every other target get no key variable, and only the
-        # APPROVED child, which holds the keys, is started with core dumps off (a preexec_fn that fails is a start that did not happen).
-        route = "transition-approved" if call is not None and call.state == "APPROVED" and not call.dry_run else "transition"
-        done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=_rust_timeout_s(), env=_binary_env(route),
-                              preexec_fn=_no_core_dumps if route == "transition-approved" else None)
-    except subprocess.TimeoutExpired:
-        return _unknown_outcome(argv, call, "the gsd_engine binary did not answer within the call deadline")
-    except (OSError, subprocess.SubprocessError):
-        if not explicit:
-            return None  # fallback: nothing was started
-        return _refuse(ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")
-    code = done.returncode
-    if code not in (AgentScript.EXIT_OK, AgentScript.EXIT_FAIL, AgentScript.EXIT_ERROR):
-        how = f"killed by signal {-code}" if code < 0 else f"exit status {code}"
-        return _unknown_outcome(argv, call, f"the gsd_engine binary ended with {how}")
-    reply = _reply_object(done.stdout)
-    if reply is None:
-        return _unknown_outcome(argv, call, "the gsd_engine binary printed no JSON object")
-    stdout = done.stdout
-    if code == AgentScript.EXIT_ERROR:
-        error_code, details = _error_code(reply), _error_details(reply)
-        state = details.get("write_state")
-        # Python's own `max_attempts exceeded` refusal is E-TIMEOUT too, and names its task in details; the call deadline's does not
-        if error_code == ErrorCode.E_TIMEOUT.value and not isinstance(details.get("task_id"), str):
-            return _unknown_outcome(argv, call, "the gsd_engine binary reported E-TIMEOUT")
-        if state == "not_started":
-            return None  # Python answers: the binary wrote nothing
-        if error_code is None or state not in (None, "final") or (state is None and error_code == ErrorCode.E_INTERNAL.value):
-            return _unknown_outcome(argv, call, "the gsd_engine binary refused without saying that nothing was written")
-    else:
-        lost, row = _run_effects(call, before, effects_path)
-        if lost is not None:
-            _record_effects_lost(call, lost)
-        reply, stdout = _settled_reply(reply, stdout, row)
-    try:
-        SCRIPT.record_external_reply(argv, reply, code)
-    except Exception as exc:  # noqa: BLE001 - a write is never handed to Python once the binary has answered
-        _warn(f"the run-log record of the binary's answer failed ({type(exc).__name__}); the answer stands and was not repeated")
-    sys.stdout.buffer.write(stdout)
-    sys.stdout.flush()
-    return code
+# The transition route. A hook that reads a name of this module at call time (a default row, the child guard, rust_serves) is a lambda,
+# so a name patched on the module is the one used. Only a real transition to APPROVED verifies signatures: a dry run and every other
+# target get no key variable, and only the APPROVED child, which holds the keys, is started with core dumps off (a preexec_fn that
+# fails is a start that did not happen).
+WRITE_ROUTE = engine_select.Route(
+    claims=lambda argv: any(token == "--transition" or token.startswith("--transition=") for token in argv),
+    parse=parse_write_argv,
+    default=lambda: DEFAULT_ENGINE_WRITE,
+    env_route=lambda argv, call: "transition-approved" if call is not None and call.state == "APPROVED" and not call.dry_run else "transition",
+    write=engine_select.WriteFlow(
+        before=lambda call: _state_before(call) if call is not None and not call.dry_run else None,
+        commit=_commit_effects,
+        unknown=_unknown_hint,
+        preexec=lambda route: _no_core_dumps if route == "transition-approved" else None,
+    ),
+)
+READ_ROUTE = engine_select.Route(
+    claims=lambda argv: True,
+    parse=lambda argv: argv if rust_serves(argv) else None,
+    default=lambda: DEFAULT_ENGINE,
+    env_route=lambda argv, call: "history" if any(token == "--history" or token.startswith("--history=") for token in argv) else "list",
+)
+SELECTOR = engine_select.Selector(SCRIPT, (WRITE_ROUTE, READ_ROUTE), RUST_ENV_KEYS, _binary_env)
+run_rust = functools.partial(engine_select.run_read, SELECTOR, READ_ROUTE)
+run_rust_write = functools.partial(engine_select.run_write, SELECTOR, WRITE_ROUTE)
 
 
 def select_engine(argv: list[str]) -> int | None:
     """Resolves the engine for one call. An int is the final exit code (the selector already printed the answer); None runs the Python body."""
-    if os.environ.get("SWARM_PURE_PYTHON") == "1":
-        return None
-    requested = os.environ.get("GSD_ENGINE", "")
-    if requested == "python":
-        return None
-    if requested not in ("", "rust"):
-        return _refuse(ErrorCode.E_INPUT, "GSD_ENGINE must be 'python' or 'rust'")
-    explicit = requested == "rust"
-    write = any(token == "--transition" or token.startswith("--transition=") for token in argv)
-    if not explicit and (DEFAULT_ENGINE_WRITE if write else DEFAULT_ENGINE) != "rust":
-        return None
-    binary = os.environ.get("GSD_ENGINE_BIN", "")
-    if not binary and RELEASE_BINARY.is_file() and os.access(RELEASE_BINARY, os.X_OK):
-        binary = str(RELEASE_BINARY)
-    if not explicit:
-        serves = rust_serves_write(argv) if write else rust_serves(argv)
-        if not serves or not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
-            return None
-    if os.environ.get("GSD_RUST_BACKEND", "") not in ("", "host", "sandbox"):
-        return _refuse(ErrorCode.E_INPUT, "GSD_RUST_BACKEND must be 'host' or 'sandbox' when set")
-    if not binary:
-        return _refuse(ErrorCode.E_DEP, "GSD_ENGINE=rust needs GSD_ENGINE_BIN set to the gsd_engine binary")
-    return (run_rust_write if write else run_rust)(argv, binary, explicit=explicit)
+    return engine_select.select_engine(SELECTOR, argv, release_binary=RELEASE_BINARY)
 
 
 if __name__ == "__main__":
