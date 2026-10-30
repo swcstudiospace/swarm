@@ -14,6 +14,9 @@ crate-type = ["cdylib"]
 # Switches the `transition` mode on (Phase 14.5 pin P1). Off, the guest is the read-only build whose digest is committed in
 # `gsd-sandbox/guest-module.sha256`; on, it is the build pinned by `gsd-sandbox/guest-module-write.sha256`.
 write-routes = ["gsd-route/write-routes"]
+# Adds the second batch (Phase 14.5 pin P2): the ingest, plan, approval and catalog modes. Implies `write-routes`. Off, the guest bytes
+# are the ones pinned by `guest-module-write.sha256` (P1) and `guest-module.sha256` (read only).
+write-routes-2 = ["write-routes", "gsd-route/write-routes-2"]
 
 [dependencies]
 gsd-codes = { path = "../gsd-codes" }

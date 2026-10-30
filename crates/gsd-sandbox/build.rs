@@ -9,7 +9,8 @@
 //! `GSD_GUEST_DIGEST_FILE`, so a test can compare the build with the committed pin.
 //!
 //! With this crate's `write-routes` feature the nested build gets the guest's `write-routes` feature, and the committed pin is
-//! `guest-module-write.sha256` instead of `guest-module.sha256`. Its path is published as `GSD_GUEST_PIN_FILE`, so the crate and its
+//! `guest-module-write.sha256` instead of `guest-module.sha256`. With `write-routes-2` the nested build gets the guest's
+//! `write-routes-2` feature (which implies `write-routes`) and the same write pin. Its path is published as `GSD_GUEST_PIN_FILE`, so the crate and its
 //! pin test read the pin of the guest they embed and nothing else.
 
 use std::env;
@@ -39,7 +40,8 @@ fn main() {
     let workspace_root = manifest_dir.join("..").join("..");
     let target_dir = out_dir.join("guest-target");
 
-    let write_routes = env::var_os("CARGO_FEATURE_WRITE_ROUTES").is_some();
+    let write_routes_2 = env::var_os("CARGO_FEATURE_WRITE_ROUTES_2").is_some();
+    let write_routes = write_routes_2 || env::var_os("CARGO_FEATURE_WRITE_ROUTES").is_some();
 
     // The outer build's encoded rustflags describe the host build; the guest must read its own
     // flags from the environment and the cargo config files.
@@ -58,7 +60,9 @@ fn main() {
             "--target-dir",
         ])
         .arg(&target_dir);
-    if write_routes {
+    if write_routes_2 {
+        build.args(["--features", "write-routes-2"]);
+    } else if write_routes {
         build.args(["--features", "write-routes"]);
     }
     let status = build

@@ -1554,3 +1554,14 @@ mod tests {
 
 #[cfg(feature = "write-routes-2")]
 pub mod catalog;
+
+#[cfg(feature = "write-routes-2")]
+pub mod approval_wire;
+#[cfg(feature = "write-routes-2")]
+pub mod catalog_wire;
+#[cfg(feature = "write-routes-2")]
+pub mod ingest_wire;
+#[cfg(feature = "write-routes-2")]
+pub mod plan_wire;
+#[cfg(feature = "write-routes-2")]
+pub mod reconcile_wire;
