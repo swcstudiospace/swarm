@@ -1,12 +1,12 @@
 //! Per-invocation engine routing for the strangler seam (U4.2).
 //!
 //! `GSD_ENGINE` is read on every call. An unset or empty value resolves through the per-route default
-//! table ([`default_engine`]); `python` is explicit Python. `rust` applies to two route classes only:
-//! the read-only `orch_status --json` listing and history, and the host `orch_status --transition --json`
-//! write route (opt-in: its default row stays Python until the flip unit). Every other `rust` request is
-//! refused with `E-DEP` and `write_state = "not_started"`, so nothing else flips (G-strangler-order). An
+//! table ([`default_engine`]); `python` is explicit Python. `rust` applies to three route classes only:
+//! the read-only `orch_status --json` listing and history, the host `orch_status --transition --json`
+//! write route, and the host `orch_status --ingest PATH --json` route. Each is opt-in: its default row stays
+//! Python until its flip unit. Every other `rust` request is refused with `E-DEP` and
+//! `write_state = "not_started"`, so nothing else flips (G-strangler-order). An
 //! unknown value is rejected with `E-INPUT`. Today every row of the table is Python; a route's row changes
-//! in the phase that flips it.
 
 use gsd_failure::ErrorCode;
 
@@ -14,6 +14,7 @@ use crate::join_affinity_guard::Engine;
 use crate::strangler_seam::{
     before_any_write, error_reply, invoke, CoreBackend, Entrypoint, Invocation,
 };
+use gsd_route::ingest_args::parse_ingest_args;
 use gsd_route::transition_args::parse_transition_args;
 use gsd_route::{parse_orch_status_read, Reply, SeamError};
 
@@ -46,6 +47,12 @@ pub fn is_transition_route(entry: Entrypoint, argv: &[String]) -> bool {
     matches!(entry, Entrypoint::OrchStatus) && parse_transition_args(argv).is_some()
 }
 
+/// Returns true when the call is the host ingest route: `orch_status --ingest PATH --json` inside the grammar of
+/// [`parse_ingest_args`], the same set the selector's `rust_serves_ingest` serves.
+pub fn is_ingest_route(entry: Entrypoint, argv: &[String]) -> bool {
+    matches!(entry, Entrypoint::OrchStatus) && parse_ingest_args(argv).is_some()
+}
+
 /// The engine the `orch_status` read route runs on when `GSD_ENGINE` is unset or empty.
 ///
 /// Python until the flip unit (R12 of Phase 14.3) sets it, after parity evidence and the user's
@@ -58,6 +65,11 @@ pub const ORCH_STATUS_READ_DEFAULT: Engine = Engine::Python;
 /// the user's approval. `GSD_ENGINE=rust` reaches the route whatever this row says.
 pub const ORCH_STATUS_TRANSITION_DEFAULT: Engine = Engine::Python;
 
+/// The engine the `orch_status --ingest` route runs on when `GSD_ENGINE` is unset or empty.
+///
+/// Python until the write flip unit (U3.8c of Phase 14.5) sets it. `GSD_ENGINE=rust` reaches the route whatever this row says.
+pub const ORCH_STATUS_INGEST_DEFAULT: Engine = Engine::Python;
+
 /// The per-route default engine: the engine that answers a call when `GSD_ENGINE` is unset or empty.
 ///
 /// The `orch_status` read route resolves to [`ORCH_STATUS_READ_DEFAULT`] and the `--transition` route to
@@ -68,6 +80,8 @@ pub fn default_engine(entry: Entrypoint, argv: &[String]) -> Engine {
         ORCH_STATUS_READ_DEFAULT
     } else if is_transition_route(entry, argv) {
         ORCH_STATUS_TRANSITION_DEFAULT
+    } else if is_ingest_route(entry, argv) {
+        ORCH_STATUS_INGEST_DEFAULT
     } else {
         Engine::Python
     }
@@ -82,12 +96,16 @@ pub fn route_for_call(
 ) -> Result<Engine, SeamError> {
     match requested {
         Engine::Python => Ok(Engine::Python),
-        Engine::Rust if is_read_only_route(entry, argv) || is_transition_route(entry, argv) => {
+        Engine::Rust
+            if is_read_only_route(entry, argv)
+                || is_transition_route(entry, argv)
+                || is_ingest_route(entry, argv) =>
+        {
             Ok(Engine::Rust)
         }
         Engine::Rust => Err(before_any_write(SeamError::new(
             ErrorCode::Dep,
-            "no rust route for this entrypoint and flags; only orch_status --json (read) and orch_status --transition --json are served; unset GSD_ENGINE or use python",
+            "no rust route for this entrypoint and flags; only orch_status --json (read), orch_status --transition --json and orch_status --ingest PATH --json are served; unset GSD_ENGINE or use python",
         ))),
     }
 }
@@ -198,6 +216,14 @@ mod tests {
             route_for_call(
                 Engine::Rust,
                 Entrypoint::OrchStatus,
+                &argv(&["--ingest", "r.json", "--json"])
+            ),
+            Ok(Engine::Rust)
+        ));
+        assert!(matches!(
+            route_for_call(
+                Engine::Rust,
+                Entrypoint::OrchStatus,
                 &argv(&["--history", "T-A", "--json"])
             ),
             Ok(Engine::Rust)
@@ -215,7 +241,7 @@ mod tests {
             code_of(route_for_call(
                 Engine::Rust,
                 Entrypoint::OrchStatus,
-                &argv(&["--ingest", "r.json", "--json"])
+                &argv(&["--ingest", "r.json"])
             )),
             Some(ErrorCode::Dep)
         );
