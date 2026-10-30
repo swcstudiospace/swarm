@@ -313,7 +313,11 @@ async fn answer_call(call: &Invocation) -> Result<Reply, SeamError> {
     let corr = correlation.map_or_else(|| new_correlation.clone(), str::to_string);
     match probe.outcome {
         Outcome::DryRun => {
-            write_manifest(call, &manifest(&[], probe.ctx_correlation_id.as_deref(), false)).ok();
+            write_manifest(
+                call,
+                &manifest(&[], probe.ctx_correlation_id.as_deref(), false),
+            )
+            .ok();
             return Ok(finish(probe.reply, &call.agent, &call.script));
         }
         Outcome::Created => {}
@@ -581,7 +585,10 @@ fn manifest(effects: &[PlanEffect], correlation: Option<&str>, live_refresh: boo
         })
         .collect();
     Json::Obj(vec![
-        ("correlation_id".to_string(), correlation.map_or(Json::Null, jstr)),
+        (
+            "correlation_id".to_string(),
+            correlation.map_or(Json::Null, jstr),
+        ),
         ("effects".to_string(), Json::Arr(items)),
         ("live_refresh".to_string(), Json::Bool(live_refresh)),
     ])
@@ -980,7 +987,13 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(bytes[8], b'-');
         assert_eq!(bytes[14], b'4', "version nibble");
-        assert!(matches!(bytes[19], b'8' | b'9' | b'a' | b'b'), "variant bits");
-        assert!(is_safe_id(&id), "a random id passes the id rule it is checked against");
+        assert!(
+            matches!(bytes[19], b'8' | b'9' | b'a' | b'b'),
+            "variant bits"
+        );
+        assert!(
+            is_safe_id(&id),
+            "a random id passes the id rule it is checked against"
+        );
     }
 }
