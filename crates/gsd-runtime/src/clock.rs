@@ -129,11 +129,11 @@ impl SimClock {
         }
     }
 
-    /// Register a waiter for time advancement
-    async fn wait_for_time_advance(&self) {
+    /// Register a waiter for the next time advancement
+    fn register_waiter(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.waiters.lock().push(tx);
-        let _ = rx.await;
+        rx
     }
 }
 
@@ -174,11 +174,16 @@ impl Clock for SimClock {
                     self_clone.virtual_time_ns.load(Ordering::SeqCst) + duration.as_nanos() as u64;
 
                 loop {
-                    let current = self_clone.virtual_time_ns.load(Ordering::SeqCst);
-                    if current >= target_time {
+                    if self_clone.virtual_time_ns.load(Ordering::SeqCst) >= target_time {
                         break;
                     }
-                    self_clone.wait_for_time_advance().await;
+                    // Register before the re-check: an advance that lands after the re-check finds
+                    // this waiter, and one that landed before registration is caught by the re-check.
+                    let woken = self_clone.register_waiter();
+                    if self_clone.virtual_time_ns.load(Ordering::SeqCst) >= target_time {
+                        break;
+                    }
+                    let _ = woken.await;
                 }
             })
         } else {
@@ -367,6 +372,30 @@ mod tests {
 
         clock.sleep(Duration::from_millis(30)).await;
         // Reaching this point means the sleep completed once the spawned task advanced virtual time.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_sim_sleep_is_not_lost_to_concurrent_advance() {
+        for _ in 0..1_000 {
+            let clock = SimClock::new();
+            let advancer = clock.clone();
+            let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&finished);
+            let ticking = tokio::spawn(async move {
+                while !flag.load(Ordering::SeqCst) {
+                    advancer.advance(Duration::from_millis(1));
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                clock.sleep(Duration::from_millis(1)),
+            )
+            .await
+            .expect("sim sleep was never woken by advance()");
+            finished.store(true, Ordering::SeqCst);
+            ticking.await.unwrap();
+        }
     }
 
     #[test]

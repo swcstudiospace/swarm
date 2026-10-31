@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Barrier, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Lock-free MPSC queue for high-throughput message passing
 pub struct LockFreeQueue<T> {
@@ -267,39 +267,30 @@ fn next_waiter_index(waiters: &VecDeque<Waiter>) -> Option<usize> {
     best.map(|(idx, _)| idx)
 }
 
-/// Async barrier with timeout support
+/// Reusable async barrier with timeout support.
+///
+/// Waiters are released in generations of `count`, with one leader per generation.
+///
+/// # Cancellation safety
+///
+/// Like [`tokio::sync::Barrier`], waiting is not cancellation safe. Dropping a wait
+/// (including when `wait_timeout` expires) does not roll back an arrival already
+/// counted toward the current generation.
 #[derive(Clone)]
 pub struct AsyncBarrier {
-    count: Arc<AtomicUsize>,
-    target: usize,
-    notify: Arc<Notify>,
+    inner: Arc<Barrier>,
 }
 
 impl AsyncBarrier {
     pub fn new(count: usize) -> Self {
+        assert!(count > 0, "AsyncBarrier needs at least one participant");
         Self {
-            count: Arc::new(AtomicUsize::new(count)),
-            target: count,
-            notify: Arc::new(Notify::new()),
+            inner: Arc::new(Barrier::new(count)),
         }
     }
 
     pub async fn wait(&self) -> bool {
-        // Register for the release before arriving: `notify_waiters` only wakes
-        // futures that already exist, so a release racing with arrival must not be missed.
-        let mut released = std::pin::pin!(self.notify.notified());
-        released.as_mut().enable();
-
-        let remaining = self.count.fetch_sub(1, Ordering::AcqRel);
-        if remaining == 1 {
-            // Last arrival is the leader: reset for the next round and release the rest.
-            self.count.store(self.target, Ordering::Release);
-            self.notify.notify_waiters();
-            true
-        } else {
-            released.await;
-            false
-        }
+        self.inner.wait().await.is_leader()
     }
 
     pub async fn wait_timeout(
@@ -435,10 +426,14 @@ impl WaitGroup {
     }
 
     pub async fn wait(&self) {
+        // Register before re-checking the count: `notify_waiters` wakes only futures that
+        // already exist, so a `done()` racing with this check must not be missed.
+        let mut released = std::pin::pin!(self.notify.notified());
+        released.as_mut().enable();
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }
-        self.notify.notified().await;
+        released.await;
     }
 }
 
@@ -463,56 +458,61 @@ where
 /// Rate limiter using token bucket algorithm
 pub struct TokenBucket {
     capacity: usize,
-    tokens: Arc<AsyncMutex<f64>>,
     refill_rate: f64, // tokens per second
-    last_refill: Arc<AsyncMutex<Instant>>,
+    state: std::sync::Mutex<BucketState>,
+}
+
+struct BucketState {
+    tokens: f64,
+    last_refill: Instant,
 }
 
 impl TokenBucket {
     pub fn new(capacity: usize, refill_rate: f64) -> Self {
         Self {
             capacity,
-            tokens: Arc::new(AsyncMutex::new(capacity as f64)),
             refill_rate,
-            last_refill: Arc::new(AsyncMutex::new(Instant::now())),
+            state: std::sync::Mutex::new(BucketState {
+                tokens: capacity as f64,
+                last_refill: Instant::now(),
+            }),
         }
     }
 
-    pub async fn take(&self, tokens: usize) -> bool {
-        let mut tokens_guard = self.tokens.lock().await;
-        let mut last_refill = self.last_refill.lock().await;
-
+    /// Refills for the time elapsed since the last refill, then takes `tokens` if enough remain.
+    /// `take` and `try_take` share this path so both refill identically.
+    fn take_now(&self, tokens: usize) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
-        let elapsed = now.duration_since(*last_refill).as_secs_f64();
+        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        state.tokens = (state.tokens + elapsed * self.refill_rate).min(self.capacity as f64);
+        state.last_refill = now;
 
-        *tokens_guard = (*tokens_guard + elapsed * self.refill_rate).min(self.capacity as f64);
-        *last_refill = now;
-
-        if *tokens_guard >= tokens as f64 {
-            *tokens_guard -= tokens as f64;
+        if state.tokens >= tokens as f64 {
+            state.tokens -= tokens as f64;
             true
         } else {
             false
         }
     }
 
+    pub async fn take(&self, tokens: usize) -> bool {
+        self.take_now(tokens)
+    }
+
     pub fn try_take(&self, tokens: usize) -> bool {
-        let tokens_guard = self.tokens.try_lock();
-        if let Ok(mut guard) = tokens_guard {
-            if *guard >= tokens as f64 {
-                *guard -= tokens as f64;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        self.take_now(tokens)
     }
 
     pub fn available(&self) -> f64 {
-        let guard = self.tokens.blocking_lock();
-        *guard
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.tokens
     }
 }
 
@@ -586,6 +586,30 @@ mod tests {
         assert_eq!([last, l1, l2].iter().filter(|leader| **leader).count(), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_barrier_rounds_survive_arrivals_during_reset() {
+        let barrier = AsyncBarrier::new(3);
+        for _ in 0..500 {
+            let handles: Vec<_> = (0..3u32)
+                .map(|spins| {
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..spins {
+                            tokio::task::yield_now().await;
+                        }
+                        barrier.wait_timeout(Duration::from_secs(1)).await
+                    })
+                })
+                .collect();
+            let mut leaders = 0;
+            for handle in handles {
+                let led = handle.await.unwrap().expect("barrier round hung");
+                leaders += usize::from(led);
+            }
+            assert_eq!(leaders, 1);
+        }
+    }
+
     #[tokio::test]
     async fn test_wait_group() {
         let wg = WaitGroup::new();
@@ -600,6 +624,20 @@ mod tests {
         }
 
         wg.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_wait_group_wait_is_not_lost_to_done_race() {
+        for _ in 0..10_000 {
+            let wg = WaitGroup::new();
+            wg.add(1);
+            let finisher = wg.clone();
+            let handle = tokio::spawn(async move { finisher.done() });
+            tokio::time::timeout(Duration::from_secs(1), wg.wait())
+                .await
+                .expect("wait() hung after done() raced it");
+            handle.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -620,6 +658,14 @@ mod tests {
         assert!(bucket.take(5).await);
         assert!(bucket.take(5).await);
         assert!(!bucket.take(1).await);
+    }
+
+    #[tokio::test]
+    async fn test_try_take_refills_after_drain() {
+        let bucket = TokenBucket::new(1, 1000.0);
+        assert!(bucket.try_take(1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(bucket.try_take(1), "try_take must refill like take does");
     }
 
     async fn wait_for_queued(sem: &PrioritySemaphore, count: usize) {

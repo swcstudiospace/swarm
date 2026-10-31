@@ -252,8 +252,15 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
         const lerr = (lres.stderr || "").trim();
         const lout = (lres.stdout || "").trim();
         if (lerr || lout) process.stderr.write(`[/swarm] signing key lifecycle ${promptSafe(lerr || lout)}\n`);
-        process.stderr.write(`[/swarm] swarm init state=LOADING for ${earlyCorr} (signing key lifecycle first; LOADING before INITIALIZING; reduced if no key; enterprise audit/integrity; gsd workflowz ultrathink orchestrate path; msgs shown at start)\n`);
-        process.stderr.write(`[/swarm] swarm init state=INITIALIZING for ${earlyCorr} (before gsd workflowz, state logged, messages shown; no activity from prior unit triggers)\n`);
+        // TS-05: a lifecycle step that did not run (no python3, a non-zero exit, a signal) is reported with its reason; the
+        // LOADING/INITIALIZING lines are not written, since they would claim a lifecycle that never happened
+        if (lres.error || lres.status !== 0) {
+          const why = lres.error ? lres.error.message : lres.signal ? `killed by ${lres.signal}` : `exit ${lres.status}`;
+          notify(ctx, `/swarm: signing key lifecycle did not complete (${why}); swarm init state not logged`, "warning");
+        } else {
+          process.stderr.write(`[/swarm] swarm init state=LOADING for ${earlyCorr} (signing key lifecycle first; LOADING before INITIALIZING; reduced if no key; enterprise audit/integrity; gsd workflowz ultrathink orchestrate path; msgs shown at start)\n`);
+          process.stderr.write(`[/swarm] swarm init state=INITIALIZING for ${earlyCorr} (before gsd workflowz, state logged, messages shown; no activity from prior unit triggers)\n`);
+        }
       } catch (e) {
         process.stderr.write(`[/swarm] signing key lifecycle note (non-fatal): ${promptSafe(String(e))}\n`);
       }

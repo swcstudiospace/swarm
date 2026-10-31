@@ -65,6 +65,14 @@ def build_plan(release_id: str, risk: str, tasks: list[str], gates: list[str], a
             "tasks": tasks, "artifacts": artifacts, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+def _gate_state(gate: str, per_task: dict) -> str:
+    """P4-05: a gate's signed run state over the evaluated targets. all() over no targets is true, so a gate that evaluated
+    nothing reports skipped, never pass."""
+    if not per_task:
+        return "skipped:no-task"
+    return "pass" if all(t["gates"].get(gate, "ok") == "ok" for t in per_task.values()) else "fail"
+
+
 def run(args, ctx) -> dict:
     swarm_dir(ctx.root, create=True)
     if args.freeze and not ctx.dry_run:
@@ -143,7 +151,7 @@ def run(args, ctx) -> dict:
     release_id = check_task_id(args.release_id or f"REL-{primary}", "release id")  # a file name below (CR-01)
     gates = sorted({g for t in per_task.values() for g in t["required"]}) or [g for g in GATES_BY_RISK[risk] if g != "release"]
     plan = build_plan(release_id, risk, ids, gates, [a for a in artifacts if a])
-    runs = {g: ("pass" if all(t["gates"].get(g, "ok") == "ok" for t in per_task.values()) else "fail") for g in gates}
+    runs = {g: _gate_state(g, per_task) for g in gates}
     runs["freeze"] = "active" if frozen else "none"
     # a release gate task records each target's verdict from that target's own findings plus any freeze (D-13)
     env, recorded = issue_gate(ctx, gate="release", agent_id="A12@local", findings=findings, runs=runs,

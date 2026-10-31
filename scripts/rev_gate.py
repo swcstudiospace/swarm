@@ -130,7 +130,7 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
                     val = m.group(m.lastindex or 0)
                     if m.lastindex and _entropy(val) < 3.2:
                         continue
-                    add("major", "secret", "secret-looking string added (value redacted)", loc, val[:4] + "…")
+                    add("major", "secret", "secret-looking string added (value redacted)", loc, f"value not recorded ({len(val)} chars)")
     if src_changed and not tests_changed:
         add("minor", "coverage", "source files changed but no test files changed", "tests/")
     return findings

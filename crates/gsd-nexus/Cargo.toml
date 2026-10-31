@@ -8,25 +8,6 @@ repository = "https://github.com/swcstudiospace/agent-swarm"
 categories = ["concurrency", "distributed-systems", "crdt", "pubsub"]
 keywords = ["nexus", "crdt", "pubsub", "coordination", "shared-memory"]
 
-[dependencies]
-tokio = { workspace = true }
-yrs = { workspace = true }
-automerge = { workspace = true }
-dashmap = { workspace = true }
-parking_lot = { workspace = true }
-uuid = { workspace = true }
-ulid = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_with = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-tracing = { workspace = true }
-crossbeam = { workspace = true }
-bytes = { workspace = true }
-futures = { workspace = true }
-
 [dev-dependencies]
 tokio = { workspace = true }
 tokio-test = "0.4"

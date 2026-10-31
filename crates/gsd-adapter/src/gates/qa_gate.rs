@@ -5,6 +5,7 @@
 //! identical to Python is `E-DEP` with `write_state = not_started`, and the selector runs the Python body.
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -271,26 +272,49 @@ fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), Se
                 "a runner could not be started; Python answers",
             ))
         })?;
+    // Both pipes are drained while the child runs. A runner that writes more than a pipe buffer would otherwise block
+    // on the write and be reported as a timeout.
+    let (Some(mut out_pipe), Some(mut err_pipe)) = (child.stdout.take(), child.stderr.take())
+    else {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(before_any_write(SeamError::new(
+            ErrorCode::Dep,
+            "a runner's output pipe is missing; Python answers",
+        )));
+    };
+    let out_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        out_pipe.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        err_pipe.read_to_end(&mut buffer).map(|_| buffer)
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout.max(1));
+    let mut exited = None;
     loop {
-        if let Some(status) = child.try_wait().map_err(|_| {
-            before_any_write(SeamError::new(
-                ErrorCode::Dep,
-                "a runner could not be waited; Python answers",
-            ))
-        })? {
-            let output = child.wait_with_output().map_err(|_| {
+        if exited.is_none() {
+            exited = child.try_wait().map_err(|_| {
                 before_any_write(SeamError::new(
                     ErrorCode::Dep,
-                    "a runner's output could not be read; Python answers",
+                    "a runner could not be waited; Python answers",
                 ))
             })?;
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            return Ok((status.code().unwrap_or(1), text));
+        }
+        if let Some(status) = exited {
+            if out_reader.is_finished() && err_reader.is_finished() {
+                let stdout = read_pipe(out_reader)?;
+                let stderr = read_pipe(err_reader)?;
+                let mut text = String::from_utf8_lossy(&stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&stderr));
+                return Ok((status.code().unwrap_or(1), text));
+            }
         }
         if std::time::Instant::now() > deadline {
             child.kill().ok();
+            child.wait().ok();
+            // The reader threads are left to finish on their own once the pipes close.
             return Err(before_any_write(SeamError::new(
                 ErrorCode::Dep,
                 "a runner exceeded --timeout; Python answers",
@@ -298,6 +322,21 @@ fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), Se
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn read_pipe(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, SeamError> {
+    reader
+        .join()
+        .ok()
+        .and_then(|read| read.ok())
+        .ok_or_else(|| {
+            before_any_write(SeamError::new(
+                ErrorCode::Dep,
+                "a runner's output could not be read; Python answers",
+            ))
+        })
 }
 
 fn finding(
@@ -775,7 +814,7 @@ fn load_per_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{committed, count, write_plan_file};
+    use super::{committed, count, run_cmd, write_plan_file};
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
     use gsd_taskwriter::{GateFile, GateIssueRequest, GatePlan, GateWrite};
@@ -868,5 +907,20 @@ mod tests {
         let error = write_plan_file(dir.path(), &derived, commits).expect_err("the write fails");
         assert_eq!(write_state(&error), Some("not_started"));
         assert_eq!(error.code(), ErrorCode::Dep);
+    }
+
+    #[test]
+    fn a_runner_that_writes_more_than_a_pipe_buffer_is_not_a_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 256 KiB is several pipe buffers: an undrained pipe blocks the runner until the deadline.
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "head -c 262144 /dev/zero".to_string(),
+        ];
+        let (code, text) =
+            run_cmd(&cmd, dir.path(), 10).expect("a runner that exits 0 is not a timeout");
+        assert_eq!(code, 0);
+        assert_eq!(text.len(), 262_144);
     }
 }

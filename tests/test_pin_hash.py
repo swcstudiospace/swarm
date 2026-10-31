@@ -4,6 +4,7 @@ change moves the digest, comment and layout changes do not, and an unreadable so
 import importlib.util
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,16 @@ def _run(root: Path, *extra: str) -> subprocess.CompletedProcess:
 def test_the_committed_digest_matches_this_checkout():
     result = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, cwd=ROOT)
     assert result.returncode == 0, result.stderr
+
+
+def test_workspace_wasmtime_dependency_matches_the_exact_security_pin():
+    cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace = cargo["workspace"]
+    runtime = workspace["dependencies"]["wasmtime"]
+    version = workspace["metadata"]["gsd-pins"]["wasmtime"]
+    assert version == "50.0.1"
+    assert runtime["version"] == f"={version}"
+    assert "component-model" in runtime["features"]
 
 
 def test_a_pinned_value_change_moves_the_digest(tmp_path):

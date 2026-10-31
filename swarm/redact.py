@@ -1209,7 +1209,8 @@ def _walk(value: object, level: int, max_depth: int, sensitive: bool) -> object:
         if level > max_depth:
             return REDACTED  # depth cap: never recurse unbounded (cycles included), never pass an unexamined subtree
         if isinstance(value, dict):
-            return {k: _walk(v, level + 1, max_depth, sensitive or _credential_pair(k, v)) for k, v in value.items()}
+            return {(redact_text(k) if isinstance(k, str) else k): _walk(v, level + 1, max_depth, sensitive or _credential_pair(k, v))
+                    for k, v in value.items()}
         return [_walk(v, level + 1, max_depth, sensitive) for v in value]
     return value
 

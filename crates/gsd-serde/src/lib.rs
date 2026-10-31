@@ -236,8 +236,14 @@ pub fn deserialize_batch<M: prost::Message + Default>(bytes: &[u8]) -> SerdeResu
     let _deserializer = Deserializer::new();
 
     while offset < bytes.len() {
-        if offset + 4 > bytes.len() {
-            break;
+        // Each record is a 4-byte little-endian length followed by that many bytes.
+        // Bytes that cannot form a whole record are truncated input, not a clean end.
+        if bytes.len() - offset < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated batch: incomplete length prefix",
+            )
+            .into());
         }
 
         let len = u32::from_le_bytes([
@@ -249,8 +255,12 @@ pub fn deserialize_batch<M: prost::Message + Default>(bytes: &[u8]) -> SerdeResu
 
         offset += 4;
 
-        if offset + len > bytes.len() {
-            break;
+        if bytes.len() - offset < len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated batch: record body shorter than its length prefix",
+            )
+            .into());
         }
 
         let msg_bytes = &bytes[offset..offset + len];
@@ -435,5 +445,28 @@ mod tests {
 
         let result = deserialize_with_version::<gsd_proto::gsd::v1::Task>(&encoded, 2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_rejects_truncated_input() {
+        let tasks: Vec<gsd_proto::gsd::v1::Task> = (1..=3)
+            .map(|i| gsd_proto::gsd::v1::Task {
+                id: Some(TaskId {
+                    value: i.to_string(),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let encoded = serialize_batch(&tasks).unwrap();
+
+        let decoded: Vec<gsd_proto::gsd::v1::Task> = deserialize_batch(&encoded).unwrap();
+        assert_eq!(decoded.len(), 3);
+
+        let short_body = &encoded[..encoded.len() - 1];
+        assert!(deserialize_batch::<gsd_proto::gsd::v1::Task>(short_body).is_err());
+
+        let mut short_header = encoded.clone();
+        short_header.extend_from_slice(&[0, 0]);
+        assert!(deserialize_batch::<gsd_proto::gsd::v1::Task>(&short_header).is_err());
     }
 }

@@ -1,9 +1,10 @@
 //! Loom models of the pool: every interleaving of submit, completion and shutdown up to a preemption bound.
 //!
 //! Run with `RUSTFLAGS="--cfg loom" cargo test --release -p gsd-sched-core pool::loom_tests`. Loom's condition variable never times
-//! out, so each wait below is an untimed wait: a lost wakeup shows up as a loom deadlock panic. The models are kept to two jobs and
+//! wait below is an untimed wait: a lost wakeup shows up as a loom deadlock panic. The models are kept to at most three jobs and
 //! one worker slot or two, because the interleavings grow very fast with each thread and lock operation.
 
+use std::panic::resume_unwind;
 use std::time::Duration;
 
 use loom::model::Builder;
@@ -109,5 +110,35 @@ fn shutdown_accounts_for_every_job_exactly_once() {
         );
         assert_eq!(pool.in_flight(), 0);
         assert!(pool.submit("late", || 9).is_err());
+    });
+}
+
+/// Two workers and three jobs, the first of which panics: the panicking worker must publish its `Crashed` completion, hand its slot
+/// to the queued job and wake the loop thread blocked in `next_completion`. All three completions arrive, the payload never leaves the
+/// worker and the pool ends empty. `resume_unwind` skips the panic hook, so no interleaving prints a message.
+#[test]
+fn a_worker_panic_under_contention_frees_its_slot_and_loses_no_completion() {
+    model(|| {
+        let pool: Pool<usize> = Pool::new(2);
+        pool.submit("t0", || 0).unwrap();
+        pool.submit("boom", || -> usize { resume_unwind(Box::new("boom")) })
+            .unwrap();
+        pool.submit("t2", || 2).unwrap();
+        let mut got: Vec<(String, Outcome<usize>)> = (0..3)
+            .map(|_| {
+                let done = pool.next_completion(FOREVER).unwrap();
+                (done.task_id, done.outcome)
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            [
+                ("boom".to_owned(), Outcome::Crashed),
+                ("t0".to_owned(), Outcome::Done(0)),
+                ("t2".to_owned(), Outcome::Done(2)),
+            ]
+        );
+        assert_eq!((pool.in_flight(), pool.queued()), (0, 0));
     });
 }

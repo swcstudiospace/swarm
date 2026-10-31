@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use gsd_failure::{ErrorCode, FailureError};
 use gsd_proto::gsd::v1::Task;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{Id, JoinError, JoinSet};
 
 use crate::aimd_limiter::AimdLimiter;
 use crate::dag_build::BuiltDag;
+use crate::panic_text::panic_message;
 use crate::ready_frontier::{ready_frontier, FrontierInput, PathClaim};
 use crate::{SchedulerError, SchedulerResult};
 
@@ -293,7 +294,8 @@ struct Run<W> {
     active_claims: HashMap<String, Vec<PathClaim>>,
     running_per_agent: HashMap<String, usize>,
     in_flight: HashMap<String, String>,
-    set: JoinSet<Joined>,
+    set: JoinSet<Result<(), TaskFailure>>,
+    task_ids: HashMap<Id, String>,
     report: DispatchReport,
     gate: RateLimitGate,
     submitted_at: HashMap<String, Instant>,
@@ -347,10 +349,18 @@ where
         self.report.max_in_flight = self.report.max_in_flight.max(self.in_flight.len());
     }
 
-    /// Runs the worker in its own task so a panic is isolated and attributable to `id`.
+    /// Runs the worker as its own task, so a panic is isolated and attributable to `id`. The `JoinSet`
+    /// owns the task, so dropping the run aborts it.
     fn spawn_worker(&mut self, id: String, task: Task) {
-        let handle = tokio::spawn((*self.worker)(task));
-        self.set.spawn(async move { (id, handle.await) });
+        let abort = self.set.spawn((*self.worker)(task));
+        self.task_ids.insert(abort.id(), id);
+    }
+
+    /// Returns the task id that tokio task `task_id` ran, and forgets the mapping.
+    fn finish_id(&mut self, task_id: Id) -> SchedulerResult<String> {
+        self.task_ids.remove(&task_id).ok_or_else(|| {
+            SchedulerError::Other(format!("dispatch lost track of worker task {task_id}"))
+        })
     }
 
     /// Records one finished task and feeds its signal to the limiter.
@@ -397,23 +407,6 @@ where
     }
 }
 
-/// Failure text for a worker that panicked or was cancelled.
-///
-/// Built only from the panic payload. `JoinError`'s display embeds tokio's process-wide task id,
-/// which differs between runs, so it must never reach a completion record.
-fn panic_message(join_error: JoinError) -> String {
-    let payload = match join_error.try_into_panic() {
-        Ok(payload) => payload,
-        Err(_) => return format!("{WORKER_FAILURE_CODE}: worker task was cancelled"),
-    };
-    let detail = payload
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string());
-    format!("{WORKER_FAILURE_CODE}: worker panicked: {detail}")
-}
-
 /// Dispatches every task of `built` through `worker` and returns once no task can run.
 ///
 /// `worker` receives an owned task and returns `Ok(())` on success or a [`TaskFailure`]. A panic in
@@ -444,6 +437,7 @@ where
         gate: RateLimitGate::default(),
         submitted_at: HashMap::new(),
         set: JoinSet::new(),
+        task_ids: HashMap::new(),
         report: DispatchReport::default(),
     };
     loop {
@@ -453,12 +447,14 @@ where
         if run.set.is_empty() {
             break;
         }
-        match run.set.join_next().await {
-            Some(Ok(joined)) => run.complete(joined),
+        match run.set.join_next_with_id().await {
+            Some(Ok((task_id, result))) => {
+                let id = run.finish_id(task_id)?;
+                run.complete((id, Ok(result)));
+            }
             Some(Err(join_error)) => {
-                return Err(SchedulerError::Other(format!(
-                    "dispatch wrapper failed: {join_error}"
-                )))
+                let id = run.finish_id(join_error.id())?;
+                run.complete((id, Err(join_error)));
             }
             None => break,
         }
@@ -476,7 +472,7 @@ where
 mod tests {
     use super::*;
     use gsd_proto::gsd::v1::{SubagentType, TaskId};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -688,6 +684,41 @@ mod tests {
         let second = panic_text().await;
         assert_eq!(first, second);
         assert_eq!(first, "E-INTERNAL: worker panicked: boom");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_run_aborts_a_blocked_worker() {
+        /// Sets the flag when the worker future is dropped.
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dropped);
+        let worker = move |_task: Task| {
+            let flag = Arc::clone(&flag);
+            async move {
+                let _guard = DropFlag(flag);
+                std::future::pending::<()>().await;
+                Ok::<(), TaskFailure>(())
+            }
+        };
+        let run = run_force_parallel(built(vec![task("a", 0, "w", &[])]), serial(1), worker);
+        let stopped = tokio::time::timeout(Duration::from_millis(50), run).await;
+        assert!(stopped.is_err(), "the worker should still be blocked");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker outlived the dropped run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

@@ -83,7 +83,16 @@ def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: fl
             out, err = proc.communicate(timeout=grace)
         except subprocess.TimeoutExpired:
             _signal_pid(proc.pid, signal.SIGKILL)
-            out, err = proc.communicate()
+            try:
+                out, err = proc.communicate(timeout=grace)
+            except subprocess.TimeoutExpired:
+                # A grandchild that inherited the pipes can outlive the SIGKILL of its parent and hold them open, so
+                # communicate() would never return. Close the pipes, reap the killed direct child and abandon its output.
+                for pipe in (proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                proc.wait()
+                out, err = None, None
     return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, out or "", err or "")
 
 

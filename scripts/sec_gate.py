@@ -91,7 +91,7 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
                 if name == "generic-credential" and (_entropy(val) < 3.2 or val.isalpha()):
                     continue
                 add(name, "critical", "secrets", "credential material committed (value redacted)", loc,
-                    evidence=val[:4] + "…" + f" ({len(val)} chars)", cwe="CWE-798")
+                    evidence=f"value not recorded ({len(val)} chars)", cwe="CWE-798")
             if ext in CODE_EXTS and not COMMENT_RE.match(line):
                 for name, rx, exts, sev in SAST_RULES:
                     if ext in exts and rx.search(line):
@@ -138,7 +138,9 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
             crit = data.get("vulnerabilities", {}).get("count", 0)
         elif name == "govulncheck":
             high = sum(1 for ln in out.splitlines() if '"finding"' in ln and '"trace"' in ln)
-        elif proc.returncode != 0:
+        if proc.returncode != 0 and not (crit or high or other):
+            # P4-01/P4-02: a non-zero exit that counts no vulnerability did not complete the audit (npm's {"error": ...}
+            # JSON, a govulncheck load failure with no finding lines): fail closed, as an unparseable run does.
             high = 1
         runs[name] = "pass" if not (crit or high or other) else "fail"
         if kev or crit:

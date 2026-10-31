@@ -204,11 +204,32 @@ describe("fail", () => {
     expect(run(call("bash", { command: "ls" }), brokenBranch(entries))).toBeUndefined();
   });
 
-  test("a guard throw with an unreadable session log returns undefined (swarm marker not established)", () => {
-    process.env.SWARM_TASK_ID = "T-1";
-    const { run } = guardHandler({ activeTools: ["task"] });
-    const unreadable: ExtensionContext = { cwd: CWD, sessionManager: { getEntries: throwing, getBranch: throwing } };
-    expect(run(call("bash", {}), unreadable)).toBeUndefined();
+  const unreadableSession: ExtensionContext = {
+    cwd: CWD,
+    sessionManager: {
+      getEntries: () => {
+        throw new Error("session log unreadable");
+      },
+      getBranch: () => {
+        throw new Error("branch must not be read");
+      },
+    },
+  };
+
+  test("an unreadable session log without a swarm marker leaves main-session tools unaffected", () => {
+    const { pi, run } = guardHandler({ activeTools: ["task"] });
+    expect(run(call("bash", {}), unreadableSession)).toBeUndefined();
+    expect(pi.runtimeCalls).toEqual([]);
+  });
+
+  test.each(["SWARM_TASK_ID", "SWARM_AGENT"])("an unreadable session log with %s fails closed before reading active tools", (marker) => {
+    process.env[marker] = marker === "SWARM_TASK_ID" ? "T-1" : "a05-backend";
+    const { pi, run } = guardHandler({ activeTools: ["task"] });
+    expect(run(call("bash", {}), unreadableSession)).toEqual({
+      block: true,
+      reason: `${GUARD_ERROR_PREFIX}session log unreadable)`,
+    });
+    expect(pi.runtimeCalls).toEqual([]);
   });
 
   test.each([

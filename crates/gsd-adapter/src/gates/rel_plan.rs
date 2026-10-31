@@ -504,7 +504,14 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
             let pass = per_task
                 .iter()
                 .all(|(_, _, _, required)| !required.iter().any(|item| item == gate));
-            (gate.clone(), jstr(if pass { "pass" } else { "fail" }))
+            let state = if ids.is_empty() {
+                "skipped:no-task"
+            } else if pass {
+                "pass"
+            } else {
+                "fail"
+            };
+            (gate.clone(), jstr(state))
         })
         .chain(std::iter::once((
             "freeze".into(),
@@ -825,8 +832,7 @@ mod tests {
         // No store file: the writer refuses before any write, and Python answers.
         let error = open_for_write(&WriterConfig::new(dir.path().join("tasks.db")))
             .await
-            .err()
-            .expect("no store");
+            .expect_err("no store");
         let refusal = issue_gate_refusal(&error);
         assert_eq!(write_state(&refusal), Some("not_started"));
         assert_eq!(refusal.code(), ErrorCode::Dep);

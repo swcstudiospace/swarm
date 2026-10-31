@@ -52,11 +52,21 @@ impl TracingLayer {
         let metrics_sink = Arc::new(MetricsSink::new());
 
         let tracer_provider = if let Some(endpoint) = &config.otlp_endpoint {
-            let exporter = SpanExporter::builder()
+            let exporter = match SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint.clone())
                 .build()
-                .ok();
+            {
+                Ok(exporter) => Some(exporter),
+                Err(err) => {
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        error = %err,
+                        "OTLP span exporter failed to build; spans will not be exported"
+                    );
+                    None
+                }
+            };
 
             if let Some(exporter) = exporter {
                 let provider = SdkTracerProvider::builder()
@@ -179,4 +189,38 @@ pub fn init_default_observability() {
     let layer = TracingLayer::new(ObservabilityConfig::default());
     layer.init_logging();
     GLOBAL_TRACING.set(Arc::new(layer)).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tracing_subscriber::layer::{Context as LayerContext, Layer};
+
+    #[derive(Clone, Default)]
+    struct WarnCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for WarnCounter {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_exporter_build_warns_and_disables_tracing() {
+        let warnings = WarnCounter::default();
+        let subscriber = Registry::default().with(warnings.clone());
+        let config = ObservabilityConfig {
+            // "[::1" is not a valid URI, so the OTLP endpoint cannot be built.
+            otlp_endpoint: Some("http://[::1".to_string()),
+            ..ObservabilityConfig::default()
+        };
+
+        let layer = tracing::subscriber::with_default(subscriber, || TracingLayer::new(config));
+
+        assert_eq!(warnings.0.load(Ordering::SeqCst), 1);
+        assert!(layer.tracer_provider.is_none());
+    }
 }

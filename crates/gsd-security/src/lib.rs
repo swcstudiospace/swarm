@@ -272,10 +272,17 @@ impl AuditLogger {
     /// before the file is touched.
     pub fn new(config: SecurityConfig) -> SecurityResult<Self> {
         config.validate()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.audit_log_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        // The audit log carries unredacted metadata, so a file created here is
+        // owner-only (0o600 before umask). `mode` applies only when the file is
+        // created; an existing file keeps the mode it already has.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&config.audit_log_path)?;
 
         Ok(Self {
             file: Mutex::new(file),
@@ -653,6 +660,24 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains(TEST_SECRET));
         assert!(rendered.contains("<redacted>"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_audit_log_is_owner_only() -> SecurityResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("audit.log");
+        let config = SecurityConfig::new(TEST_SECRET, path.to_string_lossy())?;
+        let _logger = AuditLogger::new(config)?;
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "audit log mode {mode:o} grants group or other access"
+        );
         Ok(())
     }
 }

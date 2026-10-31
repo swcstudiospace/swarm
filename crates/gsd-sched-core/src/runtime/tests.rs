@@ -1146,3 +1146,77 @@ fn no_lock_is_held_while_the_loop_thread_is_inside_a_port() {
     fake.wake();
     assert_eq!(run.summary().dispatched, 2);
 }
+
+/// Thirty-two workers on the fake host, one pass. Every worker waits for a permit, so all thirty-two run at once (`peak`), and the
+/// loop is parked inside `complete` for the first completion while the pool answers from another thread: every session has finished
+/// without the loop, so no Rust lock is held across the port. Then the run drives to its end and the summary counts are checked.
+#[test]
+fn thirty_two_workers_run_to_completion_with_no_lock_held_across_a_port() {
+    const WORKERS: usize = 32;
+    let fake = Fake::new(
+        (1..=WORKERS)
+            .map(|n| Task::new(&format!("T{n}")).act(Act::Permit("DONE")))
+            .collect(),
+    );
+    fake.lock().hold_complete = true;
+    let run = start(&fake, config(WORKERS as u32));
+    fake.wait_until("all 32 sessions running at once", |s| {
+        s.started.len() == WORKERS
+    });
+    assert_eq!(
+        fake.lock().peak,
+        WORKERS,
+        "every worker ran at the same time"
+    );
+    fake.permit(WORKERS);
+    fake.wait_until("the loop thread parked in complete", |s| s.in_complete);
+    let pool = Arc::clone(&run.pool);
+    let (sender, answered) = mpsc::channel();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.in_flight() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = sender.send((pool.in_flight(), pool.queued()));
+    });
+    let counts = answered
+        .recv_timeout(WAIT)
+        .expect("the pool answered while the loop thread was inside a port");
+    assert_eq!(
+        counts,
+        (0, 0),
+        "all sessions finished while the loop thread was parked"
+    );
+    fake.lock().hold_complete = false;
+    fake.wake();
+    let summary = run.summary();
+    assert_eq!(summary.dispatched, WORKERS as u64);
+    assert_eq!(summary.effective_parallel, WORKERS as u32);
+    assert_eq!(summary.stopped, StopReason::NothingReady);
+    assert!(!summary.closed && !summary.extension_down);
+    assert!(summary.abandoned.is_empty() && summary.waiting.is_empty());
+    assert!(
+        summary.rounds >= 2,
+        "a pass after the last completion found nothing"
+    );
+    let state = fake.lock();
+    assert_eq!(
+        state.passes[0].submitted, WORKERS,
+        "one pass dispatched every task"
+    );
+    assert_eq!(state.calls_of("submit").len(), WORKERS);
+    assert_eq!(
+        state.calls_of("complete").len(),
+        WORKERS,
+        "each dispatch completed once"
+    );
+    assert_eq!((state.running, state.peak), (0, WORKERS));
+    let mut started = state.started.clone();
+    started.sort();
+    started.dedup();
+    assert_eq!(started.len(), WORKERS, "each task started exactly once");
+    assert!(
+        (1..=WORKERS).all(|n| { state.phase(&format!("T{n}")) == Phase::Final("DONE".to_owned()) })
+    );
+    assert_eq!(state.kills, 0);
+}

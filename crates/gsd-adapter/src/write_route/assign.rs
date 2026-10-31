@@ -313,7 +313,11 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
             "specialist assignments require the trusted A01 controller",
         ));
     }
-    if let Ok(agent) = std::env::var("SWARM_AGENT") {
+    // The selector forwards `SWARM_AGENT` in the overlay only when it is in its allowlist, and the process env carries it
+    // on the Python path (`orch_assign.py` reads `os.environ`). Either source naming a specialist refuses the call.
+    let process_agent = std::env::var("SWARM_AGENT").unwrap_or_default();
+    let overlay_agent = env_value(&call.env, "SWARM_AGENT").unwrap_or("");
+    for agent in [overlay_agent, process_agent.as_str()] {
         if !agent.is_empty() && agent != "A01" && agent != "a01-orchestrator" {
             return Ok(refusal(
                 "E-POLICY",
@@ -363,11 +367,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
         return Ok(refusal("E-POLICY", message));
     }
     let repo = canonical_or(&call.root.join(&args.root));
-    let swarm_dir_env = std::env::var("SWARM_DIR").ok();
-    let swarm = resolve_swarm_dir(
-        &repo,
-        env_value(&call.env, "SWARM_DIR").or(swarm_dir_env.as_deref()),
-    );
+    let swarm = resolve_swarm_dir(&repo, env_value(&call.env, "SWARM_DIR"));
     let db = swarm.join("tasks.db");
     if !db.is_file() {
         return Ok(refusal("E-INPUT", "existing task store is unavailable"));
@@ -556,11 +556,34 @@ fn signed_prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{answer, parse};
+    use crate::strangler_seam::Invocation;
+    use std::time::Duration;
 
     #[test]
     fn an_unknown_flag_is_left_to_python() {
         let argv = ["--json".into(), "--payload".into(), "x".into()];
         assert!(parse(&argv).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_specialist_overlay_is_refused_before_any_store_read() {
+        let call = Invocation {
+            agent: "A01".to_string(),
+            script: "orch_assign".to_string(),
+            argv: ["--json", "--task-id", "T-1", "--correlation-id", "C-1"]
+                .iter()
+                .map(|token| token.to_string())
+                .collect(),
+            root: std::env::temp_dir(),
+            env: vec![("SWARM_AGENT".to_string(), "A02".to_string())],
+            deadline: Duration::from_secs(5),
+            effects_path: None,
+        };
+        let reply = answer(&call)
+            .await
+            .expect("a refusal is a reply, not an error");
+        let body: serde_json::Value = serde_json::from_str(&reply.stdout).expect("reply is JSON");
+        assert_eq!(body["error"]["code"], "E-POLICY");
     }
 }

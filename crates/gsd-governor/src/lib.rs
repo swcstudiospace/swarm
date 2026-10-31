@@ -4,6 +4,7 @@
 
 use dashmap::DashMap;
 use gsd_proto::gsd::v1::{Budget, BudgetSnapshot};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -114,35 +115,9 @@ impl Governor {
         else {
             return denied_grant();
         };
-        let Ok(tokens) = u64::try_from(request.tokens) else {
-            return denied_grant();
-        };
-
-        // Check global limits
-        if !self
-            .global_usage
-            .check_and_reserve(tokens, request.cost_usd)
-        {
-            return gsd_proto::gsd::v1::BudgetGrant {
-                granted: false,
-                tokens_granted: 0,
-                wall_time_ms_granted: 0,
-                tool_calls_granted: 0,
-                cost_usd_granted: 0.0,
-                valid_for: None,
-            };
-        }
-
         // Check rate limits
         if !self.rate_limiters.check_rate_limit() {
-            return gsd_proto::gsd::v1::BudgetGrant {
-                granted: false,
-                tokens_granted: 0,
-                wall_time_ms_granted: 0,
-                tool_calls_granted: 0,
-                cost_usd_granted: 0.0,
-                valid_for: None,
-            };
+            return denied_grant();
         }
 
         match self.try_reserve_budget(&request, &session_id.value, &thread_id.value) {
@@ -151,13 +126,14 @@ impl Governor {
         }
     }
 
-    /// Reserves session and thread budgets. Refuses with `BudgetExceeded` when any amount exceeds what remains; a refusal changes nothing.
+    /// Reserves session, thread and global budgets. Refuses with `InvalidBudget` for negative or non-finite amounts and with `BudgetExceeded` when any amount exceeds what remains; a refusal changes nothing.
     fn try_reserve_budget(
         &self,
         request: &gsd_proto::gsd::v1::BudgetRequest,
         session_id: &str,
         thread_id: &str,
     ) -> GovernorResult<gsd_proto::gsd::v1::BudgetGrant> {
+        let tokens = validate_request(request)?;
         let session_arc = self.get_or_create_session_budget(session_id);
         let mut session = session_arc.write();
         check_remaining(&session, request, "session")?;
@@ -165,6 +141,16 @@ impl Governor {
         let thread_arc = self.get_or_create_thread_budget(thread_id);
         let mut thread = thread_arc.write();
         check_remaining(&thread, request, "thread")?;
+
+        // Global check and add run under the local locks, so a refusal at any level changes nothing.
+        if !self
+            .global_usage
+            .try_reserve(request, session_id, thread_id, tokens)
+        {
+            return Err(GovernorError::BudgetExceeded(
+                "global token or cost cap reached".to_string(),
+            ));
+        }
 
         apply_reserve(&mut session, request);
         apply_reserve(&mut thread, request);
@@ -239,20 +225,45 @@ impl Governor {
         tool_calls: i32,
         cost_usd: f64,
     ) -> GovernorResult<()> {
-        let global_tokens = u64::try_from(tokens).map_err(|_| {
-            GovernorError::InvalidBudget(format!("negative token release: {tokens}"))
-        })?;
-        if let Some(budget) = self.session_budgets.get(session_id) {
-            let mut budget = budget.write();
-            release_amounts(&mut budget, tokens, wall_time_ms, tool_calls, cost_usd);
-        }
+        validate_amounts(tokens, wall_time_ms, tool_calls, cost_usd)?;
 
-        if let Some(budget) = self.thread_budgets.get(thread_id) {
-            let mut budget = budget.write();
-            release_amounts(&mut budget, tokens, wall_time_ms, tool_calls, cost_usd);
+        // Match both ids before touching either aggregate. A session or thread alone does not
+        // identify which reservation is being returned.
+        if let (Some(session), Some(thread)) = (
+            self.session_budgets
+                .get(session_id)
+                .map(|budget| Arc::clone(&budget)),
+            self.thread_budgets
+                .get(thread_id)
+                .map(|budget| Arc::clone(&budget)),
+        ) {
+            // Keep the reservation lock order: session, thread, then global accounting.
+            let mut session = session.write();
+            let mut thread = thread.write();
+            let requested = ReservedAmounts {
+                tokens,
+                wall_time_ms,
+                tool_calls,
+                cost_usd,
+                cost_micros: 0,
+            };
+            if let Some(freed) = self.global_usage.release(session_id, thread_id, &requested) {
+                release_amounts(
+                    &mut session,
+                    freed.tokens,
+                    freed.wall_time_ms,
+                    freed.tool_calls,
+                    freed.cost_usd,
+                );
+                release_amounts(
+                    &mut thread,
+                    freed.tokens,
+                    freed.wall_time_ms,
+                    freed.tool_calls,
+                    freed.cost_usd,
+                );
+            }
         }
-
-        self.global_usage.release(global_tokens, cost_usd);
         self.metrics.inc_releases();
         Ok(())
     }
@@ -276,38 +287,122 @@ impl Governor {
     }
 }
 
+/// Tokens and cost reserved across every session and thread.
 struct GlobalUsage {
-    tokens_used: std::sync::atomic::AtomicU64,
-    cost_usd_used: std::sync::atomic::AtomicU64, // Store as micros USD
+    totals: parking_lot::Mutex<GlobalTotals>,
+}
+
+#[derive(Default)]
+struct GlobalTotals {
+    tokens_used: u64,
+    cost_micros_used: u64,
+    reservations: HashMap<String, HashMap<String, ReservedAmounts>>,
+}
+
+/// Outstanding amounts for one session/thread pair, including the micros actually charged.
+#[derive(Default)]
+struct ReservedAmounts {
+    tokens: i64,
+    wall_time_ms: i64,
+    tool_calls: i32,
+    cost_usd: f64,
+    cost_micros: u64,
 }
 
 impl GlobalUsage {
     fn new() -> Self {
         Self {
-            tokens_used: std::sync::atomic::AtomicU64::new(0),
-            cost_usd_used: std::sync::atomic::AtomicU64::new(0),
+            totals: parking_lot::Mutex::new(GlobalTotals::default()),
         }
     }
 
-    fn check_and_reserve(&self, tokens: u64, cost_usd: f64) -> bool {
-        let current_tokens = self.tokens_used.load(Ordering::Acquire);
-        let current_cost = self.cost_usd_used.load(Ordering::Acquire) as f64 / 1_000_000.0;
-
-        if current_tokens + tokens > 1_000_000 || current_cost + cost_usd > 100.0 {
+    /// Checks the global limits and adds the reservation under one lock, so concurrent callers cannot all pass the check.
+    fn try_reserve(
+        &self,
+        request: &gsd_proto::gsd::v1::BudgetRequest,
+        session_id: &str,
+        thread_id: &str,
+        tokens: u64,
+    ) -> bool {
+        let mut totals = self.totals.lock();
+        let current_cost = micros_to_usd(totals.cost_micros_used);
+        if totals.tokens_used + tokens > 1_000_000 || current_cost + request.cost_usd > 100.0 {
             return false;
         }
+        let cost_micros = usd_to_micros(request.cost_usd);
+        totals.tokens_used += tokens;
+        totals.cost_micros_used += cost_micros;
 
-        self.tokens_used.fetch_add(tokens, Ordering::AcqRel);
-        self.cost_usd_used
-            .fetch_add((cost_usd * 1_000_000.0) as u64, Ordering::AcqRel);
+        // Allocate keys only for a newly seen pair, not on every reservation.
+        if !totals.reservations.contains_key(session_id) {
+            totals
+                .reservations
+                .insert(session_id.to_owned(), HashMap::new());
+        }
+        let threads = totals.reservations.get_mut(session_id).unwrap();
+        if !threads.contains_key(thread_id) {
+            threads.insert(thread_id.to_owned(), ReservedAmounts::default());
+        }
+        let reserved = threads.get_mut(thread_id).unwrap();
+        reserved.tokens += request.tokens;
+        reserved.wall_time_ms += request.wall_time_ms;
+        reserved.tool_calls += request.tool_calls;
+        reserved.cost_usd += request.cost_usd;
+        reserved.cost_micros += cost_micros;
         true
     }
 
-    fn release(&self, tokens: u64, cost_usd: f64) {
-        self.tokens_used.fetch_sub(tokens, Ordering::AcqRel);
-        self.cost_usd_used
-            .fetch_sub((cost_usd * 1_000_000.0) as u64, Ordering::AcqRel);
+    fn release(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        requested: &ReservedAmounts,
+    ) -> Option<ReservedAmounts> {
+        let mut totals = self.totals.lock();
+        let threads = totals.reservations.get_mut(session_id)?;
+        let reserved = threads.get_mut(thread_id)?;
+        let mut freed = ReservedAmounts {
+            tokens: requested.tokens.min(reserved.tokens),
+            wall_time_ms: requested.wall_time_ms.min(reserved.wall_time_ms),
+            tool_calls: requested.tool_calls.min(reserved.tool_calls),
+            cost_usd: requested.cost_usd.min(reserved.cost_usd),
+            cost_micros: 0,
+        };
+        reserved.tokens -= freed.tokens;
+        reserved.wall_time_ms -= freed.wall_time_ms;
+        reserved.tool_calls -= freed.tool_calls;
+        reserved.cost_usd = (reserved.cost_usd - freed.cost_usd).max(0.0);
+        // A full return refunds exactly the micros charged to this pair, even when separate
+        // sub-micro reservations rounded differently from their aggregate USD amount.
+        freed.cost_micros = if reserved.cost_usd == 0.0 {
+            reserved.cost_micros
+        } else {
+            usd_to_micros(freed.cost_usd).min(reserved.cost_micros)
+        };
+        reserved.cost_micros -= freed.cost_micros;
+        if reserved.tokens == 0
+            && reserved.wall_time_ms == 0
+            && reserved.tool_calls == 0
+            && reserved.cost_usd == 0.0
+            && reserved.cost_micros == 0
+        {
+            threads.remove(thread_id);
+        }
+        if threads.is_empty() {
+            totals.reservations.remove(session_id);
+        }
+        totals.tokens_used -= freed.tokens as u64;
+        totals.cost_micros_used -= freed.cost_micros;
+        Some(freed)
     }
+}
+
+fn usd_to_micros(cost_usd: f64) -> u64 {
+    (cost_usd * 1_000_000.0).round() as u64
+}
+
+fn micros_to_usd(micros: u64) -> f64 {
+    micros as f64 / 1_000_000.0
 }
 
 struct RateLimiterRegistry;
@@ -344,6 +439,42 @@ impl GovernorMetrics {
     fn inc_releases(&self) {
         self.releases.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Checks every reservation or release amount. Negative or non-finite values would mint or corrupt budget.
+fn validate_amounts(
+    tokens: i64,
+    wall_time_ms: i64,
+    tool_calls: i32,
+    cost_usd: f64,
+) -> GovernorResult<u64> {
+    let tokens_checked = u64::try_from(tokens)
+        .map_err(|_| GovernorError::InvalidBudget(format!("negative token amount: {tokens}")))?;
+    if wall_time_ms < 0 {
+        return Err(GovernorError::InvalidBudget(format!(
+            "negative wall_time_ms amount: {wall_time_ms}"
+        )));
+    }
+    if tool_calls < 0 {
+        return Err(GovernorError::InvalidBudget(format!(
+            "negative tool_calls amount: {tool_calls}"
+        )));
+    }
+    if !cost_usd.is_finite() || cost_usd < 0.0 {
+        return Err(GovernorError::InvalidBudget(format!(
+            "invalid cost_usd amount: {cost_usd}"
+        )));
+    }
+    Ok(tokens_checked)
+}
+
+fn validate_request(request: &gsd_proto::gsd::v1::BudgetRequest) -> GovernorResult<u64> {
+    validate_amounts(
+        request.tokens,
+        request.wall_time_ms,
+        request.tool_calls,
+        request.cost_usd,
+    )
 }
 
 /// Refuses when any requested amount exceeds the snapshot's remaining amount.
@@ -407,7 +538,7 @@ fn apply_reserve(
     budget.cost_usd_remaining -= request.cost_usd;
 }
 
-/// Removes a release from the used fields and returns the amount actually freed to the remaining fields.
+/// Removes at most the amounts held locally and restores only that capacity.
 fn release_amounts(
     budget: &mut gsd_proto::gsd::v1::BudgetSnapshot,
     tokens: i64,
@@ -416,26 +547,26 @@ fn release_amounts(
     cost_usd: f64,
 ) {
     let tokens_before = budget.tokens_used;
-    budget.tokens_used = tokens_before.saturating_sub(tokens);
-    budget.tokens_remaining = budget
-        .tokens_remaining
-        .saturating_add(tokens_before.saturating_sub(budget.tokens_used));
+    budget.tokens_used = tokens_before.saturating_sub(tokens).max(0);
+    let tokens_freed = tokens_before.saturating_sub(budget.tokens_used).max(0);
+    budget.tokens_remaining = budget.tokens_remaining.saturating_add(tokens_freed);
 
     let wall_before = budget.wall_time_ms_used;
-    budget.wall_time_ms_used = wall_before.saturating_sub(wall_time_ms);
+    budget.wall_time_ms_used = wall_before.saturating_sub(wall_time_ms).max(0);
     budget.wall_time_ms_remaining = budget
         .wall_time_ms_remaining
         .saturating_add(wall_before.saturating_sub(budget.wall_time_ms_used));
 
     let calls_before = budget.tool_calls_used;
-    budget.tool_calls_used = calls_before.saturating_sub(tool_calls);
+    budget.tool_calls_used = calls_before.saturating_sub(tool_calls).max(0);
     budget.tool_calls_remaining = budget
         .tool_calls_remaining
         .saturating_add(calls_before.saturating_sub(budget.tool_calls_used));
 
     let cost_before = budget.cost_usd_used;
     budget.cost_usd_used = (cost_before - cost_usd).max(0.0);
-    budget.cost_usd_remaining += cost_before - budget.cost_usd_used;
+    let cost_freed = cost_before - budget.cost_usd_used;
+    budget.cost_usd_remaining += cost_freed;
 }
 
 #[cfg(test)]
@@ -555,5 +686,119 @@ mod tests {
         assert_eq!(thread.wall_time_ms_remaining, 300_000);
         assert_eq!(thread.tool_calls_remaining, 100);
         assert_eq!(thread.cost_usd_remaining, 1.0);
+    }
+
+    fn budget_request(
+        session: &str,
+        thread: &str,
+        tokens: i64,
+        cost_usd: f64,
+    ) -> gsd_proto::gsd::v1::BudgetRequest {
+        gsd_proto::gsd::v1::BudgetRequest {
+            session_id: Some(gsd_proto::gsd::v1::SessionId {
+                value: session.to_string(),
+            }),
+            thread_id: Some(gsd_proto::gsd::v1::ChatThreadId {
+                value: thread.to_string(),
+            }),
+            tokens,
+            cost_usd,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refused_reservation_leaves_global_usage_untouched() {
+        let gov = Governor::new(GovernorConfig::default());
+        for _ in 0..100 {
+            let grant =
+                tokio_test::block_on(gov.reserve_budget(budget_request("s", "t", 25_000, 0.0)));
+            assert!(!grant.granted);
+        }
+        assert_eq!(gov.global_usage.totals.lock().tokens_used, 0);
+
+        let grant = tokio_test::block_on(gov.reserve_budget(budget_request("s", "t", 1_000, 0.0)));
+        assert!(grant.granted);
+    }
+
+    #[test]
+    fn release_without_matching_reservation_frees_no_global_usage() {
+        let gov = Governor::new(GovernorConfig::default());
+        gov.try_reserve_budget(&request(1_000, 0, 0, 0.0), "s", "t")
+            .expect("reservation accepted");
+        gov.try_reserve_budget(&request(2_000, 0, 0, 0.0), "s2", "t2")
+            .expect("reservation accepted");
+
+        for _ in 0..2 {
+            tokio_test::block_on(gov.release_budget("s", "t", 1_000, 0, 0, 0.0))
+                .expect("release accepted");
+        }
+        assert_eq!(gov.global_usage.totals.lock().tokens_used, 2_000);
+
+        tokio_test::block_on(gov.release_budget("unknown", "unknown", 5_000, 0, 0, 0.0))
+            .expect("release accepted");
+        assert_eq!(gov.global_usage.totals.lock().tokens_used, 2_000);
+    }
+
+    #[test]
+    fn invalid_amounts_are_refused_before_any_mutation() {
+        let gov = Governor::new(GovernorConfig::default());
+        gov.try_reserve_budget(&request(0, 0, 0, 0.0), "s", "t")
+            .expect("zero reservation accepted");
+        let session_before = session_snapshot(&gov, "s");
+        let thread_before = thread_snapshot(&gov, "t");
+
+        for bad in [
+            request(0, 0, 0, -5.0),
+            request(0, 0, 0, f64::NAN),
+            request(0, -500, 0, 0.0),
+            request(0, 0, -2, 0.0),
+        ] {
+            let err = gov
+                .try_reserve_budget(&bad, "s", "t")
+                .expect_err("invalid amount is refused");
+            assert!(matches!(err, GovernorError::InvalidBudget(_)));
+        }
+
+        let grant = tokio_test::block_on(gov.reserve_budget(budget_request("s", "t", 0, -5.0)));
+        assert!(!grant.granted);
+
+        assert_eq!(session_snapshot(&gov, "s"), session_before);
+        assert_eq!(thread_snapshot(&gov, "t"), thread_before);
+        assert_eq!(gov.global_usage.totals.lock().cost_micros_used, 0);
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_global_token_cap() {
+        let mut config = GovernorConfig::default();
+        config.default_session_budget.max_tokens = 10_000_000;
+        config.default_thread_budget.max_tokens = 10_000_000;
+        let gov = Arc::new(Governor::new(config));
+
+        let granted: u64 = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..64)
+                .map(|i| {
+                    let gov = Arc::clone(&gov);
+                    scope.spawn(move || {
+                        let thread = format!("t{i}");
+                        let grant = tokio_test::block_on(
+                            gov.reserve_budget(budget_request("s", &thread, 20_000, 0.0)),
+                        );
+                        if grant.granted {
+                            20_000u64
+                        } else {
+                            0u64
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("reserving thread joins"))
+                .sum()
+        });
+
+        assert!(granted <= 1_000_000);
+        assert_eq!(gov.global_usage.totals.lock().tokens_used, granted);
     }
 }

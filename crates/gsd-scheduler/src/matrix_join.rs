@@ -15,12 +15,13 @@ use std::future::Future;
 use std::sync::Arc;
 
 use gsd_proto::gsd::v1::Task;
-use tokio::task::JoinError;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::dag_build::{build_dag_from, BuiltDag};
 use crate::force_parallel_dispatch::{
     run_force_parallel, DispatchConfig, DispatchMode, TaskFailure, TaskOutcome, WORKER_FAILURE_CODE,
 };
+use crate::panic_text::panic_message;
 use crate::semaphore::SemaphoreManager;
 use crate::{MatrixScheduler, SchedulerError, SchedulerResult};
 
@@ -174,12 +175,7 @@ where
     let gated = move |task: Task| {
         let semaphores = Arc::clone(&semaphores);
         let worker = Arc::clone(&worker);
-        async move {
-            match semaphores.global().acquire().await {
-                Ok(_permit) => run_isolated((*worker)(task)).await,
-                Err(error) => Err(TaskFailure::Exception(error.to_string())),
-            }
-        }
+        async move { run_gated(semaphores, (*worker)(task)).await }
     };
     let report = run_force_parallel(built, config, gated).await?;
 
@@ -396,33 +392,50 @@ fn outcome_of(result: Result<(), TaskFailure>) -> TaskOutcome {
     }
 }
 
-/// Runs one worker call in its own spawned task, so a panic fails only that task. The gated dispatch
-/// path and the replay both use this, so a panic gives the same outcome in both.
+/// Runs one worker call in its own spawned task, so a panic fails only that task. The replay uses this.
+/// The gated dispatch path uses the same wait, so a panic gives the same outcome in both.
 async fn run_isolated<Fut>(attempt: Fut) -> Result<(), TaskFailure>
 where
     Fut: Future<Output = Result<(), TaskFailure>> + Send + 'static,
 {
-    match tokio::spawn(attempt).await {
+    join_attempt(tokio::spawn(attempt)).await
+}
+
+/// Like [`run_isolated`], but the attempt first takes a permit from the global pool and holds it until
+/// the attempt itself ends. A permit is therefore never freed while its worker is still running, even
+/// when the join is cancelled.
+async fn run_gated<Fut>(semaphores: Arc<SemaphoreManager>, attempt: Fut) -> Result<(), TaskFailure>
+where
+    Fut: Future<Output = Result<(), TaskFailure>> + Send + 'static,
+{
+    let handle = tokio::spawn(async move {
+        let _permit = semaphores
+            .global()
+            .acquire()
+            .await
+            .map_err(|error| TaskFailure::Exception(error.to_string()))?;
+        attempt.await
+    });
+    join_attempt(handle).await
+}
+
+/// Waits for an attempt started by [`run_isolated`] or [`run_gated`]. Dropping the wait aborts the
+/// attempt, so a cancelled join does not leave its workers running.
+async fn join_attempt(handle: JoinHandle<Result<(), TaskFailure>>) -> Result<(), TaskFailure> {
+    let _abort_on_drop = AbortOnDrop(handle.abort_handle());
+    match handle.await {
         Ok(result) => result,
         Err(join_error) => Err(TaskFailure::Exception(panic_message(join_error))),
     }
 }
 
-/// Failure text for a worker that panicked or was cancelled.
-///
-/// Built only from the panic payload. `JoinError`'s display embeds tokio's process-wide task id,
-/// which differs between runs, so it must never reach a completion record.
-fn panic_message(join_error: JoinError) -> String {
-    let payload = match join_error.try_into_panic() {
-        Ok(payload) => payload,
-        Err(_) => return format!("{WORKER_FAILURE_CODE}: worker task was cancelled"),
-    };
-    let detail = payload
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string());
-    format!("{WORKER_FAILURE_CODE}: worker panicked: {detail}")
+/// Aborts the task behind its handle when dropped. Dropping an [`AbortHandle`] alone does not abort.
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn task_id_of(task: &Task) -> &str {
@@ -437,6 +450,7 @@ fn agent_of(task: &Task) -> &str {
 mod tests {
     use super::*;
     use gsd_proto::gsd::v1::{SubagentType, TaskId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn task(id: &str, deps: &[&str]) -> Task {
@@ -700,5 +714,74 @@ mod tests {
             rec(0, 1, 4, "q"),
         ]);
         assert_eq!(ids(&log), vec!["q", "b", "m", "z", "a"]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_join_does_not_free_pool_slots_early() {
+        /// Counts one live worker body. The count drops when the body is dropped.
+        struct Live(Arc<AtomicUsize>);
+
+        impl Drop for Live {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let worker = {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move |_task: Task| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let _live = Live(active);
+                    std::future::pending::<()>().await;
+                    Ok::<(), TaskFailure>(())
+                }
+            }
+        };
+        let wide = || {
+            let mut config = DispatchConfig {
+                requested_parallel: 30,
+                ..Default::default()
+            };
+            config.agent_max_parallel.insert("w".to_string(), 30);
+            config
+        };
+        let thirty = |stage: u32| {
+            batch(
+                stage,
+                (0..30).map(|i| task(&format!("t{i}"), &[])).collect(),
+            )
+        };
+        let semaphores = permits();
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_matrix_join(thirty(0), wide(), Arc::clone(&semaphores), worker.clone()),
+        )
+        .await;
+        assert!(first.is_err(), "first join should still be blocked");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            30,
+            "first join should fill the pool"
+        );
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_matrix_join(thirty(1), wide(), Arc::clone(&semaphores), worker),
+        )
+        .await;
+        assert!(second.is_err(), "second join should still be blocked");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 30,
+            "pool exceeded after cancel: peak {}",
+            peak.load(Ordering::SeqCst)
+        );
     }
 }

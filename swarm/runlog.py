@@ -6,8 +6,8 @@ end-of-run summary reports (via log_summary).
 Every agent script + swarm_run + hooks + subagent_lifecycle use it for causal audit by correlation_id.
 Logging paths spec lives in swarm.paths.logging_paths().
 """
-from __future__ import annotations
 import json
+import logging
 import re
 import time
 import uuid
@@ -93,10 +93,15 @@ def read_events(*, correlation_id: str | None = None, task_id: str | None = None
     if not log_file.exists():
         return []
     out: list[dict[str, Any]] = []
+    skipped = 0
     for line in log_file.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        rec = json.loads(line)
+        try:
+            rec = json.loads(line)
+        except ValueError:  # a torn trailing line from a crash mid-append must not fail every reader (telemetry skips it too)
+            skipped += 1
+            continue
         if correlation_id and rec.get("correlation_id") != correlation_id:
             continue
         if task_id and rec.get("task_id") != task_id:
@@ -104,6 +109,8 @@ def read_events(*, correlation_id: str | None = None, task_id: str | None = None
         if event_type and rec.get("type") != event_type:
             continue
         out.append(rec)
+    if skipped:
+        logging.getLogger(__name__).warning("skipped %d undecodable line(s) in %s", skipped, log_file)
     return out
 
 

@@ -301,12 +301,17 @@ where
     let mut buffer = [0u8; 8192];
     let mut total = 0u64;
     let mut cancel_rx = cancel;
+    // Once every sender is dropped, `changed()` fails at once; the cancel branch is then disabled.
+    let mut cancel_open = true;
 
     loop {
         tokio::select! {
             biased;
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
+            changed = cancel_rx.changed(), if cancel_open => {
+                if changed.is_err() {
+                    // Every sender is gone, so no cancel can arrive; stop polling this branch.
+                    cancel_open = false;
+                } else if *cancel_rx.borrow() {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
                 }
             }
@@ -590,5 +595,21 @@ mod tests {
         assert!(path.exists());
         manager.cleanup().await.unwrap();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn copy_with_cancel_keeps_copying_after_sender_dropped() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        let payload = vec![7u8; 1024];
+        let mut out: Vec<u8> = Vec::new();
+        let copied = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            copy_with_progress_and_cancel(payload.as_slice(), &mut out, |_, _| {}, rx),
+        )
+        .await
+        .expect("copy must not spin once the cancel sender is gone");
+        assert_eq!(copied.unwrap(), 1024);
+        assert_eq!(out, payload);
     }
 }

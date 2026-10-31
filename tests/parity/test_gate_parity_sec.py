@@ -5,10 +5,13 @@ selector's request, which answers a served call (exit 0 or 1, a `sec_gate` body)
 `E-DEP`, `write_state = not_started`); and the selector with `GSD_ENGINE=rust`, which hands a declined call to Python.
 A served cell must be answered by the binary. A declined cell must be refused by the binary and then answered by Python.
 Every cell's reply bytes equal Python's once the masked envelope fields (message ids, trace, timestamps, signature) are
-replaced. The secret values are generated in the run; nothing secret-like is committed. Unset `GSD_ENGINE_BIN` skips.
+replaced. Recovery cells cover failed audits with no counted findings, clean controls, and length-only secret evidence.
+Keyed selectors pin the binary's digest at fixture time. The secret values are generated in the run; nothing secret-like
+is committed. Unset `GSD_ENGINE_BIN` skips.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -28,7 +31,37 @@ sys.path.insert(0, str(HERE))
 
 import gen_sec_gate_vectors as gen  # noqa: E402
 
-CASES = gen.build_cases(random.Random(20261030))
+AUDIT_RECOVERY = [
+    ("npm_error_json", "npm-audit", "package.json", "npm", '{"error": {"code": "EAUDITNOLOCK"}}', 1),
+    ("npm_clean", "npm-audit", "package.json", "npm", '{"metadata": {"vulnerabilities": {}}}', 0),
+    ("npm_zero_counts_failure", "npm-audit", "package.json", "npm", '{"metadata": {"vulnerabilities": {}}}', 1),
+    ("go_load_failure", "govulncheck", "go.mod", "govulncheck", '{"error": "package load failed"}', 1),
+    ("go_clean", "govulncheck", "go.mod", "govulncheck", '{"config": {}}', 0),
+    ("pip_empty_failure", "pip-audit", "requirements.txt", "pip-audit", "[]", 1),
+    ("pip_clean", "pip-audit", "requirements.txt", "pip-audit", "[]", 0),
+    ("cargo_zero_counts_failure", "cargo-audit", "Cargo.lock", "cargo", '{"vulnerabilities": {"count": 0}}', 1),
+    ("cargo_clean", "cargo-audit", "Cargo.lock", "cargo", '{"vulnerabilities": {"count": 0}}', 0),
+]
+AUDIT_EXPECTATIONS = {
+    f"recovery_{name}": (audit, "fail" if status else "pass")
+    for name, audit, _, _, _, status in AUDIT_RECOVERY
+}
+RECOVERY_SECRET = "ghp_" + "".join(random.Random(20261031).choices(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=36))
+CASES = gen.build_cases(random.Random(20261030)) + [
+    gen.Case(
+        f"recovery_{name}", True, ["--json"],
+        files={manifest: ""},
+        shims={
+            **({"cargo-audit": "exit 0"} if audit == "cargo-audit" else {}),
+            binary: f"printf '%s\\n' '{output}'\nexit {status}",
+        },
+    )
+    for name, audit, manifest, binary, output, status in AUDIT_RECOVERY
+] + [
+    gen.Case("recovery_secret_length_only", True, ["--json"],
+             files={"src/config.py": f'token = "{RECOVERY_SECRET}"\n'}),
+]
 
 # Fields the signed envelope derives from the clock or from random ids: replaced before the byte comparison.
 MASKS = [
@@ -44,6 +77,13 @@ def _binary() -> str:
     if not os.access(value, os.X_OK):
         pytest.fail(f"GSD_ENGINE_BIN is not executable: {value}")
     return value
+
+
+@pytest.fixture
+def engine_binary(monkeypatch: pytest.MonkeyPatch) -> str:
+    binary = str(Path(_binary()).resolve())
+    monkeypatch.setenv("GSD_ENGINE_BIN_SHA256", hashlib.sha256(Path(binary).read_bytes()).hexdigest())
+    return binary
 
 
 def _masked(raw: bytes) -> str:
@@ -101,8 +141,8 @@ def _declined(returncode: int, body: Optional[dict[str, Any]]) -> bool:
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
-def test_case_matches_python(case: gen.Case, tmp_path: Path) -> None:
-    binary = _binary()
+def test_case_matches_python(case: gen.Case, tmp_path: Path, engine_binary: str) -> None:
+    binary = engine_binary
     base = tmp_path / case.name
     base.mkdir()
     py_paths = gen.materialize(case, base / "py")
@@ -130,3 +170,21 @@ def test_case_matches_python(case: gen.Case, tmp_path: Path) -> None:
                               cwd=ROOT, timeout=120)
     assert selected.returncode == python.returncode, f"{case.name}: selector exit differs"
     assert _masked(selected.stdout) == _masked(python.stdout), f"{case.name}: selector bytes differ from Python"
+
+    if case.name in AUDIT_EXPECTATIONS:
+        audit, expected = AUDIT_EXPECTATIONS[case.name]
+        for answer in (json.loads(python.stdout), body, json.loads(selected.stdout)):
+            assert answer["runs"][audit] == expected
+            assert answer["verdict"] == expected
+            if expected == "fail":
+                assert any(finding["kind"] == "deps" and finding["severity"] == "major"
+                           for finding in answer["findings"])
+            else:
+                assert answer["findings"] == []
+    if case.name == "recovery_secret_length_only":
+        for answer in (json.loads(python.stdout), body, json.loads(selected.stdout)):
+            secrets = [finding for finding in answer["findings"] if finding["kind"] == "secrets"]
+            assert len(secrets) == 1
+        for output in (python.stdout, raw, selected.stdout):
+            assert RECOVERY_SECRET.encode() not in output
+            assert RECOVERY_SECRET[:4].encode() not in output

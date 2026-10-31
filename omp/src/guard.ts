@@ -135,6 +135,8 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
     const mcp = devices.find((p) => MCP_DEVICE.test(p) && !ownSubstrateTool(p, facts));
     if (mcp !== undefined) return { block: true, reason: reason("mcp", mcp) };
   }
+  // TS-02: an ast_edit write whose content names no `paths` array would act on files the guard cannot see: refused
+  if (event.toolName === "write" && astEditUnjudgeable(event.input)) return { block: true, reason: reason("protected_path", "ast-edit-unjudgeable") };
   if ((event.toolName === "read" || event.toolName === "grep") && signerToolRead(event, facts)) {
     return { block: true, reason: reason("signer_credential", "signer-file-read") };
   }
@@ -219,6 +221,24 @@ export function editTargets(input: unknown): string[] {
     if (Array.isArray(paths)) for (const p of paths) add(p);
   }
   return out;
+}
+
+/**
+ * TS-02: a `write` to the `xd://ast_edit` device whose `content` is not JSON with a `paths` array names no file the guard
+ * can judge, yet the device still acts on it: such a call is refused, never passed on with its targets dropped. (`edit` has
+ * no `content` parameter, so only the write shape carries the device payload.)
+ */
+function astEditUnjudgeable(input: unknown): boolean {
+  if (typeof input !== "object" || input === null) return false;
+  const { path, file_path, content } = input as { path?: unknown; file_path?: unknown; content?: unknown };
+  if (![path, file_path].some((p) => typeof p === "string" && AST_EDIT_DEVICE.test(p.trim()))) return false;
+  let args: { paths?: unknown } | null | undefined;
+  try {
+    args = typeof content === "string" ? JSON.parse(content) : undefined;
+  } catch {
+    return true;
+  }
+  return !Array.isArray(args?.paths);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -342,6 +362,8 @@ export interface Segment {
   /** Its stdin is a pipe (a pipeline member after the first). */
   piped: boolean;
   cwd: string | undefined;
+  /** Set past MAX_LITERAL_DEPTH on a segment whose shell body (`sh -c`, su/trap/alias/env -S) is not unwrapped: nothing judges it. */
+  unjudged?: true;
 }
 type Matcher = (seg: Segment, facts: GuardFacts, command: string) => boolean;
 
@@ -398,7 +420,7 @@ const SHELL_WORD = /^(?:sh|bash|rbash|zsh|dash|ash|ksh|mksh|oksh|pdksh|yash|posh
 const JOINS_ARGS = /^\s*(?:(?:\S*\/)?(?:eval|watch|parallel)\b|(?:\S*\/)?sudo\b.*\s(?:-[A-Za-z]*[si]|--shell|--login)(?:\s|$))/;
 /** `env -S LINE` / `--split-string=LINE` once the `env` word was stripped: the rest of the line is the command. */
 const SPLIT_STRING = /^(?:-[A-Za-z]*S\s*|--split-string(?:=|\s+))/;
-/** Nesting cap for `sh -c "sh -c '…'"` recursion. */
+/** Nesting cap for `sh -c "sh -c '…'"` recursion: past it a shell body is refused as unjudged (nested-shell-depth), never dropped. */
 const MAX_LITERAL_DEPTH = 3;
 
 /** The value of the `$'…'` escape whose letter is at `word[i]`, and the index of its last character. */
@@ -726,6 +748,8 @@ interface Normalized {
   piped: boolean;
   /** A top-level item of a `$(…)`/backtick body in `payload`: it expands before the command's own prefix assignment takes effect. */
   substitution?: boolean;
+  /** Set past MAX_LITERAL_DEPTH on an item whose shell body is not unwrapped (see Segment.unjudged). */
+  unjudged?: true;
 }
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
@@ -811,6 +835,8 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     // `sudo -e FILE` edits FILE
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
+    // TS-04: past the depth cap a shell body is not unwrapped; the segment is marked unjudged and refused, never passed on
+    const unjudged = seg !== "" && depth >= MAX_LITERAL_DEPTH && (shellDashC(shellWords(seg)) !== undefined || otherCommandLines(seg).length > 0);
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
       const shellLines = shellDashC(shellWords(seg));
       if (shellLines !== undefined) {
@@ -834,7 +860,7 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     const runtime = info?.runtime;
     if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
     const opaque = /(?:^|\s)(?:\u0001[\uE000-\uF8FF])+(?:\s|$)/.test(prefix);
-    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn };
+    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn, ...(unjudged ? { unjudged: true as const } : {}) };
     attach(item, `${prefix} ${seg} ${piece.body ?? ""}`);
     items.push(item);
     pipeIn = piece.end === "|" || (pipeIn && seg === "" && (piece.end === "(" || piece.end === "{"));
@@ -955,7 +981,7 @@ const REDIRECT_WORD = new RegExp(`^${REDIRECT_OP}`);
  * scan reads their targets from `marked`), unquoted brace lists expanded (`{touch,.swarm/x}`, `cp a{,.bak}`) and
  * run-time operands marked CUT; `cwd` is set by the caller.
  */
-function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque" | "piped">): Segment {
+function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque" | "piped" | "unjudged">): Segment {
   const all: string[] = [];
   const raw = shellWords(item.text);
   for (let i = 0; i < raw.length; i++) {
@@ -978,7 +1004,7 @@ function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "op
   // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
   const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
   const text = item.text.replace(CUT_TOKEN, " ").trim();
-  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix };
+  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix, ...(item.unjudged ? { unjudged: true as const } : {}) };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -3428,6 +3454,13 @@ export const RULES: readonly Rule[] = [
       "cast wallet derive 'a b c'",
       "cast wallet public-key --raw-private-key 0x01",
     ],
+  },
+  // TS-04: a shell body past MAX_LITERAL_DEPTH is not unwrapped, so nothing judges what it runs: refused, not passed with the body unread
+  {
+    id: "nested-shell-depth",
+    capability: "eval",
+    pattern: (seg) => seg.unjudged === true,
+    samples: [String.raw`sh -c "sh -c \"sh -c \\\"sh -c 'echo nested'\\\"\""`],
   },
 ];
 

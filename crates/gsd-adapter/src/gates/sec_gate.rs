@@ -520,8 +520,7 @@ impl Scan {
     fn add(
         &mut self,
         kind: &str,
-        rule: &str,
-        severity: &str,
+        (rule, severity): (&str, &str),
         summary: &str,
         loc: &str,
         evidence: String,
@@ -564,14 +563,12 @@ fn scan_line(patterns: &Patterns, scan: &mut Scan, ext: &str, rel: &str, no: usi
         if *name == "generic-credential" && (entropy(val) < 3.2 || is_alpha(val)) {
             continue;
         }
-        let prefix: String = val.chars().take(4).collect();
         scan.add(
             "secrets",
-            name,
-            "critical",
+            (name, "critical"),
             "credential material committed (value redacted)",
             &loc,
-            format!("{prefix}… ({} chars)", val.chars().count()),
+            format!("value not recorded ({} chars)", val.chars().count()),
             "CWE-798",
         );
     }
@@ -600,8 +597,7 @@ fn scan_line(patterns: &Patterns, scan: &mut Scan, ext: &str, rel: &str, no: usi
             };
             scan.add(
                 "sast",
-                name,
-                severity,
+                (name, severity),
                 "dangerous pattern",
                 &loc,
                 py_strip(line).chars().take(160).collect(),
@@ -614,8 +610,7 @@ fn scan_line(patterns: &Patterns, scan: &mut Scan, ext: &str, rel: &str, no: usi
             if regex.is_match(line) {
                 scan.add(
                     "iac",
-                    name,
-                    severity,
+                    (name, severity),
                     "insecure infrastructure setting",
                     &loc,
                     py_strip(line).chars().take(160).collect(),
@@ -930,7 +925,9 @@ fn audit_outcome(
             .iter()
             .filter(|line| line.contains("\"finding\"") && line.contains("\"trace\""))
             .count() as i64;
-    } else if nonzero {
+    }
+    if nonzero && crit == 0 && high == 0 && other == 0 {
+        // A failed audit with no counted vulnerability did not complete, even when its output parsed.
         high = 1;
     }
     let state = if crit != 0 || high != 0 || other != 0 {
@@ -1045,11 +1042,10 @@ fn int_field(map: &serde_json::Map<String, Value>, key: &str) -> Result<i64, Sea
     }
 }
 
+type DependencyAuditResults = (Vec<(String, String)>, Vec<Finding>);
+
 /// `dep_audit`: one audit per manifest that exists. Returns the `runs` entries and the findings in Python's order.
-fn dep_audits(
-    root: &Path,
-    timeout: u64,
-) -> Result<(Vec<(String, String)>, Vec<Finding>), SeamError> {
+fn dep_audits(root: &Path, timeout: u64) -> Result<DependencyAuditResults, SeamError> {
     let mut runs = Vec::new();
     let mut findings = Vec::new();
     for (name, globs, binary, argv) in AUDITS {

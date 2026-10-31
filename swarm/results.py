@@ -451,7 +451,10 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | Non
         if failing:
             before = t["rework_loops"]
             with leases.transition(tid) if leases is not None else nullcontext():
-                nt = store.transition(tid, S.CHANGES_REQUESTED, reason=f"gates failed: {failing}")
+                with store.transaction():  # CHANGES_REQUESTED then IN_PROGRESS commit together: a crash between them strands the task
+                    nt = store.transition(tid, S.CHANGES_REQUESTED, reason=f"gates failed: {failing}")
+                    if nt["state"] != S.ESCALATED.value:
+                        store.transition(tid, S.IN_PROGRESS, reason="rework loop")
                 if nt["state"] == S.ESCALATED.value:
                     emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": failing,
                                                 "options": ["human review", "cancel", "waive gate (L3)"]})
@@ -462,7 +465,6 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | Non
                     if leases is not None:
                         leases.settle(tid)
                 else:
-                    store.transition(tid, S.IN_PROGRESS, reason="rework loop")
                     notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
                     if handoffs is not None:  # the verdict rows read above: the transition made them stale
                         handoffs.gate_failed(tid, failing, latest, rework=nt["rework_loops"])
@@ -532,8 +534,9 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | Non
                      task_id=tid)
                 notes_log.append(f"{tid}: advisory, approval not attempted")
                 continue
-            store.transition(tid, S.APPROVED, reason="all required gates pass")
-            store.transition(tid, S.DONE, reason="approved")
+            with store.transaction():  # APPROVED without DONE would strand the task in APPROVED: both commit or neither
+                store.transition(tid, S.APPROVED, reason="all required gates pass")
+                store.transition(tid, S.DONE, reason="approved")
             notes_log.append(f"{tid}: DONE")
             if leases is not None:
                 leases.settle(tid)

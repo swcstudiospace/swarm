@@ -12,6 +12,7 @@ pub mod force_parallel_dispatch;
 pub mod hitl;
 pub mod matrix_join;
 pub mod nexus_barrier_join;
+mod panic_text;
 pub mod policy;
 pub mod policy_config;
 pub mod ready_frontier;

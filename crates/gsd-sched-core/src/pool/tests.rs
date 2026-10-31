@@ -70,8 +70,9 @@ fn next(pool: &Pool<usize>) -> Completion<usize> {
 
 #[test]
 fn never_more_than_max_workers_run_and_the_rest_queue() {
-    for max in [1_usize, 3, 8] {
-        let jobs = 20;
+    for max in [1_usize, 3, 8, 16, 32] {
+        // Twice the cap and at least 20 jobs: the cap fills and at least one job queues behind it.
+        let jobs = (2 * max).max(20);
         let pool: Pool<usize> = Pool::new(max);
         let gate = Arc::new(Gate::default());
         let running = Arc::new(AtomicUsize::new(0));

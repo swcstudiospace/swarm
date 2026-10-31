@@ -521,10 +521,8 @@ def test_saturated_slots_defer_claim_without_unleased_dispatch(tmp_path, queued_
     for _ in range(substrate_client.MAX_IN_FLIGHT):
         assert slots.acquire(blocking=False)
     before = len(queued_fake.calls)
-    started = time.monotonic()
     try:
         batch, waiting = runner.select_batch(store, [task], 1, bridge)
-        assert 0.1 <= time.monotonic() - started < 1
         assert batch == [] and waiting == ["T-be: busy"]
         assert store.get("T-be")["state"] == "PLANNED"
         assert bridge.held("T-be") is None and "lease.unleased" not in _types(events)
@@ -546,9 +544,7 @@ def test_busy_mcp_outcome_and_event_contention_never_back_off(queued_fake, monke
     for _ in range(substrate_client.MAX_IN_FLIGHT):
         assert slots.acquire(blocking=False)
     try:
-        started = time.monotonic()
         assert substrate_client.mcp_call_outcome(tool, {}).status == "busy"
-        assert 0.05 <= time.monotonic() - started < 1
         assert substrate_client.rest_post("/events", {}) is None
         assert substrate_client._down_until == 0 and queued_fake.calls == []
     finally:

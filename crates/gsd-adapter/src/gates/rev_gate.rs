@@ -615,10 +615,12 @@ fn key_value_secret(bytes: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// The evidence string of a redacted secret: its first four characters and an ellipsis.
-fn redacted(value: &[u8]) -> String {
-    let head = &value[..value.len().min(4)];
-    format!("{}…", String::from_utf8_lossy(head))
+/// The evidence string of a redacted secret: its length, never the value (P4-04; `scripts/rev_gate.py` `mechanical_checks`).
+fn unrecorded_value(value: &[u8]) -> String {
+    format!(
+        "value not recorded ({} chars)",
+        String::from_utf8_lossy(value).chars().count()
+    )
 }
 
 /// The evidence of every secret pattern that hits `text`, in `SECRET_RES` order.
@@ -636,11 +638,11 @@ fn secret_evidence(text: &str) -> Vec<String> {
     ]
     .into_iter()
     .flatten()
-    .map(redacted)
+    .map(unrecorded_value)
     .collect();
     if let Some(value) = key_value_secret(bytes) {
         if entropy(value) >= 3.2 {
-            hits.push(redacted(value));
+            hits.push(unrecorded_value(value));
         }
     }
     hits
@@ -1540,15 +1542,22 @@ mod tests {
     #[test]
     fn secret_hits_use_leftmost_matches_and_the_entropy_gate() {
         let key = format!("AKIA{}", "ABCDEFGHIJKLMNOP");
-        assert_eq!(secret_evidence(&key), vec!["AKIA…".to_string()]);
+        assert!(matches!(
+            secret_evidence(&key).as_slice(),
+            [evidence] if !evidence.contains(&key) && !evidence.contains(&key[..4])
+        ));
         assert!(secret_evidence(&format!("{key} example")).is_empty());
         let low = "password = 'aaaaaaaaaaaaaaaaaaaa'";
         assert!(
             secret_evidence(low).is_empty(),
             "entropy below 3.2 is skipped"
         );
-        let high = "password = 'Zk3mQ9xL2vB7nR4tY8wE'";
-        assert_eq!(secret_evidence(high), vec!["Zk3m…".to_string()]);
+        let secret = "Zk3mQ9xL2vB7nR4tY8wE";
+        let high = format!("password = '{secret}'");
+        assert!(matches!(
+            secret_evidence(&high).as_slice(),
+            [evidence] if !evidence.contains(secret) && !evidence.contains(&secret[..4])
+        ));
     }
 
     #[test]

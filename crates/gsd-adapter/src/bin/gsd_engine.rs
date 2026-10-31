@@ -12,8 +12,13 @@
 //! served by the write guest when the binary is built with the `sandbox-write` feature and refused before
 //! any write (`E-DEP`, `write_state` `not_started`) otherwise. Whether a refusal or fault falls back to
 //! the Python body is the caller's decision, not this binary's.
+//!
+//! A call that names a signing key (`KEY_ENV_NAMES`) first makes this process non-dumpable on Linux (`harden_for_keys`), so no
+//! core dump or debugger attach reads the key. If the kernel refuses, the binary reads nothing and answers the `E-DEP` refusal
+//! with `write_state` `not_started`.
 
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,7 +28,7 @@ use gsd_adapter::route_table::invoke_routed;
 use gsd_adapter::sandbox_engine::{failover_notice, SandboxEngine};
 use gsd_adapter::strangler_seam::{error_reply, CoreBackend, Invocation, PythonEngine, RustEngine};
 use gsd_failure::ErrorCode;
-use gsd_route::{obj_get, parse_json, Json, Reply, SeamError};
+use gsd_route::{jstr, obj_get, parse_json, Json, Reply, SeamError};
 
 /// Environment variable that names the Rust backend.
 const BACKEND_ENV: &str = "GSD_RUST_BACKEND";
@@ -31,6 +36,13 @@ const BACKEND_ENV: &str = "GSD_RUST_BACKEND";
 /// Per-call deadline. The stdin object carries none; 600 s is the default bridge timeout
 /// (`plan/rust-wasmer-omp-options.md:60`).
 const DEADLINE: Duration = Duration::from_secs(600);
+
+/// Environment names that carry a signing key: the names of `KEY_ENV_NAMES` in `swarm/engine_select.py`.
+const KEY_ENV_NAMES: [&str; 3] = [
+    "SWARM_SIGNING_KEY",
+    "SWARM_ED25519_KEY",
+    "SWARM_ED25519_KEY_FILE",
+];
 
 /// The Rust backend a call runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,12 +62,63 @@ struct Answer {
 }
 
 fn main() -> ExitCode {
-    let answer = answer();
+    let answer = answer_when_hardened(harden_for_keys(&|name| env::var_os(name)));
     ExitCode::from(emit(
         &answer,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     ))
+}
+
+/// Only a successful hardening decision may reach stdin. Keeping this boundary separate also lets
+/// tests exercise a deterministic kernel refusal without changing the process's security policy.
+fn answer_when_hardened(hardened: Result<bool, String>) -> Answer {
+    match hardened {
+        Ok(_) => answer(),
+        Err(message) => plain(hardening_refusal(&message)),
+    }
+}
+
+/// Makes this process non-dumpable when its environment names a signing key (`KEY_ENV_NAMES`), so no core dump or debugger
+/// attach can read the key (F-6). A name counts when the environment holds it at all, empty value included: the rule of
+/// `carries_key` in `swarm/engine_select.py`, which guards the child the same way. Returns `Ok(true)` when the hardening applied,
+/// `Ok(false)` when no key name is set, and `Err` with the reason when the kernel refuses.
+///
+/// Only Linux has the `PR_SET_DUMPABLE` control, so on other targets this returns `Ok(false)` even with a key set: the hardening
+/// is not applied there and the call is answered as it would be without a key.
+fn harden_for_keys(env: &dyn Fn(&str) -> Option<OsString>) -> Result<bool, String> {
+    if KEY_ENV_NAMES.iter().any(|name| env(name).is_some()) {
+        not_dumpable()
+    } else {
+        Ok(false)
+    }
+}
+
+/// Sets the process non-dumpable (Linux `PR_SET_DUMPABLE`). The error names the kernel refusal, never a key.
+#[cfg(target_os = "linux")]
+fn not_dumpable() -> Result<bool, String> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map(|()| true)
+        .map_err(|err| {
+            format!("cannot make the process non-dumpable while it holds a signing key: {err}")
+        })
+}
+
+/// Off Linux the hardening is not available: `Ok(false)`, see [`harden_for_keys`].
+#[cfg(not(target_os = "linux"))]
+fn not_dumpable() -> Result<bool, String> {
+    Ok(false)
+}
+
+/// The refusal for a process that cannot be hardened: `E-DEP` with `write_state` `not_started`, the reply a refusal before any
+/// write takes. Nothing is read from stdin or written, so Python answers the call.
+fn hardening_refusal(message: &str) -> Reply {
+    error_reply(
+        "",
+        "",
+        &SeamError::new(ErrorCode::Dep, message)
+            .with_details(vec![("write_state".to_string(), jstr("not_started"))]),
+    )
 }
 
 /// Writes the notice, if any, as one line to `stderr`, then the reply to `stdout`, and returns the
@@ -406,6 +469,144 @@ mod tests {
         let noticed = answer_with(RustEngine::new(), &call, |_| Some(NOTICE.to_string()));
         assert_eq!(noticed.notice.as_deref(), Some(NOTICE));
         assert_eq!(noticed.reply.stdout, host.reply.stdout);
+        Ok(())
+    }
+
+    /// Runs every dumpable assertion in a fresh copy of this test harness. No test in the parent
+    /// changes process-wide state, and each key starts from a known dumpable baseline.
+    fn isolated_hardening(case: &str, key: Option<(&str, &str)>) -> Result<(), String> {
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let mut command = Command::new(env::current_exe().map_err(|e| e.to_string())?);
+        command
+            .args([
+                "--exact",
+                "tests::hardening_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GSD_F6_TEST_CASE", case)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in KEY_ENV_NAMES {
+            command.env_remove(name);
+        }
+        if let Some((name, value)) = key {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
+        // Keep stdin open and empty: a refusal that reads stdin would block until the deadline.
+        let stdin = child.stdin.take().ok_or("no stdin pipe")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("hardening child timed out: {case}"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(stdin);
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        // Do not print child output: an output regression must not disclose a key canary.
+        assert!(output.status.success(), "hardening child failed: {case}");
+        Ok(())
+    }
+
+    #[test]
+    fn no_key_name_is_ok_false_and_leaves_dumpable_unchanged() -> Result<(), String> {
+        isolated_hardening("no-key", None)?;
+        isolated_hardening("no-key-already-hardened", None)
+    }
+
+    #[test]
+    fn each_key_name_is_hardened_in_its_own_process() -> Result<(), String> {
+        for name in KEY_ENV_NAMES {
+            isolated_hardening("held-key", Some((name, "f6-private-key-canary")))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn each_empty_key_name_counts_as_held() -> Result<(), String> {
+        for name in KEY_ENV_NAMES {
+            isolated_hardening("held-key", Some((name, "")))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hardening_refusal_does_not_read_stdin() -> Result<(), String> {
+        isolated_hardening("refusal", None)
+    }
+
+    /// Invoked only by `isolated_hardening`, never alongside other tests in this process.
+    #[test]
+    #[ignore = "subprocess-only process-wide dumpable checks"]
+    fn hardening_child() -> Result<(), String> {
+        let case = env::var("GSD_F6_TEST_CASE").map_err(|e| e.to_string())?;
+        if case == "refusal" {
+            let answer = answer_when_hardened(Err("deterministic kernel refusal".to_string()));
+            let (stdout, stderr, code) = emitted(&answer);
+            let value: serde_json::Value =
+                serde_json::from_slice(&stdout).map_err(|e| e.to_string())?;
+            assert_eq!(code, 2);
+            assert_eq!(value["error"]["code"], "E-DEP");
+            assert_eq!(value["error"]["details"]["write_state"], "not_started");
+            assert!(stderr.is_empty());
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        let baseline = if case == "no-key-already-hardened" {
+            rustix::process::DumpableBehavior::NotDumpable
+        } else {
+            rustix::process::DumpableBehavior::Dumpable
+        };
+        #[cfg(target_os = "linux")]
+        rustix::process::set_dumpable_behavior(baseline).map_err(|e| e.to_string())?;
+        match case.as_str() {
+            "no-key" | "no-key-already-hardened" => {
+                // These policy/configuration names alone must not expand the three-name trigger.
+                let unrelated = |name: &str| {
+                    [
+                        "SWARM_DIR",
+                        "HOME",
+                        "XDG_CONFIG_HOME",
+                        "SWARM_REQUIRE_KEY",
+                        "SWARM_AGENT_SESSION",
+                        "SWARM_ALLOW_INSECURE_DEV_KEY",
+                    ]
+                    .contains(&name)
+                    .then(OsString::new)
+                };
+                assert!(!harden_for_keys(&unrelated)?);
+                assert!(!harden_for_keys(&|name| env::var_os(name))?);
+                #[cfg(target_os = "linux")]
+                assert_eq!(
+                    rustix::process::dumpable_behavior().map_err(|e| e.to_string())?,
+                    baseline
+                );
+            }
+            "held-key" => {
+                let applied = harden_for_keys(&|name| env::var_os(name))?;
+                #[cfg(target_os = "linux")]
+                {
+                    assert!(applied);
+                    assert_eq!(
+                        rustix::process::dumpable_behavior().map_err(|e| e.to_string())?,
+                        rustix::process::DumpableBehavior::NotDumpable
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
+                assert!(!applied);
+            }
+            _ => return Err("unknown hardening child case".to_string()),
+        }
         Ok(())
     }
 }
