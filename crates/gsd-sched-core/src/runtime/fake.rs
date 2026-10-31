@@ -37,6 +37,49 @@ impl Clock {
     }
 }
 
+/// A monotonic drain clock: callbacks and empty waits advance it explicitly, never by sleeping.
+pub(super) struct DrainClock {
+    origin: Instant,
+    nanos: AtomicU64,
+    /// `(deadline, time before wait, timeout)` for each nonzero drain wait.
+    waits: Mutex<Vec<(Instant, Instant, Duration)>>,
+}
+
+impl DrainClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            nanos: AtomicU64::new(0),
+            waits: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(super) fn now(&self) -> Instant {
+        self.origin + Duration::from_nanos(self.nanos.load(Ordering::SeqCst))
+    }
+
+    pub(super) fn advance(&self, elapsed: Duration) {
+        self.nanos.fetch_add(
+            u64::try_from(elapsed.as_nanos()).expect("scripted duration fits u64 nanoseconds"),
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(super) fn record_wait(&self, deadline: Instant, now: Instant, timeout: Duration) {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((deadline, now, timeout));
+    }
+
+    pub(super) fn waits(&self) -> Vec<(Instant, Instant, Duration)> {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// What a worker does on one attempt.
 #[derive(Clone)]
 pub(super) enum Act {
@@ -209,6 +252,16 @@ pub(super) struct State {
     pub(super) inject: Option<(&'static str, Inject)>,
     /// Seconds the wall clock advances on every `cancel_state` poll.
     pub(super) poll_advance: f64,
+    /// Polls inside the final hard drain only; the first can park so fault injection cannot hit an earlier poll.
+    pub(super) post_kill_polls: usize,
+    pub(super) hold_post_kill_poll: bool,
+    pub(super) post_kill_error: Option<PortError>,
+    /// Scripted age when `request_cancel` first records the request; subsequent snapshots use `drain_clock` (real age if absent).
+    pub(super) cancel_elapsed_s: Option<f64>,
+    /// First request observed this far into the initial `cancel_state` callback, instead of before the poll.
+    pub(super) cancel_on_poll: Option<Duration>,
+    /// One-shot monotonic time consumed before each named callback returns, for residual-budget tests.
+    pub(super) callback_advance: HashMap<&'static str, Duration>,
 }
 
 impl State {
@@ -242,6 +295,7 @@ pub(super) struct Fake {
     state: Mutex<State>,
     changed: Condvar,
     pub(super) clock: Arc<Clock>,
+    pub(super) drain_clock: Arc<DrainClock>,
 }
 
 impl Fake {
@@ -277,9 +331,16 @@ impl Fake {
                 in_complete: false,
                 inject: None,
                 poll_advance: 0.0,
+                post_kill_polls: 0,
+                hold_post_kill_poll: false,
+                post_kill_error: None,
+                cancel_elapsed_s: None,
+                cancel_on_poll: None,
+                callback_advance: HashMap::new(),
             }),
             changed: Condvar::new(),
             clock: Arc::new(Clock::new(1000.0)),
+            drain_clock: Arc::new(DrainClock::new()),
         })
     }
 
@@ -311,11 +372,21 @@ impl Fake {
 
     /// A cancel request now.
     pub(super) fn request_cancel(&self, reason: &str, force: bool) {
-        self.lock().cancel = Some(CancelRequest {
-            at: Instant::now(),
-            force,
-            reason: reason.to_owned(),
-        });
+        let mut state = self.lock();
+        if let Some(request) = &mut state.cancel {
+            // A repeated signal escalates, but never changes the first observation time or reason.
+            request.force |= force;
+        } else {
+            state.cancel = Some(CancelRequest {
+                at: match state.cancel_elapsed_s {
+                    Some(age) => self.drain_clock.now() - Duration::from_secs_f64(age),
+                    None => Instant::now(),
+                },
+                force,
+                reason: reason.to_owned(),
+            });
+        }
+        drop(state);
         self.changed.notify_all();
     }
 
@@ -350,6 +421,15 @@ impl Fake {
             }
             _ => Ok(state),
         }
+    }
+}
+
+/// Release blocked callbacks and hanging workers even if a new regression fails an assertion.
+pub(super) struct Cleanup(pub(super) Arc<Fake>);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.0.end();
     }
 }
 
@@ -583,6 +663,12 @@ impl SchedulerPorts for Fake {
         } else {
             Phase::Final(done.outcome.clone())
         };
+        self.drain_clock.advance(
+            state
+                .callback_advance
+                .remove("complete")
+                .unwrap_or_default(),
+        );
         self.changed.notify_all();
         Ok(completion)
     }
@@ -600,14 +686,60 @@ impl SchedulerPorts for Fake {
     }
 
     fn cancel_state(&self) -> Result<CancelState, PortError> {
-        let state = self.enter("cancel_state", "")?;
+        let mut state = self.enter("cancel_state", "")?;
+        if state.killed {
+            state.post_kill_polls += 1;
+            self.changed.notify_all();
+            state = self
+                .changed
+                .wait_while(state, |s| s.hold_post_kill_poll && !s.ended)
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(error) = state.post_kill_error.take() {
+                return Err(error);
+            }
+        }
         let advance = state.poll_advance;
+        let callback_delay = state
+            .callback_advance
+            .remove("cancel_state")
+            .unwrap_or_default();
+        if let Some(after) = state.cancel_on_poll.take() {
+            assert!(
+                state.cancel.is_none(),
+                "the first request is observed during this poll"
+            );
+            assert!(
+                after <= callback_delay,
+                "the request precedes the returned age sample"
+            );
+            assert!(
+                state.cancel_elapsed_s.is_some(),
+                "a scripted request uses the drain clock"
+            );
+            self.drain_clock.advance(after);
+            state.cancel = Some(CancelRequest {
+                at: self.drain_clock.now(),
+                force: false,
+                reason: "signal SIGTERM".to_owned(),
+            });
+            self.drain_clock.advance(callback_delay - after);
+        } else {
+            self.drain_clock.advance(callback_delay);
+        }
         let cancel = match &state.cancel {
             Some(request) => CancelState {
                 is_set: true,
                 force: request.force,
                 reason: Some(request.reason.clone()),
-                elapsed_s: request.at.elapsed().as_secs_f64(),
+                // Like the cheap Python snapshot, sample AFTER the callback/GIL delay, not at entry.
+                elapsed_s: if state.cancel_elapsed_s.is_some() {
+                    self.drain_clock
+                        .now()
+                        .saturating_duration_since(request.at)
+                        .as_secs_f64()
+                } else {
+                    request.at.elapsed().as_secs_f64()
+                },
             },
             None => CancelState::default(),
         };
@@ -618,16 +750,34 @@ impl SchedulerPorts for Fake {
 
     fn cancel_begin(&self, reason: &str, grace_s: f64, in_flight: usize) -> Result<(), PortError> {
         let mut state = self.enter("cancel_begin", reason)?;
-        state.begin = Some((Instant::now(), reason.to_owned(), grace_s, in_flight));
+        let now = if state.cancel_elapsed_s.is_some() {
+            self.drain_clock.now()
+        } else {
+            Instant::now()
+        };
+        state.begin = Some((now, reason.to_owned(), grace_s, in_flight));
+        self.drain_clock.advance(
+            state
+                .callback_advance
+                .remove("cancel_begin")
+                .unwrap_or_default(),
+        );
         self.changed.notify_all();
         Ok(())
     }
 
     fn kill(&self, grace_s: f64, reason: &str) -> Result<(), PortError> {
         let mut state = self.enter("kill", reason)?;
-        state.kill = Some((Instant::now(), grace_s, reason.to_owned()));
+        let now = if state.cancel_elapsed_s.is_some() {
+            self.drain_clock.now()
+        } else {
+            Instant::now()
+        };
+        state.kill = Some((now, grace_s, reason.to_owned()));
         state.kills += 1;
         state.killed = true;
+        self.drain_clock
+            .advance(state.callback_advance.remove("kill").unwrap_or_default());
         self.changed.notify_all();
         Ok(())
     }

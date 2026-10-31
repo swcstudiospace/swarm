@@ -107,6 +107,14 @@ Read as: `swarm/engine_select.py` (`KEY_ENV_NAMES`, `carries_key`, `identity_ref
 - **Linux process inspection (F-6).** Before reading stdin, `gsd_engine` checks the same three key names for presence, including an empty-present value, and uses the safe rustix API to set `PR_SET_DUMPABLE` to zero. A kernel refusal returns `E-DEP` with `write_state: not_started` before an invocation is read; the diagnostic contains no key value. Unkeyed processes are unchanged. This is defence in depth against unprivileged process inspection, not per-agent UID/container isolation or protection from a privileged debugger; AR-04 key custody remains open.
 - **What the check keys on.** The identity check and the core-dump guard test only `KEY_ENV_NAMES`, three names. The isolated HOME (`child_home`) is triggered by those three plus `SWARM_REQUIRE_KEY`, `SWARM_ALLOW_INSECURE_DEV_KEY`, `SWARM_AGENT_SESSION` and `XDG_CONFIG_HOME` (`HOME_ISOLATING_ENV_NAMES`; section 10, L1). A child that gets only those non-key names is HOME-isolated but neither identity-checked nor core-dump guarded.
 
+### 3.3 Scoped core scheduler panic output
+
+`gsd-sched-core::panic_guard::NativeSchedulerScope::enter()` is an explicit, thread-bound Rust opt-in. Its first use installs one hook; importing the module, creating an ordinary pool, or submitting ordinary work installs none. Native-marked work suppresses panic-hook payload output, while unmarked work calls the captured prior hook unchanged. Pool submissions capture the mark per job, including queued work; a guard stays alive through catch/unwind and caught-payload disposal.
+
+`with_host_callback` suspends and restores the native mark around arbitrary host/Python execution. This is not a Python debug API or a claim to censor callback-owned output. The embedding host must finish hook setup before first entry and must not replace the hook during supported use. Later replacement, unavailable thread-local storage, `panic=abort`, and output outside the hook are explicit limits; the implementation does not fight a host replacement.
+
+Core child-process tests and a standalone public-API consumer exercise native worker isolation, sibling completion, and prior-hook behavior. These are core proofs, not evidence that the pending Python runtime binding or scheduler default flip is complete. All defaults remain unchanged.
+
 ## 4. Routes
 
 | Route | Selector (script) | Argv the selector claims | Selector class | Default row | Rust route (`crates/gsd-adapter/src/route_table.rs`) |

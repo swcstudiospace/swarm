@@ -24,7 +24,9 @@
 //!
 //! A job runs under `catch_unwind`. A job that panics yields [`Outcome::Crashed`]: the completion carries **no payload text** (the
 //! payload is dropped, itself guarded against a panicking drop), the thread goes on with the next queued job, and every other job and the
-//! pool are unaffected. The default panic hook still prints its message to stderr; that is the host's to configure.
+//! pool are unaffected. Only jobs submitted within an explicit [`crate::panic_guard::NativeSchedulerScope`] inherit its native
+//! panic-output policy, through unwind and caught payload disposal. Ordinary jobs retain the prior host hook, including when
+//! sharing a worker with opted-in jobs. See [`crate::panic_guard`] for callback suspension, once-only installation and host limits.
 //!
 //! # Model checking
 //!
@@ -40,6 +42,7 @@ use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use self::sync::{thread, Arc, Condvar, Mutex, MutexGuard};
+use crate::panic_guard::{self, NativeSchedulerScope};
 
 #[cfg(all(test, loom))]
 mod loom_tests;
@@ -116,6 +119,7 @@ struct Queued<R> {
     seq: u64,
     task_id: String,
     job: Job<R>,
+    native_context: bool,
 }
 
 /// Everything the mutex guards. Invariant at every lock release: `queue` is non-empty only while `running.len()` equals the cap.
@@ -188,6 +192,8 @@ impl<R: Send + 'static> Pool<R> {
 
     /// Queues `job` under `task_id`: it starts on its own worker thread at once when fewer than `max_workers` jobs run, otherwise it
     /// waits for a slot behind the jobs submitted before it. Returns without waiting for the job.
+    /// The current native scheduler mark is captured separately for each submission; an ordinary or callback-suspended caller
+    /// does not opt in, even when this pool is also running marked jobs. No hook is installed by an unmarked submission.
     ///
     /// # Errors
     ///
@@ -197,6 +203,7 @@ impl<R: Send + 'static> Pool<R> {
         F: FnOnce() -> R + Send + 'static,
     {
         let task_id = task_id.into();
+        let native_context = panic_guard::native_context();
         let seq = {
             let mut state = self.shared.lock();
             if state.closed {
@@ -209,6 +216,7 @@ impl<R: Send + 'static> Pool<R> {
                     seq,
                     task_id,
                     job: Box::new(job),
+                    native_context,
                 });
                 return Ok(());
             }
@@ -219,7 +227,7 @@ impl<R: Send + 'static> Pool<R> {
         let spawned = thread::Builder::new()
             .name(format!("sched-worker-{seq}"))
             .stack_size(WORKER_STACK_BYTES)
-            .spawn(move || run_worker(&shared, seq, task_id, Box::new(job)));
+            .spawn(move || run_worker(&shared, seq, task_id, Box::new(job), native_context));
         if let Err(error) = spawned {
             let mut state = self.shared.lock();
             state.running.remove(&seq);
@@ -315,8 +323,10 @@ fn run_worker<R: Send + 'static>(
     mut seq: u64,
     mut task_id: String,
     mut job: Job<R>,
+    mut native_context: bool,
 ) {
     loop {
+        let native_scope = native_context.then(NativeSchedulerScope::enter);
         let outcome = match catch_unwind(AssertUnwindSafe(job)) {
             Ok(value) => Outcome::Done(value),
             Err(payload) => {
@@ -325,6 +335,8 @@ fn run_worker<R: Send + 'static>(
                 Outcome::Crashed
             }
         };
+        // Keep the mark through catch/unwind AND both caught payload drops, but never carry it into the next queued job.
+        drop(native_scope);
         let mut state = shared.lock();
         state.running.remove(&seq);
         state.completions.push_back(Completion { task_id, outcome });
@@ -342,5 +354,6 @@ fn run_worker<R: Send + 'static>(
         seq = queued.seq;
         task_id = queued.task_id;
         job = queued.job;
+        native_context = queued.native_context;
     }
 }

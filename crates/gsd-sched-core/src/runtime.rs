@@ -47,9 +47,15 @@
 //! with a panic payload.
 //!
 //! The cancel drain is `_cancel_drain`: [`SchedulerPorts::cancel_begin`] (flag, degraded record, log line), wait the cooperative
-//! grace of [`crate::drain::plan`] counted from the request unless a force request arrives, [`SchedulerPorts::kill`] once, wait
-//! the kill grace plus the settle time, then report what is still in flight as [`RunSummary::abandoned`]. Abandoned workers stay
-//! detached on their threads; the pool never joins them.
+//! grace of [`crate::drain::plan`] counted from the request unless a force request arrives, [`SchedulerPorts::kill`] once, then
+//! reap within the kill/settle window and the remaining shutdown budget. Idle hard-drain ticks still poll `cancel_state`.
+//! Abandoned workers are reported as [`RunSummary::abandoned`] and stay detached; the pool never joins them.
+//!
+//! The deadline uses `CancelState.elapsed_s` from the first **Python-observed** request, not kernel signal delivery. Rust pairs
+//! that cheap, near-return age sample with its monotonic clock immediately after the poll returns. The returned age already
+//! includes any callback/GIL delay after the request; time before the request is not charged. This is not an exact cross-language
+//! timestamp: sampling-to-return latency remains uncertainty. Once established, no callback or force poll renews the deadline.
+//! Callbacks/GIL remain cooperative: an already-running host call can overrun it; an exhausted returned age kills with zero grace.
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -177,6 +183,9 @@ struct Runtime {
     config: RunConfig,
     wall: WallClock,
     pool: Arc<Pool<WorkerResult>>,
+    /// Only drain regressions substitute a monotonic clock; production always uses `Instant::now`.
+    #[cfg(test)]
+    drain_clock: Option<Arc<fake::DrainClock>>,
     /// `RunConfig::wait_tick_s` as a duration.
     tick: Duration,
     limiter: AimdLimiter,
@@ -233,6 +242,8 @@ impl Runtime {
             config: config.clone(),
             wall,
             pool,
+            #[cfg(test)]
+            drain_clock: None,
             limiter,
             last_decrease: None,
             claims: ClaimTable::new(),
@@ -287,9 +298,9 @@ impl Runtime {
         let mut idle: u32 = 0;
         loop {
             let cancel = ports.cancel_state()?;
-            let polled_at = Instant::now();
             if cancel.is_set {
-                self.cancel_drain(&cancel, polled_at)?;
+                let sampled_at = self.drain_now();
+                self.cancel_drain(&cancel, sampled_at)?;
                 return Ok(StopReason::Cancelled);
             }
             let barrier = self.config.barrier;
@@ -633,7 +644,7 @@ impl Runtime {
 
     /// The cancel flow. Python: `Scheduler._cancel_drain` (`swarm_run.py:2226`); its log line, the degraded record and the flag are
     /// [`SchedulerPorts::cancel_begin`], the kill is [`SchedulerPorts::kill`], and `abandoned after kill: [...]` is the host's.
-    fn cancel_drain(&mut self, cancel: &CancelState, polled_at: Instant) -> Result<(), RunError> {
+    fn cancel_drain(&mut self, cancel: &CancelState, sampled_at: Instant) -> Result<(), RunError> {
         let config = &self.config;
         let plan = drain::plan(
             config.cancel_grace_s,
@@ -643,34 +654,88 @@ impl Runtime {
             config.kill_settle_s,
         );
         let reason = cancel.reason.as_deref().unwrap_or("cancelled").to_owned();
-        // the grace is counted from the request, which was `elapsed_s` before the poll
-        let left = Duration::try_from_secs_f64((plan.grace_s - cancel.elapsed_s).max(0.0))
-            .unwrap_or(Duration::ZERO);
-        let deadline = polled_at.checked_add(left).unwrap_or(polled_at);
+        let seconds = |value: f64| Duration::try_from_secs_f64(value).unwrap_or(Duration::ZERO);
+        // Pair the returned request age with poll return, not entry: the age already charges post-request callback/GIL time.
+        // Establish the absolute deadlines once; every later callback and poll consumes them without renewing either window.
+        let shutdown = sampled_at
+            .checked_add(seconds(
+                (config.shutdown_budget_s - cancel.elapsed_s).max(0.0),
+            ))
+            .unwrap_or(sampled_at);
+        let grace = sampled_at
+            .checked_add(seconds((plan.grace_s - cancel.elapsed_s).max(0.0)))
+            .unwrap_or(sampled_at)
+            .min(shutdown);
         let ports = Arc::clone(&self.ports);
-        ports.cancel_begin(&reason, plan.grace_s, self.inflight.len())?;
-        while !self.inflight.is_empty() && Instant::now() < deadline && !ports.cancel_state()?.force
-        {
-            self.reap(deadline)?;
+        let remaining_grace = grace.saturating_duration_since(self.drain_now());
+        ports.cancel_begin(&reason, remaining_grace.as_secs_f64(), self.inflight.len())?;
+        while !self.inflight.is_empty() && !cancel.force && self.drain_now() < grace {
+            if ports.cancel_state()?.force {
+                break;
+            }
+            self.reap(grace)?;
         }
         if !self.inflight.is_empty() {
-            ports.kill(plan.kill_grace_s, &reason)?;
-            let window = Duration::try_from_secs_f64(plan.kill_grace_s + plan.settle_s)
-                .unwrap_or(Duration::ZERO);
-            let hard = Instant::now().checked_add(window).unwrap_or(polled_at);
-            while !self.inflight.is_empty() && Instant::now() < hard {
+            let killing_at = self.drain_now();
+            let remaining = shutdown.saturating_duration_since(killing_at);
+            let kill_grace = seconds(plan.kill_grace_s).min(remaining);
+            // Anchor BEFORE kill: a slow kill callback must not receive a fresh kill+settle window on return.
+            let window = kill_grace
+                .saturating_add(seconds(plan.settle_s))
+                .min(remaining);
+            let hard = killing_at
+                .checked_add(window)
+                .unwrap_or(killing_at)
+                .min(shutdown);
+            ports.kill(kill_grace.as_secs_f64(), &reason)?;
+            while !self.inflight.is_empty() && self.drain_now() < hard {
+                // Poll even when the preceding bounded reap produced no completion. No pool guard crosses this call;
+                // `?` preserves the host's opaque PortError without rebuilding its payload.
+                ports.cancel_state()?;
                 self.reap(hard)?;
             }
         }
         Ok(())
     }
 
+    fn drain_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.drain_clock {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
     /// Waits for finished dispatches until `deadline` at most one tick, and handles them.
     fn reap(&mut self, deadline: Instant) -> Result<(), RunError> {
-        let timeout = self
-            .tick
-            .min(deadline.saturating_duration_since(Instant::now()));
-        for item in self.wait_finished(timeout) {
+        let now = self.drain_now();
+        let timeout = self.tick.min(deadline.saturating_duration_since(now));
+        // A callback (including cancel_state) can consume the last of the budget. Do not start another wait afterward.
+        if timeout.is_zero() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let scripted = self.drain_clock.clone();
+        #[cfg(test)]
+        if let Some(clock) = &scripted {
+            clock.record_wait(deadline, now, timeout);
+        }
+        #[cfg(test)]
+        let wait = if scripted.is_some() {
+            Duration::ZERO
+        } else {
+            timeout
+        };
+        #[cfg(not(test))]
+        let wait = timeout;
+        let finished = self.wait_finished(wait);
+        #[cfg(test)]
+        if finished.is_empty() {
+            if let Some(clock) = &scripted {
+                clock.advance(timeout);
+            }
+        }
+        for item in finished {
             self.finish(item)?;
         }
         Ok(())

@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::fake::{Act, Fake, Inject, Phase, Task, PANIC_TEXT, WAIT};
-use super::{run, run_with, LOOP_PANICKED, WORKER_PANICKED};
+use super::fake::{Act, Cleanup, Fake, Inject, Phase, Task, PANIC_TEXT, WAIT};
+use super::{run, run_with, Runtime, LOOP_PANICKED, WORKER_PANICKED};
 use super::{WorkerResult, WORKER_NOT_STARTED};
 use crate::pool::Pool;
 use crate::ports::{
-    Completion, LeaseVerdict, RunConfig, RunError, RunSummary, SchedCode, SchedulerPorts,
-    StopReason,
+    Completion, LeaseVerdict, PortError, RunConfig, RunError, RunSummary, SchedCode,
+    SchedulerPorts, StopReason,
 };
 
 /// A configuration for tests: a short tick and no AIMD cooldown, everything else the Python default.
@@ -838,6 +838,60 @@ fn cancel_config(max_concurrent: u32, cancel_grace_s: f64) -> RunConfig {
     }
 }
 
+/// Dispatch real workers before cancellation, then drive the existing loop with the test-only monotonic clock.
+/// `stage_completion` transfers an actual pool completion to the runtime's settled queue before the cancel drain starts.
+fn start_scripted_cancel(
+    fake: &Arc<Fake>,
+    config: RunConfig,
+    stage_completion: bool,
+    force: bool,
+) -> Running {
+    let pool = Arc::new(Pool::new(config.max_concurrent as usize));
+    let ports: Arc<dyn SchedulerPorts> = Arc::clone(fake) as Arc<dyn SchedulerPorts>;
+    let mut runtime = Runtime::new(ports, &config, fake.wall(), Arc::clone(&pool))
+        .expect("the scripted configuration is valid");
+    runtime.drain_clock = Some(Arc::clone(&fake.drain_clock));
+    let count = fake.lock().tasks.len();
+    runtime.schedule().expect("the initial pass dispatched");
+    fake.wait_until("all scripted workers started", |s| s.started.len() == count);
+    if stage_completion {
+        let completion = pool
+            .next_completion(WAIT)
+            .expect("the returning worker finished");
+        match completion.outcome {
+            crate::pool::Outcome::Done(result) => {
+                runtime
+                    .settled
+                    .push_back(result.expect("the worker succeeded"));
+            }
+            crate::pool::Outcome::Crashed => panic!("the scripted worker unexpectedly panicked"),
+        }
+    }
+    let request_during_poll = fake.lock().cancel_on_poll.is_some();
+    if !request_during_poll {
+        fake.request_cancel("signal SIGTERM", force);
+    }
+    let (sender, result) = mpsc::channel();
+    thread::Builder::new()
+        .name("scripted-cancel-loop".to_owned())
+        .spawn(move || {
+            let _ = sender.send(runtime.drive());
+        })
+        .expect("the scripted loop starts");
+    Running { result, pool }
+}
+
+fn hard_drain_config() -> RunConfig {
+    RunConfig {
+        cancel_grace_s: 0.0,
+        shutdown_budget_s: 2.0,
+        kill_grace_s: 0.5,
+        kill_settle_s: 0.25,
+        wait_tick_s: 0.125,
+        ..config(2)
+    }
+}
+
 /// The cancel flow: the grace elapses with sessions still running, the sessions are killed once with the plan's kill grace, and the
 /// sessions that end on the kill complete normally.
 #[test]
@@ -853,11 +907,9 @@ fn a_cancel_waits_the_grace_then_kills_once() {
     fake.request_cancel("swarm-timeout", false);
     let summary = run.summary();
     let state = fake.lock();
-    let (_, reason, grace, in_flight) = state.begin.clone().expect("cancel_begin was called");
-    assert_eq!(
-        (reason.as_str(), grace, in_flight),
-        ("swarm-timeout", 0.05, 2)
-    );
+    let (_, reason, _, in_flight) = state.begin.clone().expect("cancel_begin was called");
+    // The begin argument is the residual grace, not the nominal 0.05; scripted age tests below assert its exact value.
+    assert_eq!((reason.as_str(), in_flight), ("swarm-timeout", 2));
     let (killed_at, kill_grace, kill_reason) =
         state.kill.clone().expect("the sessions were killed");
     assert_eq!((kill_grace, kill_reason.as_str()), (5.0, "swarm-timeout"));
@@ -983,6 +1035,537 @@ fn a_task_submitted_while_the_cancel_is_set_still_gets_its_worker_call() {
     assert_eq!(state.completed.len(), 2);
     assert_eq!(summary.dispatched, 2);
     assert_eq!(summary.stopped, StopReason::Cancelled);
+}
+
+/// The hard drain must poll on every idle tick, not only when a worker finishes. Repeated force requests do not renew it.
+#[test]
+fn hard_drain_polls_cancel_state_without_completions() {
+    let fake = Fake::new(vec![
+        Task::new("T2").act(Act::Hang),
+        Task::new("T1").act(Act::Hang),
+    ]);
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    {
+        let mut state = fake.lock();
+        state.cancel_elapsed_s = Some(0.0);
+        state.hold_post_kill_poll = true;
+    }
+    let origin = fake.drain_clock.now();
+    let run = start_scripted_cancel(&fake, hard_drain_config(), false, false);
+    fake.wait_until("the first final-hard-drain poll", |s| {
+        s.post_kill_polls == 1
+    });
+    let first_request_at = fake
+        .lock()
+        .cancel
+        .as_ref()
+        .expect("cancel was requested")
+        .at;
+    fake.request_cancel("second signal", true);
+    fake.request_cancel("third signal", true);
+    {
+        let mut state = fake.lock();
+        assert!(
+            state.completed.is_empty(),
+            "no completion can satisfy the poll observation"
+        );
+        assert_eq!(state.cancel.as_ref().unwrap().at, first_request_at);
+        state.hold_post_kill_poll = false;
+    }
+    fake.wake();
+    fake.wait_until("multiple idle hard-drain polls", |s| s.post_kill_polls >= 3);
+    let summary = run.summary();
+    {
+        let state = fake.lock();
+        assert_eq!(state.post_kill_polls, 6, "one poll per bounded idle tick");
+        assert_eq!(state.calls_of("cancel_begin").len(), 1);
+        assert_eq!(state.kills, 1);
+        let (_, kill_grace, reason) = state.kill.as_ref().unwrap();
+        assert_eq!((*kill_grace, reason.as_str()), (0.5, "signal SIGTERM"));
+        let begin = state
+            .calls
+            .iter()
+            .position(|call| call.starts_with("cancel_begin "))
+            .unwrap();
+        let kill = state
+            .calls
+            .iter()
+            .position(|call| call.starts_with("kill "))
+            .unwrap();
+        assert!(begin < kill);
+        assert!(state.calls[kill + 1..]
+            .iter()
+            .all(|call| call == "cancel_state"));
+        assert!(state.completed.is_empty());
+    }
+    let waits = fake.drain_clock.waits();
+    assert_eq!(waits.len(), 6);
+    for (index, (deadline, now, timeout)) in waits.into_iter().enumerate() {
+        assert_eq!(deadline, origin + Duration::from_millis(750));
+        assert_eq!(now, origin + Duration::from_millis(125 * index as u64));
+        assert_eq!(timeout, Duration::from_millis(125));
+    }
+    assert_eq!(fake.drain_clock.now(), origin + Duration::from_millis(750));
+    assert_eq!(summary.stopped, StopReason::Cancelled);
+    assert_eq!(
+        summary.abandoned,
+        strings(&["T1", "T2"]),
+        "sorted, not submission order"
+    );
+    fake.end();
+    fake.wait_until("hanging workers released in cleanup", |s| s.running == 0);
+}
+
+/// Inject only after a post-kill poll has parked: neither the initial nor cooperative-grace poll can satisfy this test.
+#[test]
+fn hard_drain_preserves_cancel_port_error_payload() {
+    struct Opaque(u8);
+    let original = Arc::new(Opaque(19));
+    let payload = Box::new(Arc::clone(&original));
+    let payload_address = (&*payload as *const Arc<Opaque>) as usize;
+    let fake = Fake::new(vec![
+        Task::new("T1").act(Act::Hang),
+        Task::new("T2").act(Act::Hang),
+    ]);
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    {
+        let mut state = fake.lock();
+        state.cancel_elapsed_s = Some(0.0);
+        state.hold_post_kill_poll = true;
+    }
+    let run = start_scripted_cancel(&fake, hard_drain_config(), false, false);
+    fake.wait_until("hard-drain entry before injecting the error", |s| {
+        s.post_kill_polls == 1
+    });
+    {
+        let mut state = fake.lock();
+        assert_eq!(state.kills, 1);
+        assert!(state.completed.is_empty());
+        state.post_kill_error = Some(PortError::new("opaque scripted failure", payload));
+        state.hold_post_kill_poll = false;
+    }
+    fake.wake();
+    match run.outcome() {
+        Err(RunError::Port(error)) => {
+            assert_eq!(error.summary(), "opaque scripted failure");
+            let returned = error
+                .into_payload()
+                .downcast::<Arc<Opaque>>()
+                .expect("original payload type");
+            assert_eq!((&*returned as *const Arc<Opaque>) as usize, payload_address);
+            assert!(
+                Arc::ptr_eq(&original, &returned),
+                "the same opaque object, not a reconstruction"
+            );
+            assert_eq!(returned.0, 19);
+        }
+        other => panic!("expected the hard-drain port error, got {other:?}"),
+    }
+    {
+        let state = fake.lock();
+        assert_eq!(state.post_kill_polls, 1);
+        assert_eq!(state.calls_of("cancel_begin").len(), 1);
+        assert_eq!(state.calls_of("kill").len(), 1);
+        assert_eq!(state.calls.last().map(String::as_str), Some("cancel_state"));
+        assert!(state.completed.is_empty());
+    }
+    assert!(
+        fake.drain_clock.waits().is_empty(),
+        "the error stops the drain before another wait"
+    );
+    fake.end();
+    fake.wait_until("error-path hanging workers released", |s| s.running == 0);
+}
+
+/// Exact scripted seconds: returned request age charges the initial delay once; later callbacks consume the fixed deadlines.
+#[test]
+fn cancel_drain_charges_callback_elapsed_to_remaining_budget() {
+    let fake = Fake::new(vec![
+        Task::new("T1").act(Act::Return("DONE")),
+        Task::new("T2").act(Act::Hang),
+    ]);
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    {
+        let mut state = fake.lock();
+        // The request is already one second old at poll entry; the near-return sample includes the next two seconds too.
+        state.cancel_elapsed_s = Some(1.0);
+        for (port, seconds) in [
+            ("cancel_state", 2),
+            ("cancel_begin", 3),
+            ("complete", 5),
+            ("kill", 1),
+        ] {
+            state
+                .callback_advance
+                .insert(port, Duration::from_secs(seconds));
+        }
+    }
+    let origin = fake.drain_clock.now();
+    let run = start_scripted_cancel(
+        &fake,
+        RunConfig {
+            cancel_grace_s: 10.0,
+            shutdown_budget_s: 15.0,
+            kill_grace_s: 5.0,
+            kill_settle_s: 3.0,
+            wait_tick_s: 4.0,
+            ..config(2)
+        },
+        true,
+        false,
+    );
+    let summary = run.summary();
+    {
+        let state = fake.lock();
+        assert_eq!(state.completed, strings(&["T1"]));
+        assert_eq!(state.calls_of("cancel_begin").len(), 1);
+        assert_eq!(state.kills, 1);
+        assert_eq!(
+            state.begin.as_ref().unwrap().2,
+            4.0,
+            "three seconds of the seven-second grace already elapsed"
+        );
+        assert_eq!(
+            state.kill.as_ref().unwrap().1,
+            4.0,
+            "only four seconds remain at kill entry"
+        );
+        assert!(
+            state.callback_advance.is_empty(),
+            "all four callback delays were exercised"
+        );
+        let begin = state
+            .calls
+            .iter()
+            .position(|call| call.starts_with("cancel_begin "))
+            .unwrap();
+        let complete = state
+            .calls
+            .iter()
+            .position(|call| call == "complete T1")
+            .unwrap();
+        let kill = state
+            .calls
+            .iter()
+            .position(|call| call.starts_with("kill "))
+            .unwrap();
+        assert!(begin < complete && complete < kill);
+    }
+    assert_eq!(
+        fake.drain_clock.waits(),
+        vec![
+            // Poll returns at two with age three: grace ends at six; cancel_begin consumes another three seconds.
+            (
+                origin + Duration::from_secs(6),
+                origin + Duration::from_secs(5),
+                Duration::from_secs(1)
+            ),
+            // Complete consumed five more seconds, kill one: the hard wait has only three seconds, not 5+3.
+            (
+                origin + Duration::from_secs(14),
+                origin + Duration::from_secs(11),
+                Duration::from_secs(3)
+            ),
+        ],
+    );
+    assert_eq!(fake.drain_clock.now(), origin + Duration::from_secs(14));
+    assert_eq!(summary.stopped, StopReason::Cancelled);
+    assert_eq!(summary.abandoned, strings(&["T2"]));
+    fake.end();
+    fake.wait_until("callback-budget worker released", |s| s.running == 0);
+}
+
+/// Poll entry 100, first Python observation 129, return/sample 130 with age one: shutdown is 144, not 114.
+/// A later hard-drain callback may consume or overrun that deadline, but cannot renew it.
+#[test]
+fn cancel_drain_request_first_observed_during_initial_poll_preserves_request_budget() {
+    let cases = [
+        (0, vec![(44, 36, 4), (44, 40, 4)], 44),
+        (6, vec![(44, 42, 2)], 44),
+        (20, vec![], 56),
+    ];
+    for (later_poll_delay, hard_waits, ended_s) in cases {
+        let fake = Fake::new(vec![
+            Task::new("T2").act(Act::Hang),
+            Task::new("T1").act(Act::Hang),
+        ]);
+        let _cleanup = Cleanup(Arc::clone(&fake));
+        fake.drain_clock.advance(Duration::from_secs(100));
+        let entry = fake.drain_clock.now();
+        {
+            let mut state = fake.lock();
+            state.cancel_elapsed_s = Some(0.0);
+            state.cancel_on_poll = Some(Duration::from_secs(29));
+            state
+                .callback_advance
+                .insert("cancel_state", Duration::from_secs(30));
+            state.hold_post_kill_poll = true;
+        }
+        let run = start_scripted_cancel(
+            &fake,
+            RunConfig {
+                cancel_grace_s: 10.0,
+                shutdown_budget_s: 15.0,
+                kill_grace_s: 5.0,
+                kill_settle_s: 3.0,
+                wait_tick_s: 4.0,
+                ..config(2)
+            },
+            false,
+            false,
+        );
+        fake.wait_until("hard-drain entry after the request-relative grace", |s| {
+            s.post_kill_polls == 1
+        });
+        {
+            let state = fake.lock();
+            assert_eq!(
+                state.cancel.as_ref().unwrap().at,
+                entry + Duration::from_secs(29)
+            );
+            let (at, reason, grace, in_flight) = state.begin.as_ref().unwrap();
+            assert_eq!(
+                (*at, reason.as_str(), *grace, *in_flight),
+                (entry + Duration::from_secs(30), "signal SIGTERM", 6.0, 2)
+            );
+            let (at, grace, reason) = state.kill.as_ref().unwrap();
+            assert_eq!(
+                (*at, *grace, reason.as_str()),
+                (entry + Duration::from_secs(36), 5.0, "signal SIGTERM")
+            );
+        }
+        fake.request_cancel("second signal", true);
+        fake.request_cancel("third signal", true);
+        {
+            let mut state = fake.lock();
+            state
+                .callback_advance
+                .insert("cancel_state", Duration::from_secs(later_poll_delay));
+            state.hold_post_kill_poll = false;
+        }
+        fake.wake();
+        let summary = run.summary();
+        let mut expected = vec![(36, 30, 4), (36, 34, 2)];
+        expected.extend(hard_waits);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(deadline, now, timeout)| {
+                (
+                    entry + Duration::from_secs(deadline),
+                    entry + Duration::from_secs(now),
+                    Duration::from_secs(timeout),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fake.drain_clock.waits(),
+            expected,
+            "later poll delay {later_poll_delay}"
+        );
+        assert_eq!(fake.drain_clock.now(), entry + Duration::from_secs(ended_s));
+        {
+            let state = fake.lock();
+            assert_eq!(
+                state.cancel.as_ref().unwrap().at,
+                entry + Duration::from_secs(29)
+            );
+            assert_eq!(state.calls_of("cancel_begin").len(), 1);
+            assert_eq!(state.kills, 1);
+            assert!(
+                state.callback_advance.is_empty(),
+                "both initial and later poll delays were consumed"
+            );
+            assert!(state.completed.is_empty());
+        }
+        assert_eq!(summary.stopped, StopReason::Cancelled);
+        assert_eq!(summary.abandoned, strings(&["T1", "T2"]));
+        fake.end();
+        fake.wait_until("during-poll request workers released", |s| s.running == 0);
+    }
+}
+
+/// A request recorded at 99 is age five when the blocked 100→104 poll returns, not age one plus another four-second charge.
+#[test]
+fn cancel_drain_request_recorded_before_initial_poll_charges_delay_once() {
+    let fake = Fake::new(vec![
+        Task::new("T2").act(Act::Hang),
+        Task::new("T1").act(Act::Hang),
+    ]);
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    fake.drain_clock.advance(Duration::from_secs(100));
+    let entry = fake.drain_clock.now();
+    {
+        let mut state = fake.lock();
+        state.cancel_elapsed_s = Some(1.0);
+        state
+            .callback_advance
+            .insert("cancel_state", Duration::from_secs(4));
+        state
+            .callback_advance
+            .insert("cancel_begin", Duration::from_secs(1));
+    }
+    let run = start_scripted_cancel(
+        &fake,
+        RunConfig {
+            cancel_grace_s: 10.0,
+            shutdown_budget_s: 15.0,
+            kill_grace_s: 5.0,
+            kill_settle_s: 3.0,
+            wait_tick_s: 4.0,
+            ..config(2)
+        },
+        false,
+        false,
+    );
+    let summary = run.summary();
+    {
+        let state = fake.lock();
+        assert_eq!(
+            state.cancel.as_ref().unwrap().at,
+            entry - Duration::from_secs(1)
+        );
+        let (at, reason, grace, in_flight) = state.begin.as_ref().unwrap();
+        assert_eq!(
+            (*at, reason.as_str(), *grace, *in_flight),
+            (entry + Duration::from_secs(4), "signal SIGTERM", 2.0, 2)
+        );
+        let (at, grace, reason) = state.kill.as_ref().unwrap();
+        assert_eq!(
+            (*at, *grace, reason.as_str()),
+            (entry + Duration::from_secs(6), 5.0, "signal SIGTERM")
+        );
+        assert_eq!(state.calls_of("cancel_begin").len(), 1);
+        assert_eq!(state.kills, 1);
+        assert!(state.callback_advance.is_empty());
+    }
+    assert_eq!(
+        fake.drain_clock.waits(),
+        vec![
+            // cancel_begin received the residual two seconds, and consumed one without renewing the grace.
+            (
+                entry + Duration::from_secs(6),
+                entry + Duration::from_secs(5),
+                Duration::from_secs(1)
+            ),
+            (
+                entry + Duration::from_secs(14),
+                entry + Duration::from_secs(6),
+                Duration::from_secs(4)
+            ),
+            (
+                entry + Duration::from_secs(14),
+                entry + Duration::from_secs(10),
+                Duration::from_secs(4)
+            ),
+        ]
+    );
+    assert_eq!(fake.drain_clock.now(), entry + Duration::from_secs(14));
+    assert_eq!(summary.stopped, StopReason::Cancelled);
+    assert_eq!(summary.abandoned, strings(&["T1", "T2"]));
+    fake.end();
+    fake.wait_until("pre-poll request workers released", |s| s.running == 0);
+}
+
+/// A callback may cooperatively overrun, but its return never starts a new grace or kill/settle window.
+#[test]
+fn cancel_drain_exhausted_budget_does_not_restart_grace() {
+    let cases = [
+        // label, already observed elapsed, delayed port, queued completion, force, kill argument, final clock, wait count
+        ("already exhausted", 20.0, None, false, false, 0.0, 0, 0),
+        (
+            "initial poll/GIL",
+            0.0,
+            Some("cancel_state"),
+            false,
+            false,
+            0.0,
+            20,
+            0,
+        ),
+        (
+            "cancel_begin",
+            0.0,
+            Some("cancel_begin"),
+            false,
+            false,
+            0.0,
+            20,
+            0,
+        ),
+        ("complete", 0.0, Some("complete"), true, false, 0.0, 20, 1),
+        ("kill return", 0.0, Some("kill"), false, true, 5.0, 20, 0),
+    ];
+    for (label, elapsed, delayed, stage_completion, force, kill_grace, ended_s, wait_count) in cases
+    {
+        let fake = Fake::new(vec![
+            Task::new("T1").act(if stage_completion {
+                Act::Return("DONE")
+            } else {
+                Act::Hang
+            }),
+            Task::new("T2").act(Act::Hang),
+        ]);
+        let _cleanup = Cleanup(Arc::clone(&fake));
+        {
+            let mut state = fake.lock();
+            state.cancel_elapsed_s = Some(elapsed);
+            if let Some(port) = delayed {
+                state.callback_advance.insert(port, Duration::from_secs(20));
+            }
+        }
+        let origin = fake.drain_clock.now();
+        let run = start_scripted_cancel(
+            &fake,
+            RunConfig {
+                cancel_grace_s: 10.0,
+                shutdown_budget_s: 15.0,
+                kill_grace_s: 5.0,
+                kill_settle_s: 3.0,
+                wait_tick_s: 4.0,
+                ..config(2)
+            },
+            stage_completion,
+            force,
+        );
+        let summary = run.summary();
+        {
+            let state = fake.lock();
+            assert_eq!(state.calls_of("cancel_begin").len(), 1, "{label}");
+            assert_eq!(state.kills, 1, "{label}");
+            assert_eq!(state.kill.as_ref().unwrap().1, kill_grace, "{label}");
+            if label == "already exhausted" || label == "initial poll/GIL" {
+                assert_eq!(state.begin.as_ref().unwrap().2, 0.0, "{label}");
+            }
+        }
+        let shutdown = origin + Duration::from_secs_f64((15.0 - elapsed).max(0.0));
+        let waits = fake.drain_clock.waits();
+        assert_eq!(
+            waits.len(),
+            wait_count,
+            "{label}: no wait after the callback exhausted the budget"
+        );
+        for (deadline, now, timeout) in waits {
+            assert!(deadline <= shutdown && now < deadline, "{label}");
+            assert!(
+                timeout <= deadline.saturating_duration_since(now),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            fake.drain_clock.now(),
+            origin + Duration::from_secs(ended_s),
+            "{label}"
+        );
+        assert_eq!(summary.stopped, StopReason::Cancelled, "{label}");
+        let abandoned = if stage_completion {
+            strings(&["T2"])
+        } else {
+            strings(&["T1", "T2"])
+        };
+        assert_eq!(summary.abandoned, abandoned, "{label}");
+        fake.end();
+        fake.wait_until("exhausted-budget workers released", |s| s.running == 0);
+    }
 }
 
 // ---- errors, panics, configuration, locks -----------------------------------------------------------------------------------------

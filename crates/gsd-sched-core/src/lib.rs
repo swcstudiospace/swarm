@@ -13,6 +13,7 @@ pub mod backoff;
 pub mod claim_pattern;
 pub mod claims;
 pub mod drain;
+pub mod panic_guard;
 pub mod pool;
 pub mod ports;
 pub mod priority;
