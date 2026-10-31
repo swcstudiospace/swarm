@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from conftest import _BASE_ENV_ALLOW, _scrubbed_base_env, pytest_configure
+from conftest import ROOT, _BASE_ENV_ALLOW, _scrubbed_base_env, pytest_configure
 
 _PARENT = {  # what a polluted host looks like: allow-listed vars, a locale var, and vars the scrub must drop
     "SWARM_DIR": "/parent/swarm", "SWARM_PURE_PYTHON": "1", "LC_ALL": "C.UTF-8", "LC_FOO": "bar",
@@ -100,3 +100,46 @@ def test_a_tests_own_env_override_wins_over_the_forwarded_values(parent_env, sel
                           env={**_scrubbed_base_env(), **override})
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout) == seen
+
+
+@pytest.mark.parametrize("selector", [None, "python"], ids=["unset", "python"])
+def test_python_child_start_reuses_original_controller_monitor_helper(parent_env, selector):
+    """Helper extraction leaves the Python child on its original controller and pool."""
+    if selector is not None:
+        parent_env.setenv("SWARM_TEST_ENGINE", selector)
+    code = f"""
+import importlib.util, json, sys, threading
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location("swarm_run_rig_helper", {str(ROOT / "scripts" / "swarm_run.py")!r})
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+controller = mod.Scheduler.__new__(mod.Scheduler)
+controller.mgr = SimpleNamespace(max_concurrent=1)
+controller._monitor_stop = threading.Event()
+seen = []
+real = mod.Scheduler._start_monitor
+def start_monitor(self):
+    seen.append((self, self.pool))
+    return real(self)
+mod.Scheduler._start_monitor = start_monitor
+mod.Scheduler._watch = lambda self: self._monitor_stop.wait(5)
+controller.start()
+try:
+    print(json.dumps({{
+        "same_controller": len(seen) == 1 and seen[0][0] is controller,
+        "same_pool": len(seen) == 1 and seen[0][1] is controller.pool,
+        "python_pool": isinstance(controller.pool, mod.WorkerPool),
+        "monitor_daemon": controller._monitor.daemon,
+    }}))
+finally:
+    controller._monitor_stop.set()
+    controller._monitor.join(5)
+    controller.pool.shutdown()
+"""
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30,
+                          cwd=ROOT, env=_scrubbed_base_env())
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {
+        "same_controller": True, "same_pool": True, "python_pool": True, "monitor_daemon": True,
+    }

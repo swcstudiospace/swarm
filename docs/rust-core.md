@@ -115,6 +115,12 @@ Read as: `swarm/engine_select.py` (`KEY_ENV_NAMES`, `carries_key`, `identity_ref
 
 Core child-process tests and a standalone public-API consumer exercise native worker isolation, sibling completion, and prior-hook behavior. These are core proofs, not evidence that the pending Python runtime binding or scheduler default flip is complete. All defaults remain unchanged.
 
+### 3.4 Scheduler controller lifecycle
+
+`scripts/swarm_run.py` retains one authoritative `Scheduler` controller for signals, sessions, telemetry, leases, handoffs and final results. Its `_start_monitor()` starts only monitoring. `_open_run(task, agent)` registers the run/SID/in-flight record and returns `OpenRun(item, failure)` with an optional setup failure; it queues no worker. `_finish_run(item, done)` performs shared lifecycle and telemetry completion, while the execution engine retains claim release, retry, AIMD and extension-stop decisions.
+
+The Python path still submits through its existing `WorkerPool` and completes every admitted run once, including setup failures. These private lifecycle helpers do not select an engine, create a second controller or make a host callback preemptible. Cancellation deadlines and bounded cooperative operations remain separate execution responsibilities.
+
 ## 4. Routes
 
 | Route | Selector (script) | Argv the selector claims | Selector class | Default row | Rust route (`crates/gsd-adapter/src/route_table.rs`) |

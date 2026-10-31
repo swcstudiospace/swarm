@@ -1743,6 +1743,22 @@ class Inflight(NamedTuple):
     future: Future
 
 
+class OpenRun(NamedTuple):
+    """Registered dispatch and its optional setup failure; no worker has been submitted.
+
+    `item.future` is passive (already resolved to `failure` on setup failure). Python
+    `_submit` replaces it with the pool's Future only on successful submission.
+    """
+    item: Inflight
+    failure: Done | None
+
+
+class FinishedRun(NamedTuple):
+    """Lifecycle result consumed by the engine's own completion decisions."""
+    failed: bool
+    reason: str
+
+
 class Pass(NamedTuple):
     """One scheduling pass: dispatchable tasks seen, tasks submitted, lease waits, earliest backoff expiry (wall)."""
     ready: int
@@ -1862,6 +1878,14 @@ class Scheduler:
     def start(self) -> None:
         self.t0 = time.monotonic()
         self.pool = WorkerPool(self.mgr.max_concurrent, "swarm-run")
+        self._start_monitor()
+
+    def _start_monitor(self) -> None:
+        """Start only this controller's monitor; allocate/submit no Python worker pool.
+
+        `start` owns the Python pool and resets t0. A non-Python engine sets its run
+        start time before calling this bound helper and retains abort/close ownership.
+        """
         self._monitor = threading.Thread(target=self._watch, name="swarm-monitor", daemon=True)
         self._monitor.start()
 
@@ -1978,13 +2002,24 @@ class Scheduler:
               free_slots=max(0, free - submitted), max_parallel=self.mgr.max_concurrent, effective_parallel=eff,
               per_agent=per_agent, skipped=reported)
 
-    def _submit(self, task: dict, agent: dict) -> None:
+    def _open_run(self, task: dict, agent: dict) -> OpenRun:
+        """Register one dispatch on this controller, without submitting any worker.
+
+        Owns RunBook opening, RunHandle/SID creation, immediate dispatch status,
+        inflight insertion and the dispatched increment (including setup failure).
+        The task/agent dicts and RunHandle are retained by identity. The Future is
+        passive; a setup Exception is recorded once through _internal_failure,
+        resolves that Future and releases an allocated SID before returning.
+        As before, RunBook/RunHandle construction errors precede the setup guard.
+        """
         tid = task["task_id"]
         corr, ctx, dry = self.corr, self.ctx, self.args.dry_run
         run_id = self.book.seen(task, waiting=False, queue_depth=0)
         self.book.opened(run_id)
         run = RunHandle(self.tel, run_id, tid, agent["slug"], "",
                         float(task["budget"].get("max_wall_s") or self.args.task_timeout))
+        future: Future = Future()
+        failure: Done | None = None
         try:
             run.sid = sid = self.mgr.new_subagent_id(tid, root=ctx.root, correlation_id=corr)
             # immediate emit calls for spawn events, subagent IDs, real-time status to OMP
@@ -1994,14 +2029,29 @@ class Scheduler:
                          root=ctx.root, dry_run=dry)
             emit_gsd_omp("consolidated", subagent_id=sid, task_id=tid, audit="spawn", wave="wave1", corr=corr,
                          root=ctx.root, dry_run=dry)
-            future = self.pool.submit(self._worker, task, agent, sid, run)
         except Exception as exc:  # noqa: BLE001 - a dispatch that cannot even be queued fails that task only
-            future = Future()
-            future.set_result(self._internal_failure(task, agent, exc))
+            failure = self._internal_failure(task, agent, exc)
+            future.set_result(failure)
             if run.sid:
                 self.mgr.release(run.sid)
-        self.inflight[tid] = Inflight(task, agent, run.sid, run, future)
+        item = Inflight(task, agent, run.sid, run, future)
+        self.inflight[tid] = item
         self.dispatched += 1
+        return OpenRun(item, failure)
+
+    def _submit(self, task: dict, agent: dict) -> None:
+        opened = self._open_run(task, agent)
+        if opened.failure is not None:
+            return
+        item = opened.item
+        try:
+            future = self.pool.submit(self._worker, task, agent, item.sid, item.run)
+        except Exception as exc:  # noqa: BLE001 - preserve the failed-submission Future path
+            future = item.future
+            future.set_result(self._internal_failure(task, agent, exc))
+            if item.sid:
+                self.mgr.release(item.sid)
+        self.inflight[task["task_id"]] = item._replace(future=future)
 
     # ---- the worker (runs on a pool thread) ------------------------------------------------------------------------
     def _worker(self, task: dict, agent: dict, sid: str, run: RunHandle) -> Done:
@@ -2079,6 +2129,27 @@ class Scheduler:
                                           else RuntimeError(repr(crashed)))
         else:
             done = future.result()
+        finished = self._finish_run(item, done)
+        self._backpressure(run, finished.failed, item.task, finished.reason)
+        if finished.failed and not self.cancel.event.is_set():
+            self._schedule_retry(item.task, finished.reason, run.rate_limited)
+        if _extension_failed(self.store, tid) and not self.extension_down:
+            self.extension_down = True
+            self.closed = True
+            self.log.append("stopped: omp extension failed to load; no further sessions this run")
+
+    def _finish_run(self, item: Inflight, done: Done) -> FinishedRun:
+        """Finish lifecycle/telemetry/status/log only; make no engine decisions.
+
+        The completion caller must remove inflight, release SID (idempotent), and
+        release its engine's claims exactly once BEFORE calling this helper.
+        Python _complete retains that order before resolving its Future, then
+        consumes this result for AIMD, retry and extension checks in that order.
+        Native callers pass their Done directly, not the passive Future's result;
+        they own the equivalent pre-finish cleanup and native decisions. Neither
+        this helper nor close submits work or settles leases (the worker does).
+        """
+        tid, run = item.task["task_id"], item.run
         aid, outcome = done.agent_id, done.outcome
         failed = done.error is not None or outcome == S.FAILED.value
         reason = (done.error or last_failure(self.store, tid)) if failed else ""
@@ -2099,13 +2170,7 @@ class Scheduler:
                      corr=self.corr, root=self.ctx.root, dry_run=self.args.dry_run)
         emit_gsd_omp("consolidated", subagent_id=item.sid, task_id=tid, audit="result", outcome=outcome,
                      corr=self.corr, root=self.ctx.root, dry_run=self.args.dry_run)
-        self._backpressure(run, failed, item.task, reason)
-        if failed and not self.cancel.event.is_set():
-            self._schedule_retry(item.task, reason, run.rate_limited)
-        if _extension_failed(self.store, tid) and not self.extension_down:
-            self.extension_down = True
-            self.closed = True
-            self.log.append("stopped: omp extension failed to load; no further sessions this run")
+        return FinishedRun(failed, reason)
 
     def _backpressure(self, run: RunHandle, failed: bool, task: dict, reason: str) -> None:
         """AIMD: a rate-limited session halves the effective parallelism (swarm.degraded) once per burst, a success adds
