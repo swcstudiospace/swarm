@@ -462,6 +462,80 @@ Keys: the binary reads signing keys only for a transition to APPROVED and only w
 
 Known gaps, as of this section: no kill -9 evidence for the APPROVED target, the four gate routes or `orch_plan` (see the flip record); `swarm_tool catalog` has no route; no quiet-host record (U3.8a); no flip approval (U3.8c).
 
+### npm / Node test compatibility
+
+The Python quality gate and its Rust host twin recognize a deliberately literal
+subset of `package.json`'s `scripts.test`: `SCRIPT = SIMPLE (&& SIMPLE)*`, where
+`&&` must be unquoted and every command is nonempty. Detection only tokenizes; it
+does not execute the script. The final decoded command head must be exactly the
+bare name `node` (quoting or escaping the name is allowed, executable paths and
+`nodejs` are not). Exactly one `--test` must precede filename mode. At most one
+`--test-reporter` selecting `tap` or `spec` is allowed, joined with `=` or supplied
+as the next token, before or after `--test` but always before filenames. Unknown,
+duplicate, eval/print and other options, including `--`, and any option after the
+first filename are outside this adapter.
+
+For example, both `node --test --test-reporter=tap test/example.test.js` and
+`tsc -p tsconfig.json && node --test "dist/test/**/*.test.js"` are recognized.
+Single/double quotes and literal backslash escapes are decoded without losing a
+quoted glob token. In double quotes, backslash is special only before `$`,
+backtick, `"` or backslash. NUL, CR, LF and continuations, malformed quotes,
+unquoted controls other than space/tab, unquoted `; | & < > ( )`, comments,
+unquoted glob/brace/tilde expansion and active
+`$`/backtick expansion or substitution are rejected. Quoted/escaped literal
+metacharacters are permitted. Every command head is checked against assignment
+syntax (`=`). Its decoded basename (also for path-qualified precursors) is
+checked against reserved/control words and the conservative wrapper list:
+`! . : [ [[ ]] { } case do done elif else esac fi for function if in select then
+time until while coproc break continue return exit exec eval command builtin env
+sudo doas xargs source bash sh dash zsh fish nohup timeout nice setsid`.
+This is not a general shell parser and intentionally declines more elaborate
+scripts rather than guessing their runner from a substring or a filename.
+
+For this recognized subset the gate runs only `npm test --silent`, without
+injecting `--ci`. Every other npm script retains the existing
+`npm test --silent -- --ci` fallback and Jest/Mocha count regexes. Normal npm
+lifecycle hooks still run. Subprocesses inherit the caller's environment;
+the adapter does not rewrite `PATH`, `NODE_OPTIONS`, reporter/color settings,
+signing configuration or engine routing, and does not install dependencies.
+
+Node success requires the actual subprocess return code to be zero **and**
+complete top-level aggregate evidence with `passed > 0` and `failed == 0`.
+Evidence is read separately from stdout and stderr, with ANSI CSI/OSC stripped
+only from a parsing copy. Raw output tails, actual return codes and observed
+numeric counts are retained; `executed[].evidence_complete` is separate from
+those counts and is present only for this Node adapter. Individual `ok` rows
+and indented subtest aggregates are not counted.
+
+The terminal candidate is an unindented, contiguous metadata block beginning
+with exactly `# ` (TAP) or `ℹ ` (spec). It must include an anchored integer
+`pass N` and `fail N` pair in the same block, style and stream. Standard metadata
+`tests`, `suites`, `cancelled`, `skipped`, `todo`, `duration_ms`, `duration`,
+`start`, `end` and `time` may surround the pair. A nonmetadata line closes the
+block; a style switch or repeated metadata key begins a new candidate. A later
+incomplete or metadata-only candidate invalidates an earlier complete pair.
+Candidates in both streams are ambiguous and cannot establish completeness;
+the terminal stderr candidate supplies observed counts, without adding streams.
+Zero-pass, skip/todo-only and output-free successful processes fail closed with
+the finding `npm test missing Node test evidence (complete pass/fail aggregate
+with passed > 0 required)`, without inventing failed tests. A nonzero process
+always fails even if it printed a passing aggregate. Other runner semantics,
+risk tiers, per-target findings, dry-run, signing and write-route ownership/no
+replay remain unchanged.
+
+Regression coverage uses temporary genuine npm/Node consumers and, when `tsc`
+is available on the inherited `PATH`, the exact compiler-then-Node chain above.
+The compiler fixture keeps strict checking enabled with small local ambient
+declarations for the Node APIs it uses; it neither downloads dependencies nor
+replaces the compiler or suppresses type checking. A real compile error must
+short-circuit before emission and before the Node marker is written. Literal
+classification and aggregate edge cases are tested as pure parser samples;
+canned subprocess output and printed Jest/Mocha summaries are not treated as
+end-to-end runner evidence. Missing-evidence regressions assert observable
+status, return codes, counts, completeness and structured findings rather than
+pinning diagnostic prose.
+
+
 
 ## Rust redaction engine (opt-in)
 

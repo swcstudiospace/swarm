@@ -29,6 +29,7 @@ struct Runner {
     cmd: Vec<String>,
     pass_re: &'static str,
     fail_re: &'static str,
+    node_test: bool,
 }
 
 struct Executed {
@@ -37,6 +38,7 @@ struct Executed {
     passed: i64,
     failed: i64,
     tail: String,
+    evidence_complete: Option<bool>,
 }
 
 /// True when `argv` is the grammar this route serves. `--json` is required so Python's text mode stays Python's.
@@ -167,6 +169,186 @@ fn pytest_importable() -> bool {
         .unwrap_or(false)
 }
 
+/// Deliberately not a shell parser: only literal simple commands joined by unquoted `&&`.
+/// Quotes and escapes decode literal argv; active expansion and other shell syntax decline.
+fn literal_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    if script.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
+        return None;
+    }
+    let mut chars = script.chars().peekable();
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Some('"') => match c {
+                '"' => quote = None,
+                '$' | '`' => return None,
+                '\\' => {
+                    let next = chars.next()?;
+                    // POSIX double quotes only remove backslash for these characters.
+                    if !matches!(next, '$' | '`' | '"' | '\\') {
+                        word.push('\\');
+                    }
+                    word.push(next);
+                }
+                _ => word.push(c),
+            },
+            None => match c {
+                '\'' | '"' => {
+                    started = true;
+                    quote = Some(c);
+                }
+                '\\' => {
+                    started = true;
+                    word.push(chars.next()?);
+                }
+                ' ' | '\t' => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                '&' if chars.next() == Some('&') => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                    if words.is_empty() {
+                        return None;
+                    }
+                    commands.push(std::mem::take(&mut words));
+                }
+                '&' | ';' | '|' | '<' | '>' | '(' | ')' | '$' | '`' | '#' | '~' | '{' | '}'
+                | '*' | '?' | '[' | ']' => return None,
+                _ if c.is_control() => return None,
+                _ => {
+                    started = true;
+                    word.push(c);
+                }
+            },
+            _ => unreachable!(),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return None;
+    }
+    commands.push(words);
+    for command in &commands {
+        let head = command.first()?.as_str();
+        let basename = head.rsplit('/').next().unwrap_or(head);
+        if head.is_empty()
+            || head.contains('=')
+            || matches!(
+                basename,
+                "!" | "{"
+                    | "}"
+                    | "case"
+                    | "do"
+                    | "done"
+                    | "elif"
+                    | "else"
+                    | "esac"
+                    | "fi"
+                    | "for"
+                    | "function"
+                    | "if"
+                    | "in"
+                    | "select"
+                    | "then"
+                    | "time"
+                    | "until"
+                    | "while"
+                    | "coproc"
+                    | "break"
+                    | "continue"
+                    | "return"
+                    | "exit"
+                    | "exec"
+                    | "eval"
+                    | "command"
+                    | "builtin"
+                    | "env"
+                    | "sudo"
+                    | "xargs"
+                    | "."
+                    | ":"
+                    | "["
+                    | "[["
+                    | "]]"
+                    | "doas"
+                    | "source"
+                    | "bash"
+                    | "sh"
+                    | "dash"
+                    | "zsh"
+                    | "fish"
+                    | "nohup"
+                    | "timeout"
+                    | "nice"
+                    | "setsid"
+            )
+        {
+            return None;
+        }
+    }
+    Some(commands)
+}
+
+fn is_node_test_script(script: &str) -> bool {
+    let Some(commands) = literal_commands(script) else {
+        return false;
+    };
+    let command = commands.last().expect("a nonempty literal chain");
+    if command[0] != "node" {
+        return false;
+    }
+    let mut test = false;
+    let mut reporter = false;
+    let mut filenames = false;
+    let mut index = 1;
+    while let Some(arg) = command.get(index) {
+        index += 1;
+        if arg == "--test" && !filenames && !test {
+            test = true;
+        } else if !filenames && !reporter && arg == "--test-reporter" {
+            let Some(value) = command.get(index) else {
+                return false;
+            };
+            if !matches!(value.as_str(), "tap" | "spec") {
+                return false;
+            }
+            reporter = true;
+            index += 1;
+        } else if !filenames
+            && !reporter
+            && matches!(arg.as_str(), "--test-reporter=tap" | "--test-reporter=spec")
+        {
+            reporter = true;
+        } else if arg.starts_with('-') || !test {
+            return false;
+        } else {
+            filenames = true;
+        }
+    }
+    test
+}
+
 fn detect_runners(root: &Path) -> Vec<Runner> {
     let mut runners = Vec::new();
     let pytest_marker = root.join("pyproject.toml").exists()
@@ -193,28 +375,28 @@ fn detect_runners(root: &Path) -> Vec<Runner> {
             ],
             pass_re: r"(\d+) passed",
             fail_re: r"(\d+) failed|(\d+) error",
+            node_test: false,
         });
     }
     if let Ok(text) = fs::read_to_string(root.join("package.json")) {
-        let has_test = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("scripts")
-                    .and_then(|scripts| scripts.get("test"))
-                    .map(|_| ())
-            })
-            .is_some();
+        let package = serde_json::from_str::<serde_json::Value>(&text).ok();
+        let test = package
+            .as_ref()
+            .and_then(|value| value.get("scripts"))
+            .and_then(|scripts| scripts.get("test"));
+        let has_test = test.is_some();
+        let node_test = test
+            .and_then(|value| value.as_str())
+            .is_some_and(is_node_test_script);
         if has_test && which("npm") {
+            let mut cmd = vec!["npm".into(), "test".into(), "--silent".into()];
+            if !node_test {
+                cmd.extend(["--".into(), "--ci".into()]);
+            }
             runners.push(Runner {
                 name: "npm test",
-                cmd: vec![
-                    "npm".into(),
-                    "test".into(),
-                    "--silent".into(),
-                    "--".into(),
-                    "--ci".into(),
-                ],
+                cmd,
+                node_test,
                 pass_re: r"Tests:\s+(\d+) passed|(\d+) passing",
                 fail_re: r"(\d+) failed|(\d+) failing",
             });
@@ -226,6 +408,7 @@ fn detect_runners(root: &Path) -> Vec<Runner> {
             cmd: vec!["go".into(), "test".into(), "./...".into()],
             pass_re: r"^ok",
             fail_re: r"^FAIL|--- FAIL",
+            node_test: false,
         });
     }
     if root.join("Cargo.toml").exists() && which("cargo") {
@@ -234,6 +417,7 @@ fn detect_runners(root: &Path) -> Vec<Runner> {
             cmd: vec!["cargo".into(), "test".into(), "-q".into()],
             pass_re: r"(\d+) passed",
             fail_re: r"(\d+) failed",
+            node_test: false,
         });
     }
     runners
@@ -259,7 +443,104 @@ fn count(pattern: &str, text: &str) -> i64 {
         .sum()
 }
 
-fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), SeamError> {
+#[derive(Debug, Default, PartialEq)]
+struct NodeEvidence {
+    passed: i64,
+    failed: i64,
+    complete: bool,
+}
+
+/// Only the terminal, contiguous, top-level aggregate block is evidence. A new
+/// style, repeated key or intervening nonmetadata line starts a new candidate.
+fn node_stream_evidence(text: &str) -> Option<NodeEvidence> {
+    use std::sync::LazyLock;
+    static ANSI: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+            .expect("ANSI regex")
+    });
+    static METADATA: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+        r"^(#|ℹ) (?:(tests|suites|pass|fail|cancelled|skipped|todo) ([0-9]+)|(duration_ms) ([0-9]+(?:\.[0-9]+)?)|(duration) ([0-9]+(?:\.[0-9]+)?(?:ms|s))|(start|end|time) (.+))$"
+    ).expect("Node aggregate regex")
+    });
+    let normalized = ANSI.replace_all(text, "");
+    let mut candidate = None;
+    let mut style = "";
+    let mut keys: u16 = 0;
+    let mut active = false;
+    for line in normalized.lines() {
+        let Some(caps) = METADATA.captures(line) else {
+            active = false;
+            continue;
+        };
+        let next_style = caps.get(1).expect("style").as_str();
+        let key = [2, 4, 6, 8]
+            .iter()
+            .find_map(|i| caps.get(*i))
+            .expect("key")
+            .as_str();
+        let bit = match key {
+            "tests" => 1,
+            "suites" => 2,
+            "pass" => 4,
+            "fail" => 8,
+            "cancelled" => 16,
+            "skipped" => 32,
+            "todo" => 64,
+            "duration_ms" => 128,
+            "duration" => 256,
+            "start" => 512,
+            "end" => 1024,
+            "time" => 2048,
+            _ => unreachable!(),
+        };
+        if !active || style != next_style || keys & bit != 0 {
+            candidate = Some(NodeEvidence::default());
+            keys = 0;
+            style = next_style;
+        }
+        active = true;
+        keys |= bit;
+        let evidence = candidate.as_mut().expect("candidate");
+        if key == "pass" || key == "fail" {
+            let Some(value) = caps.get(3).and_then(|v| v.as_str().parse::<i64>().ok()) else {
+                // An unrepresentable count cannot establish a complete aggregate.
+                active = false;
+                candidate = Some(NodeEvidence::default());
+                continue;
+            };
+            if key == "pass" {
+                evidence.passed = value;
+            } else {
+                evidence.failed = value;
+            }
+        }
+        evidence.complete = keys & 12 == 12;
+    }
+    candidate
+}
+
+fn node_evidence(stdout: &str, stderr: &str) -> NodeEvidence {
+    match (node_stream_evidence(stdout), node_stream_evidence(stderr)) {
+        (Some(_), Some(mut evidence)) => {
+            // There is no cross-stream chronology: never combine or pick a pass.
+            evidence.complete = false;
+            evidence
+        }
+        (Some(evidence), None) | (None, Some(evidence)) => evidence,
+        (None, None) => NodeEvidence::default(),
+    }
+}
+
+fn node_ok(code: i32, evidence: &NodeEvidence) -> bool {
+    code == 0 && evidence.complete && evidence.passed > 0 && evidence.failed == 0
+}
+
+fn run_cmd_streams(
+    cmd: &[String],
+    cwd: &Path,
+    timeout: u64,
+) -> Result<(i32, String, String), SeamError> {
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
         .current_dir(cwd)
@@ -306,9 +587,11 @@ fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), Se
             if out_reader.is_finished() && err_reader.is_finished() {
                 let stdout = read_pipe(out_reader)?;
                 let stderr = read_pipe(err_reader)?;
-                let mut text = String::from_utf8_lossy(&stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&stderr));
-                return Ok((status.code().unwrap_or(1), text));
+                return Ok((
+                    status.code().unwrap_or(1),
+                    String::from_utf8_lossy(&stdout).into_owned(),
+                    String::from_utf8_lossy(&stderr).into_owned(),
+                ));
             }
         }
         if std::time::Instant::now() > deadline {
@@ -322,6 +605,12 @@ fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), Se
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), SeamError> {
+    let (code, mut stdout, stderr) = run_cmd_streams(cmd, cwd, timeout)?;
+    stdout.push_str(&stderr);
+    Ok((code, stdout))
 }
 
 fn read_pipe(
@@ -478,10 +767,16 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
             }
         } else {
             for runner in &runners {
-                let (code, out) = run_cmd(&runner.cmd, &root, args.timeout)?;
-                let passed = count(runner.pass_re, &out);
-                let failed = count(runner.fail_re, &out);
-                let ok = code == 0 && failed == 0;
+                let (code, mut out, stderr) = run_cmd_streams(&runner.cmd, &root, args.timeout)?;
+                let node = runner.node_test.then(|| node_evidence(&out, &stderr));
+                out.push_str(&stderr);
+                let (passed, failed, ok) = if let Some(evidence) = &node {
+                    (evidence.passed, evidence.failed, node_ok(code, evidence))
+                } else {
+                    let passed = count(runner.pass_re, &out);
+                    let failed = count(runner.fail_re, &out);
+                    (passed, failed, code == 0 && failed == 0)
+                };
                 let tail = out
                     .chars()
                     .rev()
@@ -496,6 +791,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                     passed,
                     failed,
                     tail: tail.clone(),
+                    evidence_complete: node.as_ref().map(|e| e.complete),
                 });
                 if tiers.iter().any(|tier| tier == "unit") {
                     if let Some(slot) = runs.iter_mut().find(|(name, _)| name == "unit") {
@@ -520,11 +816,18 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                         .chars()
                         .rev()
                         .collect();
+                    let summary = if code == 0
+                        && node.as_ref().is_some_and(|e| !e.complete || e.passed == 0)
+                    {
+                        "npm test missing Node test evidence (complete pass/fail aggregate with passed > 0 required)".into()
+                    } else {
+                        format!("{} failed ({failed} failing)", runner.name)
+                    };
                     findings.push(finding(
                         &id,
                         "major",
                         "functional",
-                        &format!("{} failed ({failed} failing)", runner.name),
+                        &summary,
                         &evidence,
                         "A05",
                     ));
@@ -706,13 +1009,17 @@ fn obj_str<'a>(value: &'a Json, key: &str) -> Option<&'a str> {
 }
 
 fn executed_json(item: &Executed) -> Json {
-    Json::Obj(vec![
+    let mut fields = vec![
         ("runner".into(), jstr(&item.runner)),
         ("returncode".into(), Json::Int(i64::from(item.returncode))),
         ("passed".into(), Json::Int(item.passed)),
         ("failed".into(), Json::Int(item.failed)),
         ("tail".into(), jstr(&item.tail)),
-    ])
+    ];
+    if let Some(complete) = item.evidence_complete {
+        fields.push(("evidence_complete".into(), Json::Bool(complete)));
+    }
+    Json::Obj(fields)
 }
 
 fn verdict_of(envelope: &Json, recorded: &[(String, Json)]) -> String {
@@ -814,7 +1121,10 @@ fn load_per_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{committed, count, run_cmd, write_plan_file};
+    use super::{
+        committed, count, is_node_test_script, literal_commands, node_evidence, node_ok, run_cmd,
+        write_plan_file, NodeEvidence,
+    };
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
     use gsd_taskwriter::{GateFile, GateIssueRequest, GatePlan, GateWrite};
@@ -824,6 +1134,179 @@ mod tests {
         assert_eq!(count(r"(\d+) passed", "3 passed, 1 passed"), 4);
         assert_eq!(count(r"(\d+) failed|(\d+) error", "2 failed\n1 error"), 3);
         assert_eq!(count(r"^ok", "ok\nok"), 2);
+    }
+
+    #[test]
+    fn legacy_npm_accounting_parses_jest_and_mocha_samples() {
+        let pass_re = r"Tests:\s+(\d+) passed|(\d+) passing";
+        let fail_re = r"(\d+) failed|(\d+) failing";
+        assert_eq!(count(pass_re, "Tests: 3 passed\n2 passing"), 5);
+        assert_eq!(count(fail_re, "1 failed\n2 failing"), 3);
+        assert_eq!(count(pass_re, "# pass 3\n# fail 0\n"), 0);
+        assert_eq!(count(fail_re, "# pass 0\n# fail 2\n"), 0);
+    }
+
+    #[test]
+    fn node_selector_accepts_only_literal_terminal_node_test_commands() {
+        for script in [
+            "node --test",
+            "node --test 'dist/test/**/*.test.js'",
+            "tsc -p tsconfig.json && node --test \"dist/test/**/*.test.js\"",
+            "node --test-reporter=tap --test test.js",
+            "node --test --test-reporter spec test.js",
+            "node --test-reporter spec --test test.js",
+            "node --test --test-reporter=spec test.js",
+            "'node' --test 'literal;$.test.js'",
+            "tsc -p 'a && b.json'&&node --test a\\ b.test.js",
+            "/usr/bin/tsc -p tsconfig.json && node --test ''",
+        ] {
+            assert!(is_node_test_script(script), "{script}");
+        }
+        let parsed =
+            literal_commands("tsc -p tsconfig.json && node --test \"dist/test/**/*.test.js\"")
+                .expect("literal Realm chain");
+        assert_eq!(parsed[1][2], "dist/test/**/*.test.js");
+    }
+
+    #[test]
+    fn node_selector_declines_shell_and_runner_lookalikes() {
+        for script in [
+            "",
+            "node",
+            "nodejs --test",
+            "./node --test",
+            "/usr/bin/node --test",
+            "echo 'node --test'",
+            "echo node --test",
+            "node 'node --test'",
+            "node -e 'node --test'",
+            "node --eval 'node --test'",
+            "node -p 'node --test'",
+            "node --test-reporter 'node --test'",
+            "node --test-reporter=json --test",
+            "node --test --test",
+            "node --test-reporter=tap --test --test-reporter=spec",
+            "node --test --unknown",
+            "node --test a.js --test-reporter=tap",
+            "node --test -- a.js",
+            "node --test dist/**/*.test.js",
+            "node --test $TESTS",
+            "node --test \"${TESTS}\"",
+            "node --test $(echo a.js)",
+            "node --test `echo a.js`",
+            "node --test > output",
+            "node --test | cat",
+            "node --test; echo ok",
+            "node --test || echo ok",
+            "node --test &",
+            "node --test &&",
+            "&& node --test",
+            "true && && node --test",
+            "if true && node --test",
+            "env X=1 && node --test",
+            "X=1 && node --test",
+            "sh -c true && node --test",
+            "command node --test",
+            "time node --test",
+            "node --test\n",
+            "node --test\\\na.js",
+            "node --test 'unclosed",
+            "node --test a\\",
+            "node --test # comment",
+            "node --test ~/a.js",
+            "node --test {a,b}.js",
+            "node --test \"$(echo a)\"",
+            "node --test\0",
+            "/bin/sh -c true && node --test",
+            "/usr/bin/env true && node --test",
+            "./tools/sudo true && node --test",
+            "node --test\u{000b}file.js",
+            "node --test\u{000c}file.js",
+            "node --test\u{007f}file.js",
+            "node --test\u{0085}file.js",
+        ] {
+            assert!(!is_node_test_script(script), "{script:?}");
+        }
+    }
+
+    #[test]
+    fn node_counts_use_only_the_terminal_top_level_block() {
+        for (text, passed, failed, complete) in [
+            (
+                "# tests 3\n# pass 2\n# fail 1\n# duration_ms 1.5\n",
+                2,
+                1,
+                true,
+            ),
+            (
+                "ℹ tests 2\nℹ pass 2\nℹ fail 0\nℹ duration_ms 1\n",
+                2,
+                0,
+                true,
+            ),
+            (
+                "    # pass 8\n    # fail 4\nok 1 - nested\n# pass 1\n# fail 0\n",
+                1,
+                0,
+                true,
+            ),
+            (
+                "\x1b[32mℹ pass 1\x1b[39m\n\x1b[32mℹ fail 0\x1b[39m\n",
+                1,
+                0,
+                true,
+            ),
+            ("# pass 2\n# fail 0\n# pass 1\n", 1, 0, false),
+            ("# pass 2\n# fail 0\n\n# tests 0\n", 0, 0, false),
+            ("# pass 2\n# fail 0\nℹ pass 1\n", 1, 0, false),
+            ("# pass 2\nℹ fail 0\n", 0, 0, false),
+            ("# pass 2\nnoise\n# fail 0\n", 0, 0, false),
+            (
+                "# pass 9\n# fail 2\n# tests 1\n# tests 1\n# pass 1\n# fail 0\n",
+                1,
+                0,
+                true,
+            ),
+            ("ok 1 - individual\n", 0, 0, false),
+            ("# pass 0\n# fail 0\n# skipped 1\n# todo 1\n", 0, 0, true),
+            ("", 0, 0, false),
+        ] {
+            assert_eq!(
+                node_evidence(text, ""),
+                NodeEvidence {
+                    passed,
+                    failed,
+                    complete
+                },
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            node_evidence("# pass 2\n# fail 0\n", "ℹ pass 1\nℹ fail 0\n"),
+            NodeEvidence {
+                passed: 1,
+                failed: 0,
+                complete: false
+            },
+        );
+        assert_eq!(
+            node_evidence("# pass 2\n", "# fail 1\n"),
+            NodeEvidence {
+                passed: 0,
+                failed: 1,
+                complete: false
+            },
+        );
+    }
+
+    #[test]
+    fn node_verdict_requires_real_positive_evidence_and_successful_exit() {
+        assert!(node_ok(0, &node_evidence("# pass 1\n# fail 0\n", "")));
+        assert!(!node_ok(1, &node_evidence("# pass 1\n# fail 0\n", "")));
+        assert!(!node_ok(0, &node_evidence("# pass 1\n# fail 1\n", "")));
+        assert!(!node_ok(0, &node_evidence("# pass 0\n# fail 0\n", "")));
+        assert!(!node_ok(0, &node_evidence("# pass 1\n", "")));
+        assert!(!node_ok(0, &node_evidence("", "")));
     }
 
     fn write_state(error: &SeamError) -> Option<&str> {
