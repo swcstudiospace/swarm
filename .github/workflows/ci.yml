@@ -200,6 +200,45 @@ jobs:
           name: parity-out
           path: parity-out/
           if-no-files-found: ignore
+  # The scheduler gate (phase 14.4, unit 14): scripts/ci_scheduler_rust.sh runs the native scheduler legs fail-closed on RELEASE builds
+  # (the plan's release rule) and writes its reports to scheduler-out/. Every leg's children must be witnessed on that leg's engine.
+  scheduler:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: scripts/ci_host_facts.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
+      # The pool's tool cache is read-only, so the packages go into a venv beside the interpreter (see the `test` job).
+      - name: Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install pytest pyyaml cryptography
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: scheduler gate (native build, binding, threads, vectors, both engines, types, clippy)
+        env:
+          SCHEDULER_CONTINUOUS_SHA256: ${{ vars.SCHEDULER_CONTINUOUS_SHA256 }}
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0" "mypy==1.18.2"
+          if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
+            VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --release --locked
+          fi
+          cargo build -p gsd-adapter --bin gsd_engine --release --locked
+          target_dir="$(cargo metadata --format-version 1 --no-deps --locked | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+          GSD_ENGINE_BIN="$target_dir/release/gsd_engine" scripts/ci_scheduler_rust.sh scheduler-out
+      - name: upload the scheduler reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-out
+          path: scheduler-out/
+          if-no-files-found: ignore
   # Headless Chrome against the cross-origin-isolation headers and the SharedArrayBuffer vectors (tests/acceptance/*.mjs). Chrome must
   # exist on the runner image; without it scripts/_ci_browser_gate.py exits 3 and says so. The repository variable BROWSER_GATE=skip
   # turns the job off without a code change.

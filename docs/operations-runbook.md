@@ -2,7 +2,7 @@
 
 Commands assume the repo root. The registry command is `python3 -m swarm.tool_registry`. Docs and contract tests are generated; do not hand-edit `docs/tools/`, `docs/skills/` or `tests/generated/test_tool_contracts.py`. The v2.2 runtime (scheduler, telemetry, handover, skills, bar) is described in [swarm-command-center.md](swarm-command-center.md).
 
-CI (`.github/workflows/ci.yml`) has six jobs on every push to `main` and every pull request, all on the Omega runner pool: `test` (`ruff`, `pytest`, `build_agents.py --check`, `scripts/_check_pins.py`, the tool registry `check`, `docs --check` and `gen-tests --check`, the skill registry `check` and `docs --check`, `scripts/_registry_intake.py --check`, both TS suites), `rust` (build and test), `clippy` (`cargo fmt --check` and clippy), `parity-rust`, `browser` and `supply-chain`. `.github/workflows/wheel.yml` (job `wheel`, then `install-and-gate`) is the one GitHub-hosted workflow. Commands, knobs and rollback are in "CI gates" below. `.pre-commit-config.yaml` runs the registry, skill and intake checks (not the TS suites or pytest) before a commit when the hook is installed. Both are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
+CI (`.github/workflows/ci.yml`) has seven jobs on every push to `main` and every pull request, all on the Omega runner pool: `test` (`ruff`, `pytest`, `build_agents.py --check`, `scripts/_check_pins.py`, the tool registry `check`, `docs --check` and `gen-tests --check`, the skill registry `check` and `docs --check`, `scripts/_registry_intake.py --check`, both TS suites), `rust` (build and test), `clippy` (`cargo fmt --check` and clippy), `parity-rust`, `scheduler` (`scripts/ci_scheduler_rust.sh OUT_DIR`, the fail-closed native scheduler gate; it needs the repository variable `SCHEDULER_CONTINUOUS_SHA256` and no feature-branch trigger yet), `browser` and `supply-chain`. `.github/workflows/wheel.yml` (job `wheel`, then `install-and-gate`) is the one GitHub-hosted workflow. Commands, knobs and rollback are in "CI gates" below. `.pre-commit-config.yaml` runs the registry, skill and intake checks (not the TS suites or pytest) before a commit when the hook is installed. Both are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
 
 ## Enable the commit-time drift gate
 
@@ -58,7 +58,7 @@ Each row is unconfirmed until the first run. The first run's logs (host-facts bl
 | Node | `browser` | host facts `node`; `actions/setup-node` step |
 | Chrome | `browser` | the gate's `chrome: <path> (<version>)` line, or exit 3 `NOT RUN: no Chrome`; host facts probes only `google-chrome` |
 | Whether `~/.cargo` and `target` persist between jobs | the length of every Rust job (all build cold today) | not printed; compare the compile time of consecutive runs |
-| How many jobs run at once | job duration, saturation | host facts `loadavg` and `nproc`; start times of the six jobs |
+| How many jobs run at once | job duration, saturation | host facts `loadavg` and `nproc`; start times of the seven jobs |
 
 On the pool the `test` job took about 69 minutes (per its comment in `ci.yml`), and an earlier run on `main` was cancelled at 32.6 minutes with the cause unknown; the Rust jobs build cold and can run long.
 
@@ -244,6 +244,41 @@ python3 scripts/swarm_run.py --repo /path/to/codebase --swarm-timeout 3600   # c
 3. The failed run is retried after `notes.retry_after` = capped exponential backoff (`SWARM_RETRY_BASE_S` 2, `SWARM_RETRY_CAP_S` 120, a provider `Retry-After` can lengthen it up to the cap) while attempts remain. A task left in `backoff` is not stuck: the loop sleeps to the earliest retry.
 4. A task that keeps hitting limits: lower the global cap (`--max-parallel 2` or `SWARM_MAX_PARALLEL=2`) rather than raising the cooldown. One failed task does not reduce parallelism (it follows the retry ladder). `SWARM_FAIL_STREAK` (default 3, `0` off) consecutive failures of distinct tasks with no success in between halve it once (`swarm.degraded` with `reason: consecutive_failures`, `mode: reduced_parallelism`); a success resets the streak and recovers one slot after `SWARM_RATE_COOLDOWN_S`.
 5. `SWARM_SCHEDULER=rounds` runs the old per-round barrier if you suspect the continuous scheduler; report what you saw.
+
+## Select the scheduler engine
+
+The continuous scheduler in `scripts/swarm_run.py` (`Scheduler`) has two engines. The Python `Scheduler` is the default and the oracle. The native runtime is opt-in: `run_scheduler` in the `swarm._native` extension (crates `gsd-sched-core` and `gsd-python`). This section changes no default.
+
+**Status of the switch.** The `GSD_ENGINE` selector for the scheduler is not wired yet (phase 14.4, unit S3.2). `scripts/swarm_run.py` does not read `GSD_ENGINE`, so every swarm run uses the Python `Scheduler` whatever that variable is set to. The extension exports `run_scheduler`, but no production run calls it. `GSD_ENGINE_BIN` is not read by the scheduler: its native runtime is the extension, not the `gsd_engine` binary. The flip record is [tests/parity/flip_record_scheduler.md](../tests/parity/flip_record_scheduler.md); its status is "not flipped".
+
+**The switch once the selector is wired.** The selector reads `GSD_ENGINE` in `run()`, before any dispatch:
+
+| `GSD_ENGINE` | Scheduler |
+|---|---|
+| unset or empty | the default, `python` (the planned module constant `SCHEDULER_DEFAULT_ENGINE` is added with the selector) |
+| `python` | the Python `Scheduler`, the oracle |
+| `rust` | the native runtime, composed around the same `Scheduler` controller |
+| anything else | refused before anything is dispatched: `E-INPUT`, exit 2, the value is not echoed |
+
+- `SWARM_PURE_PYTHON=1` (exactly `1`) forces Python and wins over `GSD_ENGINE`.
+- A stale extension without `run_scheduler` warns once at selection time and the run uses Python. The engine never changes in the middle of a run.
+- Both engines log `scheduler_engine: <name>`. Check that line in the run log to see which engine answered.
+- `SWARM_SCHEDULER=rounds` is unchanged by this switch. Rounds mode must also match on both engines before any flip (flip record, criterion 6).
+- Rollback is one switch: `GSD_ENGINE=python`. Both engines use the same Task Store, leases, handoffs and telemetry, all in Python, so a rollback needs no data migration.
+
+**Architecture B (approved).** Rust owns the worker pool threads and the decision loop, on the calling main thread. Python keeps the rest: session execution (`_worker`, `execute_one`), the Task Store, telemetry (`events.jsonl`, `live.json`), leases, handoffs, signals and abort, the final run result, and signing. The two sides meet only through sixteen Python callbacks: `begin_pass`, `agent_for`, `claims_for`, `block`, `lease`, `observe_pass`, `submit`, `worker`, `internal_failure`, `complete`, `set_retry_after`, `random_unit`, `cancel_state`, `cancel_begin`, `kill` and `log`. Signing keys never enter Rust.
+
+**Approved limits.** These are the exact limits. Nothing wider is approved.
+
+- Priority: an unknown or missing priority is P2, Python's own fallback. Rust does not invent a rank.
+- Cooperative cancel: the shutdown budget starts at the Python-observed `CancelRequest`, not at kernel delivery of the signal. A Python callback that is already running is not force-preempted. The budget covers the native side's finite, cancel-aware waits, and callback and GIL delay count against it. A worker stuck after the kill must not keep the process alive. Both points are proved only by the S5.4 tests, which are still pending.
+- Panics: a scoped native panic guard. It applies only to marked native scheduler work. A panic there fails that task with `E-INTERNAL`; any other panic goes to the hook installed before it. There is no debug API and no new dependency.
+- Keys: keys never enter Rust. Signing and key material stay in Python.
+- Speed: no speed-up is claimed. Python stays the default until both paired p50 and paired p95 ratios (Rust over Python) are strictly below 1.00 on a qualifying quiet host (1-minute load below 1.5 for ten minutes), and the user has explicitly approved the flip, recorded in `.planning/STATE.md`. A ratio of exactly 1.00 fails. The existing A2 records are moderate-load runs and do not count.
+
+**What is still open.** The selector (S3.2), the port tests (`tests/test_scheduler_ports.py`), the thread and stuck-worker tests (`tests/parity/test_scheduler_threads.py`), the local S5 green, the feature-branch CI run, the quiet-host paired A2 run (S6), and the user's approval with an exercised rollback (S7). Until these are recorded, the default is Python and nothing in this section is a flip.
+
+**What operators do now.** Nothing changes: the default is Python. If you suspect the continuous scheduler, use `SWARM_SCHEDULER=rounds` (see above) and report what you saw. Once the selector is wired, use `GSD_ENGINE=rust` only in a test or canary run, and set `GSD_ENGINE=python` to roll back.
 
 ## Handover verification failures
 

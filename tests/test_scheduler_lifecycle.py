@@ -5,8 +5,13 @@ observe real store histories, lifecycle manager slots and telemetry, not source 
 """
 import importlib.util
 import json
+import logging
+import signal
+import subprocess
 import sys
 import threading
+import time
+import types
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -203,7 +208,7 @@ def test_python_pool_submission_failure_retains_structured_completion(lifecycle)
 
 
 @pytest.mark.parametrize("exit_path", ["success", "acquire-refusal", "pre-pickup-cancel"])
-def test_original_worker_and_completion_share_run_and_cleanup(lifecycle, monkeypatch, exit_path):
+def test_worker_clears_run_and_slot_and_completion_records_one_terminal_state(lifecycle, monkeypatch, exit_path):
     rig = lifecycle
     opened = rig.sched._open_run(rig.task, rig.agent)
     item = opened.item
@@ -256,7 +261,7 @@ def test_original_worker_and_completion_share_run_and_cleanup(lifecycle, monkeyp
     _terminal_once(rig, state)
 
 
-def test_finish_returns_metadata_without_claims_or_engine_decisions(lifecycle, monkeypatch):
+def test_finish_run_returns_metadata_without_backoff_or_retry(lifecycle, monkeypatch):
     rig = lifecycle
     item = rig.sched._open_run(rig.task, rig.agent).item
     calls = []
@@ -362,3 +367,115 @@ def test_run_uses_active_synthetic_module_helpers_and_execute_one(lifecycle, mon
     assert len(events) == 1 and events[0]["payload"]["state"] == "completed"
     assert len(_events(rig, "subagent.complete.immediate")) == 1
     assert controller.book.unsettled() == []
+
+
+def test_a_signal_reentering_request_forces_the_cancel_and_keeps_its_signum_without_deadlock(lifecycle, monkeypatch):
+    rig = lifecycle
+    cancel = rig.mod.CancelRequest()
+    real_monotonic = time.monotonic
+    nested = []
+
+    def monotonic():
+        if not nested:  # the first clock read is inside the outer request's critical section
+            nested.append(cancel.request("signal SIGTERM", signal.SIGTERM))
+        return real_monotonic()
+
+    monkeypatch.setattr(rig.mod, "time", types.SimpleNamespace(monotonic=monotonic))
+    outer = []
+    worker = threading.Thread(target=lambda: outer.append(cancel.request("swarm timeout")), daemon=True)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert outer == [True] and nested == [False]
+    assert cancel.event.is_set() and cancel.force.is_set()
+    assert cancel.reason == "swarm timeout" and cancel.signum == signal.SIGTERM
+
+
+def test_reap_group_abandons_a_child_the_kernel_will_not_reap(lifecycle, monkeypatch, caplog):
+    rig = lifecycle
+    signalled = []
+    monkeypatch.setattr(rig.mod, "kill_group", lambda pgid, sig: signalled.append((pgid, sig)))
+
+    class Unreapable:
+        pid = 0
+        killed = False
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("child", timeout)
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("child", timeout)
+
+    fake = Unreapable()
+    result = []
+    worker = threading.Thread(target=lambda: result.append(rig.mod.reap_group(fake)), daemon=True)
+    with caplog.at_level(logging.ERROR, logger="swarm.run"):
+        worker.start()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert result == [("", "")] and fake.killed
+    assert signalled == [(0, signal.SIGTERM), (0, signal.SIGKILL)]
+    errors = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "pid 0" in errors[0].getMessage()
+
+
+def _snapshot(rig):
+    """Every counter and record a repeated release or close could touch, read back from its real owner."""
+    path = rig.store.path.parent / "events.jsonl"
+    return (rig.sched.dispatched, dict(rig.sched._internal), list(rig.sched.log), rig.sched.closed,
+            rig.sched.extension_down, rig.mgr.active_ids(), _history(rig), list(rig.emitted), (path.read_text() if path.exists() else ""))
+
+
+@pytest.mark.parametrize("exit_path", ["abandoned", "setup-failed-after-sid"])
+def test_repeated_release_and_close_change_no_counter_or_event(lifecycle, monkeypatch, exit_path):
+    rig = lifecycle
+    real_status = rig.mod.stream_subagent_status
+    if exit_path == "setup-failed-after-sid":
+        def fail(*args, **kwargs):
+            raise RuntimeError("after sid")
+        monkeypatch.setattr(rig.mod, "stream_subagent_status", fail)
+    item = rig.sched._open_run(rig.task, rig.agent).item
+    monkeypatch.setattr(rig.mod, "stream_subagent_status", real_status)
+    if exit_path == "setup-failed-after-sid":
+        rig.sched._complete(item.future)
+        state = "failed"
+    else:
+        state = "cancelled"
+    rig.sched.close()
+    assert rig.sched.dispatched == 1 and rig.mgr.active_ids() == []
+    before = _snapshot(rig)
+    assert rig.mgr.release(item.sid) is None
+    rig.sched.close()
+    assert _snapshot(rig) == before
+    _terminal_once(rig, state)
+
+
+def test_repeated_pool_shutdown_leaves_the_queue_empty(lifecycle):
+    rig = lifecycle
+    barrier = threading.Barrier(2, timeout=10)
+    pool = rig.mod.WorkerPool(2, "shutdown-test")
+    # Two calls that block on each other force two real worker threads into existence.
+    futures = [pool.submit(barrier.wait) for _ in range(2)]
+    for future in futures:
+        future.result(timeout=10)
+    threads = list(pool._threads)
+    assert len(threads) == 2 and all(thread.is_alive() for thread in threads)
+    pool.shutdown()
+    pool.shutdown()
+    assert pool._queue.qsize() == 0
+    assert not any(thread.is_alive() for thread in threads)
+
+
+def test_dot_and_dotdot_correlation_ids_are_refused_and_write_no_flag(lifecycle, tmp_path):
+    rig = lifecycle
+    sdir = tmp_path / ".swarm"
+    for corr in ("..", "."):
+        with pytest.raises(rig.mod.SwarmError) as refused:
+            rig.mod.write_cancel_flag(sdir, corr, "operator stop", 1.0)
+        assert refused.value.code == rig.mod.ErrorCode.E_INPUT
+        with pytest.raises(rig.mod.SwarmError):
+            rig.mod.clear_cancel_flag(sdir, corr)
+    assert not (sdir / "cancel").exists()

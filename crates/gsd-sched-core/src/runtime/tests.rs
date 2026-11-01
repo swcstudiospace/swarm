@@ -850,9 +850,12 @@ fn start_scripted_cancel(
     let ports: Arc<dyn SchedulerPorts> = Arc::clone(fake) as Arc<dyn SchedulerPorts>;
     let mut runtime = Runtime::new(ports, &config, fake.wall(), Arc::clone(&pool))
         .expect("the scripted configuration is valid");
-    runtime.drain_clock = Some(Arc::clone(&fake.drain_clock));
+    runtime.mono.scripted = Some(Arc::clone(&fake.drain_clock));
     let count = fake.lock().tasks.len();
-    runtime.schedule().expect("the initial pass dispatched");
+    // The setup pass runs outside the observed window: its checkpoints would otherwise take the scripted callback budget first.
+    runtime
+        .schedule(false)
+        .expect("the initial pass dispatched");
     fake.wait_until("all scripted workers started", |s| s.started.len() == count);
     if stage_completion {
         let completion = pool
@@ -1018,7 +1021,8 @@ fn a_cancel_before_the_first_pass_dispatches_nothing() {
 }
 
 /// Replays the new obligation of `test_the_lifecycle_slot_is_released_on_every_worker_exit_path` (tests/test_scheduler_continuous.py:963):
-/// a task submitted to the pool while the cancel is already set still gets its `worker` call, so the host can release its slot.
+/// a dispatch admitted while a cancel is raised during its submit still gets its `worker` call. The cutoff is the checkpoint before the
+/// next submission, so the second selected task is never submitted.
 #[test]
 fn a_task_submitted_while_the_cancel_is_set_still_gets_its_worker_call() {
     let fake = Fake::new(
@@ -1026,15 +1030,408 @@ fn a_task_submitted_while_the_cancel_is_set_still_gets_its_worker_call() {
             .map(|n| Task::new(&format!("T{n}")).act(Act::Return("SKIPPED")))
             .collect(),
     );
-    fake.lock().cancel_on_submit = true;
+    fake.lock().cancel_at_call = Some(("submit", 1));
     let summary = run_to_end(&fake, cancel_config(2, 5.0));
     let state = fake.lock();
-    let mut started = state.started.clone();
-    started.sort();
-    assert_eq!(started, strings(&["T1", "T2"]));
-    assert_eq!(state.completed.len(), 2);
-    assert_eq!(summary.dispatched, 2);
+    assert_eq!(state.started, strings(&["T1"]));
+    assert_eq!(state.completed, strings(&["T1"]));
+    assert_eq!(state.calls_of("submit"), vec!["submit T1"]);
+    assert_eq!(
+        state.passes[0].submitted, 1,
+        "the report counts the admitted dispatch, not the batch"
+    );
+    assert_eq!(summary.dispatched, 1);
     assert_eq!(summary.stopped, StopReason::Cancelled);
+}
+
+/// The port calls after the first call equal to `marker`, leaving out the polls and the worker calls that run beside them.
+fn calls_after(calls: &[String], marker: &str) -> Vec<String> {
+    let start = calls
+        .iter()
+        .position(|call| call == marker)
+        .expect("the marker call was made")
+        + 1;
+    calls[start..]
+        .iter()
+        .filter(|call| *call != "cancel_state" && !call.starts_with("worker"))
+        .cloned()
+        .collect()
+}
+
+/// Runs the two-task scenario with one cancel request raised by call `nth` of `port`, and returns the summary.
+fn cancel_raised_at(
+    fake: &Arc<Fake>,
+    port: &'static str,
+    nth: usize,
+    max_concurrent: u32,
+) -> RunSummary {
+    fake.lock().cancel_at_call = Some((port, nth));
+    run_to_end(fake, cancel_config(max_concurrent, 5.0))
+}
+
+/// The owners of the claims the runtime holds.
+fn held_owners(runtime: &Runtime) -> Vec<String> {
+    runtime
+        .claims
+        .held()
+        .map(|(owner, _)| owner.to_owned())
+        .collect()
+}
+
+/// A cancel raised by `begin_pass` ends the pass before any selection: the pass is reported with nothing admitted and the run drains
+/// with nothing in flight. Empty ready facts change nothing, because the request is what stops the pass.
+#[test]
+fn a_cancel_raised_by_begin_pass_stops_the_pass_before_any_selection() {
+    for fake in [Fake::new(tasks(2)), Fake::new(Vec::new())] {
+        let summary = cancel_raised_at(&fake, "begin_pass", 1, 2);
+        let state = fake.lock();
+        assert_eq!(
+            calls_after(&state.calls, "begin_pass 1"),
+            strings(&["observe_pass 1", "cancel_begin signal SIGTERM"])
+        );
+        assert_eq!(state.passes[0].submitted, 0);
+        assert_eq!(state.begin.as_ref().map(|begin| begin.3), Some(0));
+        assert_eq!(state.kills, 0);
+        assert_eq!((summary.rounds, summary.dispatched), (1, 0));
+        assert_eq!(summary.stopped, StopReason::Cancelled);
+    }
+}
+
+/// A cancel raised while an agent is resolved stops the selection before any claim is read.
+#[test]
+fn a_cancel_raised_while_an_agent_is_resolved_stops_before_the_claims() {
+    let fake = Fake::new(tasks(2));
+    let summary = cancel_raised_at(&fake, "agent_for", 1, 2);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "agent_for T1"),
+        strings(&["observe_pass 1", "cancel_begin signal SIGTERM"])
+    );
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (0, StopReason::Cancelled)
+    );
+}
+
+/// A task with no agent, whose agent lookup is where the cancel lands: the block is never written, so the task stays pending.
+#[test]
+fn a_cancel_raised_while_an_agent_is_missing_blocks_nothing() {
+    let fake = Fake::new(vec![Task::new("T1").no_agent(), Task::new("T2")]);
+    let summary = cancel_raised_at(&fake, "agent_for", 1, 2);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "agent_for T1"),
+        strings(&["observe_pass 1", "cancel_begin signal SIGTERM"])
+    );
+    assert_eq!(state.phase("T1"), Phase::Pending);
+    assert_eq!(summary.stopped, StopReason::Cancelled);
+}
+
+/// A cancel raised while claims are read stops before the lease: the lease port is never asked.
+#[test]
+fn a_cancel_raised_while_claims_are_read_stops_before_the_lease() {
+    let fake = Fake::new(tasks(2));
+    fake.lock().leases = Some(HashMap::new());
+    let summary = cancel_raised_at(&fake, "claims_for", 1, 2);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "claims_for T1"),
+        strings(&["observe_pass 1", "cancel_begin signal SIGTERM"])
+    );
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (0, StopReason::Cancelled)
+    );
+}
+
+/// A cancel raised during a granted lease keeps the grant and admits nothing after it.
+#[test]
+fn a_cancel_raised_during_a_lease_keeps_its_verdict_and_admits_nothing_after_it() {
+    let fake = Fake::new(tasks(2));
+    fake.lock().leases = Some(HashMap::new());
+    let summary = cancel_raised_at(&fake, "lease", 1, 2);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "lease T1 A"),
+        strings(&["observe_pass 1", "cancel_begin signal SIGTERM"])
+    );
+    assert!(
+        summary.waiting.is_empty(),
+        "a granted lease waits for nothing"
+    );
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (0, StopReason::Cancelled)
+    );
+}
+
+/// A refused lease in a pass the cancel cuts short is reported as refused, and the cancel wins over the lease-wait verdict.
+#[test]
+fn a_cancel_raised_during_a_refused_lease_ends_as_cancelled_not_as_a_lease_wait() {
+    let fake = Fake::new(tasks(1));
+    fake.lock().leases = Some(HashMap::from([(
+        "T1".to_owned(),
+        LeaseVerdict {
+            dispatch: false,
+            status: "held".to_owned(),
+            holder: None,
+        },
+    )]));
+    let summary = cancel_raised_at(&fake, "lease", 1, 2);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "lease T1 A"),
+        strings(&["observe_pass 1", "cancel_begin signal SIGTERM"])
+    );
+    assert_eq!(
+        state.passes[0].skipped,
+        vec![("T1".to_owned(), "lease:held".to_owned())]
+    );
+    assert_eq!(summary.stopped, StopReason::Cancelled);
+    assert!(summary.waiting.is_empty());
+}
+
+/// A cancel raised by `complete` stops the run before any retry: the jitter draw never happens and no second pass starts.
+#[test]
+fn a_cancel_raised_by_complete_admits_no_retry() {
+    let fake = Fake::new(vec![
+        Task::new("T1")
+            .attempts(2)
+            .act(Act::Return("FAILED"))
+            .comp(Completion {
+                failed: true,
+                retry_attempt: Some(1),
+                ..Completion::default()
+            }),
+        Task::new("T2"),
+    ]);
+    let summary = cancel_raised_at(&fake, "complete", 1, 1);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "complete T1"),
+        strings(&["cancel_begin signal SIGTERM"])
+    );
+    assert!(state.calls_of("random_unit").is_empty());
+    assert!(state.retry_writes.is_empty());
+    assert_eq!(
+        state.calls_of("begin_pass").len(),
+        1,
+        "no second pass starts"
+    );
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (1, StopReason::Cancelled)
+    );
+}
+
+/// A cancel raised by the jitter draw admits no retry: the retry note is not written and nothing is logged for it.
+#[test]
+fn a_cancel_raised_by_the_jitter_draw_writes_no_retry_note() {
+    let fake = Fake::new(vec![
+        Task::new("T1")
+            .attempts(2)
+            .act(Act::Return("FAILED"))
+            .comp(Completion {
+                failed: true,
+                retry_attempt: Some(1),
+                ..Completion::default()
+            }),
+        Task::new("T2"),
+    ]);
+    let summary = cancel_raised_at(&fake, "random_unit", 1, 1);
+    let state = fake.lock();
+    assert_eq!(
+        calls_after(&state.calls, "random_unit"),
+        strings(&["cancel_begin signal SIGTERM"])
+    );
+    assert!(state.calls_of("set_retry_after").is_empty());
+    assert!(state.retry_writes.is_empty());
+    assert!(!state
+        .logs
+        .iter()
+        .any(|line| line.contains("transient failure")));
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (1, StopReason::Cancelled)
+    );
+}
+
+/// A dispatch whose set-up failed and was admitted before the cancel counts once, finishes once and gets no worker call.
+#[test]
+fn a_failed_setup_admitted_before_the_cancel_counts_once_and_gets_no_worker() {
+    let fake = Fake::new(tasks(2));
+    fake.lock().submit_failed = strings(&["T1"]);
+    fake.lock().cancel_at_call = Some(("submit", 1));
+    let summary = run_to_end(&fake, cancel_config(2, 5.0));
+    let state = fake.lock();
+    assert!(state.started.is_empty());
+    assert!(state.calls_of("worker").is_empty());
+    assert_eq!(state.completed, strings(&["T1"]));
+    assert_eq!(state.calls_of("submit"), vec!["submit T1"]);
+    assert_eq!(state.passes[0].submitted, 1);
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (1, StopReason::Cancelled)
+    );
+}
+
+/// A stop during submission gives back only the claims of the selected task that was never submitted; the admitted task keeps its
+/// claim until its dispatch finishes.
+#[test]
+fn a_stop_during_submission_releases_only_the_claims_of_undispatched_tasks() {
+    let fake = Fake::new(vec![
+        Task::new("T1")
+            .claims(&[("src/a.rs", false)])
+            .act(Act::Return("DONE")),
+        Task::new("T2").claims(&[("src/b.rs", false)]),
+    ]);
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    fake.lock().cancel_at_call = Some(("submit", 1));
+    let config = cancel_config(2, 5.0);
+    let ports: Arc<dyn SchedulerPorts> = Arc::clone(&fake) as Arc<dyn SchedulerPorts>;
+    let mut runtime = Runtime::new(ports, &config, fake.wall(), Arc::new(Pool::new(2)))
+        .expect("the scripted configuration is valid");
+    runtime.schedule(true).expect("the pass ends at the stop");
+    assert_eq!(held_owners(&runtime), strings(&["T1"]));
+    assert_eq!(runtime.inflight.len(), 1);
+    {
+        let state = fake.lock();
+        assert_eq!(state.calls_of("submit"), vec!["submit T1"]);
+    }
+    let summary = runtime.drive().expect("the drain ends the run");
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (1, StopReason::Cancelled)
+    );
+    assert!(
+        held_owners(&runtime).is_empty(),
+        "the finished dispatch released its claim"
+    );
+}
+
+/// A stop after a granted lease gives the granted task's claim back, reports its lease as unsubmitted, and asks the lease of no
+/// other task.
+#[test]
+fn a_stop_after_a_granted_lease_gives_its_claim_back_and_leases_nothing_more() {
+    let fake = Fake::new(vec![
+        Task::new("T1").claims(&[("src/a.rs", false)]),
+        Task::new("T2").claims(&[("src/b.rs", false)]),
+    ]);
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    {
+        let mut state = fake.lock();
+        state.leases = Some(HashMap::new());
+        state.cancel_at_call = Some(("lease", 1));
+    }
+    let config = cancel_config(2, 5.0);
+    let ports: Arc<dyn SchedulerPorts> = Arc::clone(&fake) as Arc<dyn SchedulerPorts>;
+    let mut runtime = Runtime::new(ports, &config, fake.wall(), Arc::new(Pool::new(2)))
+        .expect("the scripted configuration is valid");
+    runtime.schedule(true).expect("the pass ends at the stop");
+    assert!(held_owners(&runtime).is_empty());
+    assert!(runtime.cancel.is_some(), "the stop was observed");
+    {
+        let state = fake.lock();
+        assert_eq!(state.calls_of("lease"), vec!["lease T1 A"]);
+        assert_eq!(state.calls_of("agent_for"), vec!["agent_for T1"]);
+        assert!(state.calls_of("submit").is_empty());
+        assert_eq!(
+            state.passes[0].unsubmitted,
+            [("T1".to_owned(), "A".to_owned())],
+            "the lease granted to T1 is reported for the host to settle"
+        );
+    }
+    let summary = runtime.drive().expect("the drain ends the run");
+    assert_eq!(
+        (summary.dispatched, summary.stopped),
+        (0, StopReason::Cancelled)
+    );
+}
+
+/// A port error that ends a pass after a lease was granted is reported to `observe_pass` before the error goes on: the granted pair
+/// that was never submitted comes back in `unsubmitted`, once, whether a later selection fails or the first submission does.
+#[test]
+fn a_port_error_after_a_granted_lease_is_reported_before_the_error() {
+    let two_tasks = || {
+        Fake::new(vec![
+            Task::new("T1").claims(&[("src/a.rs", false)]),
+            Task::new("T2").claims(&[("src/b.rs", false)]),
+        ])
+    };
+
+    // the selection of T2 fails after the lease of T1 was granted, so T1 is granted and never submitted
+    let fake = two_tasks();
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    {
+        let mut state = fake.lock();
+        state.leases = Some(HashMap::new());
+        state.fail_at_call = Some(("agent_for", 2));
+    }
+    let ports: Arc<dyn SchedulerPorts> = Arc::clone(&fake) as Arc<dyn SchedulerPorts>;
+    let mut runtime = Runtime::new(ports, &config(2), fake.wall(), Arc::new(Pool::new(2)))
+        .expect("the scripted configuration is valid");
+    let error = match runtime.schedule(true) {
+        Err(RunError::Port(error)) => error,
+        Err(other) => panic!("expected a port error, got {other:?}"),
+        Ok(_) => panic!("the failing pass must not return a pass"),
+    };
+    assert_eq!(
+        *error
+            .into_payload()
+            .downcast::<&'static str>()
+            .expect("the payload is the original one"),
+        "agent_for"
+    );
+    {
+        let state = fake.lock();
+        assert_eq!(state.calls_of("lease"), vec!["lease T1 A"]);
+        assert!(state.calls_of("submit").is_empty());
+        assert_eq!(state.passes.len(), 1, "the failing pass is reported once");
+        assert_eq!(state.passes[0].submitted, 0);
+        assert_eq!(
+            state.passes[0].unsubmitted,
+            [("T1".to_owned(), "A".to_owned())],
+            "the lease granted to T1 is reported before the error goes on"
+        );
+    }
+
+    // the first submission fails after the leases of both tasks were granted, so neither is submitted
+    let fake = two_tasks();
+    let _cleanup = Cleanup(Arc::clone(&fake));
+    {
+        let mut state = fake.lock();
+        state.leases = Some(HashMap::new());
+        state.inject = Some(("submit", Inject::Err));
+    }
+    let ports: Arc<dyn SchedulerPorts> = Arc::clone(&fake) as Arc<dyn SchedulerPorts>;
+    let mut runtime = Runtime::new(ports, &config(2), fake.wall(), Arc::new(Pool::new(2)))
+        .expect("the scripted configuration is valid");
+    let error = match runtime.schedule(true) {
+        Err(RunError::Port(error)) => error,
+        Err(other) => panic!("expected a port error, got {other:?}"),
+        Ok(_) => panic!("the failing pass must not return a pass"),
+    };
+    assert_eq!(
+        *error
+            .into_payload()
+            .downcast::<&'static str>()
+            .expect("the payload is the original one"),
+        "submit"
+    );
+    {
+        let state = fake.lock();
+        assert_eq!(state.calls_of("submit"), vec!["submit T1"]);
+        assert_eq!(state.passes.len(), 1, "the failing pass is reported once");
+        assert_eq!(state.passes[0].submitted, 0);
+        assert_eq!(
+            state.passes[0].unsubmitted,
+            [
+                ("T1".to_owned(), "A".to_owned()),
+                ("T2".to_owned(), "A".to_owned())
+            ],
+            "both granted leases are reported before the error goes on"
+        );
+    }
 }
 
 /// The hard drain must poll on every idle tick, not only when a worker finishes. Repeated force requests do not renew it.

@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from scripts import _dotnet_quality as dotnet
+from scripts import _dotnet_quality as dotnet  # noqa: E402
 
 
 CLI = r'''#!@PY@

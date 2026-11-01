@@ -434,7 +434,8 @@ def _ancestors(task: dict[str, Any], rows: list[dict[str, Any]]) -> set[str]:
 
 
 def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | None = None,
-              handoffs: HandoffBridge | None = None, *, approve: bool = True) -> list[str]:
+              handoffs: HandoffBridge | None = None, *, approve: bool = True,
+              stop_requested: Callable[[], bool] | None = None) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates.
 
     `leases` is the runner's substrate_lease.LeaseBridge, or None (ingest, dry runs, substrate off). It is told about
@@ -442,9 +443,15 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases: LeaseBridge | Non
     it for the rework, ESCALATED releases it (LEASE-07). `handoffs` is the runner's substrate_handoff.HandoffBridge, or
     None likewise. It writes a packet at each transition here that changes the accountable agent: a failing gate hands
     the rework to the producer, and ESCALATED hands the task on (HAND-01). The transition, packet and settlement share
-    the keeper's per-task lock, so neither thread releases the lease before the handoff finishes."""
+    the keeper's per-task lock, so neither thread releases the lease before the handoff finishes.
+
+    `stop_requested` (keyword-only, optional) is asked before each next IN_REVIEW target, never inside one: a target
+    already admitted completes its transaction, packet, settlement and gate/rerun lineage first. Omitted, it is never
+    called."""
     notes_log = []
     for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
+        if stop_requested is not None and stop_requested():
+            break  # before the next target: every target already acted on is complete, lineage included
         tid = t["task_id"]
         latest = store.latest_verdicts(tid, verified_only=True)
         failing = [g for g in store.required_gates(tid) if latest.get(g, {}).get("verdict") == "fail"]

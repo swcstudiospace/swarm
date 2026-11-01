@@ -300,6 +300,15 @@ Swarm runtime lives at {ROOT} (scripts: `python3 {ROOT}/scripts/<script>.py --ro
 Execute the task per your agent instructions and finish with your summary and the single ```json result block."""
 
 
+def _witness_engine(engine: str) -> None:
+    """Appends the scheduler engine this run used to the file named by SWARM_SCHEDULER_WITNESS, when that is set. The native gate
+    (scripts/ci_scheduler_rust.sh) reads that file, so a leg whose children ran on another engine cannot pass unnoticed. Unset: no-op."""
+    witness = os.environ.get("SWARM_SCHEDULER_WITNESS")
+    if witness:
+        with open(witness, "a", encoding="utf-8") as handle:
+            handle.write(engine + "\n")
+
+
 def preflight_signing() -> None:
     """Refuse before any task is claimed when task.assign cannot be signed.
 
@@ -360,16 +369,24 @@ def runtime_bin(runtime: str, args) -> str:
     return {"claude": getattr(args, "claude_bin", "claude"), "grok": getattr(args, "grok_bin", "grok"),
             "omp": getattr(args, "omp_bin", "omp")}[runtime]
 
+def unsupported_approval(runtime: str, args) -> tuple[ErrorCode, str] | None:
+    """The named refusal for an unsupported transport or bypass mode, as (code, message); None when it may be dispatched."""
+    if runtime == "grok":
+        return (ErrorCode.E_DEP, "grok headless dispatch is unsupported: its documented single-prompt "
+                "interface does not accept this runner's stdin assignment transport; use --runtime claude "
+                "or --runtime omp with normal approval controls")
+    if runtime == "omp" and getattr(args, "approval_mode", "write") not in OMP_APPROVAL_MODES:
+        return (ErrorCode.E_INPUT, "omp requires normal approval mode: write or always-ask")
+    if runtime == "claude" and args.permission_mode not in CLAUDE_PERMISSION_MODES:
+        return (ErrorCode.E_INPUT, "claude requires normal permission mode: default, acceptEdits or plan")
+    return None
+
+
 def validate_runtime_approval(runtime: str, args) -> None:
     """Refuse unsupported transports and bypass modes before a task or lease is claimed."""
-    if runtime == "grok":
-        raise SwarmError(ErrorCode.E_DEP, "grok headless dispatch is unsupported: its documented single-prompt "
-                         "interface does not accept this runner's stdin assignment transport; use --runtime claude "
-                         "or --runtime omp with normal approval controls")
-    if runtime == "omp" and getattr(args, "approval_mode", "write") not in OMP_APPROVAL_MODES:
-        raise SwarmError(ErrorCode.E_INPUT, "omp requires normal approval mode: write or always-ask")
-    if runtime == "claude" and args.permission_mode not in CLAUDE_PERMISSION_MODES:
-        raise SwarmError(ErrorCode.E_INPUT, "claude requires normal permission mode: default, acceptEdits or plan")
+    refused = unsupported_approval(runtime, args)
+    if refused is not None:
+        raise SwarmError(*refused)
 
 
 
@@ -617,8 +634,8 @@ def kill_sessions(grace: float = 5, reason: str = SHUTDOWN_REASON) -> None:
 
 
 def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
-    """SIGTERM the child's whole process group, SIGKILL it after STOP_GRACE_S; the partial (stdout, stderr). Returns
-    once every process in the group is gone, not only the leader."""
+    """SIGTERM the child's whole process group, SIGKILL it after STOP_GRACE_S; the partial (stdout, stderr).
+    Waits for the leader, then for the group, bounded by STOP_GRACE_S: members still alive at that bound are SIGKILLed."""
     deadline = time.monotonic() + STOP_GRACE_S
     for sig in (signal.SIGTERM, signal.SIGKILL):
         kill_group(proc.pid, sig)
@@ -629,7 +646,10 @@ def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
         _end_group(proc.pid, deadline)
         return out
     proc.kill()  # a descendant that left the group still holds the pipes
-    proc.wait()
+    try:
+        proc.wait(timeout=KILL_SETTLE_S)
+    except subprocess.TimeoutExpired:
+        _LOG.error("child pid %s did not exit within %.1fs of SIGKILL; abandoned", proc.pid, KILL_SETTLE_S)
     return "", ""
 
 
@@ -1099,16 +1119,25 @@ def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     return path
 
 
-def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=frozenset()) -> list[dict]:
+def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=frozenset(),
+                 stop_requested: Callable[[], bool] | None = None) -> list[dict]:
     """Tasks to dispatch now: ready (PLANNED/RETRY with their dependencies met), reworks, and FAILED tasks with attempts
     left (moved to RETRY here); FAILED tasks out of attempts are escalated. Tasks named in `skip` (the scheduler's
-    in-flight dispatches) are left exactly as they are."""
+    in-flight dispatches) are left exactly as they are.
+
+    `stop_requested`, when given, is asked before each next task and before a FAILED task's retry or escalation is
+    admitted. An admitted task finishes its transition, emit, packet and settlement; on a stop, the tasks gathered so
+    far are returned and nothing more is admitted."""
     ready = [t for t in store.ready(corr) if t["task_id"] not in skip]
     # rework tasks sit in IN_PROGRESS with no running session; treat them as ready too
     for t in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
+        if stop_requested is not None and stop_requested():
+            return ready
         if t["task_id"] not in skip and t["notes_json"].get("running") is None and store.deps_satisfied(t):
             ready.append(t)
     for t in store.list(correlation_id=corr, state=S.FAILED.value):
+        if stop_requested is not None and stop_requested():
+            return ready
         if t["task_id"] in skip:
             continue
         if t["attempt"] < t["max_attempts"]:
@@ -1132,7 +1161,8 @@ def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=froze
 
 
 def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases, *, running: dict[str, int] | None = None,
-                 claims: ClaimStore | None = None, skipped: dict[str, str] | None = None) -> tuple[list[tuple[dict, dict]], list[str]]:
+                 claims: ClaimStore | None = None, skipped: dict[str, str] | None = None,
+                 stop_requested: Callable[[], bool] | None = None) -> tuple[list[tuple[dict, dict]], list[str]]:
     """(task, agent) pairs to dispatch now, and the tasks left waiting on a lease.
 
     `max_parallel` is the number of free global slots. The same agent fills more than one of them, up to that
@@ -1145,51 +1175,77 @@ def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases,
     or run (LEASE-05).
 
     `skipped`, when given, receives {task_id: reason} for every task left out: `no-free-slot`,
-    `class-ceiling:<agent>`, `claim-conflict:<holder task>`, `lease:<status>`."""
+    `class-ceiling:<agent>`, `claim-conflict:<holder task>`, `lease:<status>`.
+
+    `stop_requested`, when given, is asked before each candidate and again before its lease is requested. A candidate
+    stopped there gives its claims back and selection ends. A candidate granted its lease is selected before the loop
+    looks again, so every returned pair holds a real lease; the caller owns each pair it does not submit. If this call
+    raises, it gives back the claims and leases it took for its candidates before the exception propagates."""
     batch, waiting, slots, replicas = [], [], max_parallel, dict(running or {})
     skip = skipped if skipped is not None else {}
-    for t in ready:
-        tid = t["task_id"]
-        if slots <= 0:
-            skip.setdefault(tid, "no-free-slot")
-            continue
-        try:
-            agent = resolve_agent(t)
-        except (KeyError, IndexError):
-            store.transition(tid, S.BLOCKED, reason="no agent for capability")
-            slots -= 1
-            continue
-        ceiling = max(1, int(agent.get("max_parallel") or 1))
-        if replicas.get(agent["id"], 0) >= ceiling:
-            skip[tid] = f"class-ceiling:{agent['id']}"
-            continue  # a later task of another class can still take a free global slot
-        if claims is not None:
+    open_tid: str | None = None  # the candidate holding a claim or lease that has not joined batch yet
+    try:
+        for t in ready:
+            if stop_requested is not None and stop_requested():
+                break
+            tid = t["task_id"]
+            if slots <= 0:
+                skip.setdefault(tid, "no-free-slot")
+                continue
             try:
-                wanted = parse_claims(t["notes_json"])
-            except ValueError as e:
-                store.transition(tid, S.BLOCKED, reason=f"E-INPUT: invalid notes.claims: {e}"[:500])
+                agent = resolve_agent(t)
+            except (KeyError, IndexError):
+                store.transition(tid, S.BLOCKED, reason="no agent for capability")
                 slots -= 1
                 continue
-            taken = claims.acquire(tid, wanted)
-            if not taken.ok:
-                skip[tid] = f"claim-conflict:{taken.conflicts[0].owner}"
-                continue
-        if leases is not None:
-            claim = leases.acquire(t, agent["id"])
-            if not claim.dispatch:
+            ceiling = max(1, int(agent.get("max_parallel") or 1))
+            if replicas.get(agent["id"], 0) >= ceiling:
+                skip[tid] = f"class-ceiling:{agent['id']}"
+                continue  # a later task of another class can still take a free global slot
+            if claims is not None:
+                try:
+                    wanted = parse_claims(t["notes_json"])
+                except ValueError as e:
+                    store.transition(tid, S.BLOCKED, reason=f"E-INPUT: invalid notes.claims: {e}"[:500])
+                    slots -= 1
+                    continue
+                taken = claims.acquire(tid, wanted)
+                if not taken.ok:
+                    skip[tid] = f"claim-conflict:{taken.conflicts[0].owner}"
+                    continue
+            open_tid = tid
+            if stop_requested is not None and stop_requested():  # stopped before any lease: nothing of this one is held
                 if claims is not None:
                     claims.release(tid)
-                holder = (claim.holder or {}).get("session_id")
-                waiting.append(f"{tid}: {claim.status}" + (f" (held by {holder})" if holder else ""))
-                skip[tid] = f"lease:{claim.status}"
+                break
+            if leases is not None:
+                claim = leases.acquire(t, agent["id"])
+                if not claim.dispatch:
+                    if claims is not None:
+                        claims.release(tid)
+                    holder = (claim.holder or {}).get("session_id")
+                    waiting.append(f"{tid}: {claim.status}" + (f" (held by {holder})" if holder else ""))
+                    skip[tid] = f"lease:{claim.status}"
+                    open_tid = None
+                    continue
+            if not take_agent_slot(replicas, agent["id"], ceiling):
+                if claims is not None:
+                    claims.release(tid)
+                skip[tid] = f"class-ceiling:{agent['id']}"
+                open_tid = None
                 continue
-        if not take_agent_slot(replicas, agent["id"], ceiling):
+            batch.append((t, agent))
+            open_tid = None
+            slots -= 1
+    except BaseException:
+        # the batch is never handed back, so none of it is the caller's: give back what it and the candidate in progress
+        # hold, then re-raise
+        for held in [t["task_id"] for t, _agent in batch] + ([open_tid] if open_tid is not None else []):
             if claims is not None:
-                claims.release(tid)
-            skip[tid] = f"class-ceiling:{agent['id']}"
-            continue
-        batch.append((t, agent))
-        slots -= 1
+                claims.release(held)
+            if leases is not None:
+                leases.settle(held)
+        raise
     return batch, waiting
 
 
@@ -1430,6 +1486,7 @@ def _extension_failed(store: TaskStore, tid: str) -> bool:
 _LOG = logging.getLogger("swarm.run")
 PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 SCHEDULERS = ("continuous", "rounds")
+SCHEDULER_DEFAULT_ENGINE = "python"  # GSD_ENGINE unset or empty; only the separately approved S7 change flips it to "rust"
 CANCEL_GRACE_DEFAULT_S = 10.0
 SHUTDOWN_BUDGET_DEFAULT_S = 15.0  # the supervisor's SIGTERM -> SIGKILL window (hooks/autonomous_run.py default)
 KILL_GRACE_S = 5.0  # SIGTERM -> SIGKILL between the runner and its session groups at the end of a cancel
@@ -1478,6 +1535,52 @@ def scheduler_mode() -> str:
     return mode
 
 
+def scheduler_engine() -> str:
+    """The engine this run executes on: `python`, the Scheduler, or `rust`, the native loop composed around that Scheduler.
+
+    GSD_ENGINE unset or empty takes SCHEDULER_DEFAULT_ENGINE; `python` and `rust` are themselves; any other value is E-INPUT and
+    is not echoed. SWARM_PURE_PYTHON=1 forces python and wins over rust, with one warning on stderr."""
+    if os.environ.get("SWARM_PURE_PYTHON") == "1":
+        if os.environ.get("GSD_ENGINE") == "rust":
+            print("SWARM_PURE_PYTHON=1 forces the python scheduler; GSD_ENGINE=rust is not used", file=sys.stderr, flush=True)
+        return "python"
+    requested = os.environ.get("GSD_ENGINE", "") or SCHEDULER_DEFAULT_ENGINE
+    if requested not in ("python", "rust"):
+        raise SwarmError(ErrorCode.E_INPUT, "GSD_ENGINE must be 'python' or 'rust'")
+    return requested
+
+
+def _native_scheduler() -> tuple[Callable[..., dict], Callable[[], object]]:
+    """`(run_scheduler, NativeCleanupFence)` of the loaded extension. The rust engine fails closed: an extension that cannot be
+    imported, or that lacks either name, refuses the run with E-DEP before anything is claimed, and Python never runs instead."""
+    try:
+        native = importlib.import_module("swarm._native")
+    except ImportError as err:
+        raise SwarmError(ErrorCode.E_DEP, f"GSD_ENGINE=rust needs the native scheduler extension swarm._native: {err}") from err
+    run_native = getattr(native, "run_scheduler", None)
+    fence = getattr(native, "NativeCleanupFence", None)
+    if not callable(run_native) or not callable(fence):
+        raise SwarmError(ErrorCode.E_DEP, "GSD_ENGINE=rust needs run_scheduler and NativeCleanupFence in swarm._native")
+    return run_native, fence
+
+
+def _native_execution(sched: Scheduler, native: tuple[Callable[..., dict], Callable[[], object]]):
+    """The native loop composed around the active controller, bound to this runner's helpers and the settings read now."""
+    from swarm.limiter import _env_cooldown, _retry_cap_s
+    from swarm.retry import DEFAULT_BASE_S, DEFAULT_CAP_S, _env_seconds
+    from swarm.rust_scheduler import RunnerHelpers, RunSettings, RustScheduler
+    run_native, fence = native
+    helpers = RunnerHelpers(dispatchable=dispatchable, resolve_agent=resolve_agent, extension_failed=_extension_failed,
+                            kill_sessions=kill_sessions, write_cancel_flag=write_cancel_flag, safe=_safe)
+    settings = RunSettings(cooldown_s=_env_cooldown(), retry_cap_s=_retry_cap_s(),
+                           backoff_base_s=_env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S),
+                           backoff_cap_s=_env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S),
+                           wait_tick_s=WAIT_TICK_S, internal_failure_limit=INTERNAL_FAILURE_LIMIT,
+                           kill_grace_s=KILL_GRACE_S, kill_settle_s=KILL_SETTLE_S)
+    return RustScheduler(sched, helpers=helpers, settings=settings, run_native=run_native, fence_factory=fence,
+                         limiter=sched.limiter)
+
+
 def resolve_agent(task: dict) -> dict:
     """The manifest agent a task is dispatched to; KeyError/IndexError when none matches."""
     return get_agent(task["agent_id"]) if task["agent_id"] else by_capability(task["capability"])[0]
@@ -1521,31 +1624,63 @@ class CancelRequest:
         self.signum: int | None = None
         self.at: float | None = None  # time.monotonic() of the first request: the shutdown budget runs from here
         self._lock = threading.Lock()
+        self._nested_signum: int | None = None  # signum of a signal that found _lock held: the outer request applies it
+
+    @property
+    def exit_signum(self) -> int | None:
+        """The signal whose exit status the run reports: the request's own signal, else one that re-entered it."""
+        return self.signum if self.signum is not None else self._nested_signum
 
     def request(self, reason: str, signum: int | None = None) -> bool:
-        with self._lock:
+        # A signal handler runs on the main thread, possibly inside this method while that thread holds _lock. A signal
+        # caller therefore never blocks: if the lock is already held, a cancel is under way and the signal forces it; its
+        # signum waits in _nested_signum for that cancel to apply, so the signal's exit status survives.
+        if signum is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(blocking=False):
+            self._nested_signum = signum
+            self.force.set()
+            return False
+        try:
             if self.event.is_set():
                 if signum is not None:
                     self.force.set()
+                    if self.signum is None:  # a signal that lands after the cancel ended still sets the exit status
+                        self.signum = signum
                 return False
             self.reason, self.signum, self.at = reason, signum, time.monotonic()
+            if self.signum is None:  # a signal that re-entered this request while it ran supplies the exit status
+                self.signum = self._nested_signum
+            # D-02 (residual): force.set() and event.set() take Condition locks. A signal that interrupts this thread while it
+            # holds one of them deadlocks if its handler sets the same flag. Accepted residual.
             self.event.set()
             return True
+        finally:
+            if self.signum is None:  # a nested signal that landed after the body applied _nested_signum
+                self.signum = self._nested_signum
+            self._lock.release()
 
 
+
+
+def _cancel_flag_path(sdir: Path, corr: str) -> Path:
+    """The flag of one correlation id. '', '.' and '..' resolve to a directory, not a flag: refused (E-INPUT)."""
+    if corr in ("", ".", ".."):
+        raise SwarmError(ErrorCode.E_INPUT, f"correlation id {corr!r} cannot name a cancel flag")
+    return cancel_flag_path(sdir, corr)
 
 
 def write_cancel_flag(sdir: Path, corr: str, reason: str, grace_s: float) -> Path:
     """`<swarm_dir>/cancel/<correlation_id>` = {requested_wall, reason, grace_s}, atomic. Sessions poll it (the shared
     cancel-check tool); the runner waits `grace_s` for them to finish before it kills their process groups."""
-    path = cancel_flag_path(sdir, corr)
+    path = _cancel_flag_path(sdir, corr)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps({"requested_wall": time.time(), "reason": reason, "grace_s": grace_s}))
     return path
 
 
 def clear_cancel_flag(sdir: Path, corr: str) -> None:
-    cancel_flag_path(sdir, corr).unlink(missing_ok=True)
+    _cancel_flag_path(sdir, corr).unlink(missing_ok=True)
 
 
 # ---- one run's handle: what the worker thread reports to Telemetry and back to the scheduler -------------------------
@@ -1812,6 +1947,7 @@ class WorkerPool:
     def shutdown(self, wait: bool = True) -> None:
         """Stop the workers once the queue is empty. `wait=False` drops calls not yet started and returns at once."""
         with self._lock:
+            first = not self._closed
             self._closed = True
             threads = list(self._threads)
             if not wait:
@@ -1822,8 +1958,9 @@ class WorkerPool:
                         break
                     if item is not None:
                         item[0].cancel()
-            for _ in threads:
-                self._queue.put(None)
+            if first:
+                for _ in threads:
+                    self._queue.put(None)
         if wait:
             for thread in threads:
                 thread.join()
@@ -1948,11 +2085,16 @@ class Scheduler:
     def _schedule(self) -> Pass:
         self.rounds += 1
         corr, store, ctx = self.corr, self.store, self.ctx
-        self.log += reconcile(store, corr, ctx.emit, leases=self.leases, handoffs=self.handoffs)
+        # the original cancel event, passed explicitly to each helper below; a stop ends the pass before its next unit
+        stop = self.cancel.event.is_set
+        self.log += reconcile(store, corr, ctx.emit, leases=self.leases, handoffs=self.handoffs, stop_requested=stop)
         log_phase("reconcile", {"round": self.rounds}, source="A01@swarm_run", correlation_id=corr, root=self.repo)
         if self.handoffs is not None:
-            self.handoffs.flush()
-        ready = dispatchable(store, corr, ctx.emit, handoffs=self.handoffs, skip=frozenset(self.inflight))
+            self.handoffs.flush(stop_requested=stop)
+        if stop():
+            return Pass(0, 0, [], None)
+        ready = dispatchable(store, corr, ctx.emit, handoffs=self.handoffs, skip=frozenset(self.inflight),
+                             stop_requested=stop)
         now = time.time()
         skipped: dict[str, str] = {}
         eligible: list[dict] = []
@@ -1970,25 +2112,36 @@ class Scheduler:
         tasks = store.list(correlation_id=corr)
         ready_ids = {t["task_id"] for t in ready}
         for t in tasks:
+            if stop():  # before each RunBook item: an unregistered task has no run, and close() settles the rest
+                return Pass(len(ready), 0, [], None)
             if t["task_id"] in self.inflight:
                 continue
             if t["task_id"] in ready_ids:
                 self.book.seen(t, waiting=False, queue_depth=len(ready))
             elif t["state"] in (S.CREATED.value, S.VALIDATED.value, S.PLANNED.value, S.RETRY.value):
                 self.book.seen(t, waiting=True, queue_depth=len(ready))
+        if stop():
+            return Pass(len(ready), 0, [], None)
         eff = self.effective_parallel()
         free = max(0, eff - len(self.inflight))
         if not self.barrier:  # `--max-rounds` is a total: never start more than what is left of it in one pass
             free = min(free, max(0, self.budget - self.dispatched))
         per_class = Counter(i.agent["id"] for i in self.inflight.values())
         batch, waiting = select_batch(store, eligible, free, self.leases, running=per_class, claims=self.claims,
-                                      skipped=skipped)
+                                      skipped=skipped, stop_requested=stop)
         self.error_handler.detect_parallel(len(batch), self.mgr.max_concurrent)
-        for t, a in batch:
-            self._submit(t, a)
-        self._tick(len(ready), len(batch), eff, free, skipped)
+        submitted = 0
+        try:
+            for t, a in batch:
+                if stop():  # before each submission: a pair not yet admitted is never started; it is given back below
+                    break
+                self._submit(t, a)
+                submitted += 1
+        finally:
+            self._release_unsubmitted(batch[submitted:])
+        self._tick(len(ready), submitted, eff, free, skipped)
         self._wake_wall = backoff_wall
-        return Pass(len(ready), len(batch), waiting, backoff_wall)
+        return Pass(len(ready), submitted, waiting, backoff_wall)
 
     def _tick(self, ready: int, submitted: int, eff: int, free: int, skipped: dict) -> None:
         per_agent: dict[str, dict] = {}
@@ -2053,15 +2206,33 @@ class Scheduler:
                 self.mgr.release(item.sid)
         self.inflight[task["task_id"]] = item._replace(future=future)
 
+    def _skipped(self, tid: str, agent: dict) -> Done:
+        """A dispatch the cancel stopped before its session started: its lease is settled by the task's real state (a
+        HOLDING state keeps it), and the result is SKIPPED, which is not a failure."""
+        if self.leases is not None:
+            self.leases.settle(tid)
+        return Done(tid, agent["id"], "SKIPPED")
+
+    def _release_unsubmitted(self, pairs: list[tuple[dict, dict]]) -> None:
+        """Selected pairs this pass did not admit: give back their claims and settle their leases by the task's real
+        state. A pair already admitted (in `inflight`) is the worker's: its claims, lease and session are its own."""
+        for t, _agent in pairs:
+            tid = t["task_id"]
+            if tid in self.inflight:
+                continue
+            self.claims.release(tid)
+            if self.leases is not None:
+                self.leases.settle(tid)
+
     # ---- the worker (runs on a pool thread) ------------------------------------------------------------------------
     def _worker(self, task: dict, agent: dict, sid: str, run: RunHandle) -> Done:
         tid = task["task_id"]
         try:
             if self.cancel.event.is_set():  # cancelled between the pass and the pool picking this up: never starts
-                if self.leases is not None:
-                    self.leases.settle(tid)
-                return Done(tid, agent["id"], "SKIPPED")
+                return self._skipped(tid, agent)
             self.mgr.acquire(sid)
+            if self.cancel.event.is_set():  # cancelled while waiting for a slot: the session never starts
+                return self._skipped(tid, agent)
             run.slot_acquired()
             with run_scope(run):
                 tid, aid, outcome = execute_one(self.store_path, task, agent, self.args, self.ctx, self.repo,
@@ -2224,6 +2395,8 @@ class Scheduler:
         delay = backoff_s(max(1, int(current["attempt"])))
         if rate_hit:
             delay = max(delay, min(float(rate_hit), backoff_s(62, jitter=0)))  # 62 doublings: the configured cap
+        if self.cancel.event.is_set():  # a cancel that landed during the jitter: no new retry note is admitted
+            return
         self.store.set_notes(task["task_id"], retry_after=time.time() + delay)
         self.log.append(f"{task['task_id']}: transient failure, re-dispatch in {delay:.1f}s")
 
@@ -2257,6 +2430,9 @@ class Scheduler:
             if need_pass and not self.closed and not (self.barrier and self.inflight):
                 need_pass = False
                 res = self._schedule()
+                if self.cancel.event.is_set():  # a partial pass is not idle: no once/budget/idle verdict; drain once
+                    self._cancel_drain()
+                    return
                 if self.once or self.extension_down or (self.barrier and self.rounds >= self.max_rounds) \
                         or (not self.barrier and self.dispatched >= self.budget):
                     self.closed = True
@@ -2375,6 +2551,8 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
                          "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
     mode = scheduler_mode()
+    engine = scheduler_engine()
+    native = _native_scheduler() if engine == "rust" else None  # before any claim: an incomplete extension refuses here
     swarm_timeout = non_negative_seconds(getattr(args, "swarm_timeout", 0), "--swarm-timeout")
     args.swarm_timeout = swarm_timeout
     # read once, before anything is dispatched: a malformed value is an input error now, not a surprise at cancel time
@@ -2392,7 +2570,10 @@ def run(args, ctx) -> dict:
                            dry_run=args.dry_run)
     emit_gsd_omp("consolidated", audit="run.init", wave="wave1", corr=corr, root=ctx.root, dry_run=args.dry_run)
     args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
-    validate_runtime_approval(args.runtime, args)
+    refused = unsupported_approval(args.runtime, args)
+    if refused is not None:  # under rust the named refusals are E-POLICY; still before any claim, lease or dispatch
+        refused_code, refused_message = refused
+        raise SwarmError(ErrorCode.E_POLICY if engine == "rust" else refused_code, refused_message)
     if not args.dry_run:
         name = runtime_bin(args.runtime, args)
         binary = shutil.which(name)
@@ -2408,7 +2589,8 @@ def run(args, ctx) -> dict:
     tel = Telemetry(root=ctx.root, correlation_id=corr, tee=not args.dry_run)  # one per run: its correlation id
     leases = lease_bridge(args, store_path, corr, repo, ctx)
     handoffs = handoff_bridge(store_path, corr, repo, ctx, leases)
-    log: list[str] = []
+    log: list[str] = [f"scheduler_engine: {engine}"]
+    _witness_engine(engine)  # T-14.4-08: the gate's witness of the engine this child ran on (a no-op unless the gate set the file)
     cancel = CancelRequest()
     # T-06-12: SIGTERM/SIGHUP/SIGINT to the runner start a cooperative cancel (flag, grace, then the process-group
     # kill), then the previous handlers come back. WR-10: a signal inherited as ignored (nohup, a parent's SIG_IGN)
@@ -2421,6 +2603,8 @@ def run(args, ctx) -> dict:
     sched = Scheduler(args, ctx, store=store, store_path=store_path, repo=repo, corr=corr, mgr=mgr, tel=tel,
                       leases=leases, handoffs=handoffs, cancel=cancel, barrier=mode == "rounds", sdir=sdir,
                       cancel_grace=cancel_grace, shutdown_budget=shutdown_budget, fail_streak=fail_streak)
+    # the native loop composed around this controller; None keeps the Python Scheduler's own start and loop
+    rust = _native_execution(sched, native) if native is not None else None
     clear_cancel_flag(sdir, corr)  # a flag left by an earlier run of this plan must not cancel this one
     previous = ({s: signal.signal(s, _on_signal) for s in _FORWARDED
                  if signal.getsignal(s) is not signal.SIG_IGN}
@@ -2442,9 +2626,13 @@ def run(args, ctx) -> dict:
         emit_gsd_omp("consolidated", audit="dispatch.start", wave="wave1", corr=corr, root=ctx.root,
                      dry_run=args.dry_run)
         log.append("error_handler_unit: " + sched.error_handler.spec()["version"])
-        sched.start()
+        if rust is None:
+            sched.start()
         try:
-            sched.loop()
+            if rust is None:
+                sched.loop()
+            else:
+                rust.run()
         except BaseException:
             sched.abort()
             raise
@@ -2467,8 +2655,8 @@ def run(args, ctx) -> dict:
         counts[t["state"]] = counts.get(t["state"], 0) + 1
     complete = all(t["state"] in (S.DONE.value, S.CANCELLED.value) for t in tasks)
     escalated = [t["task_id"] for t in tasks if t["state"] == S.ESCALATED.value]
-    if cancel.signum is not None:  # the signal's exit status, once the sessions are gone and the records are final
-        raise SystemExit(128 + cancel.signum)
+    if cancel.exit_signum is not None:  # the signal's exit status, once the sessions are gone and the records are final
+        raise SystemExit(128 + cancel.exit_signum)
     return {
         "status": "ok" if complete else "fail",
         "correlation_id": corr,

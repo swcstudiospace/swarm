@@ -24,6 +24,16 @@ Run (about an hour on a saturated host; detach it):
     TMPDIR=<work dir> python3 tests/perf/scheduler_engines.py --work <work dir> --loop-bench-log <loop_bench.log>
 
 It reads the repository only; every file it writes is under `--work`.
+
+Paired scheduler runtimes (Phase 14.4, S5.2 and S6; decision D-P21), a separate mode:
+
+    python3 tests/perf/scheduler_engines.py --scheduler-paired --json-out <record.json> [--samples 50] [--warmup 3] [--watcher-log <watch.log>]
+    python3 tests/perf/scheduler_engines.py --qualify-json <record.json>
+
+`--scheduler-paired` times `scripts/swarm_run.py` on the path (a) fixture, a 12-task fake-omp run and one-round passes over 50 and 500 ready
+tasks, each with GSD_ENGINE=python and GSD_ENGINE=rust in alternating order, and writes the raw record. `--qualify-json` exits 0 only for a
+complete quiet candidate whose paired p50 and p95 are both strictly below 1.00 on every required fixture; every other case exits 1 with its
+reasons. Qualification is evidence for the S6 record. It is not approval, and nothing here claims a speed-up.
 """
 from __future__ import annotations
 
@@ -31,15 +41,19 @@ import argparse
 import contextlib
 import ctypes
 import gc
+import hashlib
 import importlib.util
 import json
 import math
 import os
+import platform
 import random
 import resource
 import runpy
 import shutil
+import sqlite3
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1575,10 +1589,809 @@ def dry_run_profile(env: Env) -> None:
     out()
 
 
+# ---- paired scheduler runtimes (Phase 14.4, S5.2 and S6; decision D-P21) ------------------------------------------------------------
+
+# The paired sampler times the scheduler the product runs: `scripts/swarm_run.py` as a subprocess, once with GSD_ENGINE=python and once with
+# GSD_ENGINE=rust, on identical seeded inputs, each leg on a fresh SWARM_DIR built before its clock starts, in alternating order. Before a
+# fixture is timed, its first pair is verified: results, Task Store states and transitions, event types, and the engine each leg reports on its
+# `scheduler_engine:` log line (a rust leg answered by python is a fallback). A failing, mismatching or fallback sample refuses the run. The
+# record is written before anything is judged. `--qualify-json` judges it: exit 0 only for a complete quiet candidate whose paired p50 and p95
+# are both strictly below 1.00 on every required fixture; every other case exits 1 and names its reasons. A record is evidence, never a
+# verdict, and nothing here claims a speed-up.
+
+PAIRED_SAMPLES = 50  # measured pairs per fixture (the A2 protocol)
+PAIRED_WARMUP = 3  # warm-up pairs per fixture, timed and discarded (the A2 protocol)
+RECORD_KIND = "scheduler-paired"
+RECORD_SCHEMA = 1
+QUIET_LOAD = 1.5  # the A2 quiet rule: 1-minute load below this (STATE.md P-A2)
+LOAD_EVERY_S = 10.0  # /proc/loadavg is read this often during a run
+WATCHER_MAX_AGE_S = 900  # the quiet line's log must have been written at most this long before the run started (review M2)
+ENGINES = ("python", "rust")
+READY_PASS_PARALLEL = 8  # --max-parallel of a ready-task pass: one --once round dispatches at most this many of the ready tasks
+A2_BRIEF = "a2 baseline fixture"  # the brief tests/perf/run.sh plans its path (a) fixture from
+BENCH_SIGNING_KEY = hashlib.sha256(b"agent-swarm scheduler-paired benchmark").hexdigest()  # one fixed key for every leg, not a deployment key
+RESULT_KEYS = ("status", "complete", "counts", "cancelled", "escalated", "scheduler", "max_parallel", "effective_parallel")
+FINGERPRINT_SOURCES = ("scripts/swarm_run.py", "scripts/orch_plan.py", "swarm/rust_scheduler.py", "swarm/taskstore.py",
+                       "tests/perf/scheduler_engines.py", "crates/gsd-sched-core", "crates/gsd-python")
+FINGERPRINT_GLOBS = ("swarm/**/*.py",)  # every swarm module the timed legs import; __pycache__ is excluded
+
+# The fake omp speaks the protocol the black-box suite's fake session speaks (a session event, the yield, agent_end) and nothing more. It
+# is a protocol fixture for the 12-task walltime, never performance evidence by itself.
+_FAKE_OMP = '''import json, re, sys
+prompt = sys.stdin.read()
+tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
+res = {"task_id": tid, "state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
+       "metrics": {}, "summary_md": "ok"}
+asst = {"role": "assistant", "content": [{"type": "text", "text": "done"},
+                                         {"type": "toolCall", "id": "t1", "name": "yield", "arguments": {"data": res}}],
+        "stopReason": "toolUse", "usage": {"cost": {"total": 0.01}}}
+tres = {"role": "toolResult", "toolCallId": "t1", "toolName": "yield", "isError": False,
+        "details": {"data": res, "status": "success"}}
+print(json.dumps({"type": "session", "version": 3, "id": "fake-" + tid, "cwd": ""}), flush=True)
+print(json.dumps({"type": "turn_end", "message": asst, "toolResults": [tres]}), flush=True)
+print(json.dumps({"type": "agent_end", "messages": [{"role": "user", "content": prompt}, asst, tres], "isTerminal": True,
+                  "yielded": True}), flush=True)
+'''
+
+
+@dataclass(frozen=True)
+class Fixture:
+    """One paired fixture. Mode `a2` is A2 path (a); `omp` is the 12-task fake-omp run; `ready` is one scheduling round over `tasks` ready tasks."""
+
+    id: str
+    mode: str
+    tasks: int  # plan size; 0 for the A2 brief
+    expect_rc: int
+    expect_status: str
+
+
+# A ready-task pass plans N independent tasks and runs one --once round, which dispatches at most READY_PASS_PARALLEL of them and at most
+# the A05 max_parallel (every ready task is an A05 task): an incomplete run (status fail, exit 1) by design. A wrong exit or status refuses
+# the sample like any other failure.
+FIXTURES = (
+    Fixture("a2-path-a", "a2", 0, 0, "ok"),
+    Fixture("fake-omp-12", "omp", 12, 0, "ok"),
+    Fixture("ready-50", "ready", 50, 1, "fail"),
+    Fixture("ready-500", "ready", 500, 1, "fail"),
+)
+REQUIRED_FIXTURES = tuple(fx.id for fx in FIXTURES)
+
+
+def _plan(n: int) -> dict[str, Any]:
+    """The seeded plan of n independent code tasks: the same bytes on every run."""
+    return {"tasks": [{"id": f"t{i:03d}", "capability": "code.backend", "agent": "A05", "title": f"paired fixture task {i:03d}",
+                       "depends_on": [], "gates": []} for i in range(n)]}
+
+
+def ready_dispatch_expectation() -> int:
+    """How many ready tasks one --once round admits: the smaller of the round's --max-parallel and the A05 max_parallel in agents.json,
+    since every ready task is an A05 task. Read from the manifest, so a change to the cap changes the expectation and the digest."""
+    manifest = json.loads((REPO / "agents.json").read_text(encoding="utf-8"))
+    cap = next(int(a["max_parallel"]) for a in manifest["agents"] if a.get("id") == "A05")
+    return min(READY_PASS_PARALLEL, cap)
+
+
+def fixture_digest(fx: Fixture) -> str:
+    """sha256 of a fixture's seeded inputs and expectations; a record measured on other inputs does not qualify."""
+    spec = {"id": fx.id, "mode": fx.mode, "tasks": fx.tasks, "brief": A2_BRIEF if fx.mode == "a2" else None,
+            "plan": _plan(fx.tasks) if fx.mode != "a2" else None, "expect": [fx.expect_rc, fx.expect_status],
+            "ready_parallel": [READY_PASS_PARALLEL, ready_dispatch_expectation()] if fx.mode == "ready" else None}
+    return hashlib.sha256(canon(spec).encode("utf-8")).hexdigest()
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_fingerprint() -> dict[str, str]:
+    """sha256 of each source file the paired legs run or measure: the listed files, every file under a listed directory (build output
+    excluded), and every file the FINGERPRINT_GLOBS match (__pycache__ excluded)."""
+    found: dict[str, str] = {}
+    for rel in FINGERPRINT_SOURCES:
+        base = REPO / rel
+        if base.is_file():
+            files = [base]
+        elif base.is_dir():
+            files = sorted(p for p in base.rglob("*") if p.is_file() and "target" not in p.relative_to(base).parts and "__pycache__" not in p.parts)
+        else:
+            files = []
+        if not files:
+            found[rel] = "absent"
+        for p in files:
+            found[p.relative_to(REPO).as_posix()] = _sha(p)
+    for pattern in FINGERPRINT_GLOBS:
+        for p in sorted(REPO.glob(pattern)):
+            if p.is_file() and "__pycache__" not in p.relative_to(REPO).parts:
+                found[p.relative_to(REPO).as_posix()] = _sha(p)
+    return found
+
+
+def extension_fingerprint() -> dict[str, str]:
+    """sha256 of the built swarm._native extension the rust legs import."""
+    libs = sorted((REPO / "swarm").glob("_native*.so"))
+    return {p.relative_to(REPO).as_posix(): _sha(p) for p in libs} or {"swarm/_native": "absent"}
+
+
+def elf_debug_sections(path: Path) -> list[str]:
+    """Names of the `.debug*` sections of a little-endian ELF64 file. A dev-profile build has them; the release build has none."""
+    data = path.read_bytes()
+    if data[:4] != b"\x7fELF" or data[4:6] != b"\x02\x01":
+        raise ValueError(f"{path.name} is not a little-endian ELF64 file")
+    shoff = struct.unpack_from("<Q", data, 0x28)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+
+    def header(i: int) -> tuple[int, ...]:
+        return struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize)
+
+    names_hdr = header(shstrndx)
+    table = data[names_hdr[4]: names_hdr[4] + names_hdr[5]]
+    names = [table[header(i)[0]: table.index(b"\0", header(i)[0])].decode("ascii", "replace") for i in range(shnum)]
+    return [name for name in names if name.startswith(".debug")]
+
+
+def extension_debug_sections() -> int:
+    """Debug sections across the built extension(s): 0 for a release build, -1 when there is no extension to measure."""
+    libs = sorted((REPO / "swarm").glob("_native*.so"))
+    if not libs:
+        return -1
+    return sum(len(elf_debug_sections(p)) for p in libs)
+
+
+def gsd_engine_binary() -> Path:
+    """The gsd_engine binary the rust leg's gates run: GSD_ENGINE_BIN from the operator's environment (made absolute), else the selector's default path."""
+    raw = os.environ.get("GSD_ENGINE_BIN", "").strip()
+    return Path(raw).resolve() if raw else REPO / "target" / "release" / "gsd_engine"
+
+
+def binary_fingerprint() -> dict[str, str]:
+    """sha256 of the gsd_engine binary the rust legs run; 'absent' when the file is missing."""
+    binary = gsd_engine_binary()
+    return {"path": str(binary), "sha256": _sha(binary) if binary.is_file() else "absent"}
+
+
+def _tool_version(argv: list[str]) -> str:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    return done.stdout.strip() or "unavailable"
+
+
+def host_fingerprint() -> dict[str, Any]:
+    return {"uname": " ".join(platform.uname()), "machine": platform.machine(), "nproc": os.cpu_count(), "python": sys.version.split()[0],
+            "rustc": _tool_version(["rustc", "--version"]), "configuration": "product: GSD_ENGINE selects the engine, SWARM_PURE_PYTHON unset"}
+
+
+def fingerprint_now() -> dict[str, Any]:
+    return {"source": source_fingerprint(), "extension": extension_fingerprint(), "binary": binary_fingerprint(),
+            "extension_debug_sections": extension_debug_sections(),
+            "fixtures": {fx.id: fixture_digest(fx) for fx in FIXTURES}, "host": host_fingerprint()}
+
+
+def nearest_rank(values: Sequence[float], pct: int) -> float:
+    """Nearest-rank percentile: the value at 1-based rank ceil(pct * n / 100) of the sorted values (integer rank arithmetic)."""
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("no values to take a percentile of")
+    rank = max(1, -((-pct * len(ordered)) // 100))
+    return ordered[rank - 1]
+
+
+def pair_ratios(pairs: Sequence[dict[str, Any]]) -> list[float]:
+    return [pr["rust_ns"] / pr["python_ns"] for pr in pairs]
+
+
+def watcher_last_line(path: str | None) -> str | None:
+    """The last non-blank line of the watch_quiet.sh log, or None when there is no such log."""
+    if not path or not Path(path).is_file():
+        return None
+    lines = [ln.strip() for ln in Path(path).read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+
+def watcher_state(path: str | None) -> dict[str, Any]:
+    """The watch_quiet.sh log as the run sees it at one moment: its mtime (epoch and UTC) and its last line. Empty values when there is no log."""
+    try:
+        if not path or not Path(path).is_file():
+            return {"mtime_epoch": None, "mtime_utc": None, "last_line": None}
+        mtime = Path(path).stat().st_mtime
+        return {"mtime_epoch": mtime, "mtime_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime)), "last_line": watcher_last_line(path)}
+    except OSError:
+        return {"mtime_epoch": None, "mtime_utc": None, "last_line": None}
+
+
+def _load1_now() -> float:
+    """The 1-minute load average the host reports now: the start-of-run check reads it before any fixture is timed."""
+    return float(Path("/proc/loadavg").read_text(encoding="utf-8").split()[0])
+
+
+class LoadSampler:
+    """/proc/loadavg and the watcher's last line, read before the run, every LOAD_EVERY_S seconds during it, and after it."""
+
+    def __init__(self, watcher_log: str | None = None) -> None:
+        self.readings: list[dict[str, Any]] = []
+        self._t0 = time.monotonic()
+        self._stop = threading.Event()
+        self._watcher = watcher_log
+        self._thread = threading.Thread(target=self._loop, name="loadavg", daemon=True)
+
+    def _read(self, at: str) -> None:
+        line = Path("/proc/loadavg").read_text(encoding="utf-8").strip()
+        self.readings.append({"at": at, "elapsed_s": round(time.monotonic() - self._t0, 3), "load1": float(line.split()[0]), "line": line,
+                              "watcher": watcher_last_line(self._watcher)})
+
+    def _loop(self) -> None:
+        while not self._stop.wait(LOAD_EVERY_S):
+            self._read("during")
+
+    def start(self) -> None:
+        self._read("before")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join()
+        self._read("after")
+
+
+class Refused(Exception):
+    """A sample that cannot count as evidence: the run stops, and the record says why."""
+
+
+@dataclass
+class LegRun:
+    wall_ns: int
+    rc: int
+    stdout: str
+    stderr: str
+
+
+@dataclass
+class Observation:
+    """What one leg left behind: its wall time, exit code, the engine that answered, and the results, store and events it wrote."""
+
+    engine: str
+    wall_ns: int
+    rc: int
+    served_by: str
+    result: dict[str, Any]
+    store: list[Any]
+    events: list[str]
+    engine_line: str
+    error: str = ""
+
+
+LegFn = Callable[[str, str], Observation]
+
+
+def execute_leg(argv: Sequence[str], cwd: Path, env: dict[str, str]) -> LegRun:
+    """One timed subprocess: the wall clock runs around the child only."""
+    start = time.perf_counter_ns()
+    done = subprocess.run(list(argv), cwd=cwd, env=env, capture_output=True, text=True, check=False, timeout=3600)
+    wall = time.perf_counter_ns() - start
+    return LegRun(wall, done.returncode, done.stdout, done.stderr)
+
+
+def served_by(lines: Sequence[str]) -> str:
+    """The engine named by the one `scheduler_engine: <name>` line swarm_run writes per run; any other count of lines is `unknown`."""
+    names = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("scheduler_engine:")]
+    return names[0] if len(names) == 1 else "unknown"
+
+
+def store_snapshot(sdir: Path, corr: str | None) -> list[Any]:
+    """Sorted (task, state) pairs of the run's tasks, and the Task Store's transition count. Each leg plans its own store, so the correlation prefix of a task id differs between the legs; the part after the first hyphen is compared."""
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    from swarm.taskstore import TaskStore
+
+    store = TaskStore(sdir / "tasks.db")
+    try:
+        rows = sorted([str(t["task_id"]).split("-", 1)[-1], str(t["state"])] for t in store.list(correlation_id=corr or None))
+        transitions = int(store.conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0])
+    finally:
+        store.conn.close()
+    return [rows, transitions]
+
+
+def event_types(sdir: Path) -> list[str]:
+    """The distinct event types in the run's events.jsonl. Counts follow timing, so they are not compared."""
+    log = sdir / "events.jsonl"
+    if not log.is_file():
+        return []
+    kinds: set[str] = set()
+    for ln in log.read_text(encoding="utf-8").splitlines():
+        if ln.strip():
+            rec = json.loads(ln)
+            kinds.add(str(rec.get("type")) if isinstance(rec, dict) else "<not an object>")
+    return sorted(kinds)
+
+
+def observe(engine: str, run: LegRun, sdir: Path) -> Observation:
+    """The untimed reading of one leg: its JSON result, the engine line, the store and the events. Nothing here is timed. `dispatched` counts
+    the finished dispatches in the run's log: `--once` drains every dispatch before it returns, and each finished one leaves a
+    `round N: <task> [<agent>] sid=... -> <outcome>` line."""
+    try:
+        res = json.loads(run.stdout)
+    except ValueError:
+        res = None
+    if not isinstance(res, dict):
+        return Observation(engine, run.wall_ns, run.rc, "unknown", {}, [], [], "", "stdout is not a JSON object")
+    log = res.get("log") if isinstance(res.get("log"), list) else []
+    lines = [ln for ln in log if isinstance(ln, str) and ln.startswith("scheduler_engine:")]
+    dispatched = sum(1 for ln in log if isinstance(ln, str) and ln.startswith("round ") and " sid=" in ln)
+    result = {**{k: res.get(k) for k in RESULT_KEYS}, "dispatched": dispatched}
+    try:
+        store = store_snapshot(sdir, res.get("correlation_id"))
+        events = event_types(sdir)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return Observation(engine, run.wall_ns, run.rc, served_by(lines), {}, [], [], " | ".join(lines), f"store or events unreadable: {exc}")
+    return Observation(engine, run.wall_ns, run.rc, served_by(lines), result, store, events, " | ".join(lines))
+
+
+def leg_problems(fx: Fixture, obs: Observation) -> list[str]:
+    """Why one leg cannot be timed or counted: an error, the wrong exit code, the wrong engine or a fallback, the wrong status, any cancelled
+    task or run, or, for a ready pass, a dispatch count other than the one the pass takes."""
+    problems: list[str] = []
+    if obs.error:
+        problems.append(f"{obs.engine} leg: {obs.error}")
+    if obs.rc != fx.expect_rc:
+        problems.append(f"{obs.engine} leg: exit {obs.rc}, the fixture expects {fx.expect_rc}")
+    if obs.served_by != obs.engine:
+        kind = "fallback" if obs.engine == ENGINES[1] else "wrong engine"
+        problems.append(f"{obs.engine} leg: {kind}: the scheduler log says {obs.served_by!r}")
+    if obs.result.get("status") != fx.expect_status:
+        problems.append(f"{obs.engine} leg: status {obs.result.get('status')!r}, the fixture expects {fx.expect_status!r}")
+    counts = obs.result.get("counts") if isinstance(obs.result.get("counts"), dict) else {}
+    if counts.get("CANCELLED"):
+        problems.append(f"{obs.engine} leg: {counts.get('CANCELLED')!r} CANCELLED task(s)")
+    if obs.result.get("cancelled") is not None:
+        problems.append(f"{obs.engine} leg: cancelled run: {obs.result.get('cancelled')!r}")
+    if fx.mode == "ready":
+        want = min(fx.tasks, ready_dispatch_expectation())
+        if obs.result.get("dispatched") != want:
+            problems.append(f"{obs.engine} leg: dispatched {obs.result.get('dispatched')!r}, the one-round pass takes {want}")
+    return problems
+
+
+def result_mismatches(py: Observation, rs: Observation) -> list[str]:
+    """What must be identical between the engines: the results, the Task Store states and transitions, and the event types."""
+    diffs: list[str] = []
+    if py.result != rs.result:
+        diffs.append("result")
+    if py.store != rs.store:
+        diffs.append("store")
+    if py.events != rs.events:
+        diffs.append("events")
+    return diffs
+
+
+def _other(engine: str) -> str:
+    return ENGINES[1] if engine == ENGINES[0] else ENGINES[0]
+
+
+def _pair(fx: Fixture, leg: LegFn, first: str, tag: str) -> dict[str, Observation]:
+    """One pair: both engines, `first` before the other. Raises Refused on any failing, fallback or mismatching leg."""
+    obs: dict[str, Observation] = {}
+    for engine in (first, _other(first)):
+        ob = leg(engine, tag)
+        problems = leg_problems(fx, ob)
+        if problems:
+            raise Refused(f"{tag}: " + "; ".join(problems))
+        obs[engine] = ob
+    diffs = result_mismatches(obs[ENGINES[0]], obs[ENGINES[1]])
+    if diffs:
+        raise Refused(f"{tag}: parity mismatch in {', '.join(diffs)}")
+    return obs
+
+
+def measure_fixture(fx: Fixture, leg: LegFn, samples: int, warmup: int, pairs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Verify, warm up, then measure one fixture. The first pair verifies the leg (its times are dropped), then `warmup` pairs are timed and
+    discarded, then `samples` alternating pairs are measured. Measured pairs are appended to `pairs` as they finish, so a refused run keeps the
+    pairs it had. Raises Refused on the first failing, fallback or mismatching sample."""
+    verified = _pair(fx, leg, ENGINES[0], "verify")
+    for w in range(warmup):
+        _pair(fx, leg, ENGINES[w % 2], f"warmup-{w}")
+    for j in range(samples):
+        first = ENGINES[j % 2]
+        obs = _pair(fx, leg, first, f"sample-{j}")
+        py, rs = obs[ENGINES[0]], obs[ENGINES[1]]
+        pairs.append({"index": j, "order": [first, _other(first)], "python_ns": py.wall_ns, "rust_ns": rs.wall_ns,
+                      "python_rc": py.rc, "rust_rc": rs.rc, "ratio": rs.wall_ns / py.wall_ns,
+                      "counts": {e: obs[e].result.get("counts") for e in ENGINES},
+                      "cancelled": {e: obs[e].result.get("cancelled") for e in ENGINES},
+                      "dispatched": {e: obs[e].result.get("dispatched") for e in ENGINES}})
+    ratios = pair_ratios(pairs)
+    walls = {e: [pr[f"{e}_ns"] for pr in pairs] for e in ENGINES}
+    return {
+        "id": fx.id, "digest": fixture_digest(fx), "status": "ok", "reason": "", "samples": samples, "warmup_pairs": warmup,
+        "skipped": samples - len(pairs), "expect": {"rc": fx.expect_rc, "status": fx.expect_status},
+        "parity": {"ok": True, "checked": ["result", "store", "events", "served_by"], "verify_pair": True, "mismatches": []},
+        "served_by": {e: verified[e].served_by for e in ENGINES},
+        "witness": {e: verified[e].engine_line for e in ENGINES},
+        "pairs": pairs,
+        "ratio": {"p50": nearest_rank(ratios, 50), "p95": nearest_rank(ratios, 95)},
+        "legs_ms": {e: {"p50": nearest_rank(walls[e], 50) / 1e6, "p95": nearest_rank(walls[e], 95) / 1e6} for e in ENGINES},
+    }
+
+
+def failed_fixture(fx: Fixture, samples: int, warmup: int, pairs: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+    return {"id": fx.id, "digest": fixture_digest(fx), "status": "failed", "reason": reason, "samples": samples, "warmup_pairs": warmup,
+            "skipped": samples - len(pairs), "expect": {"rc": fx.expect_rc, "status": fx.expect_status}, "pairs": list(pairs)}
+
+
+def leg_env(sdir: Path, claude: Path, tmp: Path) -> dict[str, str]:
+    """The child environment both engines share: the caller's environment without any SWARM_, GSD_ or SUBSTRATE_ variable, plus a fresh
+    SWARM_DIR, no GSD state mirror, a scratch Claude state directory and the benchmark signing key. GSD_ENGINE is added to the run only."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SWARM_", "GSD_", "SUBSTRATE_"))}
+    env.update({"SWARM_DIR": str(sdir), "SWARM_GSD_STATE_FILE": "", "SWARM_CLAUDE_STATE_DIR": str(claude),
+                "SWARM_SIGNING_KEY": BENCH_SIGNING_KEY, "TMPDIR": str(tmp)})
+    return env
+
+
+def _plan_argv(fx: Fixture, repo: Path, root: Path) -> list[str]:
+    orch_plan = [sys.executable, str(REPO / "scripts" / "orch_plan.py")]
+    if fx.mode == "a2":
+        return orch_plan + ["--brief-text", A2_BRIEF, "--pattern", "feature", "--risk-class", "medium", "--json"]
+    plan = root / "plan.json"
+    plan.write_text(json.dumps(_plan(fx.tasks), sort_keys=True), encoding="utf-8")
+    return orch_plan + ["--plan", str(plan), "--prefix", "T", "--repo", str(repo), "--risk-class", "low", "--json"]
+
+
+def setup_fixture(fx: Fixture, repo: Path, root: Path, env: dict[str, str]) -> None:
+    """The fixture's store, planned by scripts/orch_plan.py on the leg's own SWARM_DIR. Runs before the clock; a failure refuses the sample."""
+    done = subprocess.run(_plan_argv(fx, repo, root), cwd=REPO, env=env, capture_output=True, text=True, check=False, timeout=900)
+    if done.returncode != 0:
+        raise Refused(f"setup: orch_plan exited {done.returncode}: {done.stderr.strip()[-300:]}")
+
+
+def run_argv(fx: Fixture, repo: Path, omp_bin: Path) -> list[str]:
+    swarm_run = [sys.executable, str(REPO / "scripts" / "swarm_run.py")]
+    if fx.mode == "a2":
+        return swarm_run + ["--dry-run", "--json"]  # tests/perf/run.sh path (a), as run.sh runs it
+    if fx.mode == "omp":
+        return swarm_run + ["--runtime", "omp", "--omp-bin", str(omp_bin), "--repo", str(repo), "--json"]
+    return swarm_run + ["--dry-run", "--once", "--max-parallel", str(READY_PASS_PARALLEL), "--repo", str(repo), "--json"]
+
+
+def fake_omp(work: Path) -> Path:
+    path = work / "fake-omp" / "omp"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!{sys.executable}\n" + _FAKE_OMP, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def make_leg(fx: Fixture, work: Path, omp_bin: Path) -> LegFn:
+    """One leg end to end: a fresh SWARM_DIR and repository, the store planned (untimed), the timed swarm_run subprocess, then the reading (untimed)."""
+
+    def leg(engine: str, tag: str) -> Observation:
+        root = work / fx.id / f"{engine}-{tag}"
+        shutil.rmtree(root, ignore_errors=True)
+        sdir, repo, claude = root / "swarm", root / "repo", root / "claude-state"
+        for d in (sdir, repo, claude):
+            d.mkdir(parents=True)
+        env = leg_env(sdir, claude, root)
+        setup_fixture(fx, repo, root, env)
+        run_env = {**env, "GSD_ENGINE": engine}
+        if engine == "rust":
+            binary = gsd_engine_binary()
+            if not binary.is_file():
+                raise Refused(f"rust leg: gsd_engine binary absent at {binary}; build it or set GSD_ENGINE_BIN")
+            # leg_env strips GSD_* variables, and SWARM_SIGNING_KEY makes the selector require the binary's digest.
+            run_env.update({"GSD_ENGINE_BIN": str(binary), "GSD_ENGINE_BIN_SHA256": _sha(binary)})
+        run = execute_leg(run_argv(fx, repo, omp_bin), REPO, run_env)
+        obs = observe(engine, run, sdir)
+        shutil.rmtree(root, ignore_errors=True)
+        return obs
+
+    return leg
+
+
+def _utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def run_paired(json_out: Path, samples: int, warmup: int, watcher_log: str | None, work: Path) -> int:
+    """Measures every fixture and writes the raw record to `json_out`. Any failure, including an unexpected exception, becomes the run's
+    reason and nothing after it is measured; the record is written in every case. Returns 0 only for a complete run."""
+    started_epoch = time.time()
+    at_start = watcher_state(watcher_log)  # M2: the quiet line's log as the run starts
+    record: dict[str, Any] = {
+        "kind": RECORD_KIND, "schema": RECORD_SCHEMA, "status": "failed", "reason": "run interrupted", "started": _utc(),
+        "started_epoch": started_epoch,
+        "protocol": {"samples": samples, "warmup": warmup,
+                     "order": "alternating: the first pair of each fixture verifies the legs; warm-up pairs follow; measured pair j runs python first when j is even",
+                     "clock": "perf_counter_ns around the swarm_run child only", "engines": list(ENGINES),
+                     "required_fixtures": list(REQUIRED_FIXTURES), "load_every_s": LOAD_EVERY_S, "quiet_load": QUIET_LOAD,
+                     "watcher_max_age_s": WATCHER_MAX_AGE_S},
+        "fixtures": {},
+    }
+    refusal = ""
+    loader: LoadSampler | None = None
+    try:
+        record["fingerprint"] = fingerprint_now()
+        # Refused before the first fixture is timed: a stale, contended or non-A2 watcher line, or a debug build, must not spend the quiet
+        # window and only then be refused at qualification.
+        preflight = _build_reasons(record["fingerprint"]) + _watcher_reasons(
+            {"at_start": at_start, "at_end": at_start, "last_line": at_start.get("last_line")}, started_epoch, [])
+        load_now = _load1_now()
+        if load_now >= QUIET_LOAD:
+            preflight.append(f"host not quiet at start: the 1-minute load is {load_now:.2f}, at or above the quiet rule {QUIET_LOAD}")
+        if preflight:
+            raise Refused("preflight: " + "; ".join(preflight))
+        loader = LoadSampler(watcher_log)
+        loader.start()
+        omp_bin = fake_omp(work)
+        for fx in FIXTURES:
+            pairs: list[dict[str, Any]] = []
+            try:
+                record["fixtures"][fx.id] = measure_fixture(fx, make_leg(fx, work, omp_bin), samples, warmup, pairs)
+            except Exception as exc:  # noqa: BLE001 - any failure is the run's reason, and the record is still written
+                refusal = f"{fx.id}: {type(exc).__name__}: {exc}"
+                record["fixtures"][fx.id] = failed_fixture(fx, samples, warmup, pairs, refusal)
+                break
+    except Exception as exc:  # noqa: BLE001
+        refusal = refusal or f"run: {type(exc).__name__}: {exc}"
+    finally:
+        if loader is not None:
+            try:
+                loader.stop()
+            except Exception as exc:  # noqa: BLE001 - the load sampler must never mask the run's reason
+                refusal = refusal or f"load sampler: {type(exc).__name__}: {exc}"
+            record["load"] = {"readings": loader.readings}
+        try:
+            record["fingerprint_end"] = fingerprint_now()
+        except Exception as exc:  # noqa: BLE001
+            refusal = refusal or f"end fingerprint: {type(exc).__name__}: {exc}"
+        at_end = watcher_state(watcher_log)
+        record["watcher"] = {"log": watcher_log, "at_start": at_start, "at_end": at_end, "last_line": at_end["last_line"]}
+        complete = not refusal and all(record["fixtures"].get(fx.id, {}).get("status") == "ok" for fx in FIXTURES)
+        record["status"] = "ok" if complete else "failed"
+        record["reason"] = "" if complete else (refusal or "run interrupted before every fixture was measured")
+        record["finished"] = _utc()
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    for fx in FIXTURES:
+        rec = record["fixtures"].get(fx.id, {})
+        if rec.get("status") == "ok":
+            out(f"   {fx.id:<14} {len(rec['pairs'])} measured pairs; paired ratio p50 {rec['ratio']['p50']:.3f} p95 {rec['ratio']['p95']:.3f} "
+                "(measured, not a verdict)")
+        else:
+            out(f"   {fx.id:<14} refused: {rec.get('reason', 'not run')}")
+    out(f"record: {json_out} (status {record['status']}{'' if complete else ': ' + record['reason']})")
+    return 0 if complete else 1
+
+
+# ---- the qualifier: evidence in, one verdict out, fail closed -----------------------------------------------------------------------
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_num(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _expected_order(j: int) -> list[str]:
+    return [ENGINES[0], ENGINES[1]] if j % 2 == 0 else [ENGINES[1], ENGINES[0]]
+
+
+def _build_reasons(fp: dict[str, Any]) -> list[str]:
+    """A measurement is taken on a release build only: a debug gsd_engine, a dev-profile extension or a missing extension is refused
+    before any fixture runs and again at qualification, so a debug build cannot qualify (review finding 4)."""
+    reasons: list[str] = []
+    binary = fp.get("binary") if isinstance(fp.get("binary"), dict) else {}
+    path = str(binary.get("path") or "")
+    if "/debug/" in path.replace("\\", "/"):
+        reasons.append(f"debug build: the gsd_engine binary {path} is a debug build; measure with "
+                       "cargo build -p gsd-adapter --bin gsd_engine --release --locked")
+    debug = fp.get("extension_debug_sections")
+    if not _is_int(debug):
+        reasons.append("malformed record: no extension_debug_sections value")
+    elif debug == -1:
+        reasons.append("missing extension: no swarm/_native*.so to measure; build it with maturin develop --release --locked")
+    elif debug != 0:
+        reasons.append(f"debug build: the native extension carries {debug} debug section(s); measure after "
+                       "maturin develop --release --locked")
+    host = fp.get("host") if isinstance(fp.get("host"), dict) else {}
+    if host.get("rustc") in (None, "", "unavailable"):
+        reasons.append("unverified host: rustc did not report a version, so the toolchain of the measurement is unknown; "
+                       "re-measure with rustc on PATH")
+    return reasons
+
+
+def _fingerprint_reasons(fp: Any, now: dict[str, Any], label: str) -> list[str]:
+    """The fingerprint taken at the run's `label` (start or end) must equal the current one: sources, extension, binary, fixture inputs, host."""
+    if not isinstance(fp, dict):
+        return [f"malformed record: no {label} fingerprint object"]
+    reasons: list[str] = []
+    for key in ("source", "extension", "binary", "fixtures"):
+        if fp.get(key) != now[key]:
+            reasons.append(f"fingerprint mismatch: {key} at {label} (measured on other inputs; re-measure)")
+    host = fp.get("host") if isinstance(fp.get("host"), dict) else {}
+    for key in ("uname", "python", "nproc", "rustc"):
+        if host.get(key) != now["host"][key]:
+            reasons.append(f"fingerprint mismatch: host {key} at {label}")
+    reasons += _build_reasons(fp)
+    return reasons
+
+
+def _watcher_reasons(watcher: Any, started: Any, readings: Any) -> list[str]:
+    """The quiet line the record relies on: the A2 quiet line; its log written at most WATCHER_MAX_AGE_S before the run started
+    (0 <= started - mtime <= bound); the log's mtime unchanged across the run; and the same line in every load reading."""
+    if not isinstance(watcher, dict):
+        return ["missing watcher result: the record has no watcher object"]
+    at_start = watcher.get("at_start") if isinstance(watcher.get("at_start"), dict) else {}
+    at_end = watcher.get("at_end") if isinstance(watcher.get("at_end"), dict) else {}
+    last = watcher.get("last_line")
+    reasons: list[str] = []
+    if not isinstance(last, str) or not last:
+        reasons.append("missing watcher result: no watch_quiet.sh line was recorded (A2_WATCHER_LOG unset or empty)")
+    elif last.startswith("result: not quiet"):
+        reasons.append(f"contended watcher: the last watcher line is not quiet: {last}")
+    elif not last.startswith("result: quiet "):
+        reasons.append(f"malformed watcher result: {last}")
+    elif "rule: relaxed" in last:
+        reasons.append(f"relaxed watcher: the quiet window used the relaxed rule, not A2: {last}")
+    elif not last.endswith("rule: A2)"):
+        reasons.append(f"non-A2 watcher: {last}")
+    mtime = at_start.get("mtime_epoch")
+    if not _is_num(mtime):
+        reasons.append("missing watcher log mtime at run start")
+    elif not _is_num(started):
+        reasons.append("malformed record: no started_epoch")
+    elif not 0 <= started - mtime <= WATCHER_MAX_AGE_S:
+        reasons.append(f"stale or future watcher result: the quiet line's log was written {started - mtime:.0f} s before the run started "
+                       f"(the bound is {WATCHER_MAX_AGE_S} s)")
+    if at_end.get("mtime_epoch") != mtime:
+        reasons.append("watcher log changed during the run: its mtime at the start and at the end differ")
+    for r in readings if isinstance(readings, list) else []:
+        seen = r.get("watcher") if isinstance(r, dict) else None
+        if not isinstance(r, dict) or seen != last:
+            reasons.append(f"watcher changed during the run: a load reading saw {seen!r}, the final line is {last!r}")
+            break
+    return reasons
+
+
+def _load_reasons(load: Any) -> list[str]:
+    readings = load.get("readings") if isinstance(load, dict) else None
+    if not isinstance(readings, list) or not all(isinstance(r, dict) and _is_num(r.get("load1")) for r in readings):
+        return ["malformed record: load readings are missing or not numbers"]
+    reasons: list[str] = []
+    if not {"before", "after"} <= {r.get("at") for r in readings}:
+        reasons.append("insufficient load readings: the record needs readings before and after the run")
+    hot = [r["load1"] for r in readings if r["load1"] >= QUIET_LOAD]
+    if hot:
+        reasons.append(f"load >= {QUIET_LOAD}: {len(hot)} of {len(readings)} readings at or above {QUIET_LOAD} (max {max(hot):.2f})")
+    return reasons
+
+
+def _pair_leg_reasons(fid: str, j: int, pr: dict[str, Any], want_dispatch: int | None) -> list[str]:
+    """Per leg of one pair: no cancelled task and no cancelled run; a readable dispatch count, which for a ready pass must be the count the pass takes."""
+    reasons: list[str] = []
+    counts = pr.get("counts") if isinstance(pr.get("counts"), dict) else {}
+    cancelled = pr.get("cancelled") if isinstance(pr.get("cancelled"), dict) else {}
+    dispatched = pr.get("dispatched") if isinstance(pr.get("dispatched"), dict) else {}
+    for e in ENGINES:
+        leg_counts = counts.get(e)
+        if not isinstance(leg_counts, dict):
+            reasons.append(f"malformed pair {j} in fixture {fid}: no {e} counts")
+            continue
+        if leg_counts.get("CANCELLED"):
+            reasons.append(f"cancelled task: fixture {fid} pair {j} {e} leg has {leg_counts.get('CANCELLED')!r} CANCELLED task(s)")
+        if e not in cancelled or cancelled.get(e) is not None:
+            reasons.append(f"cancelled run: fixture {fid} pair {j} {e} leg reports cancelled {cancelled.get(e)!r}")
+        n = dispatched.get(e)
+        if not _is_int(n):
+            reasons.append(f"malformed pair {j} in fixture {fid}: no {e} dispatch count")
+        elif want_dispatch is not None and n != want_dispatch:
+            reasons.append(f"dispatch: fixture {fid} pair {j} {e} leg dispatched {n}, the one-round pass takes {want_dispatch}")
+    return reasons
+
+
+def _fixture_reasons(fid: str, fx: Any) -> list[str]:
+    spec = next(f for f in FIXTURES if f.id == fid)
+    if not isinstance(fx, dict):
+        return [f"malformed fixture {fid}: not an object"]
+    reasons: list[str] = []
+    if fx.get("status") != "ok":
+        reasons.append(f"fixture {fid}: status {fx.get('status')!r}: {fx.get('reason') or 'no reason recorded'}")
+    if fx.get("skipped") != 0:
+        reasons.append(f"fixture {fid}: skipped samples: {fx.get('skipped')!r}")
+    if fx.get("warmup_pairs") != PAIRED_WARMUP:
+        reasons.append(f"fixture {fid}: {fx.get('warmup_pairs')!r} warm-up pairs, the protocol takes {PAIRED_WARMUP}")
+    parity = fx.get("parity") if isinstance(fx.get("parity"), dict) else {}
+    if parity.get("ok") is not True:
+        reasons.append(f"fixture {fid}: parity mismatch: {parity.get('mismatches') or 'not recorded'}")
+    served = fx.get("served_by") if isinstance(fx.get("served_by"), dict) else {}
+    if served.get("python") != ENGINES[0] or served.get("rust") != ENGINES[1]:
+        reasons.append(f"fixture {fid}: native fallback or unknown engine: served_by {served}")
+    pairs = fx.get("pairs")
+    if not isinstance(pairs, list) or len(pairs) != PAIRED_SAMPLES:
+        count = len(pairs) if isinstance(pairs, list) else "no"
+        reasons.append(f"fixture {fid}: {count} measured pairs, the protocol takes {PAIRED_SAMPLES}")
+        return reasons
+    want_dispatch = min(spec.tasks, ready_dispatch_expectation()) if spec.mode == "ready" else None
+    ratios: list[float] = []
+    for j, pr in enumerate(pairs):
+        if not isinstance(pr, dict) or not (_is_int(pr.get("python_ns")) and _is_int(pr.get("rust_ns"))) \
+                or pr["python_ns"] <= 0 or pr["rust_ns"] <= 0:
+            reasons.append(f"malformed pair {j} in fixture {fid}: needs positive integer python_ns and rust_ns")
+            return reasons
+        if pr.get("index") != j or pr.get("order") != _expected_order(j):
+            reasons.append(f"pairing: fixture {fid} pair {j} has index {pr.get('index')!r} and order {pr.get('order')!r}; "
+                           f"the alternation takes {_expected_order(j)}")
+        if pr.get("python_rc") != spec.expect_rc or pr.get("rust_rc") != spec.expect_rc:
+            reasons.append(f"failing sample: fixture {fid} pair {j} exited python {pr.get('python_rc')!r} and rust {pr.get('rust_rc')!r}, "
+                           f"expected {spec.expect_rc}")
+        reasons += _pair_leg_reasons(fid, j, pr, want_dispatch)
+        ratios.append(pr["rust_ns"] / pr["python_ns"])
+    p50, p95 = nearest_rank(ratios, 50), nearest_rank(ratios, 95)
+    if not p50 < 1.0:
+        reasons.append(f"fixture {fid}: paired p50 {p50:.3f} is not strictly below 1.00 (rust is not faster at the median)")
+    if not p95 < 1.0:
+        reasons.append(f"fixture {fid}: paired p95 {p95:.3f} is not strictly below 1.00")
+    return reasons
+
+
+def qualify_record(record: Any, now: dict[str, Any]) -> list[str]:
+    """Every reason the record is not a complete quiet candidate with paired p50 and p95 strictly below 1.00 on each required fixture.
+    An empty list qualifies. Evidence only: a qualifying record is not approval for a default change."""
+    if not isinstance(record, dict):
+        return ["malformed record: the top level is not a JSON object"]
+    reasons: list[str] = []
+    if record.get("kind") != RECORD_KIND or record.get("schema") != RECORD_SCHEMA:
+        reasons.append(f"malformed record: kind and schema must be {RECORD_KIND!r} and {RECORD_SCHEMA}")
+    if record.get("status") != "ok":
+        reasons.append(f"run status {record.get('status')!r}: {record.get('reason') or 'no reason recorded'}")
+    protocol = record.get("protocol") if isinstance(record.get("protocol"), dict) else {}
+    if protocol.get("samples") != PAIRED_SAMPLES:
+        reasons.append(f"wrong sample count: the record took {protocol.get('samples')!r} samples, the protocol takes {PAIRED_SAMPLES}")
+    if protocol.get("warmup") != PAIRED_WARMUP:
+        reasons.append(f"wrong warm-up count: the record took {protocol.get('warmup')!r}, the protocol takes {PAIRED_WARMUP}")
+    reasons += _fingerprint_reasons(record.get("fingerprint"), now, "start")
+    reasons += _fingerprint_reasons(record.get("fingerprint_end"), now, "end")
+    load = record.get("load")
+    readings = load.get("readings") if isinstance(load, dict) else None
+    reasons += _watcher_reasons(record.get("watcher"), record.get("started_epoch"), readings)
+    reasons += _load_reasons(load)
+    fixtures = record.get("fixtures")
+    if not isinstance(fixtures, dict):
+        return reasons + ["malformed record: no fixtures object"]
+    for fid in REQUIRED_FIXTURES:
+        if fid not in fixtures:
+            reasons.append(f"missing fixture {fid}")
+        else:
+            reasons += _fixture_reasons(fid, fixtures[fid])
+    return reasons
+
+
+def qualify(path: Path) -> int:
+    """`--qualify-json`: exit 0 only for a complete quiet candidate. Every other case exits 1 and names its reasons."""
+    record: Any = None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        reasons = qualify_record(record, fingerprint_now())
+    except (OSError, ValueError) as exc:
+        reasons = [f"missing or malformed record {path}: {exc}"]
+    if reasons:
+        out("qualify: NOT QUALIFIED; this record gives no verdict, and the default engine stays python")
+        for reason in reasons:
+            out(f"   - {reason}")
+        return 1
+    out("qualify: QUALIFIED as a complete quiet candidate (evidence for the S6 record, not approval for a default change)")
+    for fid in REQUIRED_FIXTURES:
+        ratios = pair_ratios(record["fixtures"][fid]["pairs"])
+        out(f"   {fid:<14} paired p50 {nearest_rank(ratios, 50):.3f} p95 {nearest_rank(ratios, 95):.3f}")
+    return 0
+
+
 # ---- main ---------------------------------------------------------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--work", type=Path, default=None, help="work directory (default: a new directory under the temp dir)")
     parser.add_argument("--inputs", type=int, default=30, help="inputs per primitive (the p99 is the largest below 100)")
@@ -1588,10 +2401,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-dry-run", action="store_true", help="skip section 5")
     parser.add_argument("--skip", default="", help="comma list of sections to leave out while debugging: prim, decision, ports, pool (also leaves out the synthesis)")
     parser.add_argument("--profile-child", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--scheduler-paired", action="store_true", help="paired Python/Rust scheduler runtimes (S5.2, S6): needs --json-out; see the module docstring")
+    parser.add_argument("--json-out", type=Path, default=None, help="with --scheduler-paired: the raw paired record (written even when a sample refuses the run)")
+    parser.add_argument("--samples", type=int, default=PAIRED_SAMPLES, help=f"measured pairs per fixture (the protocol takes {PAIRED_SAMPLES})")
+    parser.add_argument("--warmup", type=int, default=PAIRED_WARMUP, help=f"warm-up pairs per fixture, discarded (the protocol takes {PAIRED_WARMUP})")
+    parser.add_argument("--watcher-log", default=None, help="the watch_quiet.sh log (A2_WATCHER_LOG): recorded with the pairs and judged by --qualify-json")
+    parser.add_argument("--qualify-json", type=Path, default=None, help="judge a paired record: exit 0 only for a complete quiet candidate with paired p50 and p95 strictly below 1.00; any other case exits 1 with reasons")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.profile_child:
         profile_child(args.profile_child)
         return 0
+    if args.qualify_json is not None:
+        return qualify(args.qualify_json)
+    if args.scheduler_paired:
+        if args.json_out is None:
+            parser.error("--scheduler-paired needs --json-out PATH")
+        if args.samples < 1 or args.warmup < 0:
+            parser.error("--samples must be at least 1 and --warmup at least 0")
+        work = (args.work or Path(tempfile.mkdtemp(prefix="sched_paired_"))).resolve()
+        try:
+            return run_paired(args.json_out, args.samples, args.warmup, args.watcher_log, work)
+        finally:
+            if args.work is None:
+                shutil.rmtree(work, ignore_errors=True)
     work = (args.work or Path(tempfile.mkdtemp(prefix="sched_engines_"))).resolve()
     work.mkdir(parents=True, exist_ok=True)
     env = load_env(work, max(3, args.inputs), max(2, args.passes))

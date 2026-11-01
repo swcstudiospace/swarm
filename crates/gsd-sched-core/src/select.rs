@@ -36,6 +36,13 @@
 //! Everything here runs on the loop thread. Every port call can block (the lease port makes a network round trip); no lock is held
 //! across one, because the module holds none: the claim table is a `&mut` argument. The functions never allocate beyond the result
 //! and a small per-pass map of the classes that were selected.
+//!
+//! # Cancellation checkpoints
+//!
+//! [`plan_pass`] and [`select_batch`] make the port calls described above and nothing else. The runtime's pass uses the same selection
+//! through a private entry that takes an optional checkpoint, asked before each candidate (before its slot test), before each port
+//! action on it, and before it joins the batch, leases on or off. A checkpoint that answers stop ends the selection at once, with
+//! no further port call.
 
 use std::collections::HashMap;
 
@@ -52,6 +59,42 @@ const NO_FREE_SLOT: &str = "no-free-slot";
 
 /// The skip reason of a task whose worker raised `internal_failure_limit` times (`skipped[...] = "internal-failure"` in `_schedule`).
 const INTERNAL_FAILURE: &str = "internal-failure";
+
+/// Asked before each port action of a controlled selection: `Ok(true)` stops the pass. Only the runtime's pass supplies one.
+pub(crate) type Checkpoint<'a> = &'a mut dyn FnMut() -> Result<bool, PortError>;
+
+/// What a controlled pass produced: the plan as far as it went, and whether a checkpoint stopped it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ControlledPass {
+    /// The plan. After a stop it holds only what was decided before the stop.
+    pub(crate) plan: PassPlan,
+    /// `true` when a checkpoint answered stop; the caller then admits nothing further.
+    pub(crate) stopped: bool,
+}
+
+/// What a controlled pass has decided so far. The runtime keeps it across the pass, so the tasks left out and the leases granted
+/// survive a port error that ends the pass.
+#[derive(Debug, Default)]
+pub(crate) struct PassProgress {
+    /// `len(ready)`, written when the pass starts.
+    pub(crate) ready: usize,
+    /// The effective parallelism, written before the selection starts.
+    pub(crate) effective_parallel: u32,
+    /// The free slots the selection started from, written before the selection starts.
+    pub(crate) free: usize,
+    /// The tasks left out so far, in first-skipped order.
+    pub(crate) skipped: Vec<SkippedTask>,
+    /// The `(task_id, agent_id)` pairs whose lease was granted, in selection order.
+    pub(crate) granted: Vec<(String, String)>,
+}
+
+/// Asks the checkpoint, when there is one, whether the pass must stop.
+fn stop_requested(checkpoint: &mut Option<Checkpoint<'_>>) -> Result<bool, PortError> {
+    match checkpoint {
+        Some(check) => (**check)(),
+        None => Ok(false),
+    }
+}
 
 /// One task chosen to start: the id and the agent it runs as. The loop submits these in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,11 +174,43 @@ pub fn plan_pass(
     state: &PassState<'_>,
     claims: &mut ClaimTable,
 ) -> Result<PassPlan, PortError> {
+    plan_pass_controlled(ports, rows, state, claims, None).map(|pass| pass.plan)
+}
+
+/// [`plan_pass`] with the optional checkpoint of the runtime path. Without one it makes exactly the calls of [`plan_pass`]. Python:
+/// the middle of `Scheduler._schedule`.
+pub(crate) fn plan_pass_controlled(
+    ports: &dyn SchedulerPorts,
+    rows: &[ReadyRow],
+    state: &PassState<'_>,
+    claims: &mut ClaimTable,
+    checkpoint: Option<Checkpoint<'_>>,
+) -> Result<ControlledPass, PortError> {
+    plan_pass_recorded(
+        ports,
+        rows,
+        state,
+        claims,
+        checkpoint,
+        &mut PassProgress::default(),
+    )
+}
+
+/// [`plan_pass_controlled`] that also writes what the pass decides into `progress` as it goes. The runtime's pass uses this entry:
+/// a port error ends the pass with `Err`, and `progress` still holds the tasks left out and the leases granted before it.
+pub(crate) fn plan_pass_recorded(
+    ports: &dyn SchedulerPorts,
+    rows: &[ReadyRow],
+    state: &PassState<'_>,
+    claims: &mut ClaimTable,
+    mut checkpoint: Option<Checkpoint<'_>>,
+    progress: &mut PassProgress,
+) -> Result<ControlledPass, PortError> {
     let order = priority::order_ready(
         rows.iter()
             .map(|row| (row.priority.as_deref(), row.dag_depth, row.created_at)),
     );
-    let mut skipped = Vec::new();
+    progress.ready = rows.len();
     let mut eligible: Vec<&str> = Vec::with_capacity(rows.len());
     let mut backoff_wall: Option<f64> = None;
     for index in order {
@@ -147,16 +222,18 @@ pub fn plan_pass(
             .unwrap_or(0);
         match row.retry_after {
             Some(until) if until > state.now_wall => {
-                skipped.push(SkippedTask {
+                progress.skipped.push(SkippedTask {
                     task_id: row.task_id.clone(),
                     reason: format!("backoff:{:.1}s", until - state.now_wall),
                 });
                 backoff_wall = Some(backoff_wall.map_or(until, |wall| wall.min(until)));
             }
-            _ if failures >= state.config.internal_failure_limit => skipped.push(SkippedTask {
-                task_id: row.task_id.clone(),
-                reason: INTERNAL_FAILURE.to_owned(),
-            }),
+            _ if failures >= state.config.internal_failure_limit => {
+                progress.skipped.push(SkippedTask {
+                    task_id: row.task_id.clone(),
+                    reason: INTERNAL_FAILURE.to_owned(),
+                });
+            }
             _ => eligible.push(row.task_id.as_str()),
         }
     }
@@ -173,24 +250,31 @@ pub fn plan_pass(
         let left = state.config.budget.saturating_sub(state.dispatched);
         free = free.min(usize::try_from(left).unwrap_or(usize::MAX));
     }
+    progress.effective_parallel = effective_parallel;
+    progress.free = free;
     let mut leases_off = state.leases_off;
-    let batch = select_batch(
+    let (batch, stopped) = select_controlled(
         ports,
         &eligible,
         free,
         state.per_class,
         claims,
         &mut leases_off,
-        &mut skipped,
+        &mut progress.skipped,
+        &mut progress.granted,
+        &mut checkpoint,
     )?;
-    Ok(PassPlan {
-        ready: rows.len(),
-        effective_parallel,
-        free,
-        batch,
-        skipped,
-        backoff_wall,
-        leases_off,
+    Ok(ControlledPass {
+        plan: PassPlan {
+            ready: rows.len(),
+            effective_parallel,
+            free,
+            batch,
+            skipped: std::mem::take(&mut progress.skipped),
+            backoff_wall,
+            leases_off,
+        },
+        stopped,
     })
 }
 
@@ -216,11 +300,46 @@ pub fn select_batch(
     leases_off: &mut bool,
     skipped: &mut Vec<SkippedTask>,
 ) -> Result<Batch, PortError> {
+    select_controlled(
+        ports,
+        ready,
+        free,
+        running,
+        claims,
+        leases_off,
+        skipped,
+        &mut Vec::new(),
+        &mut None,
+    )
+    .map(|(batch, _)| batch)
+}
+
+/// [`select_batch`] with the optional checkpoint of the runtime path, answering `(batch, stopped)`. The checkpoint is asked before each
+/// candidate (before its slot test), before each port action on it (`agent_for`, `claims_for`, `block`, `lease`), and before it joins
+/// the batch. When it answers stop, the selection returns at once. The candidate it stopped on gives back the claims it acquired for
+/// itself; the tasks already in the batch keep theirs, for the caller to release, because none of them was submitted.
+/// Each lease granted is appended to `granted` in selection order, so the caller still has the grants when a later port call fails.
+#[allow(clippy::too_many_arguments)]
+fn select_controlled(
+    ports: &dyn SchedulerPorts,
+    ready: &[&str],
+    free: usize,
+    running: &HashMap<String, u32>,
+    claims: &mut ClaimTable,
+    leases_off: &mut bool,
+    skipped: &mut Vec<SkippedTask>,
+    granted: &mut Vec<(String, String)>,
+    checkpoint: &mut Option<Checkpoint<'_>>,
+) -> Result<(Batch, bool), PortError> {
     let mut batch = Batch::default();
     let mut slots = free;
     // replicas selected in this pass, on top of `running` (Python copies `running` and increments it)
     let mut added: HashMap<String, u32> = HashMap::new();
     for &tid in ready {
+        // asked before anything about the candidate, the slot test included, as Python's `select_batch` asks at the top of its loop
+        if stop_requested(checkpoint)? {
+            return Ok((batch, true));
+        }
         if slots == 0 {
             skipped.push(SkippedTask {
                 task_id: tid.to_owned(),
@@ -229,6 +348,9 @@ pub fn select_batch(
             continue;
         }
         let Some(agent) = ports.agent_for(tid)? else {
+            if stop_requested(checkpoint)? {
+                return Ok((batch, true));
+            }
             ports.block(tid, BLOCK_REASON_NO_AGENT)?;
             slots -= 1;
             continue;
@@ -246,6 +368,9 @@ pub fn select_batch(
                 reason: format!("class-ceiling:{}", agent.agent_id),
             });
             continue;
+        }
+        if stop_requested(checkpoint)? {
+            return Ok((batch, true));
         }
         let invalid = match ports.claims_for(tid)? {
             ClaimsVerdict::Invalid(text) => Some(text),
@@ -278,6 +403,9 @@ pub fn select_batch(
         };
         if let Some(text) = invalid {
             // a malformed claim blocks the task rather than running it unclaimed
+            if stop_requested(checkpoint)? {
+                return Ok((batch, true));
+            }
             let reason: String = format!("E-INPUT: invalid notes.claims: {text}")
                 .chars()
                 .take(BLOCK_REASON_MAX_CHARS)
@@ -286,6 +414,13 @@ pub fn select_batch(
             slots -= 1;
             continue;
         }
+        // asked once the claims are taken and before any lease is requested, leases on or off, as Python does
+        if stop_requested(checkpoint)? {
+            // acquired for this candidate and not selected: its claims go back here
+            claims.release(tid);
+            return Ok((batch, true));
+        }
+        let mut leased = false;
         if !*leases_off {
             match ports.lease(tid, &agent.agent_id)? {
                 None => *leases_off = true,
@@ -306,8 +441,11 @@ pub fn select_batch(
                     });
                     continue;
                 }
-                Some(_) => {}
+                Some(_) => leased = true,
             }
+        }
+        if leased {
+            granted.push((tid.to_owned(), agent.agent_id.clone()));
         }
         *added.entry(agent.agent_id.clone()).or_insert(0) += 1;
         slots -= 1;
@@ -316,7 +454,7 @@ pub fn select_batch(
             agent,
         });
     }
-    Ok(batch)
+    Ok((batch, false))
 }
 
 #[cfg(test)]
@@ -1230,5 +1368,117 @@ mod tests {
         let ports = ports_for(&["a", "b"]);
         assert!(world.plan(&ports, &rows).leases_off);
         assert!(!ports.calls().iter().any(|c| c.starts_with("lease")));
+    }
+
+    /// Two tasks of one agent with one claim each: the common start of the checkpoint tests.
+    fn two_claimed_tasks() -> RecordingPorts {
+        RecordingPorts::new()
+            .agent("T-1", "A05", 6)
+            .claim("T-1", &[("src/a", false)])
+            .agent("T-2", "A05", 6)
+            .claim("T-2", &[("src/b", false)])
+    }
+
+    /// A checkpoint that never stops leaves the plan and the port calls exactly as the public path leaves them.
+    #[test]
+    fn a_checkpoint_that_never_stops_changes_neither_the_plan_nor_the_calls() {
+        let rows = [row("T-1"), row("T-2")];
+        let mut world = World::new();
+        world.leases_off = false;
+        let public_ports = two_claimed_tasks().lease_verdicts(&[("T-2", false, "busy", None)]);
+        let public = world.plan(&public_ports, &rows);
+        let checked_ports = two_claimed_tasks().lease_verdicts(&[("T-2", false, "busy", None)]);
+        let mut never_stop = || -> Result<bool, PortError> { Ok(false) };
+        let controlled = plan_pass_controlled(
+            &checked_ports,
+            &rows,
+            &world.state(),
+            &mut ClaimTable::new(),
+            Some(&mut never_stop),
+        )
+        .expect("the pass succeeds");
+        assert!(!controlled.stopped);
+        assert_eq!(controlled.plan, public);
+        assert_eq!(checked_ports.calls(), public_ports.calls());
+        assert_eq!(
+            public_ports.calls(),
+            vec![
+                "agent_for T-1",
+                "claims_for T-1",
+                "lease T-1 A05",
+                "agent_for T-2",
+                "claims_for T-2",
+                "lease T-2 A05"
+            ]
+        );
+    }
+
+    /// A stop asked before a lease gives back the claim of that candidate and asks nothing else: no lease, no other task.
+    #[test]
+    fn a_stop_before_a_lease_gives_back_the_claim_of_that_candidate_and_asks_no_more() {
+        let ports = two_claimed_tasks();
+        let mut world = World::new();
+        world.leases_off = false;
+        let mut claims = ClaimTable::new();
+        let mut stop_before_lease = || -> Result<bool, PortError> {
+            Ok(ports
+                .calls()
+                .last()
+                .is_some_and(|call| call == "claims_for T-1"))
+        };
+        let controlled = plan_pass_controlled(
+            &ports,
+            &[row("T-1"), row("T-2")],
+            &world.state(),
+            &mut claims,
+            Some(&mut stop_before_lease),
+        )
+        .expect("the pass succeeds");
+        assert!(controlled.stopped);
+        assert!(controlled.plan.batch.dispatch.is_empty());
+        assert!(owners(&claims).is_empty(), "the claim of T-1 is given back");
+        assert_eq!(ports.calls(), vec!["agent_for T-1", "claims_for T-1"]);
+    }
+
+    /// A stop after a selection leaves that selection's claims held: the caller releases them, since nothing was submitted.
+    #[test]
+    fn a_stop_after_a_selection_keeps_that_selections_claims_for_the_caller() {
+        let ports = two_claimed_tasks();
+        let mut world = World::new();
+        world.leases_off = false;
+        let mut claims = ClaimTable::new();
+        let mut stop_at_second_agent = || -> Result<bool, PortError> {
+            Ok(ports
+                .calls()
+                .last()
+                .is_some_and(|call| call == "agent_for T-2"))
+        };
+        let controlled = plan_pass_controlled(
+            &ports,
+            &[row("T-1"), row("T-2")],
+            &world.state(),
+            &mut claims,
+            Some(&mut stop_at_second_agent),
+        )
+        .expect("the pass succeeds");
+        assert!(controlled.stopped);
+        let selected: Vec<&str> = controlled
+            .plan
+            .batch
+            .dispatch
+            .iter()
+            .map(|dispatch| dispatch.task_id.as_str())
+            .collect();
+        assert_eq!(selected, vec!["T-1"]);
+        assert_eq!(owners(&claims), vec!["T-1"]);
+        assert_eq!(
+            ports.calls(),
+            vec![
+                "agent_for T-1",
+                "claims_for T-1",
+                "lease T-1 A05",
+                "agent_for T-2"
+            ]
+        );
     }
 }

@@ -169,13 +169,21 @@ class Sandbox:
         self.recorded_bin = base / "probe" / "gsd_engine"
         for directory in (self.workspace, self.swarm_dir, self.home, self.recorded_bin.parent):
             directory.mkdir(parents=True)
+        self.recorded_sha: Optional[str] = None  # the wrapper's digest, the selector's GSD_ENGINE_BIN_SHA256; set when a binary is named
         if rust_bin is not None:
-            # The selector legs name this wrapper as GSD_ENGINE_BIN: it records that the selector started the binary,
-            # then becomes the binary with stdin, argv, environment and exit code untouched.
+            # The selector legs name this wrapper as GSD_ENGINE_BIN. A child with a signing key starts only as the binary whose digest is
+            # GSD_ENGINE_BIN_SHA256 (7ce3092), so the selector checks the wrapper (invoke sets that digest). The wrapper records the start,
+            # checks the real binary against the digest taken here, and only then becomes that binary with stdin, argv, environment and
+            # exit code untouched. A binary swapped after this point is refused with exit 70 and runs nothing.
+            binary_sha = hashlib.sha256(Path(rust_bin).read_bytes()).hexdigest()
             self.recorded_bin.write_text(
-                f"#!/bin/sh\nprintf x >> {shlex.quote(str(self.started_marker))}\nexec {shlex.quote(rust_bin)} \"$@\"\n",
+                "#!/bin/sh\n"
+                f"printf x >> {shlex.quote(str(self.started_marker))}\n"
+                f"printf '%s  %s\\n' {binary_sha} {shlex.quote(rust_bin)} | sha256sum -c --quiet || exit 70\n"
+                f"exec {shlex.quote(rust_bin)} \"$@\"\n",
                 encoding="utf-8")
             self.recorded_bin.chmod(0o700)
+            self.recorded_sha = hashlib.sha256(self.recorded_bin.read_bytes()).hexdigest()
 
     def env(self, overrides: Optional[dict[str, str]] = None, unset: tuple[str, ...] = ()) -> dict[str, str]:
         """A scrubbed child environment: host PATH and locale only, then this sandbox's state."""
@@ -274,6 +282,7 @@ def invoke(sandbox: Sandbox, script: str, args: list[str], *, engine: str = "pyt
         if sandbox.rust_bin is None:
             raise RuntimeError("the Rust leg is off: no gsd_engine binary was named")
         overrides["GSD_ENGINE_BIN"] = str(sandbox.recorded_bin)
+        overrides["GSD_ENGINE_BIN_SHA256"] = sandbox.recorded_sha or ""  # HOST_ENV_KEYS would strip it; the selector checks the wrapper
         if engine == "selector":
             overrides.update(GSD_ENGINE="rust", GSD_RUST_BACKEND=sandbox.backend)
         unset = SELECTOR_LEG_UNSET

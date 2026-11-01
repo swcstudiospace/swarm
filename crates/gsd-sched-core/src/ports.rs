@@ -302,7 +302,7 @@ pub struct SkippedTask {
 ///
 /// The Python side derives `running = in_flight.len()`, `queued = max(0, ready - submitted)` and
 /// `free_slots = max(0, free - submitted)` itself, so the values stay the ones of `scheduler_tick`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PassInfo<'a> {
     /// The 1-based pass number (the Python `self.rounds`).
     pub round: u64,
@@ -319,6 +319,10 @@ pub struct PassInfo<'a> {
     /// Every task the pass left out, one entry per task with its final reason, in first-skipped order. The Python side reports only
     /// the first `SKIPPED_REPORT_MAX` (64) entries, so the order matters.
     pub skipped: &'a [SkippedTask],
+    /// The `(task_id, agent_id)` pairs, in selection order, whose lease this pass was granted but which were not submitted, because
+    /// a stop was observed or because a port error ended the pass. The host settles each one (the Python `_release_unsubmitted`).
+    /// Empty when leases are off or every granted dispatch was submitted.
+    pub unsubmitted: Vec<(String, String)>,
 }
 
 /// The answer of [`SchedulerPorts::submit`].
@@ -603,6 +607,10 @@ pub trait SchedulerPorts: Send + Sync {
     /// `round` counts passes from 1. `in_flight` holds the ids of the tasks in flight, which `dispatchable` must leave exactly as they
     /// are. The result holds every dispatchable task not in flight, in any order; an empty vector means nothing is ready. A task
     /// is returned at most once.
+    ///
+    /// The pass has no cancel input of its own, so this call must honour the cancel flag: `reconcile`, `handoffs.flush` and
+    /// `dispatchable` each receive the flag and return early once it is set (`swarm_run.py`, `_schedule`). A cancel raised while this
+    /// call runs is otherwise seen only after it returns.
     fn begin_pass(&self, round: u64, in_flight: &[&str]) -> Result<Vec<ReadyRow>, PortError>;
 
     /// Resolves the manifest agent of `task_id` (`resolve_agent`). **Loop thread.**
@@ -632,7 +640,12 @@ pub trait SchedulerPorts: Send + Sync {
     /// Reports the finished pass (`scheduler_tick`, `ErrorHandler.detect_parallel`). **Loop thread.**
     ///
     /// Called once per pass after the batch was submitted, with [`PassInfo`]. Returns nothing. With `SWARM_ENGINE_CHECK=1` the
-    /// Python side compares `in_flight` with its own mirror and raises on a difference.
+    /// Python side compares `in_flight` with its own mirror and raises on a difference. `info.unsubmitted` lists the pairs whose lease
+    /// was granted but not submitted after a stop or a port error: the host settles each one, as `_release_unsubmitted` does.
+    /// A pass that a port error ends, in its selection or in its submissions, is reported the same way before the error goes on:
+    /// `info.submitted` counts the dispatches admitted before the error, and `info.unsubmitted` holds every granted pair not
+    /// submitted. The run then returns the original error whatever this call answers. A pass that fails in `begin_pass` is not
+    /// reported, since it granted nothing. The host settles every pair in `info.unsubmitted` on every call.
     fn observe_pass(&self, info: &PassInfo<'_>) -> Result<(), PortError>;
 
     /// Sets up the dispatch of `task_id` as `agent_id` (the body of `Scheduler._submit` before `pool.submit`). **Loop thread.**
@@ -939,6 +952,7 @@ mod tests {
                 free: 2,
                 in_flight: &["T-0", "T-1"],
                 skipped: &skipped,
+                unsubmitted: Vec::new(),
             })
             .unwrap();
         let sid = match ports.submit("T-1", "A05").unwrap() {

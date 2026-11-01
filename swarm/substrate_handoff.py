@@ -413,11 +413,21 @@ class HandoffBridge:
             self.leases.handed_over(b.node_id)
         return "sent"
 
-    def flush(self) -> int:
-        """Send what the substrate did not take earlier. Returns how many landed."""
+    def flush(self, *, stop_requested: Callable[[], bool] | None = None) -> int:
+        """Send what the substrate did not take earlier. Returns how many landed.
+
+        `pending` is captured once under the lock and sent outside it. `stop_requested` (keyword-only, optional) is
+        asked before each next Boundary, never inside a send: a send that has started finishes its reservation, its
+        cache update and its uncertain-write bookkeeping first. Entries not sent stay pending for a later flush."""
         with self._lock:
             pending = list(self._pending.values())
-        return sum(self.send(b) == "sent" for b in pending)
+        landed = 0
+        for b in pending:
+            if stop_requested is not None and stop_requested():
+                break
+            if self.send(b) == "sent":
+                landed += 1
+        return landed
 
     # -- the boundaries
     def dispatched(self, task: dict[str, Any], agent_id: str) -> list[str]:

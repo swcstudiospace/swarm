@@ -92,6 +92,15 @@ def home(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def scheduler_engine_env(monkeypatch):
+    """The scheduler selector starts unset for this test: GSD_ENGINE and SWARM_PURE_PYTHON are removed, so the test selects the
+    engine itself and any child it starts inherits exactly that. monkeypatch restores both afterwards."""
+    monkeypatch.delenv("GSD_ENGINE", raising=False)
+    monkeypatch.delenv("SWARM_PURE_PYTHON", raising=False)
+    return monkeypatch
+
+
+@pytest.fixture()
 def ws(tmp_path):
     w = tmp_path / "ws"
     w.mkdir()
@@ -166,14 +175,22 @@ def _test_engine() -> str:
     return engine
 
 
+_WITNESS_FILE: str | None = None  # the native gate's witness file, taken out of this process's environment in pytest_configure
+
+
 def pytest_configure(config):
+    global _WITNESS_FILE
     _test_engine()
+    # The witness covers child runs only: this process's own in-process runs execute the Python scheduler by design (SWARM_PURE_PYTHON=1).
+    _WITNESS_FILE = os.environ.pop("SWARM_SCHEDULER_WITNESS", None)
 
 
 def _scrubbed_base_env() -> dict:
     """The child environment. With SWARM_TEST_ENGINE=rust (children only; this process stays SWARM_PURE_PYTHON=1) it adds
     GSD_ENGINE=rust, SWARM_PURE_PYTHON=0 and, when the parent has it, GSD_ENGINE_BIN; with python or unset it is unchanged."""
     env = {k: v for k, v in os.environ.items() if k in _BASE_ENV_ALLOW or k.startswith("LC_")}
+    if _WITNESS_FILE:  # each child run appends the engine it ran on to the native gate's witness file
+        env["SWARM_SCHEDULER_WITNESS"] = _WITNESS_FILE
     if _test_engine() == "rust":
         env["GSD_ENGINE"] = "rust"
         env["SWARM_PURE_PYTHON"] = "0"
@@ -185,6 +202,8 @@ def _scrubbed_base_env() -> dict:
 def run_script(name, *args, env=None):
     cmd = [sys.executable, str(ROOT / "scripts" / name), *args]
     child_env = _scrubbed_base_env()
+    if name != "swarm_run.py":  # only the scheduler under test runs on the selected engine; setup and inspection stay on Python
+        child_env.pop("GSD_ENGINE", None)
     child_env.update(env or {})
     return subprocess.run(cmd, capture_output=True, text=True, env=child_env, cwd=ROOT)
 

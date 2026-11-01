@@ -9,9 +9,24 @@ SAMPLES="${A2_SAMPLES:-50}"
 WARMUP="${A2_WARMUP:-3}"
 # Engine legs (Phase 14.3 R8), off unless A2_ENGINE_LEGS=1: path (c) again, once per engine leg and store (see below).
 ENGINE_LEGS="${A2_ENGINE_LEGS:-0}"
+# Scheduler paired legs (Phase 14.4, S5.2 and S6), off unless A2_SCHEDULER_LEGS=1: the Python and Rust scheduler, paired and alternating,
+# on the path (a) fixture, a 12-task fake-omp run and one-round passes over 50 and 500 ready tasks (tests/perf/scheduler_engines.py
+# --scheduler-paired). A2_SCHEDULER_JSON names the raw record and is required; the record is written even when a sample refuses the run.
+# A2_SAMPLES and A2_WARMUP are forwarded and A2_WATCHER_LOG is recorded. Scheduler-only: the path timings and the engine legs do not run in
+# this mode. Judge the record with: python3 tests/perf/scheduler_engines.py --qualify-json "$A2_SCHEDULER_JSON"
+SCHEDULER_LEGS="${A2_SCHEDULER_LEGS:-0}"
 QUIET_THRESH="1.5"  # the A2 quiet rule: 1-minute load below this (STATE.md P-A2); not tunable here
 PROTOCOL_SAMPLES=50  # the A2 protocol's samples per path
 PROTOCOL_WARMUP=3
+
+# A2_SCHEDULER_JSON is meant from the caller's directory: resolve it here, before the cd below (review m3).
+if [[ -n "${A2_SCHEDULER_JSON:-}" ]]; then
+  A2_SCHEDULER_JSON="$(realpath -m -- "$A2_SCHEDULER_JSON")"
+fi
+# A2_WATCHER_LOG is read after the cd below: resolve it here too, so a relative path is taken from the caller's directory.
+if [[ -n "${A2_WATCHER_LOG:-}" ]]; then
+  A2_WATCHER_LOG="$(realpath -m -- "$A2_WATCHER_LOG")"
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -314,6 +329,29 @@ print_run_status() {
 if [[ "$ENGINE_LEGS" != "0" && "$ENGINE_LEGS" != "1" ]]; then
   echo "error: A2_ENGINE_LEGS must be 0 or 1, got '$ENGINE_LEGS'" >&2
   exit 1
+fi
+if [[ "$SCHEDULER_LEGS" != "0" && "$SCHEDULER_LEGS" != "1" ]]; then
+  echo "error: A2_SCHEDULER_LEGS must be 0 or 1, got '$SCHEDULER_LEGS'" >&2
+  exit 1
+fi
+if [[ "$SCHEDULER_LEGS" == "1" ]]; then
+  if [[ -z "${A2_SCHEDULER_JSON:-}" ]]; then
+    echo "error: A2_SCHEDULER_LEGS=1 needs A2_SCHEDULER_JSON=<path> for the raw paired record" >&2
+    exit 1
+  fi
+  if [[ "$ENGINE_LEGS" == "1" ]]; then
+    echo "error: A2_SCHEDULER_LEGS and A2_ENGINE_LEGS are separate modes; set one of them" >&2
+    exit 1
+  fi
+  watcher_args=()
+  if [[ -n "${A2_WATCHER_LOG:-}" ]]; then
+    watcher_args=(--watcher-log "$A2_WATCHER_LOG")
+  fi
+  echo "== scheduler paired legs (A2_SCHEDULER_LEGS=1): python against rust, ${SAMPLES} samples and ${WARMUP} warm-up pairs per fixture =="
+  rc=0
+  python3 tests/perf/scheduler_engines.py --scheduler-paired --json-out "$A2_SCHEDULER_JSON" \
+    --samples "$SAMPLES" --warmup "$WARMUP" "${watcher_args[@]+"${watcher_args[@]}"}" || rc=$?
+  exit "$rc"
 fi
 if [[ "$ENGINE_LEGS" == "1" ]]; then
   engine_preflight

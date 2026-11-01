@@ -25,6 +25,14 @@
 //! a success adds one back after the cooldown, `fail_streak` failures of distinct tasks halve it once), then the retry delay
 //! ([`crate::backoff::backoff_s`] plus [`SchedulerPorts::set_retry_after`]), then the `extension_down` latch.
 //!
+//! # Cancellation
+//!
+//! The loop looks for a cancel request before each step that could admit work or end the run: at the top of every iteration, after a
+//! pass has been made, and inside a pass before each port action of the selection and before each submission. Once a request is seen
+//! it is kept with its clock sample, and nothing is admitted after it: a task selected but not submitted gives its claims back, a
+//! dispatch already admitted still finishes exactly once, and the pass is reported with what was really admitted. No retry is admitted
+//! after a request either, and a request is never reported as an idle or closed stop: the drain starts from that observation.
+//!
 //! # Threads, blocking and locks
 //!
 //! [`run`] runs the whole loop on the **calling thread**, which the Python binding makes the interpreter's main thread, and blocks it
@@ -57,7 +65,7 @@
 //! timestamp: sampling-to-return latency remains uncertainty. Once established, no callback or force poll renews the deadline.
 //! Callbacks/GIL remain cooperative: an already-running host call can overrun it; an exhausted returned age kills with zero grace.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::thread;
@@ -72,7 +80,7 @@ use crate::ports::{
     CancelState, Completion, PassInfo, PortError, RunConfig, RunError, RunSummary, SchedCode,
     SchedError, SchedulerPorts, StopReason, Submission, WorkerDone, BLOCK_REASON_MAX_CHARS,
 };
-use crate::select::{plan_pass, Dispatch, PassPlan, PassState};
+use crate::select::{plan_pass_recorded, Dispatch, PassProgress, PassState};
 
 #[cfg(test)]
 mod fake;
@@ -132,6 +140,52 @@ enum Finished {
     Pool(PoolCompletion<WorkerResult>),
 }
 
+/// The cancel request the loop saw first: the state its port returned, and the monotonic clock sampled right after that return.
+/// The drain is charged from this sample, so one request has one origin however many checks follow.
+#[derive(Clone)]
+struct Observed {
+    state: CancelState,
+    sampled_at: Instant,
+}
+
+/// The loop's monotonic clock: `Instant::now` in production, a scripted clock in the drain regressions.
+#[derive(Default)]
+struct Mono {
+    /// Only drain regressions substitute a monotonic clock; production always uses `Instant::now`.
+    #[cfg(test)]
+    scripted: Option<Arc<fake::DrainClock>>,
+}
+
+impl Mono {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.scripted {
+            return clock.now();
+        }
+        Instant::now()
+    }
+}
+
+/// Polls [`SchedulerPorts::cancel_state`] until a request is seen, then keeps that first observation: no later check polls again or
+/// samples the clock again. Returns the observation once there is one.
+fn observe_cancel(
+    ports: &dyn SchedulerPorts,
+    slot: &mut Option<Observed>,
+    mono: &Mono,
+) -> Result<Option<Observed>, PortError> {
+    if slot.is_none() {
+        let state = ports.cancel_state()?;
+        if state.is_set {
+            // sampled as soon as the port returned: the returned age already charges the callback and GIL time after the request
+            *slot = Some(Observed {
+                state,
+                sampled_at: mono.now(),
+            });
+        }
+    }
+    Ok(slot.clone())
+}
+
 /// Runs the scheduling loop to the end and returns how it ended; see the [module documentation](self).
 ///
 /// `ports` is the host: the same object serves the loop thread and the pool threads. `config` is validated first
@@ -183,9 +237,11 @@ struct Runtime {
     config: RunConfig,
     wall: WallClock,
     pool: Arc<Pool<WorkerResult>>,
-    /// Only drain regressions substitute a monotonic clock; production always uses `Instant::now`.
-    #[cfg(test)]
-    drain_clock: Option<Arc<fake::DrainClock>>,
+    /// The first cancel request the loop saw, with the monotonic sample taken right after its port returned. Once set, nothing is
+    /// admitted again and the drain starts from this observation; see `observe_cancel`.
+    cancel: Option<Observed>,
+    /// The loop's monotonic clock; only the drain regressions script it.
+    mono: Mono,
     /// `RunConfig::wait_tick_s` as a duration.
     tick: Duration,
     limiter: AimdLimiter,
@@ -242,8 +298,8 @@ impl Runtime {
             config: config.clone(),
             wall,
             pool,
-            #[cfg(test)]
-            drain_clock: None,
+            cancel: None,
+            mono: Mono::default(),
             limiter,
             last_decrease: None,
             claims: ClaimTable::new(),
@@ -291,28 +347,29 @@ impl Runtime {
         })
     }
 
-    /// Python: `Scheduler.loop`.
+    /// Python: `Scheduler.loop`. Each point that could start work, or leave with an idle or closed verdict, looks for a cancel
+    /// request first; once one is seen the drain runs and the run ends as cancelled.
     fn run_loop(&mut self) -> Result<StopReason, RunError> {
-        let ports = Arc::clone(&self.ports);
         let mut need_pass = true;
         let mut idle: u32 = 0;
         loop {
-            let cancel = ports.cancel_state()?;
-            if cancel.is_set {
-                let sampled_at = self.drain_now();
-                self.cancel_drain(&cancel, sampled_at)?;
+            if self.drain_if_cancelled()? {
                 return Ok(StopReason::Cancelled);
             }
             let barrier = self.config.barrier;
             if need_pass && !self.closed && !(barrier && !self.inflight.is_empty()) {
                 need_pass = false;
-                let pass = self.schedule()?;
+                let pass = self.schedule(true)?;
                 if self.config.once
                     || self.extension_down
                     || (barrier && self.rounds >= self.config.max_rounds)
                     || (!barrier && self.dispatched >= self.config.budget)
                 {
                     self.closed = true;
+                }
+                // a request seen during the pass ends the run before the idle verdict and the closed exit
+                if self.drain_if_cancelled()? {
+                    return Ok(StopReason::Cancelled);
                 }
                 if self.inflight.is_empty() && pass.submitted == 0 {
                     let verdict = self.idle(&pass);
@@ -361,7 +418,16 @@ impl Runtime {
 
     /// One scheduling pass. Python: `Scheduler._schedule` (the host does `reconcile` and the telemetry registration inside
     /// `begin_pass`, and `_tick` inside `observe_pass`).
-    fn schedule(&mut self) -> Result<Pass, RunError> {
+    ///
+    /// With `observe`, the pass consults the cancel request at each checkpoint of the controlled selection (before each candidate,
+    /// and before each port action on it and before it joins the batch) and before each submission. Once a request is seen nothing
+    /// more is admitted: the tasks selected but not submitted give their claims back, their granted leases are reported in
+    /// [`PassInfo::unsubmitted`], and the pass is reported to `observe_pass` with the dispatches that were really admitted. The caller
+    /// polls once more before any idle or closed verdict.
+    ///
+    /// A port error that ends the selection or a submission is handled alike: the leases granted and not submitted are reported to
+    /// `observe_pass` once, then the error is returned. A failure of `begin_pass` ends the pass before any lease exists.
+    fn schedule(&mut self, observe: bool) -> Result<Pass, RunError> {
         self.rounds += 1;
         let ports = Arc::clone(&self.ports);
         let rows = {
@@ -384,32 +450,126 @@ impl Runtime {
             now_wall,
             leases_off: self.leases_off,
         };
-        let plan: PassPlan = plan_pass(&*ports, &rows, &state, &mut self.claims)?;
-        self.leases_off = plan.leases_off;
-        for dispatch in &plan.batch.dispatch {
-            self.submit(dispatch)?;
+        let mut progress = PassProgress::default();
+        let planned = {
+            let host: &dyn SchedulerPorts = &*ports;
+            // the checkpoint borrows the cancel slot and the clock only, so the claims stay free for the selection
+            let slot = &mut self.cancel;
+            let mono = &self.mono;
+            let mut check =
+                || -> Result<bool, PortError> { Ok(observe_cancel(host, slot, mono)?.is_some()) };
+            let hook: &mut dyn FnMut() -> Result<bool, PortError> = &mut check;
+            plan_pass_recorded(
+                host,
+                &rows,
+                &state,
+                &mut self.claims,
+                observe.then_some(hook),
+                &mut progress,
+            )
+        };
+        let controlled = match planned {
+            Ok(controlled) => controlled,
+            Err(error) => {
+                // the selection ended before any submission: every lease it granted is reported before the error goes on
+                let ids: Vec<&str> = self
+                    .inflight
+                    .iter()
+                    .map(|item| item.task_id.as_str())
+                    .collect();
+                let info = PassInfo {
+                    round: self.rounds,
+                    ready: progress.ready,
+                    submitted: 0,
+                    effective_parallel: progress.effective_parallel,
+                    free: progress.free,
+                    in_flight: &ids,
+                    skipped: &progress.skipped,
+                    unsubmitted: progress.granted,
+                };
+                return Err(Self::fail_pass(&*ports, &info, error.into()));
+            }
+        };
+        self.leases_off = controlled.plan.leases_off;
+        let mut stopped = controlled.stopped;
+        let plan = controlled.plan;
+        let selected = plan.batch.dispatch;
+        let waiting = plan.batch.waiting;
+        let mut admitted: usize = 0;
+        let mut submitted: HashSet<&str> = HashSet::new();
+        let mut failure: Option<RunError> = None;
+        for dispatch in &selected {
+            match self.admit(dispatch, observe, &mut stopped) {
+                Ok(true) => {
+                    admitted += 1;
+                    submitted.insert(dispatch.task_id.as_str());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
         }
+        // every granted lease whose dispatch is not in flight, by a stop or by a failure, is reported for the host to settle
+        let unsubmitted: Vec<(String, String)> = progress
+            .granted
+            .into_iter()
+            .filter(|(task_id, _)| !self.inflight.iter().any(|item| item.task_id == *task_id))
+            .collect();
         let ids: Vec<&str> = self
             .inflight
             .iter()
             .map(|item| item.task_id.as_str())
             .collect();
-        ports.observe_pass(&PassInfo {
+        let info = PassInfo {
             round: self.rounds,
             ready: plan.ready,
-            submitted: plan.batch.dispatch.len(),
+            submitted: admitted,
             effective_parallel: plan.effective_parallel,
             free: plan.free,
             in_flight: &ids,
             skipped: &plan.skipped,
-        })?;
+            unsubmitted,
+        };
+        if let Some(error) = failure {
+            return Err(Self::fail_pass(&*ports, &info, error));
+        }
+        ports.observe_pass(&info)?;
         self.wake_wall = plan.backoff_wall;
         Ok(Pass {
             ready: plan.ready,
-            submitted: plan.batch.dispatch.len(),
-            waiting: plan.batch.waiting,
+            submitted: admitted,
+            waiting,
             backoff_wall: plan.backoff_wall,
         })
+    }
+
+    /// Submits one selected dispatch, or gives its claims back once a stop was observed, which admits nothing more. Returns whether
+    /// the dispatch was submitted. Python: the loop over the selected batch in `Scheduler._schedule`.
+    fn admit(
+        &mut self,
+        dispatch: &Dispatch,
+        observe: bool,
+        stopped: &mut bool,
+    ) -> Result<bool, RunError> {
+        if observe && !*stopped && self.cancel_observed()? {
+            *stopped = true;
+        }
+        if *stopped {
+            // selected but never submitted: the claims the selection took for it go back; its lease is reported by the caller
+            self.claims.release(&dispatch.task_id);
+            return Ok(false);
+        }
+        self.submit(dispatch)?;
+        Ok(true)
+    }
+
+    /// Reports a pass that a port error ends to `observe_pass`, then returns the error for the run to return. The first error is the
+    /// one that stops the run, so a failure of this observer call is dropped.
+    fn fail_pass(ports: &dyn SchedulerPorts, info: &PassInfo<'_>, error: RunError) -> RunError {
+        let _ = ports.observe_pass(info);
+        error
     }
 
     /// Sets one selected task up and queues its worker. Python: `Scheduler._submit`.
@@ -473,11 +633,28 @@ impl Runtime {
         Idle::Retry
     }
 
+    /// Whether a cancel request has been seen, polling [`SchedulerPorts::cancel_state`] only while none has been. Checks after the
+    /// first observation read it without a port call.
+    fn cancel_observed(&mut self) -> Result<bool, PortError> {
+        Ok(observe_cancel(&*self.ports, &mut self.cancel, &self.mono)?.is_some())
+    }
+
+    /// Runs the cancel drain once a request has been seen, polling for one if none has been yet. Returns `true` when it ran.
+    fn drain_if_cancelled(&mut self) -> Result<bool, RunError> {
+        match observe_cancel(&*self.ports, &mut self.cancel, &self.mono)? {
+            Some(observed) => {
+                self.cancel_drain(observed)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Waits for a retry's backoff to pass, waking early on a cancel. Python: `Scheduler._sleep_until`.
-    fn sleep_until(&self, wake: f64) -> Result<(), RunError> {
+    fn sleep_until(&mut self, wake: f64) -> Result<(), RunError> {
         loop {
             let left = wake - (self.wall)();
-            if left <= 0.0 || self.ports.cancel_state()?.is_set {
+            if left <= 0.0 || self.cancel_observed()? {
                 return Ok(());
             }
             thread::sleep(
@@ -610,11 +787,15 @@ impl Runtime {
     }
 
     /// The retry delay of a transient failure. Python: `Scheduler._schedule_retry` (`swarm_run.py:2153`); the store lookup and the
-    /// transient classification are the host's and arrive as [`Completion::retry_attempt`].
-    fn schedule_retry(&self, item: &Inflight, completion: &Completion) -> Result<(), RunError> {
+    /// transient classification are the host's and arrive as [`Completion::retry_attempt`]. A cancel seen before the jitter draw or
+    /// before the note is written admits no retry: the completion, already handled, stands.
+    fn schedule_retry(&mut self, item: &Inflight, completion: &Completion) -> Result<(), RunError> {
         let Some(attempt) = completion.retry_attempt else {
             return Ok(());
         };
+        if self.cancel_observed()? {
+            return Ok(());
+        }
         let (base, cap) = (self.config.backoff_base_s, self.config.backoff_cap_s);
         let unit = self.ports.random_unit()?;
         let mut delay = backoff_s(i64::from(attempt.max(1)), base, cap, RETRY_JITTER, unit)
@@ -632,6 +813,10 @@ impl Runtime {
                 delay = held;
             }
         }
+        // checked last, so that no poll separates the wall-clock read from the write below
+        if self.cancel_observed()? {
+            return Ok(());
+        }
         self.ports
             .set_retry_after(&item.task_id, (self.wall)() + delay)?;
         // swarm_run.py:2163
@@ -644,7 +829,11 @@ impl Runtime {
 
     /// The cancel flow. Python: `Scheduler._cancel_drain` (`swarm_run.py:2226`); its log line, the degraded record and the flag are
     /// [`SchedulerPorts::cancel_begin`], the kill is [`SchedulerPorts::kill`], and `abandoned after kill: [...]` is the host's.
-    fn cancel_drain(&mut self, cancel: &CancelState, sampled_at: Instant) -> Result<(), RunError> {
+    fn cancel_drain(&mut self, observed: Observed) -> Result<(), RunError> {
+        let Observed {
+            state: cancel,
+            sampled_at,
+        } = observed;
         let config = &self.config;
         let plan = drain::plan(
             config.cancel_grace_s,
@@ -699,11 +888,7 @@ impl Runtime {
     }
 
     fn drain_now(&self) -> Instant {
-        #[cfg(test)]
-        if let Some(clock) = &self.drain_clock {
-            return clock.now();
-        }
-        Instant::now()
+        self.mono.now()
     }
 
     /// Waits for finished dispatches until `deadline` at most one tick, and handles them.
@@ -715,7 +900,7 @@ impl Runtime {
             return Ok(());
         }
         #[cfg(test)]
-        let scripted = self.drain_clock.clone();
+        let scripted = self.mono.scripted.clone();
         #[cfg(test)]
         if let Some(clock) = &scripted {
             clock.record_wait(deadline, now, timeout);

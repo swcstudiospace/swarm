@@ -199,6 +199,7 @@ pub(super) struct PassSeen {
     pub(super) free: usize,
     pub(super) in_flight: Vec<String>,
     pub(super) skipped: Vec<(String, String)>,
+    pub(super) unsubmitted: Vec<(String, String)>,
 }
 
 /// What an injected fault does when its port is called.
@@ -244,7 +245,10 @@ pub(super) struct State {
     /// `None`: leases are off. `Some(verdicts)`: the verdict per task; a task not listed is granted.
     pub(super) leases: Option<HashMap<String, LeaseVerdict>>,
     pub(super) cancel: Option<CancelRequest>,
-    pub(super) cancel_on_submit: bool,
+    /// Raises a cancel request during the `nth` (1-based) call of port `port`; the call itself completes normally.
+    pub(super) cancel_at_call: Option<(&'static str, usize)>,
+    /// Fails the `nth` (1-based) call of port `port` with an error, before the port does anything.
+    pub(super) fail_at_call: Option<(&'static str, usize)>,
     pub(super) submit_failed: Vec<String>,
     /// The first `complete` call parks until this is cleared (or the end of the test).
     pub(super) hold_complete: bool,
@@ -325,7 +329,8 @@ impl Fake {
                 unit: 0.0,
                 leases: None,
                 cancel: None,
-                cancel_on_submit: false,
+                cancel_at_call: None,
+                fail_at_call: None,
                 submit_failed: Vec::new(),
                 hold_complete: false,
                 in_complete: false,
@@ -410,6 +415,31 @@ impl Fake {
             format!("{port} {detail}")
         };
         state.calls.push(line);
+        if let Some((name, nth)) = state.cancel_at_call {
+            let calls = state
+                .calls
+                .iter()
+                .filter(|call| call.split(' ').next() == Some(name))
+                .count();
+            if name == port && calls == nth && state.cancel.is_none() {
+                state.cancel = Some(CancelRequest {
+                    at: Instant::now(),
+                    force: false,
+                    reason: "signal SIGTERM".to_owned(),
+                });
+            }
+        }
+        if let Some((name, nth)) = state.fail_at_call {
+            let calls = state
+                .calls
+                .iter()
+                .filter(|call| call.split(' ').next() == Some(name))
+                .count();
+            if name == port && calls == nth {
+                drop(state);
+                return Err(PortError::new(format!("{port} failed"), Box::new(port)));
+            }
+        }
         match state.inject {
             Some((name, Inject::Err)) if name == port => {
                 drop(state);
@@ -515,19 +545,13 @@ impl SchedulerPorts for Fake {
                 .iter()
                 .map(|skip| (skip.task_id.clone(), skip.reason.clone()))
                 .collect(),
+            unsubmitted: info.unsubmitted.clone(),
         });
         Ok(())
     }
 
     fn submit(&self, task_id: &str, agent_id: &str) -> Result<Submission, PortError> {
         let mut state = self.enter("submit", task_id)?;
-        if state.cancel_on_submit && state.cancel.is_none() {
-            state.cancel = Some(CancelRequest {
-                at: Instant::now(),
-                force: false,
-                reason: "signal SIGTERM".to_owned(),
-            });
-        }
         let task = state.task(task_id);
         task.phase = Phase::Active;
         task.attempts += 1;

@@ -502,7 +502,7 @@ from test_qa_gate_dotnet import dotnet_repo  # noqa: E402,F401
     ({"reports": [{"module": "Other.Tests", "outcomes": ["Passed"]}]}, "fail"),
 ])
 def test_dotnet_execution_reaches_canonical_quality_authority(
-        tmp_path, swarm_dir, monkeypatch, dotnet_repo, scenario, expected):
+        tmp_path, swarm_dir, monkeypatch, dotnet_repo, scenario, expected):  # noqa: F811
     """Execution evidence reaches ordinary signed gate handling, never a worker-written verdict."""
     from test_qa_gate_dotnet import configure, load_gate
     from swarm.script_base import Ctx

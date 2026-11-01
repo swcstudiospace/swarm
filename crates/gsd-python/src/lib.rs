@@ -3,12 +3,15 @@
 //! Binds five pieces of the pure Rust engine to Python: the seven shared error codes
 //! (`gsd-codes`), the default retry policy (`gsd-failure`), the read-only `orch_status` wire
 //! (`gsd-route`), the opt-in secret-span scanner (`gsd-redact`, selected by
-//! `SWARM_REDACT_ENGINE=rust`) and the scheduler primitives of Phase 14.4 (`gsd-sched-core`:
-//! dispatch order, claim patterns and table, the AIMD limiter, retry backoff, the cancel-drain plan).
-//! The logic lives in [`pure`] and [`sched`], which have no PyO3 types; the `#[pyfunction]` and
-//! `#[pyclass]` wrappers at the bottom only convert values and raise exceptions.
+//! `SWARM_REDACT_ENGINE=rust`) and the scheduler primitives/runtime of Phase 14.4 (`gsd-sched-core`:
+//! dispatch order, claims, AIMD, retry, cancel-drain and the existing loop/std pool).
+//! The pure logic lives in [`pure`] and [`sched`]. `sched_run` adapts the sixteen host ports;
+//! native work detaches the GIL, while callbacks attach it without holding a Rust lock.
+//! A scheduler loop exception can leave detached jobs owning Python callbacks; returning
+//! from the entry is not a witness that those references are gone (see `sched_run`).
 
 pub mod sched;
+mod sched_run;
 
 use std::time::Duration;
 
@@ -361,6 +364,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sched_claims_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(sched_backoff_s, m)?)?;
     m.add_function(wrap_pyfunction!(sched_drain_plan, m)?)?;
+    m.add_function(sched_run::run_scheduler_function(m.py())?)?;
+    m.add_class::<sched_run::NativeCleanupFence>()?;
     m.add_class::<PyClaimTable>()?;
     m.add_class::<PyAimdLimiter>()?;
     Ok(())
