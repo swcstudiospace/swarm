@@ -482,3 +482,55 @@ def test_reconcile_escalates_stalled_gate(swarm_dir):
     events.clear()
     reconcile(ts, "d", emit)
     assert [p for t, p in events if t == "escalation.request"] == []
+
+
+# The controlled dotnet CLI writes actual TRX; executor behavior is not replaced
+# with mocked success. Reuse it while exercising the real gate/TaskStore boundary.
+from test_qa_gate_dotnet import dotnet_repo  # noqa: E402,F401
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ({}, "pass"),
+    ({"reports": [{"storage_module": "auth.tests", "codebase_module": "Auth.Tests",
+                   "outcomes": ["Passed"]}]}, "pass"),
+    ({"build_exit": 19}, "fail"),
+    ({"test_exit": 9}, "fail"),
+    ({"test_exit": 9, "reports": [{"module": "Auth.Tests", "outcomes": ["Passed", "Failed"],
+                                  "summary": "Failed"}]}, "fail"),
+    ({"reports": []}, "fail"),
+    ({"reports": [{"module": "Auth.Tests", "outcomes": ["NotExecuted"]}]}, "fail"),
+    ({"reports": [{"module": "Other.Tests", "outcomes": ["Passed"]}]}, "fail"),
+])
+def test_dotnet_execution_reaches_canonical_quality_authority(
+        tmp_path, swarm_dir, monkeypatch, dotnet_repo, scenario, expected):
+    """Execution evidence reaches ordinary signed gate handling, never a worker-written verdict."""
+    from test_qa_gate_dotnet import configure, load_gate
+    from swarm.script_base import Ctx
+    from swarm.taskstore import TaskStore
+
+    # conftest supplies an isolated ephemeral signing fixture; no private key,
+    # insecure signer, or production TaskStore is used by this behavior test.
+    monkeypatch.delenv("SWARM_AGENT_SESSION", raising=False)
+    configure(dotnet_repo, **scenario)
+    ts = TaskStore()
+    _gate_pair(ts, "DN")
+    gate = load_gate()
+    args = gate.AgentScript("A08", "qa_gate", gate.run, add_args=gate.add_args).parser().parse_args([
+        "--task-id", "DN-qa", "--correlation-id", "c", "--root", str(dotnet_repo),
+        "--risk-class", "medium", "--dotnet-target", "App.slnf",
+        "--dotnet-required-test-module", "Auth.Tests", "--timeout", "10"])
+    result = gate.run(args, Ctx("A08", "qa_gate", "DN-qa", "c", False, dotnet_repo))
+    assert result["verdict"] == expected
+    assert result["runs"]["unit"] == result["runs"]["integration"] == expected
+    assert result["executed"][0]["runner"] == "dotnet"
+    rows = _rows(swarm_dir, "DN-be")
+    assert rows and rows[-1]["verdict"] == expected
+    if expected == "fail":
+        assert any(finding["severity"] == "major" for finding in result["findings"])
+    else:
+        assert result["executed"][0]["modules"]["auth.tests"]["executed"] == 1
+    if scenario.get("test_exit"):
+        execution = result["executed"][0]
+        assert execution["returncode"] == scenario["test_exit"]
+        assert execution["executed"] > 0 and execution["modules"]["auth.tests"]["executed"] > 0
+        assert execution["stages"][-1]["status"] == "fail"

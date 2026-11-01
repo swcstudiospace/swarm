@@ -239,6 +239,59 @@ fn detect_runners(root: &Path) -> Vec<Runner> {
     runners
 }
 
+/// Workload suffixes `scripts/_dotnet_quality.py` detects (`_SUFFIXES`), lowercase with the dot.
+const DOTNET_SUFFIXES: [&str; 6] = [".sln", ".slnx", ".slnf", ".csproj", ".fsproj", ".vbproj"];
+
+/// Directory names `scripts/_dotnet_quality.py` prunes from its walk (`_SKIP`).
+const DOTNET_SKIP: [&str; 7] = [
+    ".git",
+    ".swarm",
+    "node_modules",
+    "bin",
+    "obj",
+    ".venv",
+    "venv",
+];
+
+/// True when `scripts/_dotnet_quality.py` `project_files(root)` finds a file under `root`, so Python would run the .NET
+/// workload. The walk matches how Python's `os.walk` is used there: a symlinked directory is never entered, a symlink to a
+/// file or a broken link counts as a file, and an unreadable directory is skipped. This route cannot run .NET, so it refuses.
+fn has_dotnet_project(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let kind = entry.file_type().ok();
+        let is_link = kind.is_some_and(|kind| kind.is_symlink());
+        let is_dir = if is_link {
+            fs::metadata(&path).is_ok_and(|meta| meta.is_dir())
+        } else {
+            kind.is_some_and(|kind| kind.is_dir())
+        };
+        if is_dir {
+            let skipped = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| DOTNET_SKIP.contains(&name));
+            if !is_link && !skipped && has_dotnet_project(&path) {
+                return true;
+            }
+            continue;
+        }
+        let dotnet = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                DOTNET_SUFFIXES.contains(&format!(".{}", ext.to_lowercase()).as_str())
+            });
+        if dotnet {
+            return true;
+        }
+    }
+    false
+}
+
 fn count(pattern: &str, text: &str) -> i64 {
     let Ok(re) = regex::RegexBuilder::new(pattern).multi_line(true).build() else {
         return 0;
@@ -460,6 +513,13 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
             }
         }
     } else {
+        if has_dotnet_project(&root) {
+            // scripts/qa_gate.py runs the .NET workload here; the host route does not implement it.
+            return Err(before_any_write(SeamError::new(
+                ErrorCode::Dep,
+                "a .NET project is under the gate root; the host route does not serve .NET, Python answers",
+            )));
+        }
         let runners = detect_runners(&root);
         if runners.is_empty() {
             let severity = if risk == "low" { "minor" } else { "major" };
@@ -814,7 +874,7 @@ fn load_per_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{committed, count, run_cmd, write_plan_file};
+    use super::{committed, count, has_dotnet_project, run_cmd, write_plan_file};
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
     use gsd_taskwriter::{GateFile, GateIssueRequest, GatePlan, GateWrite};
@@ -922,5 +982,76 @@ mod tests {
             run_cmd(&cmd, dir.path(), 10).expect("a runner that exits 0 is not a timeout");
         assert_eq!(code, 0);
         assert_eq!(text.len(), 262_144);
+    }
+
+    #[test]
+    fn a_dotnet_project_file_of_each_listed_kind_is_refused() {
+        for suffix in [
+            ".sln", ".slnx", ".slnf", ".csproj", ".fsproj", ".vbproj", ".CSPROJ",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(format!("app{suffix}")), "").expect("write");
+            assert!(
+                has_dotnet_project(dir.path()),
+                "{suffix} is a .NET workload"
+            );
+        }
+        let nested = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(nested.path().join("src/app")).expect("mkdir");
+        std::fs::write(nested.path().join("src/app/app.fsproj"), "").expect("write");
+        assert!(
+            has_dotnet_project(nested.path()),
+            "a nested project file is found"
+        );
+    }
+
+    #[test]
+    fn a_root_without_a_dotnet_project_file_is_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("Cargo.toml"), "").expect("write");
+        std::fs::write(dir.path().join("src/lib.rs"), "").expect("write");
+        std::fs::write(dir.path().join("notes.csproj.bak"), "").expect("write");
+        std::fs::write(dir.path().join(".csproj"), "").expect("write");
+        assert!(
+            !has_dotnet_project(dir.path()),
+            "no .NET project file is present"
+        );
+        assert!(
+            !has_dotnet_project(&dir.path().join("missing")),
+            "a missing root has no workload"
+        );
+    }
+
+    #[test]
+    fn a_dotnet_project_file_in_an_excluded_directory_is_not_refused() {
+        for skipped in [
+            ".git",
+            ".swarm",
+            "node_modules",
+            "bin",
+            "obj",
+            ".venv",
+            "venv",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(dir.path().join(skipped).join("nested")).expect("mkdir");
+            std::fs::write(dir.path().join(skipped).join("nested/app.csproj"), "").expect("write");
+            assert!(!has_dotnet_project(dir.path()), "{skipped} is pruned");
+            std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+            std::fs::write(dir.path().join("src/app.csproj"), "").expect("write");
+            assert!(
+                has_dotnet_project(dir.path()),
+                "a project beside {skipped} is found"
+            );
+        }
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("app.csproj"), "").expect("write");
+        let root = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("symlink");
+        assert!(
+            !has_dotnet_project(root.path()),
+            "a symlinked directory is never entered"
+        );
     }
 }
