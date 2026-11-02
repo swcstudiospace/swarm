@@ -1,0 +1,73 @@
+"""Fail-open hooks: a broken swarm dependency or an unwritable state dir must end in exit 0, never a traceback."""
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNNER = ROOT / "hooks" / "autonomous_run.py"
+ON_A01 = ROOT / "hooks" / "on_a01_complete.py"
+PROMPT_HOOK = ROOT / "hooks" / "user_prompt_submit.py"
+
+
+def _env() -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "SWARM_CHILD")}
+    env["AIO_SWARM"] = "0"
+    return env
+
+
+def _run_hook_with_blocked_module(hook: Path, module: str, stdin_text: str, cwd: Path) -> subprocess.CompletedProcess:
+    """Run `hook` as __main__ in a child whose `module` import is poisoned: sys.modules[module] = None makes it raise ImportError."""
+    probe = f"import runpy, sys\nsys.modules[{module!r}] = None\nrunpy.run_path({str(hook)!r}, run_name='__main__')\n"
+    return subprocess.run([sys.executable, "-c", probe], input=stdin_text, capture_output=True, text=True,
+                          cwd=cwd, env=_env(), timeout=120)
+
+
+def _load_runner():
+    spec = importlib.util.spec_from_file_location("autonomous_run_fail_open_under_test", RUNNER)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_hook_exits_zero_when_swarm_dir_unwritable(tmp_path):
+    """SWARM_DIR names a regular file, so creating the state dir fails. The runner must still exit 0 with JSON on stdout."""
+    blocker = tmp_path / "swarm-state"
+    blocker.write_text("not a directory\n")
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    env = {**os.environ, "SWARM_DIR": str(blocker)}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(workdir), "--brief", "implement x",
+         "--swarm-root", str(ROOT), "--dry-run"],
+        cwd=workdir, capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    json.loads(r.stdout)
+
+
+def test_on_a01_complete_exits_zero_when_hook_trigger_unimportable(tmp_path):
+    """swarm.hook_trigger cannot be imported: the shim must print the empty result and exit 0."""
+    r = _run_hook_with_blocked_module(ON_A01, "swarm.hook_trigger", "{}", tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "{}"
+
+
+def test_fallback_does_not_inject_for_uplift_wrapped_question(tmp_path):
+    """With the classifier unavailable, the fallback must judge the original question inside the uplift wrapper, not the
+    SDLC verb in the uplifted text, so no orchestration context is injected."""
+    prompt = "<UPLIFTED_PROMPT>Implement the cache layer.<original>how does the cache work?</original></UPLIFTED_PROMPT>"
+    r = _run_hook_with_blocked_module(PROMPT_HOOK, "swarm.signal_detector", json.dumps({"prompt": prompt}), tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "additionalContext" not in r.stdout, r.stdout
+
+
+def test_run_capped_accepts_cap_beyond_poll_range():
+    """A cap of 1e7 seconds is valid config. It must run the command to completion and not overflow the poll timeout."""
+    runner = _load_runner()
+    r = runner.run_capped([sys.executable, "-c", "print('ok')"], cwd=".", env=os.environ.copy(), timeout=1e7, grace=1)
+    assert r.returncode == 0
+    assert r.stdout == "ok\n"

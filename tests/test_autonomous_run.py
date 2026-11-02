@@ -271,7 +271,7 @@ time.sleep(30)
     assert elapsed < 8, elapsed
     log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
     assert log["run_rc"] == -signal.SIGKILL
-    assert r.returncode in (-signal.SIGKILL, 256 - signal.SIGKILL)
+    assert r.returncode == 0  # the hook fails open; the runner's SIGKILL is recorded in the log above
 
 
 def test_run_exports_its_grace_as_the_runners_shutdown_budget(tmp_path):
