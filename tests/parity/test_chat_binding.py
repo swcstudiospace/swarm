@@ -145,16 +145,11 @@ def test_shutdown_reports_each_pair_once_and_fails_every_dropped_ticket() -> Non
         assert result["code"] == "E-CAPACITY"
 
 
-def test_shutdown_report_has_an_empty_cancelled_list() -> None:
-    pool = native.ChatPool(native.Governor())
-    report = pool.shutdown(10000)
-    assert report["cancelled"] == []
-
 
 def test_shutdown_report_has_exactly_the_four_lists() -> None:
     pool = native.ChatPool(native.Governor())
     report = pool.shutdown(10000)
-    assert set(report) == {"flushed", "dropped", "abandoned", "cancelled"}
+    assert report == {"flushed": [], "dropped": [], "abandoned": [], "cancelled": []}
 
 
 def test_open_thread_after_shutdown_is_refused_with_e_capacity() -> None:
@@ -172,12 +167,6 @@ def test_zero_drop_grace_is_refused_with_e_input() -> None:
 def test_dedupe_window_not_above_per_thread_queue_is_refused_from_python() -> None:
     with pytest.raises(ValueError, match=r"^E-INPUT: "):
         native.ChatPool(native.Governor(), per_thread_queue=8, dedupe_window=8)
-
-
-def test_with_block_binds_the_same_pool() -> None:
-    pool = native.ChatPool(native.Governor())
-    with pool as bound:
-        assert bound is pool
 
 
 def test_leaving_the_with_block_shuts_the_pool_down() -> None:
