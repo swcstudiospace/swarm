@@ -44,6 +44,8 @@ ARGV_TAIL = ["--reason", "why", "--json"]
 BINARY_ORDER = ["script", "task", "summary", "status", "agent"]
 
 # Clock readings no two legs can share, each leg runs at its own instant. Every other byte of what the legs print and record is compared.
+pytestmark = pytest.mark.usefixtures("native_extension")
+
 MASKS = (
     # TaskStore stamps every write with time.time()
     re.compile(r'("updated_at"\s*:\s*)-?[0-9][0-9.eE+-]*'),

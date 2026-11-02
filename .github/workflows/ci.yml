@@ -41,9 +41,7 @@ jobs:
       - name: ruff
         run: ruff check .
       - name: pytest
-        # Native-only scheduler modules import swarm._native, which this pure-Python job does not build.
-        # Collection errors are reported, not hidden: the job stays red until those modules run in a native job.
-        run: python3 -m pytest --continue-on-collection-errors
+        run: python3 -m pytest
       - name: build_agents check
         run: python3 scripts/build_agents.py --check
       - name: pin hash

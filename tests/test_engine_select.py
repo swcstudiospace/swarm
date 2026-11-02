@@ -743,6 +743,7 @@ def test_without_gsd_engine_or_with_python_the_script_answers_as_before_and_star
 
 
 @pytest.mark.parametrize(("name", "agent"), SIX)
+@pytest.mark.usefixtures("native_extension")
 def test_an_unset_gsd_engine_does_not_even_import_the_selector(name: str, agent: str, tmp_path: Path) -> None:
     driver = (
         "import json, runpy, subprocess, sys\n"

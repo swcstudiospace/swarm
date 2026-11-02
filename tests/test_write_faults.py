@@ -438,6 +438,7 @@ RACES = {
 @pytest.mark.filterwarnings("ignore:record_property is incompatible:pytest.PytestWarning")  # the winners per engine go to the junit file
 @pytest.mark.parametrize("wal", JOURNAL_MODES)
 @pytest.mark.parametrize("engines", RACES.values(), ids=RACES.keys())
+@pytest.mark.usefixtures("native_extension")
 def test_eight_processes_racing_for_one_transition_have_one_winner_and_never_a_half_state(
         engines: list[str], wal: bool, new_world: Callable[..., World], wrapper: Callable[..., Wrapper],
         request: pytest.FixtureRequest, record_property: Callable[[str, object], None]) -> None:
@@ -605,6 +606,7 @@ NOT_STARTED = json.dumps({"agent": "A01", "script": "orch_status", "status": "er
 
 
 @pytest.mark.parametrize("behaviour", ["python-answers", "killed-binary"])
+@pytest.mark.usefixtures("native_extension")
 def test_a_signing_key_never_reaches_the_binary_its_request_or_any_output(
         behaviour: str, new_world: Callable[..., World], wrapper: Callable[..., Wrapper]) -> None:
     world = new_world(False)

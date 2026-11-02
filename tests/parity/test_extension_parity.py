@@ -20,8 +20,10 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
+pytest.importorskip("swarm._native")  # the native leg loads the extension; the pure-Python leg does not build it
 
 ERROR_INPUTS = [
     "E-INPUT",

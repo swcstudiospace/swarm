@@ -92,6 +92,13 @@ def home(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def native_extension() -> None:
+    """Skips unless swarm._native imports. A test that strips SWARM_PURE_PYTHON so its child reaches the default
+    selector needs the extension: the child imports it, and the pure-Python leg does not build it."""
+    pytest.importorskip("swarm._native")
+
+
+@pytest.fixture()
 def scheduler_engine_env(monkeypatch):
     """The scheduler selector starts unset for this test: GSD_ENGINE and SWARM_PURE_PYTHON are removed, so the test selects the
     engine itself and any child it starts inherits exactly that. monkeypatch restores both afterwards."""

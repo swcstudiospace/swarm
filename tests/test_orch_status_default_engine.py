@@ -597,6 +597,7 @@ def test_rust_serves_refuses_everything_else(argv: list[str], mod: ModuleType) -
 
 # --- the script as a process ------------------------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("native_extension")
 def test_script_process_prints_the_binary_answer_and_records_it_once(fake_binary: Callable[..., Fake], tmp_path: Path) -> None:
     fake = fake_binary(stdout=_rendered(OK_REPLY))
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GSD_", "SWARM_"))}

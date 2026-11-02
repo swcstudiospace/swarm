@@ -219,6 +219,7 @@ def _lease_calls(monkeypatch, mod):
     return calls
 
 
+@pytest.mark.usefixtures("native_extension")
 def test_the_default_engine_runs_the_python_scheduler(tmp_path, scheduler_engine_env):
     # in-process: the selector reads the test's own environment, with SWARM_PURE_PYTHON unset and the package already imported
     work, swarm, _env, corr = _planned(tmp_path)

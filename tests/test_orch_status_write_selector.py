@@ -952,6 +952,7 @@ def test_an_argv_outside_the_grammar_under_explicit_rust_reaches_the_binary_and_
 
 # --- the script as a process ------------------------------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("native_extension")
 def test_script_process_answers_a_killed_binary_with_the_typed_refusal_and_no_rerun(
         fake_binary: Callable[..., Fake], tmp_path: Path) -> None:
     state = tmp_path / "proc-state"

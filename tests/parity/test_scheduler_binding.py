@@ -17,8 +17,9 @@ from typing import Any
 
 import pytest
 
-from swarm import _native
 from swarm.errors import ErrorCode, SwarmError
+
+_native = pytest.importorskip("swarm._native")
 
 NativeCleanupFence = _native.NativeCleanupFence
 

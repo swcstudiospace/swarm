@@ -15,8 +15,11 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+import pytest
 
 from swarm._native_loader import load_native
+
+pytest.importorskip("swarm._native")  # every test loads the extension; the pure-Python leg does not build it
 
 THREADS = 8
 OPS_PER_THREAD = 200
