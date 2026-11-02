@@ -27,15 +27,6 @@ use crate::fair_queue::{FairQueue, OfferOutcome};
 /// Milliseconds the built-in executor sleeps between checks of its hold time.
 const HOLD_SLICE_MS: u64 = 10;
 
-/// Longest a wait may last. A requested timeout above this is clamped to it, so that
-/// `Instant::now() + timeout` cannot overflow.
-pub(crate) const MAX_WAIT: Duration = Duration::from_secs(86_400);
-
-/// The wait used for a requested `timeout`: `timeout` clamped to [`MAX_WAIT`].
-pub(crate) fn bounded_wait(timeout: Duration) -> Duration {
-    timeout.min(MAX_WAIT)
-}
-
 /// Fallback text for a caught executor panic whose payload is not a string.
 const EXECUTOR_PANIC_TEXT: &str = "executor panicked";
 /// Fallback text for a caught budget-port panic whose payload is not a string.
@@ -134,16 +125,28 @@ impl Ticket {
         true
     }
 
-    /// Waits up to `timeout`, clamped to a 24-hour maximum, for the outcome and returns a copy of it.
+    /// Waits up to `timeout` for the outcome and returns a copy of it.
     ///
-    /// Returns `None` if the message is still pending when that wait elapses (GA-5). A timeout
+    /// Returns `None` if the message is still pending when the timeout elapses (GA-5). A timeout
     /// does not cancel the message.
     pub fn wait(&self, timeout: Duration) -> Option<Completed> {
-        let deadline = Instant::now() + bounded_wait(timeout);
         let mut slot = self.slot.outcome.lock();
-        while slot.is_none() {
-            if self.slot.done.wait_until(&mut slot, deadline).timed_out() {
-                break;
+        if slot.is_none() {
+            match Instant::now().checked_add(timeout) {
+                Some(deadline) => {
+                    while slot.is_none() {
+                        if self.slot.done.wait_until(&mut slot, deadline).timed_out() {
+                            break;
+                        }
+                    }
+                }
+                // A timeout too large for an `Instant` never elapses, so the wait lasts until the
+                // outcome arrives. parking_lot's `wait_for` makes the same choice.
+                None => {
+                    while slot.is_none() {
+                        self.slot.done.wait(&mut slot);
+                    }
+                }
             }
         }
         slot.clone()
@@ -379,8 +382,6 @@ impl Runtime {
     /// and its ticket completes with `Failed(ShuttingDown)`. Workers exit once the closed queue
     /// is empty, and a worker still running an abandoned job is detached. A queued message that a
     /// cancel removes while the wait runs leaves the wait and is listed as `cancelled`.
-    ///
-    /// The wait lasts at most [`MAX_WAIT`]: a longer `grace` is waited for as `MAX_WAIT`.
     pub(crate) fn shutdown(&self, grace: Duration) -> ShutdownReport {
         let shared = &self.shared;
         let mut state = shared.state.lock();
@@ -403,14 +404,19 @@ impl Runtime {
         });
         shared.work.notify_all();
 
-        let deadline = Instant::now() + bounded_wait(grace);
+        let deadline = Instant::now().checked_add(grace);
         while state
             .watch
             .as_ref()
             .is_some_and(|watch| !watch.pending.is_empty())
         {
-            if shared.progress.wait_until(&mut state, deadline).timed_out() {
-                break;
+            match deadline {
+                Some(deadline) => {
+                    if shared.progress.wait_until(&mut state, deadline).timed_out() {
+                        break;
+                    }
+                }
+                None => shared.progress.wait(&mut state),
             }
         }
 
@@ -530,8 +536,8 @@ impl Runtime {
 
     /// Stops the runtime for its owner's drop. Nothing is reported. Closes intake, fails every
     /// queued message and every in-flight ticket with `ShuttingDown`, sets each running job's
-    /// token, and wakes the workers. Waits up to `grace`, at most [`MAX_WAIT`], for them to
-    /// exit. Returns how many are still running. Those are detached and exit on their own.
+    /// token, and wakes the workers. Waits up to `grace` for them to exit. Returns how many are
+    /// still running. Those are detached and exit on their own.
     pub(crate) fn abort(&self, grace: Duration) -> usize {
         let shared = &self.shared;
         let mut state = shared.state.lock();
@@ -547,10 +553,15 @@ impl Runtime {
                 .complete(Completed::Failed(ChatError::ShuttingDown));
         }
         shared.work.notify_all();
-        let deadline = Instant::now() + bounded_wait(grace);
+        let deadline = Instant::now().checked_add(grace);
         while shared.live.load(Ordering::Acquire) > 0 {
-            if shared.progress.wait_until(&mut state, deadline).timed_out() {
-                break;
+            match deadline {
+                Some(deadline) => {
+                    if shared.progress.wait_until(&mut state, deadline).timed_out() {
+                        break;
+                    }
+                }
+                None => shared.progress.wait(&mut state),
             }
         }
         let running = shared.live.load(Ordering::Acquire);
@@ -1493,14 +1504,5 @@ pub(crate) mod tests {
         assert!(text.contains("executor boom"), "{text}");
         runtime.shutdown(WAIT);
         Ok(())
-    }
-
-    #[test]
-    fn wait_clamps_duration_max_to_named_maximum() {
-        assert_eq!(bounded_wait(Duration::MAX), MAX_WAIT);
-        assert_eq!(
-            bounded_wait(Duration::from_millis(5)),
-            Duration::from_millis(5)
-        );
     }
 }

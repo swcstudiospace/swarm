@@ -478,8 +478,6 @@ impl ChatPool {
     /// their tickets completes with [`ChatError::ShuttingDown`]. `cancelled` lists the queued
     /// messages cancelled while shutdown waited. Messages that completed before the call are not
     /// listed.
-    ///
-    /// The wait lasts at most 24 hours, so a longer `grace` is waited for as 24 hours.
     pub fn shutdown(&self, grace: Duration) -> ShutdownReport {
         self.runtime.shutdown(grace)
     }
