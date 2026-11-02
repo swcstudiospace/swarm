@@ -29,6 +29,7 @@ import random
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +76,7 @@ def resolve_max_parallel(requested: int | None = None) -> int:
 
 def _exp_backoff(attempt: int, base: float = 1.0) -> float:
     """Exponential backoff (base * 2**attempt, capped at 60s) plus up to 0.5s jitter."""
-    return min(base * (2 ** attempt), 60.0) + random.uniform(0, 0.5)
+    return min(base * 2.0 ** attempt, 60.0) + random.uniform(0, 0.5)
 
 
 def _pre_spawn_validate(task_id: str) -> bool:
@@ -98,7 +99,7 @@ def _resolve_overdue(overdue_after_s: float | None) -> float:
 class _SubTimeout:
     """Overdue watchdog: calls on_overdue(sid) once after after_s seconds if the subagent is still running. Cancel on release."""
 
-    def __init__(self, sid: str, on_overdue, after_s: float):
+    def __init__(self, sid: str, on_overdue: Callable[[str], None], after_s: float) -> None:
         self.sid = sid
         self.on_overdue = on_overdue
         self.after_s = after_s
@@ -122,7 +123,7 @@ class _SubTimeout:
 
 
 def _drive_gsd_state(state: str, *, root: str | Path | None = None, dry_run: bool = False,
-                     corr: str | None = None, **extra) -> None:
+                     corr: str | None = None, **extra: Any) -> None:
     """Drive states LOADING etc via state store calls or emits. For wave1 gsd-autonomous OMP concurrent.
     State is written to the workspace at `root` (current directory when None). Errors isolated with try."""
     try:
@@ -336,7 +337,7 @@ class SubagentLifecycleManager:
     def current_concurrency(self) -> int:
         return self.active_count()
 
-    def register_omp(self, session_ref: str | None = None) -> dict:
+    def register_omp(self, session_ref: str | None = None) -> dict[str, Any]:
         _drive_gsd_state("REGISTERED", session=session_ref, wave="wave1", root=self.root, dry_run=self.dry_run,
                          corr=self.correlation_id)
         with self._lock:
@@ -347,14 +348,14 @@ class SubagentLifecycleManager:
             corr = info.get("correlation_id") or self.correlation_id
             stream_subagent_status(sid, "registered", task_id=info.get("task_id"), phase="omp", wave="wave1",
                                    root=info["root"], dry_run=self.dry_run, corr=corr)
-            emit_gsd_omp("status", subagent_id=sid, task_id=info.get("task_id"), status="omp-registered",
+            emit_gsd_omp("status", subagent_id=sid, task_id=info.get("task_id"), omp_status="omp-registered",
                          root=info["root"], dry_run=self.dry_run, corr=corr)
         emit_gsd_omp("consolidated", audit="register", session=session_ref, root=self.root, dry_run=self.dry_run,
                      corr=self.correlation_id)
         return {"max": self.max_concurrent, "active": list(active.keys()), "count": len(active)}
 
     def stream_all_status(self, status: str = "active") -> None:
-        _drive_gsd_state("STREAMING", status=status, wave="wave1", root=self.root, dry_run=self.dry_run,
+        _drive_gsd_state("STREAMING", omp_status=status, wave="wave1", root=self.root, dry_run=self.dry_run,
                          corr=self.correlation_id)
         with self._lock:
             for sid, info in list(self._active.items()):
@@ -364,7 +365,7 @@ class SubagentLifecycleManager:
                                        dry_run=self.dry_run, corr=corr)
                 emit_gsd_omp(status, subagent_id=sid, task_id=task_id, wave1="gsd-autonomous", root=root,
                              dry_run=self.dry_run, corr=corr)
-                emit_gsd_omp("consolidated", subagent_id=sid, task_id=task_id, audit="stream", status=status,
+                emit_gsd_omp("consolidated", subagent_id=sid, task_id=task_id, audit="stream", omp_status=status,
                              root=root, dry_run=self.dry_run, corr=corr)
 
 

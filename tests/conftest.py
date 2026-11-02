@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+os.environ.setdefault("SWARM_PURE_PYTHON", "1")
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -68,10 +69,16 @@ def _repo_state_mirrors_are_untouched(monkeypatch, tmp_path):
 @pytest.fixture()
 def swarm_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
-    # reload modules that cache SWARM_DIR at import time
-    for m in [m for m in list(sys.modules) if m.startswith("swarm")]:
-        del sys.modules[m]
-    return tmp_path / ".swarm"
+    # Every swarm* module is imported afresh inside the test. The modules the test files imported at collection time come back
+    # afterwards: a later test that patches its own module-level reference (telemetry, substrate_tee, script_base) must patch the
+    # object the code under test reaches through sys.modules, and a purge that outlived the test left the two apart.
+    original = {name: module for name, module in sys.modules.items() if name.startswith("swarm")}
+    for name in original:
+        del sys.modules[name]
+    yield tmp_path / ".swarm"
+    for name in [name for name in sys.modules if name.startswith("swarm")]:
+        del sys.modules[name]
+    sys.modules.update(original)
 
 
 @pytest.fixture()
@@ -82,6 +89,15 @@ def home(tmp_path, monkeypatch):
     for key in _ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     return h
+
+
+@pytest.fixture()
+def scheduler_engine_env(monkeypatch):
+    """The scheduler selector starts unset for this test: GSD_ENGINE and SWARM_PURE_PYTHON are removed, so the test selects the
+    engine itself and any child it starts inherits exactly that. monkeypatch restores both afterwards."""
+    monkeypatch.delenv("GSD_ENGINE", raising=False)
+    monkeypatch.delenv("SWARM_PURE_PYTHON", raising=False)
+    return monkeypatch
 
 
 @pytest.fixture()
@@ -140,16 +156,54 @@ _BASE_ENV_ALLOW = frozenset({
     "SWARM_DIR", "SWARM_GSD_STATE_FILE", "SWARM_CLAUDE_STATE_DIR",
     "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
     "SWARM_ALLOW_INSECURE_DEV_KEY",
+    "SWARM_PURE_PYTHON",
 })
 
 
+_ENGINES = ("python", "rust")
+
+
+def _test_engine() -> str:
+    """The scheduler engine the children run on: SWARM_TEST_ENGINE=python (default when unset) or rust.
+
+    Any other value, including an empty one, is a usage error: a typo must not silently run the Python engine and report a
+    green Rust leg. pytest_configure below raises it at session start; a direct call raises it too.
+    """
+    engine = os.environ.get("SWARM_TEST_ENGINE", "python")
+    if engine not in _ENGINES:
+        raise pytest.UsageError(f"SWARM_TEST_ENGINE must be one of {', '.join(_ENGINES)}; got {engine!r}")
+    return engine
+
+
+_WITNESS_FILE: str | None = None  # the native gate's witness file, taken out of this process's environment in pytest_configure
+
+
+def pytest_configure(config):
+    global _WITNESS_FILE
+    _test_engine()
+    # The witness covers child runs only: this process's own in-process runs execute the Python scheduler by design (SWARM_PURE_PYTHON=1).
+    _WITNESS_FILE = os.environ.pop("SWARM_SCHEDULER_WITNESS", None)
+
+
 def _scrubbed_base_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k in _BASE_ENV_ALLOW or k.startswith("LC_")}
+    """The child environment. With SWARM_TEST_ENGINE=rust (children only; this process stays SWARM_PURE_PYTHON=1) it adds
+    GSD_ENGINE=rust, SWARM_PURE_PYTHON=0 and, when the parent has it, GSD_ENGINE_BIN; with python or unset it is unchanged."""
+    env = {k: v for k, v in os.environ.items() if k in _BASE_ENV_ALLOW or k.startswith("LC_")}
+    if _WITNESS_FILE:  # each child run appends the engine it ran on to the native gate's witness file
+        env["SWARM_SCHEDULER_WITNESS"] = _WITNESS_FILE
+    if _test_engine() == "rust":
+        env["GSD_ENGINE"] = "rust"
+        env["SWARM_PURE_PYTHON"] = "0"
+        if "GSD_ENGINE_BIN" in os.environ:
+            env["GSD_ENGINE_BIN"] = os.environ["GSD_ENGINE_BIN"]
+    return env
 
 
 def run_script(name, *args, env=None):
     cmd = [sys.executable, str(ROOT / "scripts" / name), *args]
     child_env = _scrubbed_base_env()
+    if name != "swarm_run.py":  # only the scheduler under test runs on the selected engine; setup and inspection stay on Python
+        child_env.pop("GSD_ENGINE", None)
     child_env.update(env or {})
     return subprocess.run(cmd, capture_output=True, text=True, env=child_env, cwd=ROOT)
 

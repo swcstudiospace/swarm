@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Mapping, NamedTuple
+from typing import IO, Any, Mapping, NamedTuple, Protocol
 
 TIMEOUT_S = 1.5  # per socket operation; the whole request is also bounded, see DEADLINE_SLACK_S
 DEADLINE_SLACK_S = 0.5  # the caller's total wait for one request (DNS + connect + read) is TIMEOUT_S + this
@@ -83,10 +83,10 @@ class _Response:
     def close(self) -> None:
         self._buf.close()
 
-    def __enter__(self):
+    def __enter__(self) -> _Response:
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
 
@@ -126,12 +126,12 @@ class _Holder:
 class _TrackedHTTPConnection(http.client.HTTPConnection):
     """Registers its socket in `holder` as soon as TCP is up (before any proxy CONNECT) and again once connected."""
 
-    def __init__(self, *args, holder: _Holder, **kwargs):
+    def __init__(self, *args: Any, holder: _Holder, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._holder = holder
         self._create_connection = self._create_tracked
 
-    def _create_tracked(self, *args, **kwargs) -> socket.socket:
+    def _create_tracked(self, *args: Any, **kwargs: Any) -> socket.socket:
         return self._holder.adopt(socket.create_connection(*args, **kwargs))
 
     def connect(self) -> None:
@@ -140,6 +140,8 @@ class _TrackedHTTPConnection(http.client.HTTPConnection):
 
 
 class _TrackedHTTPSConnection(_TrackedHTTPConnection, http.client.HTTPSConnection):
+    _context: ssl.SSLContext  # set by HTTPSConnection.__init__; typeshed does not declare it
+    _tunnel_host: str | None  # set by HTTPConnection.set_tunnel; typeshed does not declare it
     def connect(self) -> None:
         http.client.HTTPConnection.connect(self)  # TCP and any proxy CONNECT tunnel, the raw socket tracked
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host,
@@ -154,17 +156,19 @@ def _holder_of(req: urllib.request.Request) -> _Holder:
 
 
 class _TrackingHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req):
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         return self.do_open(functools.partial(_TrackedHTTPConnection, holder=_holder_of(req)), req)
 
 
 class _TrackingHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
+    _context: ssl.SSLContext  # set by HTTPSHandler.__init__; typeshed does not declare it
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         return self.do_open(functools.partial(_TrackedHTTPSConnection, holder=_holder_of(req)), req, context=self._context)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str,
+                         headers: http.client.HTTPMessage, newurl: str) -> urllib.request.Request | None:
         return None  # a 3xx surfaces as an HTTPError with that status; nothing is re-sent
 
 
@@ -183,7 +187,11 @@ class RequestBusy(Exception):
     """The request deadline expired waiting for local capacity; no server outage was observed."""
 
 
-def _read_upto(f, n: int) -> bytes:
+class _Reader(Protocol):
+    def read(self, n: int = -1, /) -> bytes: ...
+
+
+def _read_upto(f: _Reader, n: int) -> bytes:
     parts: list[bytes] = []
     got = 0
     while got < n:
@@ -196,9 +204,9 @@ def _read_upto(f, n: int) -> bytes:
 
 
 def _exchange(opener: urllib.request.OpenerDirector, req: urllib.request.Request, timeout: float,
-              out: queue.SimpleQueue) -> None:
+              out: queue.SimpleQueue[_Response | BaseException]) -> None:
     """Worker: the whole exchange, body capped at MAX_BODY_BYTES + 1; hands back a _Response or the exception."""
-    got: object = OSError("substrate request worker stopped")
+    got: _Response | BaseException = OSError("substrate request worker stopped")
     try:
         try:
             with opener.open(req, timeout=timeout) as resp:
@@ -235,10 +243,10 @@ def _open(req: urllib.request.Request, timeout: float) -> _Response:
         raise RequestBusy("substrate request slots busy")
     try:
         holder = _Holder()
-        req._substrate_holder = holder  # type: ignore[attr-defined]
+        req._substrate_holder = holder  # type: ignore[attr-defined]  # urllib Request has no such slot; _holder_of reads it back
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect(), _TrackingHTTPHandler(),
                                              _TrackingHTTPSHandler(context=_ssl_context()))
-        out: queue.SimpleQueue = queue.SimpleQueue()
+        out: queue.SimpleQueue[_Response | BaseException] = queue.SimpleQueue()
         worker = threading.Thread(target=_exchange, args=(opener, req, timeout, out), name="substrate-request", daemon=True)
         with _workers_lock:
             _workers.difference_update([t for t in _workers if not t.is_alive()])
@@ -269,14 +277,14 @@ def _wait_idle(timeout: float) -> bool:
         return not _workers
 
 
-def _read_capped(resp) -> bytes:
+def _read_capped(resp: _Reader) -> bytes:
     data = resp.read(MAX_BODY_BYTES + 1)
     if len(data) > MAX_BODY_BYTES:
         raise ValueError("substrate reply larger than MAX_BODY_BYTES")
     return data
 
 
-def _request(url: str, body: dict, env: Mapping[str, str], accept: str, surface: str | None = None) -> tuple[int, str] | None:
+def _request(url: str, body: dict[str, Any], env: Mapping[str, str], accept: str, surface: str | None = None) -> tuple[int, str] | None:
     global _down_until
     if time.monotonic() < _down_until:
         return None
@@ -305,7 +313,7 @@ def _request(url: str, body: dict, env: Mapping[str, str], accept: str, surface:
     return got
 
 
-def rest_post(path: str, body: dict, env: Mapping[str, str] | None = None, *, surface: str | None = None) -> tuple[int, str] | None:
+def rest_post(path: str, body: dict[str, Any], env: Mapping[str, str] | None = None, *, surface: str | None = None) -> tuple[int, str] | None:
     """POST JSON to {SUBSTRATE_URL}{path}. ``(status, text)`` on any HTTP answer, None when off or unreachable.
 
     `surface` opts into that surface's own token (SUBSTRATE_TOKEN_<SURFACE>), falling back to SUBSTRATE_TOKEN.
@@ -320,7 +328,7 @@ def rest_post(path: str, body: dict, env: Mapping[str, str] | None = None, *, su
         return None
 
 
-def _rpc_response(text: str) -> dict | None:
+def _rpc_response(text: str) -> dict[str, Any] | None:
     """The JSON-RPC response in `text`: a plain JSON body, or an SSE body whose `data:` line holds it."""
     stripped = text.strip()
     if stripped.startswith("{"):
@@ -353,14 +361,14 @@ class Outcome(NamedTuple):
     `detail` is the server's own text for refused/error, capped at DETAIL_MAX; it never carries the token.
     """
     status: str
-    value: dict | list | None = None
+    value: dict[str, Any] | list[Any] | None = None
     detail: str = ""
 
 
 DETAIL_MAX = 300
 
 
-def mcp_call_outcome(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *,
+def mcp_call_outcome(tool: str, arguments: dict[str, Any], env: Mapping[str, str] | None = None, *,
                      surface: str | None = None) -> Outcome:
     """Call an MCP tool statelessly and classify the answer (see `Outcome`). Never raises; `surface` selects the token
     as in `rest_post`."""
@@ -403,8 +411,8 @@ def mcp_call_outcome(tool: str, arguments: dict, env: Mapping[str, str] | None =
         return Outcome("error", None, "malformed reply")
 
 
-def mcp_call_json(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *,
-                  surface: str | None = None) -> dict | list | None:
+def mcp_call_json(tool: str, arguments: dict[str, Any], env: Mapping[str, str] | None = None, *,
+                  surface: str | None = None) -> dict[str, Any] | list[Any] | None:
     """Call an MCP tool statelessly; return the JSON value (object or array) in ``result.content[0].text``, None on any failure.
 
     `surface` selects the token as in `rest_post`.
@@ -413,7 +421,7 @@ def mcp_call_json(tool: str, arguments: dict, env: Mapping[str, str] | None = No
     return got.value if got.status == "ok" else None
 
 
-def mcp_call(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *, surface: str | None = None) -> dict | None:
+def mcp_call(tool: str, arguments: dict[str, Any], env: Mapping[str, str] | None = None, *, surface: str | None = None) -> dict[str, Any] | None:
     """Call an MCP tool statelessly; return the JSON object in ``result.content[0].text``, None on any failure or non-object.
 
     `surface` selects the token as in `rest_post`.

@@ -1,0 +1,87 @@
+name: wheel
+
+# GitHub-hosted exception (D-P22): this is the one workflow that does not run on the Omega CI runner pool (ci.yml: every other job
+# does). The manylinux wheel is built inside a Docker container (scripts/ci_build_wheel.sh) and the pool's runners are unprivileged
+# containers without Docker, so the jobs below stay on ubuntu-latest. Decision by the user, 2026-10-28. Not chosen: `maturin --zig`
+# on the pool, a Docker runner on the VPS (srv1778002), no wheel job. The workflow uses no secrets and a read-only token.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    # A cold Rust build of the extension inside the manylinux container; bound it so a stuck build cannot hold a runner for 6 hours.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install maturin
+        run: python3 -m pip install maturin==1.15.0
+      - name: install mypy
+        run: python3 -m pip install mypy==1.18.2
+      - name: mypy (strict, repo config)
+        run: mypy --cache-dir "$RUNNER_TEMP/mypy-cache"
+      - name: install pinned Rust toolchain for the manylinux build
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+      - name: build abi3-py312 manylinux_2_28 x86_64 wheel
+        run: scripts/ci_build_wheel.sh dist
+      - name: upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-wheel-cp312-abi3-manylinux_2_28_x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+      - name: upload the parity suite for the installed-wheel gate
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-parity-suite
+          path: |
+            tests/parity/test_extension_parity.py
+            tests/parity/test_extension_threads.py
+            scripts/orch_status.py
+          if-no-files-found: error
+
+  install-and-gate:
+    needs: wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: python:3.12-slim-bookworm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-wheel-cp312-abi3-manylinux_2_28_x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-parity-suite
+          path: /tmp/gate
+      - name: install wheel and mypy into the clean container
+        run: python -m pip install --no-cache-dir dist/*.whl mypy==1.18.2
+      # Gates run from /tmp, outside the repository, so the installed wheel is checked, not the source tree.
+      - name: import gate
+        run: |
+          cd /tmp
+          python -c "import swarm._native"
+      - name: stubtest gate
+        run: |
+          cd /tmp
+          python -m mypy.stubtest swarm._native
+      - name: install pytest into the clean container
+        run: python -m pip install --no-cache-dir pytest==9.1.1
+      # U5 parity gate, run from /tmp/gate: the parity tests and the orch_status script, but no swarm/
+      # package, so every swarm import resolves to the installed wheel.
+      - name: U5 parity gate (installed wheel)
+        run: |
+          cd /tmp/gate
+          python -m pytest -o addopts="" -q tests/parity/test_extension_parity.py tests/parity/test_extension_threads.py

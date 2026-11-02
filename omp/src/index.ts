@@ -81,9 +81,12 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
     pi.on("tool_call", (event, ctx) => {
       const env = process.env;
       let known: Pick<GuardFacts, "agent" | "topLevel"> = { agent: undefined, topLevel: false };
+      // TS-01: until the session log is read the caller is unknown; an unreadable log then falls back to the swarm env marker
+      let unreadable = true;
       try {
         const { restricted, topLevel } = sessionAgent(ctx);
         known = { agent: callingAgent(ctx), topLevel };
+        unreadable = false;
         // getActiveTools only for A01: the depth-cap check is the only reader (D-06)
         const hasTask = known.agent === ORCHESTRATOR ? pi.getActiveTools().includes("task") : true;
         // D-08: the runtime roots bridge.swarmRoot() picks from (env SWARM_ROOT, the package's repo), spelled without fs
@@ -96,7 +99,7 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
         if (!decision?.block && event.toolName === "task") display(() => bar.taskSpawn(ctx, event.input, event.toolCallId));
         return decision;
       } catch (err) {
-        if (!inSwarm({ ...known, env })) return undefined;
+        if (!inSwarm({ agent: known.agent, topLevel: known.topLevel || unreadable, env })) return undefined;
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };
       }
     });

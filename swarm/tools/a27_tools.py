@@ -50,6 +50,7 @@ import string as _string
 import sys
 from decimal import Decimal
 from fractions import Fraction
+from typing import Any, TypeVar
 
 from swarm.redact import redact_text
 from swarm.tools.support import respond
@@ -163,28 +164,28 @@ _MNEMONIC_RE = re.compile(r"(?<![A-Za-z])(?:[a-z]{3,8}[ ,\t\n]+){11,}[a-z]{3,8}(
 REDACTED = "[REDACTED]"
 
 
-def _clean(text) -> str:
+def _clean(text: object) -> str:
     """A caller-chosen string made safe to echo: secret-looking spans become [REDACTED]."""
     value = _MNEMONIC_RE.sub(REDACTED, _KEY_RE.sub(REDACTED, redact_text(str(text))))
     return value
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": _clean(message)}
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _frac(value) -> Fraction:
+def _frac(value: object) -> Fraction:
     """Exact rational of the number as written (shortest repr); unlike Decimal it never rounds to a context precision."""
     return Fraction(repr(value))
 
 
-def _f(value, digits: int = 4) -> float:
+def _f(value: Decimal | Fraction | float, digits: int = 4) -> float:
     """Rounded float; a value beyond the float range (an exact ratio of absurd reserves) saturates at +-1.7976931348623157e308."""
     try:
         return round(float(value), digits)
@@ -192,15 +193,15 @@ def _f(value, digits: int = 4) -> float:
         return sys.float_info.max if value > 0 else -sys.float_info.max
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, Any]:
     return {"id": _clean(fid)[:200], "severity": severity, "summary": _clean(summary)[:400]}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=lambda f: (-_RANK[f["severity"]], f["id"]))
 
 
-def _verdict(findings: list[dict]) -> str:
+def _verdict(findings: list[dict[str, Any]]) -> str:
     top = max((_RANK[f["severity"]] for f in findings), default=-1)
     return "fail" if top >= _RANK["high"] else "warn" if top >= _RANK["medium"] else "pass"
 
@@ -219,7 +220,10 @@ def _is_commit(value: str) -> bool:
     return _is_hex(value, 7, 40) or _is_hex(value, 64, 64)
 
 
-def _cp_out(amount_in: Decimal, reserve_in: Decimal, reserve_out: Decimal, fee: Decimal) -> Decimal:
+_Num = TypeVar("_Num", Decimal, Fraction)  # Decimal for the AMM sweeps, exact Fraction for flashloan_profit
+
+
+def _cp_out(amount_in: _Num, reserve_in: _Num, reserve_out: _Num, fee: _Num) -> _Num:
     """Uniswap V2 getAmountOut: the fee is taken from the input, the full input stays in the pool."""
     effective = amount_in * (1 - fee)
     return effective * reserve_out / (reserve_in + effective)
@@ -241,10 +245,10 @@ def _push_size(reserve: Decimal, deviation: Decimal, fee: Decimal) -> Decimal:
 # ===================================================================================================================
 
 
-def classify_vulnerability(payload: dict) -> dict:
+def classify_vulnerability(payload: dict[str, Any]) -> dict[str, Any]:
     """Map code signals to SWC registry classes with a default severity; counts by severity and a verdict."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         observations = payload["observations"]
         seen: set[str] = set()
         counts = dict.fromkeys(SEVERITIES, 0)
@@ -279,10 +283,10 @@ def classify_vulnerability(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def score_severity(payload: dict) -> dict:
+def score_severity(payload: dict[str, Any]) -> dict[str, Any]:
     """Severity = OWASP matrix of impact (loss versus TVL, irrecoverable bump) and likelihood (privilege, preconditions)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         loss, tvl = _dec(payload["loss_usd"]), _dec(payload["tvl_usd"])
         if loss > tvl:
             return _invalid("loss_usd", "loss_usd must not exceed tvl_usd")
@@ -325,10 +329,10 @@ def score_severity(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def reentrancy_order(payload: dict) -> dict:
+def reentrancy_order(payload: dict[str, Any]) -> dict[str, Any]:
     """Checks-effects-interactions: a state write after an untrusted external call; stale checks and cross-function reach."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         functions = payload["functions"]
         names = [fn["name"] for fn in functions]
         if len(set(names)) != len(names):
@@ -339,7 +343,7 @@ def reentrancy_order(payload: dict) -> dict:
             for step in fn["steps"]:
                 if step["kind"] in ("check", "effect"):
                     touched.setdefault(step["target"], set()).add(fn["name"])
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         untrusted = 0
         compliant = 0
         for fn in sorted(functions, key=lambda item: item["name"]):
@@ -397,15 +401,15 @@ _ORACLE_REQUIRED = {
 }
 
 
-def oracle_risk(payload: dict) -> dict:
+def oracle_risk(payload: dict[str, Any]) -> dict[str, Any]:
     """Oracle manipulation risk: constant-product attack cost versus extractable profit (spot, TWAP) or feed hygiene (Chainlink)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         kind = payload["oracle_type"]
         for field in _ORACLE_REQUIRED[kind]:
             if field not in payload:
                 return _invalid(field, f"{field} is required for oracle_type {kind}")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         capital = cost = gain = Decimal(0)
         feasible = profitable = modelled = False
         if kind in ("spot_amm", "twap"):
@@ -478,10 +482,10 @@ def oracle_risk(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def flashloan_profit(payload: dict) -> dict:
+def flashloan_profit(payload: dict[str, Any]) -> dict[str, Any]:
     """Constant-product price impact of a flash-funded swap, its round-trip and flash-loan cost, and the break-even exploit gain."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         # Fractions, not Decimal: a pool reserve far below the borrow makes reserve_out - amount_out vanish at 28 digits.
         reserve_in, reserve_out = _frac(payload["reserve_in"]), _frac(payload["reserve_out"])
         borrow = _frac(payload["borrow_amount"])
@@ -525,10 +529,10 @@ def flashloan_profit(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def invariant_coverage(payload: dict) -> dict:
+def invariant_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """Coverage of mutable state variables and state-changing functions by the invariant suite."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         variables = payload["state_variables"]
         if len(set(variables)) != len(variables):
             return _invalid("state_variables", "state variable names must be unique")
@@ -589,10 +593,10 @@ def invariant_coverage(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def fuzz_adequacy(payload: dict) -> dict:
+def fuzz_adequacy(payload: dict[str, Any]) -> dict[str, Any]:
     """Runs, depth, seed diversity, coverage and revert ratio of a fuzz or invariant campaign against the audit policy."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         mode, runs = payload["mode"], payload["runs"]
         if payload["functions_exercised"] > payload["functions_total"]:
             return _invalid("functions_exercised", "functions_exercised must not exceed functions_total")
@@ -606,6 +610,7 @@ def fuzz_adequacy(payload: dict) -> dict:
             severity = "medium" if runs * 10 >= minimum else "high"
             checks.append((runs >= minimum, severity, "FUZZ-RUNS", f"{runs} runs, policy minimum {minimum}"))
         else:
+            assert depth is not None  # the schema admits only stateless and invariant; invariant without depth returned above
             total_calls = runs * depth
             minimum = payload.get("min_total_calls", INVARIANT_CALLS_MIN)
             severity = "medium" if total_calls * 10 >= minimum else "high"
@@ -649,15 +654,15 @@ def fuzz_adequacy(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def signature_replay(payload: dict) -> dict:
+def signature_replay(payload: dict[str, Any]) -> dict[str, Any]:
     """Replay surface of a signature-consuming function: nonce, chain id, contract binding, deadline, zero address, malleability."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         if payload["deadline_enforced"] and not payload["deadline_in_message"]:
             return _invalid("deadline_enforced", "a deadline cannot be enforced when it is not part of the signed message")
         if payload["chainid_recomputed"] and not payload["domain_separator_cached"]:
             return _invalid("chainid_recomputed", "chainid_recomputed only applies to a cached domain separator")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         if not payload["nonce_consumed"]:
             findings.append(_finding("SIG-REPLAY", "high", "SWC-121: no nonce or digest is marked used, the same signature can be submitted again"))
         if not payload["chain_id_bound"]:
@@ -696,15 +701,15 @@ def signature_replay(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def role_centralization(payload: dict) -> dict:
+def role_centralization(payload: dict[str, Any]) -> dict[str, Any]:
     """Effective severity of each privileged power after multisig strength, timelock delay and governance mitigation."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         roles = payload["roles"]
         names = [role["name"] for role in roles]
         if len(set(names)) != len(names):
             return _invalid("roles", "role names must be unique")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         powers = 0
         for role in sorted(roles, key=lambda item: item["name"]):
             holder, name = role["holder"], role["name"]
@@ -756,19 +761,21 @@ def role_centralization(payload: dict) -> dict:
 def _shares(mode: str, offset: int, assets: int, supply: int, total: int) -> int:
     if mode == "legacy":
         return assets if supply == 0 else assets * supply // total
-    return assets * (supply + 10**offset) // (total + 1)
+    result: int = assets * (supply + 10**offset) // (total + 1)
+    return result
 
 
 def _assets(mode: str, offset: int, shares: int, supply: int, total: int) -> int:
     if mode == "legacy":
         return shares if supply == 0 else shares * total // supply
-    return shares * (total + 1) // (supply + 10**offset)
+    result: int = shares * (total + 1) // (supply + 10**offset)
+    return result
 
 
-def vault_inflation(payload: dict) -> dict:
+def vault_inflation(payload: dict[str, Any]) -> dict[str, Any]:
     """First-depositor donation attack on an ERC-4626 vault: victim shares and loss, attacker profit, donation that zeroes the victim."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         mode, offset = payload["mode"], payload.get("decimals_offset", 0)
         supply, total = payload.get("initial_shares", 0), payload.get("initial_assets", 0)
         attacker, donation, victim = payload["attacker_deposit"], payload["donation"], payload["victim_deposit"]
@@ -788,7 +795,7 @@ def vault_inflation(payload: dict) -> dict:
         attacker_value = _assets(mode, offset, attacker_shares, supply, total)
         loss = victim - victim_value
         profit = attacker_value - attacker - donation
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         if victim_shares == 0:
             findings.append(_finding("VAULT-ZERO-SHARES", "critical", f"victim deposit of {victim} mints zero shares: the whole deposit is lost"))
         elif loss * 100 >= victim * VAULT_LOSS_FAIL_PER_100:
@@ -828,10 +835,10 @@ def _tokens(title: str) -> frozenset[str]:
     return frozenset(re.findall(r"[a-z0-9]+", title.lower()))
 
 
-def dedupe_findings(payload: dict) -> dict:
+def dedupe_findings(payload: dict[str, Any]) -> dict[str, Any]:
     """Group findings that share category, file and root cause (or function), or whose titles are >= 80% alike; flag severity conflicts and surface the highest input severity, which the verdict covers."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         items = payload["findings"]
         ids = [item["id"] for item in items]
         if len(set(ids)) != len(ids):
@@ -858,7 +865,7 @@ def dedupe_findings(payload: dict) -> dict:
                 similar_title = union > 0 and len(tok_i & tok_j) * 5 >= union * 4
                 if same_anchor or similar_title:
                     parent[find(j)] = find(i)
-        members: dict[int, list[dict]] = {}
+        members: dict[int, list[dict[str, Any]]] = {}
         for index, item in enumerate(items):
             members.setdefault(find(index), []).append(item)
         groups, findings = [], []
@@ -904,10 +911,10 @@ def dedupe_findings(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def report_completeness(payload: dict) -> dict:
+def report_completeness(payload: dict[str, Any]) -> dict[str, Any]:
     """Required sections, a proof of concept for every high or critical finding, recommendation, location and fix status."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         commit = payload["scope_commit"]
         if not _is_hex(commit, 40, 40) and not _is_hex(commit, 64, 64):
             return _invalid("scope_commit", "scope_commit must be a full git object id (40 or 64 hex characters)")
@@ -978,16 +985,16 @@ def report_completeness(payload: dict) -> dict:
 # ===================================================================================================================
 
 
-def fix_verification(payload: dict) -> dict:
+def fix_verification(payload: dict[str, Any]) -> dict[str, Any]:
     """A fix counts as verified only with a commit, a regression test and a re-audit; residual risk is severity-weighted."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         items = payload["findings"]
         ids = [item["id"] for item in items]
         if len(set(ids)) != len(ids):
             return _invalid("findings", "finding ids must be unique")
         counts = {"verified_fixed": 0, "verified_mitigated": 0, "unverified": 0, "open": 0, "accepted": 0}
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         residual = weight_total = Decimal(0)
         worst = -1
         for item in sorted(items, key=lambda entry: entry["id"]):

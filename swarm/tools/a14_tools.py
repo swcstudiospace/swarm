@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import re
+from typing import Any, cast
 
 from swarm.tools.support import respond, script
 
@@ -49,7 +50,7 @@ _URGENT_WINDOW_H = 24
 _EOL_EPIC_DAYS = 90
 
 
-def _bad(field: str, message: str) -> dict:
+def _bad(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
@@ -71,10 +72,10 @@ def _utc(text: str) -> dt.datetime | None:
         return None
 
 
-def patch_priority(payload: dict) -> dict:
+def patch_priority(payload: dict[str, Any]) -> dict[str, Any]:
     """Score = 4*CVSS + exploit points + blast points + 0.15*usage% + 10 if KEV, capped at 100."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         kev = payload["kev"]
         cvss = payload["cvss"]
         raw = (
@@ -99,15 +100,15 @@ def patch_priority(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def patch_deadline(payload: dict) -> dict:
+def patch_deadline(payload: dict[str, Any]) -> dict[str, Any]:
     """KEV or critical severity gets a 24 h window from detection; anything else uses sla_hours."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         detected = _utc(payload["detected_at"])
         if detected is None:
             return _bad("detected_at", "detected_at must be YYYY-MM-DDTHH:MM:SSZ")
         if payload["kev"] or payload["severity"] == "critical":
-            window = _URGENT_WINDOW_H
+            window: Any = _URGENT_WINDOW_H
             basis = "kev" if payload["kev"] else "critical"
         else:
             window = payload.get("sla_hours")
@@ -132,7 +133,7 @@ def _parse_semver(text: str) -> tuple[tuple[int, int, int], str | None] | None:
     return (int(match[1]), int(match[2]), int(match[3])), match[4]
 
 
-def _pre_key(pre: str | None) -> tuple:
+def _pre_key(pre: str | None) -> tuple[Any, ...]:
     """Semver precedence: a release outranks every prerelease of the same core version."""
     if pre is None:
         return (1,)
@@ -142,10 +143,10 @@ def _pre_key(pre: str | None) -> tuple:
     return (0, tuple(idents))
 
 
-def semver_bump(payload: dict) -> dict:
+def semver_bump(payload: dict[str, Any]) -> dict[str, Any]:
     """Classify from -> to. Breaking means a major change, or a minor change while major is 0."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         old = _parse_semver(payload["from"])
         if old is None:
             return _bad("from", "from must be a semver version")
@@ -177,10 +178,10 @@ def semver_bump(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def eol_distance(payload: dict) -> dict:
+def eol_distance(payload: dict[str, Any]) -> dict[str, Any]:
     """Days from today to EOL. Negative means passed; an epic is due at 90 days or less."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         today = _date(payload["today"])
         if today is None:
             return _bad("today", "today must be YYYY-MM-DD")
@@ -207,13 +208,13 @@ def eol_distance(payload: dict) -> dict:
 
 def _spec_class(spec: str) -> str:
     """Pin state of one specifier, taken from the maint_deps script so the two cannot drift."""
-    return script("maint_deps")._pin_state(spec)
+    return cast(str, script("maint_deps")._pin_state(spec))  # maint_deps._pin_state is annotated str; script() module attrs are Any
 
 
-def unpinned_count(payload: dict) -> dict:
+def unpinned_count(payload: dict[str, Any]) -> dict[str, Any]:
     """Count specifiers that are not a single exact pin. Empty and wildcard entries are unpinned too."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         classes = [_spec_class(spec) for spec in payload["specs"]]
         total = len(classes)
         if total == 0:
@@ -232,10 +233,10 @@ def unpinned_count(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def stale_age(payload: dict) -> dict:
+def stale_age(payload: dict[str, Any]) -> dict[str, Any]:
     """Days between the installed release date and the latest release date, against a threshold."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         installed = _date(payload["installed_released"])
         if installed is None:
             return _bad("installed_released", "installed_released must be YYYY-MM-DD")
@@ -256,13 +257,13 @@ def stale_age(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def debt_priority(payload: dict) -> dict:
+def debt_priority(payload: dict[str, Any]) -> dict[str, Any]:
     """score = 100 * (impact*recurrence/25) * 8/(8+effort_h), capped at 100.
 
     Iteration: score >= 70 -> I+1, >= 40 -> I+2, otherwise I+3.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         benefit = payload["impact"] * payload["recurrence"]
         score = min(100, round(100 * (benefit / 25) * (8 / (8 + payload["effort_h"]))))
         if score >= 70:
@@ -295,10 +296,10 @@ def _has_copyleft(ids: set[str]) -> bool:
     return any(ident.upper().startswith(_COPYLEFT_PREFIXES) for ident in ids)
 
 
-def license_change(payload: dict) -> dict:
+def license_change(payload: dict[str, Any]) -> dict[str, Any]:
     """Compare SPDX identifier sets between two license records."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         before = _license_ids(payload["previous_license"])
         if not before:
             return _bad("previous_license", "no SPDX identifier found")
@@ -371,10 +372,10 @@ def _changelog_problems(entry: str, version: str) -> list[str]:
     return problems
 
 
-def changelog_check(payload: dict) -> dict:
+def changelog_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate one Keep a Changelog release section against the expected version."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         problems = _changelog_problems(payload["entry"], payload["version"])
         return {
             "state": "SUCCESS",
@@ -393,12 +394,12 @@ _RANGE_CLAUSE = re.compile(r"(<=|>=|<|>)\s*(\S+)")
 _MAX_RANGE_CLAUSES = 8
 
 
-def hotfix_decision(payload: dict) -> dict:
+def hotfix_decision(payload: dict[str, Any]) -> dict[str, Any]:
     """Hotfix-vs-rollback rule: sev 1 or 2 (1 = worst, as in A13's incident.alert) primes the hotfix
     path; a low-risk rollback is preferred; a hotfix is chosen only when the root-cause fix is
     estimated under 4 h."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         severity = payload["severity"]
         if isinstance(severity, bool) or not isinstance(severity, int) or not 1 <= severity <= 5:
             return _bad("severity", "severity must be an integer from 1 to 5")
@@ -433,7 +434,7 @@ def hotfix_decision(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _range_clauses(text: str) -> list[tuple[str, str, tuple]] | None:
+def _range_clauses(text: str) -> list[tuple[str, str, tuple[Any, ...]]] | None:
     """Parse a comma-separated AND range into (operator, version text, sort key); None when malformed."""
     parts = [part.strip() for part in text.split(",")]
     if not parts or len(parts) > _MAX_RANGE_CLAUSES:
@@ -451,12 +452,12 @@ def _range_clauses(text: str) -> list[tuple[str, str, tuple]] | None:
     return clauses
 
 
-def version_affected(payload: dict) -> dict:
+def version_affected(payload: dict[str, Any]) -> dict[str, Any]:
     """True when the version satisfies every clause of an advisory range such as ``>=1.0.0,<1.4.5``.
 
     matched_clause is the normalised range (clauses joined by a comma) when affected, else empty."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         parsed = _parse_semver(payload["version"].strip())
         if parsed is None:
             return _bad("version", "version must be a semver version such as 1.2.3 or 1.2.3-rc.1")

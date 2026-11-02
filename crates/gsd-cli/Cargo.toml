@@ -1,0 +1,57 @@
+[package]
+name = "gsd-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI/API Surface for GSD-Core: programmatic control for workflow definition, execution, monitoring"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["command-line-utilities", "development-tools", "api"]
+keywords = ["cli", "orchestration", "workflow", "api", "monitoring"]
+
+[dependencies]
+tokio = { workspace = true }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-proto = { path = "../gsd-proto" }
+gsd-serde = { path = "../gsd-serde" }
+gsd-ipc = { path = "../gsd-ipc" }
+gsd-pool = { path = "../gsd-pool" }
+gsd-scheduler = { path = "../gsd-scheduler" }
+gsd-state = { path = "../gsd-state" }
+gsd-governor = { path = "../gsd-governor" }
+gsd-observability = { path = "../gsd-observability" }
+gsd-security = { path = "../gsd-security" }
+gsd-adapter = { path = "../gsd-adapter" }
+gsd-nexus = { path = "../gsd-nexus" }
+gsd-failure = { path = "../gsd-failure" }
+clap = { workspace = true }
+config = { workspace = true }
+figment = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
+figment = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
+figment = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

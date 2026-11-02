@@ -17,7 +17,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from . import substrate_client
 from .errors import ErrorCode, SwarmError
@@ -124,7 +124,7 @@ def resolve_scope(scope: str, *, graph_id: str | None = None, repo: str | None =
     return f"{scope}:{ident}"
 
 
-def _json(text: str) -> dict | None:
+def _json(text: str) -> dict[str, Any] | None:
     try:
         parsed = json.loads(text)
     except ValueError:
@@ -132,16 +132,17 @@ def _json(text: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _str(reply: Mapping, name: str) -> str:
-    value = reply.get(name)
+def _str(reply: Mapping[str, Any] | None, name: str) -> str:
+    value = reply.get(name) if reply is not None else None
     return value if isinstance(value, str) else ""
 
 
-def _outcome(status: str, reply: Mapping | None, key: str, attempts: int, **over) -> WriteOutcome:
+def _outcome(status: str, reply: Mapping[str, Any] | None, key: str, attempts: int, **over: Any) -> WriteOutcome:
     r = reply or {}
-    entry = r.get("entry") if isinstance(r.get("entry"), dict) else {}
+    raw_entry = r.get("entry")
+    entry: Mapping[str, Any] = raw_entry if isinstance(raw_entry, dict) else {}
     version = entry.get("version")
-    fields = {
+    fields: dict[str, Any] = {
         "status": status, "reason": _str(r, "reason"), "remedy": _str(r, "remedy"), "idempotency_key": key,
         "verified_persisted": r.get("verified_persisted") is True,
         "entry_id": entry.get("id") if isinstance(entry.get("id"), str) else None,
@@ -166,7 +167,7 @@ def _current_version(scope: str, subject: str | None, conflict_with: str, env: M
     """
     want = (subject or "").strip().lower()
     answered = True
-    for query in ([subject.strip()] if want else []) + [""]:
+    for query in ([(subject or "").strip()] if want else []) + [""]:
         entries = _search(query, scope, 100, env)
         if entries is None:
             answered = False
@@ -202,7 +203,7 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
         raise SwarmError(ErrorCode.E_INPUT, f"unknown memory kind {kind!r}; expected one of {', '.join(KIND_MAP)}", field="kind")
     target = resolve_scope(scope, graph_id=graph_id, repo=repo, surface=surface)
     key = idempotency_key(correlation_id, task_id, attempt, KIND_MAP[kind], target, text, subject=subject)
-    body: dict = {"scope": target, "kind": KIND_MAP[kind], "text": text, "idempotency_key": key}
+    body: dict[str, Any] = {"scope": target, "kind": KIND_MAP[kind], "text": text, "idempotency_key": key}
     if subject and subject.strip():
         body["subject"] = subject
     if graph_id:
@@ -223,7 +224,7 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
         reply = _json(raw)
         outcome = reply.get("outcome") if reply else None
         reason = _str(reply, "reason") if reply else ""
-        if outcome is None:  # not a MemoryWriteResult: an auth refusal, a 5xx from the audit gate, a proxy page
+        if reply is None or outcome is None:  # not a MemoryWriteResult: an auth refusal, a 5xx from the audit gate, a proxy page
             if http in (401, 403):
                 raise SwarmError(ErrorCode.E_POLICY, f"memory write refused (HTTP {http})", http_status=http, idempotency_key=key)
             return WriteOutcome(UNAVAILABLE, reason=f"http.{http}", idempotency_key=key, attempts=posts)
@@ -272,16 +273,16 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
         return WriteOutcome(UNAVAILABLE, reason=f"outcome.unknown:{outcome}", idempotency_key=key, attempts=posts)
 
 
-def _search(query: str, scope: str | None, limit: int, env: Mapping[str, str] | None) -> list[dict] | None:
+def _search(query: str, scope: str | None, limit: int, env: Mapping[str, str] | None) -> list[dict[str, Any]] | None:
     """``memory_search`` entries, or None when the substrate did not answer with a list (the caller decides what that means)."""
-    args: dict = {"query": query or "", "limit": max(1, min(100, int(limit)))}
+    args: dict[str, Any] = {"query": query or "", "limit": max(1, min(100, int(limit)))}
     if scope:
         args["scope"] = scope
     got = substrate_client.mcp_call_json("memory_search", args, env)
     return [e for e in got if isinstance(e, dict)] if isinstance(got, list) else None
 
 
-def memory_query(query: str, *, scope: str | None = None, limit: int = 10, env: Mapping[str, str] | None = None) -> list[dict]:
+def memory_query(query: str, *, scope: str | None = None, limit: int = 10, env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """``memory_search`` over the substrate. A list of entries; ``[]`` when the substrate is off, down or answers badly.
 
     ``scope`` is a substrate scope string (``repo:o/n``, ``graph:<id>``, ``agent:<surface>``, ``global``). Quarantined and

@@ -153,5 +153,63 @@ class AssignmentScript(AgentScript):
         return self.EXIT_ERROR
 
 
+# Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves `--json` inside the known flags.
+# An unknown flag stays this body, so the redacted argument refusal is unchanged.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    if route != "assign":
+        raise KeyError(route)
+    names = set(BINARY_ENV_NAMES) | {"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION",
+                                     "SWARM_CHILD", "SWARM_AGENT", "SWARM_AGENTS_FILE", "SUBSTRATE_URL",
+                                     "SUBSTRATE_DISABLED", "XDG_CONFIG_HOME"}
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_assign(argv: list[str]) -> bool:
+    known = {"--json", "--dry-run", "--root", "--task-id", "--correlation-id"}
+    if "--json" not in argv:
+        return False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        name = token.split("=", 1)[0]
+        if name not in known:
+            return False
+        if name in {"--root", "--task-id", "--correlation-id"} and "=" not in token:
+            index += 1
+        index += 1
+    return True
+
+
+def _assign_commit(call, before, effects_path, reply, stdout):
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AssignmentScript("A01", "orch_assign", run, description=__doc__).main())
+    script = AssignmentScript("A01", "orch_assign", run, description=__doc__)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_assign, parse=lambda argv: argv if _claims_assign(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "assign",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_assign_commit,
+                    unknown=lambda call: ("the assignment was not written", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+                                                 "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT")),
+                sys.argv[1:],
+            )
+    sys.exit(answer if answer is not None else script.main())

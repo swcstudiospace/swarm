@@ -29,11 +29,12 @@ import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from types import TracebackType
+from typing import Any, Mapping
 
-from .manifest import get_agent
+from .manifest import agent_slug
 
-SPEC = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
+SPEC: dict[str, Any] = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
 SERVER: str = SPEC["server"]
 # Claude Code's name for every tool of the server; it goes in an agent's `tools:` and in `--allowedTools`.
 CLAUDE_TOOLS = f"mcp__{SERVER}"
@@ -57,7 +58,8 @@ def server_var(surface: str) -> str:
 
 def mcp_config(workspace: str | Path, runtime: str) -> Path:
     """The project file `runtime` reads the substrate entry from."""
-    return Path(workspace) / SPEC["runtimes"][runtime]["path"]
+    path: str = SPEC["runtimes"][runtime]["path"]
+    return Path(workspace) / path
 
 
 def projected_mcp(workspace: str | Path, runtime: str) -> bool:
@@ -106,7 +108,7 @@ def _private_directory(path: Path, st: os.stat_result) -> None:
 
 
 def _open_directory(path: Path, *, create: bool = False, private: bool = False,
-                    created: list | None = None) -> int:
+                    created: list[tuple[int, str, os.stat_result]] | None = None) -> int:
     """Walk from the root with pinned, no-follow directory descriptors, never through an ancestor symlink."""
     path = path.absolute()
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
@@ -290,7 +292,8 @@ class FileTransaction:
             item.committed = True
         self.complete = True
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
+                 tb: TracebackType | None) -> None:
         problems = []
         try:
             if not self.complete:
@@ -376,9 +379,11 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     if surface is None:
         return None, "", f"no substrate surface for agent {agent_id!r}"
     path = None
+    slug: str | None = None  # looked up once, on the first branch that needs it
     if workspace is not None:
         try:
-            path = env_file(workspace, get_agent(agent_id or "")["slug"], e)
+            slug = agent_slug(agent_id or "")
+            path = env_file(workspace, slug, e)
         except KeyError:
             return None, "", f"no agent {agent_id!r} in the manifest"
         try:
@@ -394,10 +399,11 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     given = (e.get(var) or "").strip()
     if valid_token(given):
         return given, f"${var}", ""
-    try:
-        slug = get_agent(agent_id or "")["slug"]
-    except KeyError:
-        slug = ""
+    if slug is None:
+        try:
+            slug = agent_slug(agent_id or "")
+        except KeyError:
+            slug = ""
     if (e.get("SWARM_AGENT_SESSION") or "").strip() == "1" and slug and (e.get("SWARM_AGENT") or "").strip() == slug:
         session_token = (e.get(TOKEN) or "").strip()
         if valid_token(session_token):

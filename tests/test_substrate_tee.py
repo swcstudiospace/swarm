@@ -102,6 +102,7 @@ def _env(tmp_path, monkeypatch):
     for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
         monkeypatch.delenv(k)  # an ambient HTTP_PROXY/NO_PROXY never leaks into a transport test
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.setenv("SWARM_PURE_PYTHON", "1")  # the oracle switch survives the scrub: child scripts import the pure modules
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))  # a tmp dir is never mistaken for a checkout's subdir
     substrate_client.reset()
     tee_mod.reset()
@@ -662,8 +663,10 @@ def test_surfaces_match_agents_json():
 EVENT_KINDS = {"session.start", "prompt", "claim", "tool.call", "file.edit", "shell", "commit", "pr", "handoff", "session.end",
                "note", "warning"}
 _SOURCES = [*sorted((ROOT / "swarm").glob("*.py")), *sorted((ROOT / "scripts").glob("*.py")), *sorted((ROOT / "hooks").glob("*.py"))]
-# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal
-_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py"})
+# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal.
+# scripts/orch_status.py `_emit_ingest_events` replays event types the ingest manifest already recorded; those types were classified at the writer.
+# scripts/orch_plan.py `_plan_commit` replays only `plan.updated` (`_PLAN_EVENTS`), which the script itself emits as a literal (`ctx.emit("plan.updated", ...)`).
+_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py", "scripts/orch_status.py", "scripts/orch_plan.py"})
 
 
 def _emit_type_arg(call: ast.Call) -> ast.expr | None:

@@ -82,7 +82,9 @@ dependencies are open as `waiting`. `await_input` and `begin_handoff` are in the
 One channel, two sinks, both written by `swarm.telemetry.Telemetry`.
 
 **`<swarm_dir>/events.jsonl`** (schema `swarm/schemas/swarm.event.v1.json`). Records are
-`{ts, type, source, correlation_id, task_id, payload, msg_id}`; every payload passes `swarm.redact`.
+`{ts, type, source, correlation_id, task_id, payload, msg_id}`; every payload passes `swarm.redact`. Each record is appended with one
+`write(2)` on an `O_APPEND` descriptor (`swarm.paths.append_text`) and nothing is buffered across calls: an event that `emit` returned
+survives a SIGKILL of the writer, and records from several threads or processes never mix inside a line.
 
 | Type | Payload |
 |---|---|
@@ -118,6 +120,13 @@ One channel, two sinks, both written by `swarm.telemetry.Telemetry`.
   transition, so an in-session run (A01 driving `orch_status.py` through `swarm_transition`/`swarm_ingest`, no
   scheduler process) feeds the same file. A derived writer never replaces a fresh scheduler document whose pid is
   alive.
+- The derived refresh is cheap enough to run after every committed transition (record: `tests/perf/records/14.4/refresh-cost.txt`).
+  `TaskStore.transition` hands it its own connection (`refresh_live(..., conn=...)`); the task rows come without their JSON
+  columns and the transition history is folded inside SQLite (two statements); row objects are built only for the 64 listed
+  runs (the counters, the ordering and the elapsed span still cover every task); and while `live.json` is still the file this
+  process wrote last (same inode, size and mtime) the next `seq` comes from memory instead of reading the file back. Nothing
+  is debounced, no `fsync` is added or removed, and the bytes written for a given store state are unchanged
+  (`tests/test_telemetry_refresh_cost.py` compares them with a frozen copy of the earlier code).
 - A snapshot older than three heartbeats (`3 x SWARM_HEARTBEAT_S`) is stale. `scripts/swarm_live.py` then derives the
   view instead; the bar shows `live.json stale`.
 
@@ -425,6 +434,10 @@ session's token savings chips on the right; row 2: one row per run, worst state 
 <activity>`, or `no subagents running` when idle. Every state has a glyph and a word. The full legend, states, colors,
 token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 
+### 9.5 Use the native claim table
+
+Only a run with hundreds of ready tasks that all declare `notes.claims` gains from it: one scheduling pass over 500 such tasks costs about 5 s of CPU in the Python claim table and about 11 ms in the native one; with few or no claims the claim check is a small part of a pass and the difference is invisible. Build the extension (`pip install .`), make sure `SWARM_PURE_PYTHON` is not `1`, and start the run with `SWARM_CLAIMS_ENGINE=rust` (for example `SWARM_CLAIMS_ENGINE=rust python3 scripts/swarm_run.py ...`). Nothing else changes: the same tasks wait for the same holders (`claim-conflict:<holder>`). A warning from the logger `swarm.claims` on stderr means the run uses the Python table instead (the message names the reason); unset the variable to go back. To see which table a process gets: `SWARM_CLAIMS_ENGINE=rust python3 -c "import swarm.claims as c; print(type(c.make_claim_table()).__name__)"` prints `NativeClaimTable`; `tests/perf/claims_engine.py` measures the cost on your host.
+
 ## 10. Configuration
 
 | Name | Default | Read by | Meaning |
@@ -441,7 +454,7 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `SWARM_STALL_AFTER_S` | 180 | `telemetry.py` | No-activity limit for `stalled` |
 | `SWARM_CANCEL_GRACE_S` | 10 | `swarm_run.py` | Cooperative-cancel wait (see section 4 for the cap) |
 | `SWARM_SHUTDOWN_BUDGET_S` | 15 | `swarm_run.py` | Whole-shutdown budget; set by `autonomous_run.py` from `SWARM_AUTONOMOUS_RUN_GRACE_S` |
-| `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 2 / 120 | `swarm/retry.py`, `swarm/limiter.py` | Backoff base and cap; the cap also bounds `Retry-After` |
+| `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 0.1 / 5 | `swarm/retry.py`; `swarm/limiter.py` | Backoff base and cap. When set, `SWARM_RETRY_CAP_S` also bounds `Retry-After` (its own default there stays 120 s) |
 | `SWARM_RATE_COOLDOWN_S` | 60 | `swarm/limiter.py` | Wait before one slot is added back after a rate limit or a failure circuit trip |
 | `SWARM_FAIL_STREAK` | 3 | `scripts/swarm_run.py` | Consecutive failures of distinct tasks (no success between) that halve the effective parallelism once; `0` disables the circuit; a malformed value is an input error |
 | `SWARM_HANDOVER_MAX_BYTES` | 16384 | `swarm/handover.py` | Size cap of one handover |
@@ -452,6 +465,7 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `SWARM_BAR_REDUCED_MOTION` | unset | bar | `1` freezes the spinner |
 | `SWARM_BAR_IDLE_POLL_MS` | 2000 | `omp/src/swarm_bar.ts` | Period of the idle `stat` watcher of `live.json`; clamped to 500..30000, a malformed value means 2000 |
 | `notes.claims` | none | `select_batch` | Task notes: file claims (section 4) |
+| `SWARM_CLAIMS_ENGINE` | `python` | `swarm/claims.py` (`make_claim_table`, called by `Scheduler`) | Opt-in, default python, no flip: `rust` decides file-claim conflicts in `swarm._native.ClaimTable` through `NativeClaimTable` (same results, held view, first conflict owner and idempotent release as the Python table). Unset, empty or `python` uses Python; any other value warns once and uses Python; `SWARM_PURE_PYTHON=1` wins (one warning); a missing or stale extension falls back when the table is built, a native error later falls back in mid-run keeping the claims held, one warning per reason per process. CPU of 50 single-claim acquires: 2.2 ms Python (11.9 ms on first sight), 0.26 ms native; of 500: 5.2 s and 10.6 ms (`tests/perf/records/14.4/claims-engine.txt`) |
 | `notes.retry_after` | none | `Scheduler._schedule` | Task notes: epoch wall time before which the task is not re-dispatched; written by the scheduler |
 
 A malformed `SWARM_CANCEL_GRACE_S`, `SWARM_SHUTDOWN_BUDGET_S` or `SWARM_FAIL_STREAK` exits 2 with E-INPUT before anything
@@ -462,7 +476,7 @@ Other variables the runtime reads, documented where they belong:
 
 | Name | Default | Read by | Meaning |
 |---|---|---|---|
-| `SWARM_DIR` | `<git toplevel>/.swarm` | `swarm/paths.py`, bar | State dir (made absolute); every file named in this page lives under it |
+| `SWARM_DIR` | `<git toplevel>/.swarm` | `swarm/paths.py`, bar | State dir (made absolute); every file named in this page lives under it. `swarm_dir()` reads the environment per call and remembers one resolution per input (`SWARM_DIR`, the `root` argument, and the cwd where one of them is relative or absent), so a changed value resolves again |
 | `SWARM_ROOT` | the package's repo | `omp/src/bridge.ts` | Repo whose `scripts/` the omp bridge runs; must hold `scripts/orch_plan.py` |
 | `SWARM_DISPATCH_HOLD_MS` | 30 min with a UI, none headless | `omp/src/commands.ts` | How long `/swarm` holds the session; a positive integer |
 | `SWARM_LEASE_TTL_S` / `SWARM_REPLICA` | 900 (30..86400) / `r0` | `swarm/substrate_lease.py`, `swarm/substrate_tee.py` | Substrate lease TTL and replica name; a malformed value is refused when `swarm_run.py` starts |

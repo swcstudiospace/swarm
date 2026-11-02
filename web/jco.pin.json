@@ -1,0 +1,9 @@
+{
+  "package": "@bytecodealliance/jco",
+  "version": "1.39.0",
+  "component": "gsd-core",
+  "component_pin": "crates/gsd-sandbox/guest-module.sha256",
+  "component_sha256": "91b0970ebe43fb7a80e5c6df68abcf6516572a766260e9780fd6f3c199b9a175",
+  "checked_on": "2026-10-30",
+  "note": "The transpile refuses any other jco version and any component whose SHA-256 differs from component_sha256. Never use latest."
+}

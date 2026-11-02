@@ -1,0 +1,25 @@
+[package]
+name = "gsd-route"
+version = "0.1.0"
+edition = "2021"
+description = "Pure route logic for the GSD-Core Rust engine: Python-shaped JSON and Task Store row shaping, with no database access"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["development-tools"]
+keywords = ["adapter", "json", "route", "migration"]
+
+[features]
+default = ["write-routes", "write-routes-2", "host-routes"]
+# The guest `transition` mode: `invoke::core_invoke` and `transition_wire`. On by default for the hosts. The sandboxed guest
+# depends on this crate with `default-features = false` and turns it on only with its own `write-routes` feature, so the
+# default guest compiles none of this code (even dead code moves the bytes of the guest: the string pool is laid out
+# across crates, and the guest digest is pinned).
+write-routes = []
+# The pure planners of the second guest batch (P2: approval facts, result parsing, reconcile, ingest). On by default for the hosts,
+# off for the guest, so they can change until their own pin without moving the digest of the first batch.
+write-routes-2 = []
+# Host-only route code (argv grammar of the host routes). Never compiled into the guest.
+host-routes = []
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }

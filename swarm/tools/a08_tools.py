@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Hashable, Iterable
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -23,12 +25,12 @@ NAME_MAX_LENGTH = 80
 _SNAKE_CASE = re.compile(r"[a-z0-9_]+")
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _first_duplicate(values):
-    seen: set = set()
+def _first_duplicate(values: Iterable[Hashable]) -> Hashable | None:
+    seen: set[Hashable] = set()
     for value in values:
         if value in seen:
             return value
@@ -53,8 +55,8 @@ def _flake_state(outcomes: list[str]) -> str:
     return "quarantine" if fails >= FLAKE_QUARANTINE_FAILS else "watch"
 
 
-def flaky_classify(payload: dict) -> dict:
-    def work() -> dict:
+def flaky_classify(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         histories = payload["histories"]
         duplicate = _first_duplicate(item["test"] for item in histories)
         if duplicate is not None:
@@ -81,8 +83,8 @@ def flaky_classify(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def criteria_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def criteria_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         criteria = payload["criteria"]
         tests = payload["tests"]
         duplicate = _first_duplicate(criteria)
@@ -105,8 +107,8 @@ def criteria_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def mutation_gate(payload: dict) -> dict:
-    def work() -> dict:
+def mutation_gate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         killed = payload["killed"]
         survived = payload["survived"]
         timeout = payload.get("timeout", 0)
@@ -129,8 +131,8 @@ def mutation_gate(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def runtime_p95(payload: dict) -> dict:
-    def work() -> dict:
+def runtime_p95(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         durations = sorted(payload["durations_s"])
         count = len(durations)
         rank = (95 * count + 99) // 100  # nearest-rank: ceil(0.95 * count), integer arithmetic
@@ -149,8 +151,8 @@ def runtime_p95(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def skip_ratio(payload: dict) -> dict:
-    def work() -> dict:
+def skip_ratio(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         tests = payload["tests"]
         duplicate = _first_duplicate(test["name"] for test in tests)
         if duplicate is not None:
@@ -168,8 +170,8 @@ def skip_ratio(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def defect_escape_rate(payload: dict) -> dict:
-    def work() -> dict:
+def defect_escape_rate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         defects = payload["defects"]
         duplicate = _first_duplicate(defect["id"] for defect in defects)
         if duplicate is not None:
@@ -194,8 +196,8 @@ def defect_escape_rate(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def retry_budget(payload: dict) -> dict:
-    def work() -> dict:
+def retry_budget(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         runs = payload["runs"]
         duplicate = _first_duplicate(run["test"] for run in runs)
         if duplicate is not None:
@@ -213,8 +215,8 @@ def retry_budget(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def name_convention(payload: dict) -> dict:
-    def work() -> dict:
+def name_convention(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         prefix = payload["prefix"]
         limit = payload.get("max_length", NAME_MAX_LENGTH)
         violations: list[str] = []
@@ -257,12 +259,12 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _DERIVED_KEY_HEX = 16
 
 
-def _run_status(runs: dict, tier: str) -> str:
+def _run_status(runs: dict[str, str], tier: str) -> str:
     return runs.get(tier) or "skipped:not-selected"
 
 
-def tier_plan(payload: dict) -> dict:
-    def work() -> dict:
+def tier_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         risk = payload["risk_class"]
         required_by_risk = REQUIRED_TIERS.get(risk)
         if required_by_risk is None:
@@ -290,14 +292,14 @@ def tier_plan(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def finding_shape_check(payload: dict) -> dict:
-    def work() -> dict:
+def finding_shape_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         findings = payload["findings"]
-        violations: list[dict] = []
+        violations: list[dict[str, Any]] = []
         seen: set[str] = set()
 
         def flag(index: int, fid: str, field: str, message: str) -> None:
@@ -343,13 +345,13 @@ def _derived_key(component: str, ac_ref: str, title: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:_DERIVED_KEY_HEX]
 
 
-def defect_dedupe(payload: dict) -> dict:
-    def work() -> dict:
+def defect_dedupe(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         defects = payload["defects"]
         duplicate = _first_duplicate(defect["defect_id"] for defect in defects)
         if duplicate is not None:
             return _invalid("defects", f"duplicate defect_id {duplicate}")
-        groups: dict[str, list[dict]] = {}
+        groups: dict[str, list[dict[str, Any]]] = {}
         for index, defect in enumerate(defects):
             if not _normalize_title(defect["title"]):
                 return _invalid("defects", f"defect {index} has no title text")

@@ -14,6 +14,7 @@ own), and writes a signed `gate.verdict` (gate=review) envelope to
 from __future__ import annotations
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -129,7 +130,7 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
                     val = m.group(m.lastindex or 0)
                     if m.lastindex and _entropy(val) < 3.2:
                         continue
-                    add("major", "secret", "secret-looking string added (value redacted)", loc, val[:4] + "…")
+                    add("major", "secret", "secret-looking string added (value redacted)", loc, f"value not recorded ({len(val)} chars)")
     if src_changed and not tests_changed:
         add("minor", "coverage", "source files changed but no test files changed", "tests/")
     return findings
@@ -190,5 +191,53 @@ def add_args(p):
     p.add_argument("--max-lines", type=int, default=800, help="changed-lines threshold per file for a major 'size' finding")
 
 
+# Engine selector (swarm/engine_select.py). The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::rev_gate`
+# accepts (`--json`, not `--dry-run`) and leaves every other argv to this body. `ENGINE_ROUTES` is the seam a route registers in.
+# The route writes (the binary records the review gate's verdict in issue_gate's transaction), so it is a write route: Python
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"XDG_CONFIG_HOME", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION"}
+    if route != "rev-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_rev(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _rev_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A09", "rev_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A09", "rev_gate", run, description=__doc__, add_args=add_args)
+    answer = None
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
+        from swarm import engine_select
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_rev, parse=lambda argv: argv if _claims_rev(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "rev-gate",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_rev_commit,
+                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
+                                          "verdicts/ before running the gate again", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
+    sys.exit(answer if answer is not None else script.main())

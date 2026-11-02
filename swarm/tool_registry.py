@@ -13,7 +13,9 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any, TypeGuard
 
 from swarm.tools.support import Busy, StillRunning, Waiting, caller_scope, invoke_bounded
 
@@ -85,11 +87,12 @@ REQUIRED_FIELDS = (
 )
 
 
-def load_document(path: Path | None = None) -> dict:
-    return json.loads(Path(path or AGENTS_FILE).read_text(encoding="utf-8"))
+def load_document(path: Path | None = None) -> dict[str, Any]:
+    document: dict[str, Any] = json.loads(Path(path or AGENTS_FILE).read_text(encoding="utf-8"))
+    return document
 
 
-def iter_entries(data: dict):
+def iter_entries(data: dict[str, Any]) -> Iterator[tuple[str, object]]:
     """Yield (container, tool) for lane tools then shared tools. container is an agent id or 'shared'."""
     for agent in data.get("agents") or []:
         if not isinstance(agent, dict):
@@ -126,7 +129,7 @@ def validate_registry(path: Path | None = None, *, root: Path | None = None) -> 
             errors.append(f"agent {agent.get('id')}: registered_tools must be a list")
 
     seen: dict[str, str] = {}
-    ready: list[tuple[str, dict]] = []
+    ready: list[tuple[str, dict[str, Any]]] = []
     for container, tool in iter_entries(data):
         if not isinstance(tool, dict):
             errors.append(f"{container}: tool entry must be an object")
@@ -192,7 +195,7 @@ def _audit_call(name: object, caller: object, payload: object, result: object, s
 
         state = result.get("state") if isinstance(result, dict) else None
         state = state if isinstance(state, str) else "DEPENDENCY_UNAVAILABLE"
-        body: dict = {
+        body: dict[str, object] = {
             "tool": _audit_id(name) or "",
             "caller": _audit_id(caller) or "",
             "state": state,
@@ -219,8 +222,8 @@ def call_tool(
     *,
     timeout_s: float | None = None,
     path: Path | None = None,
-    data: dict | None = None,
-) -> dict:
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Call one registered tool and record it in the run log (`swarm.tool.call`, local only). Unregistered names do not
     import a handler.
 
@@ -229,7 +232,7 @@ def call_tool(
     """
     started = time.monotonic()
     existed = _state_dir_exists()
-    seen: dict = {}
+    seen: dict[str, object] = {}
     result = _call_tool(name, caller, payload, timeout_s=timeout_s, path=path, data=data, seen=seen)
     if existed or seen.get("tier") == "WRITE":  # a READ call never creates the state dir, not even for its own audit row
         _audit_call(name, caller, payload, result, started)
@@ -252,9 +255,9 @@ def _call_tool(
     *,
     timeout_s: float | None = None,
     path: Path | None = None,
-    data: dict | None = None,
-    seen: dict | None = None,
-) -> dict:
+    data: dict[str, Any] | None = None,
+    seen: dict[str, object] | None = None,
+) -> dict[str, Any]:
     if not isinstance(name, str) or not name:
         return {"state": "INVALID_INPUT", "field": "name", "message": "tool name is required"}
     if data is None:
@@ -298,7 +301,7 @@ def _call_tool(
     return _finish(tool, raw)
 
 
-def tool_tier(tool: dict) -> str:
+def tool_tier(tool: dict[str, Any]) -> str:
     """The declared side-effect tier; an absent field means READ."""
     tier = tool.get("side_effect_tier")
     return tier if isinstance(tier, str) else DEFAULT_TIER
@@ -359,19 +362,19 @@ def _schema_file_errors() -> list[str]:
     return []
 
 
-def find_tool(data: dict, name: str) -> dict | None:
+def find_tool(data: dict[str, Any], name: str) -> dict[str, Any] | None:
     """The registry entry for a tool name, else None."""
     return _find(data, name)
 
 
-def _find(data: dict, name: str) -> dict | None:
+def _find(data: dict[str, Any], name: str) -> dict[str, Any] | None:
     for _container, tool in iter_entries(data):
         if isinstance(tool, dict) and tool.get("name") == name:
             return tool
     return None
 
 
-def _check_tool(tool: dict, container: str, agent_ids: set, root: Path) -> tuple[list[str], bool]:
+def _check_tool(tool: dict[str, Any], container: str, agent_ids: set[object], root: Path) -> tuple[list[str], bool]:
     name = tool.get("name") if isinstance(tool.get("name"), str) else "?"
     owner = tool.get("owner") if isinstance(tool.get("owner"), str) else "?"
     where = f"tool {name} (owner {owner})"
@@ -413,7 +416,7 @@ def _check_tool(tool: dict, container: str, agent_ids: set, root: Path) -> tuple
     return errors, not structural
 
 
-def _check_tier(where: str, tool: dict) -> list[str]:
+def _check_tier(where: str, tool: dict[str, Any]) -> list[str]:
     if "side_effect_tier" not in tool:
         return []
     tier = tool["side_effect_tier"]
@@ -428,7 +431,7 @@ def _check_tier(where: str, tool: dict) -> list[str]:
     return []
 
 
-def _range_error(where: str, spec) -> str | None:
+def _range_error(where: str, spec: object) -> str | None:
     if not isinstance(spec, dict):
         return f"agents.json: {where} must be an object with integer min and max"
     low, high = spec.get("min"), spec.get("max")
@@ -437,7 +440,7 @@ def _range_error(where: str, spec) -> str | None:
     return None
 
 
-def _policy_errors(data: dict, agents: list) -> list[str]:
+def _policy_errors(data: dict[str, Any], agents: list[object]) -> list[str]:
     """capability_policy shape, then per-agent tool counts against it (D3)."""
     policy = data.get("capability_policy")
     if not isinstance(policy, dict):
@@ -456,6 +459,8 @@ def _policy_errors(data: dict, agents: list) -> list[str]:
         errors.append("agents.json: capability_policy.tools.enforce must be true or false")
     if errors:
         return errors
+    if not isinstance(tools_policy, dict):  # unreachable: _range_error accepted no other value for capability_policy.tools
+        return errors
     high, low = tools_policy["max"], tools_policy["min"]
     enforce = tools_policy.get("enforce", True)
     for agent in agents:
@@ -469,7 +474,7 @@ def _policy_errors(data: dict, agents: list) -> list[str]:
     return errors
 
 
-def _baseline_errors(data: dict, agents: list) -> list[str]:
+def _baseline_errors(data: dict[str, Any], agents: list[object]) -> list[str]:
     """shared_baseline: every listed tool is a shared tool that all agents may call (section 8)."""
     baseline = data.get("shared_baseline")
     if not isinstance(baseline, dict):
@@ -514,7 +519,7 @@ _SCHEMA_BY_TYPE = {
 }
 
 
-def _check_schemas(where: str, tool: dict) -> list[str]:
+def _check_schemas(where: str, tool: dict[str, Any]) -> list[str]:
     errors = []
     for key in ("input_schema", "output_schema"):
         schema = tool.get(key)
@@ -527,11 +532,11 @@ def _check_schemas(where: str, tool: dict) -> list[str]:
     return errors
 
 
-def _schema_keyword_errors(where: str, schema: dict) -> list[str]:
+def _schema_keyword_errors(where: str, schema: dict[str, Any]) -> list[str]:
     expected = schema.get("type")
     # A list or other non-string is unhashable; never use it as a dict key.
     supported = isinstance(expected, str) and expected in _SCHEMA_BY_TYPE
-    allowed = (_SCHEMA_COMMON | _SCHEMA_BY_TYPE[expected]) if supported else _SCHEMA_COMMON
+    allowed = (_SCHEMA_COMMON | _SCHEMA_BY_TYPE[expected]) if supported and isinstance(expected, str) else _SCHEMA_COMMON
     unknown = sorted(key for key in schema if key not in allowed)
     errors = []
     if not supported:
@@ -559,7 +564,7 @@ def _schema_keyword_errors(where: str, schema: dict) -> list[str]:
     return errors
 
 
-def _keyword_value_errors(where: str, schema: dict) -> list[str]:
+def _keyword_value_errors(where: str, schema: dict[str, Any]) -> list[str]:
     errors = []
     for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
         if key in schema and not _is_number(schema[key]):
@@ -582,15 +587,15 @@ def _keyword_value_errors(where: str, schema: dict) -> list[str]:
     return errors
 
 
-def _is_number(value) -> bool:
+def _is_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _is_count(value) -> bool:
+def _is_count(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _check_errors(where: str, errors_field) -> list[str]:
+def _check_errors(where: str, errors_field: object) -> list[str]:
     if not isinstance(errors_field, list):
         return [f"{where}: errors must list {', '.join(ERROR_STATES)}"]
     if set(errors_field) != set(ERROR_STATES) or len(errors_field) != len(ERROR_STATES):
@@ -598,7 +603,7 @@ def _check_errors(where: str, errors_field) -> list[str]:
     return []
 
 
-def _check_entrypoint(where: str, tool: dict, root: Path) -> list[str]:
+def _check_entrypoint(where: str, tool: dict[str, Any], root: Path) -> list[str]:
     errors = []
     entrypoint = tool.get("entrypoint")
     handler = tool.get("handler")
@@ -627,7 +632,7 @@ def _handler_file(handler: str) -> str | None:
     return f"swarm/tools/{leaf}.py"
 
 
-def _check_handler(tool: dict, root: Path) -> list[str]:
+def _check_handler(tool: dict[str, Any], root: Path) -> list[str]:
     where = f"tool {tool.get('name')} (owner {tool.get('owner')})"
     entrypoint = tool.get("entrypoint")
     handler = tool.get("handler")
@@ -645,7 +650,7 @@ def _check_handler(tool: dict, root: Path) -> list[str]:
     return []
 
 
-def _check_examples(where: str, tool: dict, agent_ids: set) -> list[str]:
+def _check_examples(where: str, tool: dict[str, Any], agent_ids: set[object]) -> list[str]:
     examples = tool.get("examples")
     if not isinstance(examples, dict):
         return [f"{where}: examples must be an object with {', '.join(EXAMPLE_KEYS)}"]
@@ -673,7 +678,7 @@ def _check_examples(where: str, tool: dict, agent_ids: set) -> list[str]:
     return errors
 
 
-def _payload_errors(schema: dict, payload: dict) -> list[tuple[str, str]]:
+def _payload_errors(schema: dict[str, Any], payload: dict[str, Any]) -> list[tuple[str, str]]:
     if schema.get("type") not in (None, "object"):
         return [("payload", "input_schema type must be object")]
     props = schema.get("properties") or {}
@@ -697,7 +702,7 @@ def _payload_errors(schema: dict, payload: dict) -> list[tuple[str, str]]:
     return errors
 
 
-def _value_error(spec: dict, value) -> str | None:
+def _value_error(spec: dict[str, Any], value: object) -> str | None:
     """Enforce declared type, numeric bounds, string length, array items, and nested objects.
 
     ``items``, ``minItems``, ``minimum``, and nested ``required`` are applied here.
@@ -711,7 +716,8 @@ def _value_error(spec: dict, value) -> str | None:
         "object": _object_error,
         "array": _array_error,
     }
-    checker = checkers.get(spec.get("type")) if isinstance(spec.get("type"), str) else None
+    kind = spec.get("type")
+    checker = checkers.get(kind) if isinstance(kind, str) else None
     if checker is not None:
         message = checker(spec, value)
         if message:
@@ -723,7 +729,7 @@ def _value_error(spec: dict, value) -> str | None:
     return None
 
 
-def _string_error(spec: dict, value) -> str | None:
+def _string_error(spec: dict[str, Any], value: object) -> str | None:
     if not isinstance(value, str):
         return "expected string"
     if _is_count(spec.get("minLength")) and len(value) < spec["minLength"]:
@@ -733,13 +739,13 @@ def _string_error(spec: dict, value) -> str | None:
     return None
 
 
-def _integer_error(spec: dict, value) -> str | None:
+def _integer_error(spec: dict[str, Any], value: object) -> str | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return "expected integer"
     return _bound_error(spec, value)
 
 
-def _number_error(spec: dict, value) -> str | None:
+def _number_error(spec: dict[str, Any], value: object) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "expected number"
     if isinstance(value, float) and not math.isfinite(value):
@@ -749,13 +755,13 @@ def _number_error(spec: dict, value) -> str | None:
     return _bound_error(spec, value)
 
 
-def _boolean_error(_spec: dict, value) -> str | None:
+def _boolean_error(_spec: dict[str, Any], value: object) -> str | None:
     if not isinstance(value, bool):
         return "expected boolean"
     return None
 
 
-def _object_error(spec: dict, value) -> str | None:
+def _object_error(spec: dict[str, Any], value: object) -> str | None:
     if not isinstance(value, dict):
         return "expected object"
     nested = _payload_errors(spec, value)
@@ -765,7 +771,7 @@ def _object_error(spec: dict, value) -> str | None:
     return None
 
 
-def _array_error(spec: dict, value) -> str | None:
+def _array_error(spec: dict[str, Any], value: object) -> str | None:
     if not isinstance(value, list):
         return "expected array"
     min_items = spec.get("minItems")
@@ -783,7 +789,7 @@ def _array_error(spec: dict, value) -> str | None:
     return None
 
 
-def _bound_error(spec: dict, value: int | float) -> str | None:
+def _bound_error(spec: dict[str, Any], value: int | float) -> str | None:
     minimum = spec.get("minimum")
     exclusive_minimum = spec.get("exclusiveMinimum")
     maximum = spec.get("maximum")
@@ -799,10 +805,10 @@ def _bound_error(spec: dict, value: int | float) -> str | None:
     return None
 
 
-def _import_handler(handler: str):
+def _import_handler(handler: str) -> Callable[[dict[str, Any]], object]:
     module_name, func_name = handler.split(":", 1)
     module = importlib.import_module(module_name)
-    fn = getattr(module, func_name)
+    fn: Callable[[dict[str, Any]], object] = getattr(module, func_name)
     if not callable(fn):
         raise TypeError(f"{handler} is not callable")
     return fn
@@ -821,7 +827,7 @@ def output_limit() -> int:
     return min(max(value, OUTPUT_LIMIT_FLOOR), OUTPUT_LIMIT_CEILING)
 
 
-def _within_limits(result: dict) -> dict:
+def _within_limits(result: dict[str, Any]) -> dict[str, Any]:
     """The last gate on a result (SEC-02): it must be strict JSON (no NaN or Infinity, which most parsers refuse) and no
     larger than `output_limit()`. An oversized result is WITHHELD, not truncated: a half result is worse than none for a
     gate or a handover. A SUCCESS or PARTIAL_SUCCESS becomes a PARTIAL_SUCCESS with completed_fraction 0 so the caller
@@ -842,11 +848,11 @@ def _within_limits(result: dict) -> dict:
     return result
 
 
-def _finish(tool: dict, raw) -> dict:
+def _finish(tool: dict[str, Any], raw: object) -> dict[str, Any]:
     return _within_limits(_finish_state(tool, raw))
 
 
-def _finish_state(tool: dict, raw) -> dict:
+def _finish_state(tool: dict[str, Any], raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict) or raw.get("state") not in TERMINAL_STATES:
         return {"state": "DEPENDENCY_UNAVAILABLE", "message": "handler did not return a terminal state"}
     state = raw["state"]

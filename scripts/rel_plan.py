@@ -14,6 +14,7 @@ exactly that task's notes.gate_for targets, each row from that target's own find
 """
 from __future__ import annotations
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,14 @@ def build_plan(release_id: str, risk: str, tasks: list[str], gates: list[str], a
                                   "deploy.telemetry verdict == rollback-suggested", "incident.alert sev<=2 naming this release",
                                   "monitoring.degraded broadcast (fail-closed: halt at current step)"],
             "tasks": tasks, "artifacts": artifacts, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def _gate_state(gate: str, per_task: dict) -> str:
+    """P4-05: a gate's signed run state over the evaluated targets. all() over no targets is true, so a gate that evaluated
+    nothing reports skipped, never pass."""
+    if not per_task:
+        return "skipped:no-task"
+    return "pass" if all(t["gates"].get(gate, "ok") == "ok" for t in per_task.values()) else "fail"
 
 
 def run(args, ctx) -> dict:
@@ -142,7 +151,7 @@ def run(args, ctx) -> dict:
     release_id = check_task_id(args.release_id or f"REL-{primary}", "release id")  # a file name below (CR-01)
     gates = sorted({g for t in per_task.values() for g in t["required"]}) or [g for g in GATES_BY_RISK[risk] if g != "release"]
     plan = build_plan(release_id, risk, ids, gates, [a for a in artifacts if a])
-    runs = {g: ("pass" if all(t["gates"].get(g, "ok") == "ok" for t in per_task.values()) else "fail") for g in gates}
+    runs = {g: _gate_state(g, per_task) for g in gates}
     runs["freeze"] = "active" if frozen else "none"
     # a release gate task records each target's verdict from that target's own findings plus any freeze (D-13)
     env, recorded = issue_gate(ctx, gate="release", agent_id="A12@local", findings=findings, runs=runs,
@@ -166,5 +175,54 @@ def add_args(p):
     p.add_argument("--unfreeze", action="store_true", help="remove an active freeze (declaring authority only)")
 
 
+# Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves `--json` except `--dry-run`, which stays
+# this body so the inert-route seam in tests/test_engine_select.py still holds.
+# The route writes (the binary records the release gate's verdicts in issue_gate's transaction), so it is a write route: Python
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    if route != "rel-plan":
+        raise KeyError(route)
+    names = set(BINARY_ENV_NAMES) | {"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION",
+                                     "XDG_CONFIG_HOME", "SWARM_DRYRUN_FAIL"}
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_rel(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _rel_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A12", "rel_plan", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A12", "rel_plan", run, description=__doc__, add_args=add_args)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_rel, parse=lambda argv: argv if _claims_rel(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "rel-plan",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_rel_commit,
+                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
+                                          "verdicts/ before running the gate again", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
+    sys.exit(answer if answer is not None else script.main())

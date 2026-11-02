@@ -16,13 +16,17 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Callable
 from decimal import Decimal
+from types import ModuleType
+from typing import Any
 
 from swarm.scan_status import incomplete_findings
 from swarm.tools.support import respond, script
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
 MAX_FINDINGS = 200
+MAX_BASE_WALK_STEPS = 10_000  # steps per _inherits call (one per base-contract visit): a cyclic base graph fails as INVALID_INPUT
 
 # --------------------------------------------------------------------------------------------------------------------
 # Keccak-256 (the pre-NIST padding Ethereum uses: 0x01 domain byte, not SHA3's 0x06). Verified in the tests against
@@ -118,7 +122,7 @@ def _text(text: str) -> str:
     return text if len(text) <= 360 else text[:357] + "..."
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": _text(message)}
 
@@ -128,27 +132,27 @@ def _short(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _finding(rule: str, severity: str, summary: str) -> dict:
+def _finding(rule: str, severity: str, summary: str) -> dict[str, Any]:
     return {"id": rule, "severity": severity, "summary": _text(summary)}
 
 
-def _incomplete_source(source: str, analysed: int) -> list[dict]:
+def _incomplete_source(source: str, analysed: int) -> list[dict[str, Any]]:
     """A major scan/incomplete finding when the Solidity source does not parse (truncated, or a declaration outside every contract
     body): the handler then reads only part of it, so the verdict fails. Only labels are reported, never the source text."""
     problems = _lint().source_problems(source)
     return [_finding(item["id"], item["severity"], item["summary"]) for item in incomplete_findings(problems, analysed)] if problems else []
 
 
-def _call_depth_bounded(work, stopped: dict):
+def _call_depth_bounded(work: Callable[[], dict[str, Any]], stopped: dict[str, Any]) -> Callable[[], dict[str, Any]]:
     """`work`, with the interpreter's recursion limit turned into a stop: a call walk past the limit returns `stopped` (its verdict
     fails) with a scan-incomplete major finding naming the limit, as a19's $ref walk stops, never as an exception."""
 
-    def bounded() -> dict:
+    def bounded() -> dict[str, Any]:
         try:
             return work()
         except RecursionError:
@@ -160,23 +164,25 @@ def _call_depth_bounded(work, stopped: dict):
     return bounded
 
 
-def _finish(findings: list[dict]) -> tuple[list[dict], int]:
+def _finish(findings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     """Findings sorted (worst first, then id, then text) and capped at MAX_FINDINGS; the second value is the uncapped count."""
     ordered = sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
     return ordered[:MAX_FINDINGS], len(ordered)
 
 
-def _worst(findings: list[dict]) -> int:
+def _worst(findings: list[dict[str, Any]]) -> int:
     return max((SEVERITY_RANK[f["severity"]] for f in findings), default=0)
 
 
-def _lint():
+def _lint() -> ModuleType:
     """scripts/sol_contract_lint.py: Solidity reader, guard/event analysis and pragma rules shared with the lint script."""
     return script("sol_contract_lint")
 
 
 def _split_top(text: str) -> list[str]:
-    parts, depth, cur = [], 0, []
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
     for ch in text:
         if ch in "([":
             depth += 1
@@ -269,9 +275,9 @@ def _checksum_ok(address: str) -> bool:
     return all(c.isupper() == (int(digest[i], 16) >= 8) for i, c in enumerate(body) if c.isalpha())
 
 
-def _entries(field: str, items: list[dict]):
+def _entries(field: str, items: list[dict[str, Any]]) -> dict[Any, Any]:
     """Validated ABI entries keyed by (kind, signature); an INVALID_INPUT dict on the first problem."""
-    keyed: dict[tuple[str, str], dict] = {}
+    keyed: dict[tuple[str, str], dict[str, Any]] = {}
     for i, item in enumerate(items):
         kind, signature = item["kind"], item["signature"]
         err = _sig_error(signature)
@@ -296,12 +302,12 @@ def _entries(field: str, items: list[dict]):
 # --------------------------------------------------------------------------------------------------------------------
 
 
-def selector_check(payload: dict) -> dict:
+def selector_check(payload: dict[str, Any]) -> dict[str, Any]:
     """4-byte selectors (keccak256 of the canonical signature), event topic0, the ERC-165 interface id (XOR of the
     selectors) and clashes: two signatures with one selector, a proxy function that shadows or clashes with an
     implementation function, a declared selector constant that does not match its signature."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         functions = payload["functions"]
         events = payload.get("events", [])
         others = payload.get("other_functions", [])
@@ -317,7 +323,7 @@ def selector_check(payload: dict) -> dict:
                 return _invalid("expected_selectors", f"expected_selectors[{i}] {item['signature']!r}: {err}")
             if not _is_hex(item["selector"], 4):
                 return _invalid("expected_selectors", f"expected_selectors[{i}].selector must be 0x followed by 8 hex digits")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         unique = sorted(set(functions))
         for signature in sorted({s for s in functions if functions.count(s) > 1}):
             findings.append(_finding("SEL-DUPLICATE", "minor", f"{signature} is listed {functions.count(signature)} times"))
@@ -380,18 +386,18 @@ def _mutability_change(old: str, new: str) -> str | None:
     return "minor"
 
 
-def abi_diff(payload: dict) -> dict:
+def abi_diff(payload: dict[str, Any]) -> dict[str, Any]:
     """Breaking changes between two ABIs: removed or re-typed functions (the selector changes), stateMutability
     changes, return-type changes, removed or re-typed events, flipped `indexed` flags (the topic layout changes)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         old = _entries("old_abi", payload["old_abi"])
         if "state" in old:
             return old
         new = _entries("new_abi", payload["new_abi"])
         if "state" in new:
             return new
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         added = removed = changed = 0
         labels = {"function": ("FN", "function", "blocker"), "event": ("EVENT", "event", "major"), "error": ("ERROR", "error", "minor")}
         for kind, (prefix, noun, gone_severity) in labels.items():
@@ -465,7 +471,7 @@ def _comparable_type(type_id: str) -> str:
 _TOKEN = re.compile(r"[\w$.:()<>,\[\]/#@~+-]*\Z")
 
 
-def _layout(field: str, items: list[dict]):
+def _layout(field: str, items: list[dict[str, Any]]) -> list[dict[str, Any]] | dict[str, Any]:
     """Validated variables of a solc storageLayout (label, slot, offset, type, numberOfBytes) or an INVALID_INPUT dict."""
     variables, seen = [], set()
     for i, item in enumerate(items):
@@ -491,30 +497,30 @@ def _layout(field: str, items: list[dict]):
     return ordered
 
 
-def _where(v: dict) -> str:
+def _where(v: dict[str, Any]) -> str:
     return f"slot {v['slot']} offset {v['offset']}"
 
 
-def storage_layout(payload: dict) -> dict:
+def storage_layout(payload: dict[str, Any]) -> dict[str, Any]:
     """Upgrade compatibility of two solc storage layouts (`solc --storage-layout`): a variable must keep its slot,
     offset, type and size; deleting, moving, retyping or inserting before existing variables corrupts proxy state; new
     variables go after the old end or into a `__gap` (an array labelled `__gap`/`__gap_*`; its end may not grow). Struct,
     contract and enum AST ids are ignored and a contract type equals `address` (as in OpenZeppelin Upgrades). Heuristic over
     top-level variables: struct members are not compared."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         old = _layout("old_layout", payload["old_layout"])
         if isinstance(old, dict):
             return old
         new = _layout("new_layout", payload["new_layout"])
         if isinstance(new, dict):
             return new
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         new_by_key = {v["key"]: v for v in new}
         new_by_start = {v["start"]: v for v in new}
         old_keys = {v["key"] for v in old}
         old_end = max(v["end"] for v in old)
-        matched: set = set()
+        matched: set[tuple[str, str]] = set()
         for o in old:
             if o["gap"]:
                 continue
@@ -694,13 +700,13 @@ _ERC165_EXTENSIONS = {
 _MUTABILITY_OK = {"view": ("view", "pure"), "write": ("nonpayable",), "write_pay": ("nonpayable", "payable")}
 
 
-def erc_conformance(payload: dict) -> dict:
+def erc_conformance(payload: dict[str, Any]) -> dict[str, Any]:
     """Required functions (mutability, return types), events (indexed flags) and ERC-165 ids of an ERC-20, 721, 1155,
     4626 (includes ERC-20 and, as EIP-4626 requires, its name/symbol/decimals) or 2612 implementation. Return types and
     `indexed` are compared only when supplied. `interface_id` is the XOR of the selectors of the standard's own functions: the
     published ERC-165 id for 721 and 1155 only (ERC-4626 and ERC-2612 publish none; the value is a convenience, not a standard)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         standard = payload["standard"]
         abi = _entries("abi", payload["abi"])
         if "state" in abi:
@@ -711,7 +717,7 @@ def erc_conformance(payload: dict) -> dict:
                 if not _is_hex(value, 4):
                     return _invalid("erc165_ids", f"erc165_ids[{i}] must be 0x followed by 8 hex digits")
         functions, events = _ERC_TABLE[standard]
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         missing = 0
         interface_id = 0
         for row in functions:
@@ -775,7 +781,7 @@ def erc_conformance(payload: dict) -> dict:
 # --------------------------------------------------------------------------------------------------------------------
 
 
-def _selected_contracts(payload: dict, field_name: str = "contract"):
+def _selected_contracts(payload: dict[str, Any], field_name: str = "contract") -> tuple[Any, list[dict[str, Any]]] | dict[str, Any]:
     parsed = _lint().parse_source(payload["source"])
     concrete = [c for c in parsed if c["kind"] == "contract"]
     if not concrete:
@@ -789,23 +795,46 @@ def _selected_contracts(payload: dict, field_name: str = "contract"):
     return parsed, concrete
 
 
-def _inherits(contract: dict, by_name: dict[str, dict], marker: str, seen: frozenset = frozenset()) -> tuple[bool, bool]:
+class _BaseWalkTooLarge(Exception):
+    """The base-contract walk took more than MAX_BASE_WALK_STEPS steps: a cyclic or very large inheritance graph."""
+
+
+def _inherits(contract: dict[str, Any], by_name: dict[str, dict[str, Any]], marker: str) -> tuple[bool, bool]:
     """(inherits a base whose name contains marker, some base could not be resolved in this source)."""
-    unresolved = False
+    found, unresolved, _ = _walk_bases(contract, by_name, marker, frozenset(), {}, [MAX_BASE_WALK_STEPS])
+    return found, unresolved
+
+
+def _walk_bases(contract: dict[str, Any], by_name: dict[str, dict[str, Any]], marker: str, seen: frozenset[str],
+                done: dict[str, bool], steps: list[int]) -> tuple[bool, bool, bool]:
+    """`_inherits` with its walk state: (found, unresolved, cut), where cut is True when a base already on the walk path (`seen`)
+    was named. A base walked without a cut has no cycle below it, so its result does not depend on the path that reached it and
+    is kept in `done`: a diamond of inheritance is walked once, not once per path."""
+    steps[0] -= 1
+    if steps[0] < 0:
+        raise _BaseWalkTooLarge()
+    unresolved = cut = False
     for base in contract["bases"]:
         if marker in base:
-            return True, False
+            return True, False, False
         if base in by_name and base not in seen:
-            found, unknown = _inherits(by_name[base], by_name, marker, seen | {contract["name"]})
+            if base in done:
+                unresolved = unresolved or done[base]
+                continue
+            found, unknown, inner_cut = _walk_bases(by_name[base], by_name, marker, seen | {contract["name"]}, done, steps)
             if found:
-                return True, False
+                return True, False, False
             unresolved = unresolved or unknown
+            cut = cut or inner_cut
+            if not inner_cut:
+                done[base] = unknown
         else:
             unresolved = True
-    return False, unresolved
+            cut = cut or base in seen
+    return False, unresolved, cut
 
 
-def upgrade_safety(payload: dict) -> dict:
+def upgrade_safety(payload: dict[str, Any]) -> dict[str, Any]:
     """Proxy-implementation hazards in Solidity source, following the OpenZeppelin Upgrades plugin rules: constructor
     state, missing _disableInitializers(), unguarded initialize*, selfdestruct, delegatecall, inline state
     initializers, immutables, a missing __gap in abstract bases, and UUPS: UUPSUpgradeable inheritance and an
@@ -813,7 +842,7 @@ def upgrade_safety(payload: dict) -> dict:
     (the plugin also wants `@custom:oz-upgrades-unsafe-allow constructor` on it; run the plugin for that check) and the
     __gap rules are advice (ERC-7201 namespaced storage replaces a gap). Heuristic: reads text, resolves no imports."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         picked = _selected_contracts(payload)
         if isinstance(picked, dict):
             return picked
@@ -822,7 +851,7 @@ def upgrade_safety(payload: dict) -> dict:
         pattern = payload["pattern"]
         by_name = {c["name"]: c for c in parsed}
         immutable_allowed = bool(re.search(r"@custom:oz-upgrades-unsafe-allow[^\n]*state-variable-immutable", payload["source"]))
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         for contract in chosen:
             index = L.visible_index(contract, parsed)
             name = contract["name"]
@@ -869,7 +898,10 @@ def upgrade_safety(payload: dict) -> dict:
             for gap in gaps:
                 if not re.search(r"\[\d+\]$", gap["type"]):
                     findings.append(_finding("UPG-GAP-TYPE", "minor", f"{name}.{gap['name']} should be a fixed-size array such as uint256[50]"))
-            inherits_uups, unresolved = _inherits(contract, by_name, "UUPS")
+            try:
+                inherits_uups, unresolved = _inherits(contract, by_name, "UUPS")
+            except _BaseWalkTooLarge:
+                return _invalid("source", "contract inheritance is cyclic or too large to walk")
             if pattern == "uups" and concrete:
                 if not inherits_uups and not any(f["name"] in ("upgradeTo", "upgradeToAndCall") for f in fns):
                     findings.append(_finding("UPG-UUPS-INFO" if unresolved else "UPG-UUPS-NOT-INHERITED", "info" if unresolved else "major",
@@ -915,7 +947,7 @@ def _is_admin_verb(name: str) -> bool:
     return bool(words) and words[0] in _ADMIN_VERBS
 
 
-def access_matrix(payload: dict) -> dict:
+def access_matrix(payload: dict[str, Any]) -> dict[str, Any]:
     """State-changing public/external functions by access guard. Guards: access modifiers (onlyOwner, onlyRole(X), auth,
     restricted; a modifier defined in the source counts only when its body checks the caller before its `_;`), inline checks
     (_checkOwner, _checkRole, hasRole, `require(msg.sender == X)`, `if (msg.sender != X) revert`, role-named allow-list lookups)
@@ -946,14 +978,14 @@ def access_matrix(payload: dict) -> dict:
     no check at all judges every such call as before the check.
     Heuristic: reads text, resolves no imports."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         picked = _selected_contracts(payload)
         if isinstance(picked, dict):
             return picked
         parsed, chosen = picked
         L = _lint()
         by_design = set(payload.get("public_by_design", []))
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         roles: dict[str, list[str]] = {}
         state_changing = guarded = unprotected = 0
         for contract in chosen:
@@ -1004,20 +1036,20 @@ def access_matrix(payload: dict) -> dict:
                                                        "roles": [], "verdict": "fail"}))
 
 
-def event_coverage(payload: dict) -> dict:
+def event_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """State-changing public/external functions that emit no event. A function counts as emitting when its body, an
     initializer modifier or a same-source internal callee (followed transitively) has `emit`; a call to an undefined
     underscore function or super is reported as delegated, not as a gap. Coverage = emitting / (emitting + missing);
     `exempt` names are skipped. Fails below `min_coverage_pct` (equal passes)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         picked = _selected_contracts(payload)
         if isinstance(picked, dict):
             return picked
         parsed, chosen = picked
         status = _lint().emission_status(parsed)
         exempt = set(payload.get("exempt", []))
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         emits = delegated = missing = 0
         for contract in chosen:
             for fn in contract["functions"]:
@@ -1045,16 +1077,16 @@ def event_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def natspec_coverage(payload: dict) -> dict:
+def natspec_coverage(payload: dict[str, Any]) -> dict[str, Any]:
     """NatSpec completeness of public/external functions, events and errors: `@notice` (or `@inheritdoc`), one `@param` per
     named parameter, one `@return` per return value. `@param` names that do not exist and surplus `@return` tags are major
     (solc rejects them). Coverage = fully documented items / items; fails below `min_coverage_pct` (equal passes) or on a
     major finding."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         parsed = _lint().parse_source(payload["source"])
         total_items = documented = 0
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         for contract in parsed:
             items = [("function", f) for f in contract["functions"] if f["kind"] == "function" and f["visibility"] in ("public", "external")]
             items += [("event", e) for e in contract["events"]] + [("error", e) for e in contract["errors"]]
@@ -1105,7 +1137,7 @@ def natspec_coverage(payload: dict) -> dict:
 # --------------------------------------------------------------------------------------------------------------------
 
 
-def _gas_map(field: str, items: list[dict]):
+def _gas_map(field: str, items: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, int] = {}
     for i, item in enumerate(items):
         if not _TOKEN.match(item["name"]):
@@ -1116,13 +1148,13 @@ def _gas_map(field: str, items: list[dict]):
     return out
 
 
-def gas_regression(payload: dict) -> dict:
+def gas_regression(payload: dict[str, Any]) -> dict[str, Any]:
     """Per-function gas against a baseline (for example two `forge test --gas-report` runs). A function regresses when
     the increase exceeds `min_delta_gas` AND its percentage increase is strictly above `max_regression_pct` (equal is
     within budget); `max_function_gas` is an absolute ceiling (strictly above fails). New functions are info, functions
     missing from the current run are minor."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         baseline = _gas_map("baseline", payload["baseline"])
         if "state" in baseline:
             return baseline
@@ -1132,7 +1164,7 @@ def gas_regression(payload: dict) -> dict:
         budget = _dec(payload["max_regression_pct"])
         min_delta = payload.get("min_delta_gas", 0)
         ceiling = payload.get("max_function_gas")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         compared = sorted(set(baseline) & set(current))
         regressions = improved = 0
         worst_name, worst_pct = "", Decimal(0)
@@ -1227,7 +1259,7 @@ def _arg_error(type_name: str, value: str) -> str:
     return "" if low <= number <= high else f"outside the {type_name} range"
 
 
-def deploy_plan_check(payload: dict) -> dict:
+def deploy_plan_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Pre-flight of a deployment plan (judged, never executed): chain id equals the guard value and matches a known
     network class (chainid.network), the script asserts block.chainid, a fork simulation passed before broadcasting,
     constructor arguments match their types (EIP-55 checked, no zero address), the source is verified, the owner is a
@@ -1235,7 +1267,7 @@ def deploy_plan_check(payload: dict) -> dict:
     private key), the RPC URL carries no credential (only the location is reported, never a value), and a mainnet
     deployment or live upgrade has a recorded human approval (L4 / L3)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         chain_id, expected = payload["chain_id"], payload["expected_chain_id"]
         kind = payload["network_kind"]
         types, args = payload["constructor_types"], payload["constructor_args"]
@@ -1248,7 +1280,7 @@ def deploy_plan_check(payload: dict) -> dict:
         threshold, signers = payload.get("multisig_threshold", 0), payload.get("multisig_signers", 0)
         if payload["owner_kind"] == "multisig" and not 1 <= threshold <= signers:
             return _invalid("multisig_threshold", "a multisig owner needs 1 <= multisig_threshold <= multisig_signers")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         local, mainnet = kind == "local", kind == "mainnet"
         known = _CHAINS.get(chain_id)
         if chain_id != expected:
@@ -1333,7 +1365,7 @@ def deploy_plan_check(payload: dict) -> dict:
 # --------------------------------------------------------------------------------------------------------------------
 
 
-def pragma_policy(payload: dict) -> dict:
+def pragma_policy(payload: dict[str, Any]) -> dict[str, Any]:
     """Compiler pragma review. A pragma is pinned when it admits exactly one version; ranges follow Solidity semver
     (^0.8.20 = >=0.8.20 <0.9.0, ~0.8.5 = >=0.8.5 <0.9.0, as liblangutil/SemVerHandler.cpp reads them). Findings: not pinned
     (major when `require_pinned`, else info), admits versions below `min_version` (major), admits or pins a version hit by a
@@ -1341,15 +1373,15 @@ def pragma_policy(payload: dict) -> dict:
     known): pinned = major, range = minor. IR-only bugs apply only with `via_ir`, optimizer bugs only with `optimizer_enabled`;
     the `layout at` bug (SOL-2026-3) needs the source, so only the lint script (which reads it) reports it."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         L = _lint()
         try:
             minimum = L.parse_version(payload["min_version"])
         except ValueError:
             return _invalid("min_version", "min_version must be X.Y.Z, for example 0.8.20")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         pinned = floating = buggy = 0
-        lowest: list = []
+        lowest: list[Any] = []
         for i, expr in enumerate(payload["pragmas"]):
             try:
                 review = L.pragma_findings(expr, min_version=minimum, floating_severity="major" if payload["require_pinned"] else "info",
@@ -1381,14 +1413,14 @@ def _pct(hit: int, found: int) -> Decimal:
     return Decimal(100) if found == 0 else Decimal(hit) * 100 / Decimal(found)
 
 
-def test_gate(payload: dict) -> dict:
+def test_gate(payload: dict[str, Any]) -> dict[str, Any]:
     """Release gate for contract tests from lcov-style numbers (LF/LH, BRF/BRH, FNF/FNH per file) and test counts. Overall line and
     branch coverage fail strictly below their minimum (equal passes); a file below `min_file_line_pct` is minor. Failing
     tests and zero tests are blockers, skipped tests minor; no fuzz test, fewer than `min_fuzz_runs` runs per fuzz test
     (default 256) or, when required, no invariant test are major. Zero branches is vacuously 100%. Fuzz adequacy
     beyond these floors (depth, seeds, corpus) belongs to the auditor."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         files = payload["files"]
         paths: set[str] = set()
         for i, f in enumerate(files):
@@ -1406,7 +1438,7 @@ def test_gate(payload: dict) -> dict:
                 return _invalid(field, f"{field} exceeds tests_total")
         sums = {kind: (sum(f[f"{kind}_hit"] for f in files), sum(f[f"{kind}_found"] for f in files)) for kind in ("lines", "branches", "functions")}
         line, branch, function = (_pct(*sums[k]) for k in ("lines", "branches", "functions"))
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         if sums["lines"][1] == 0:
             findings.append(_finding("TEST-NO-COVERAGE", "blocker", "no instrumented lines: coverage was not measured"))
         elif sums["lines"][0] * 100 < _dec(payload["min_line_pct"]) * sums["lines"][1]:
@@ -1453,7 +1485,7 @@ _EIP712_ATOMIC = re.compile(r"(?:address|bool|string|bytes|bytes(?:[1-9]|[12]\d|
 _STRUCT_DEF = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\(([^()]*)\)")
 
 
-def _parse_encode_type(text: str):
+def _parse_encode_type(text: str) -> list[tuple[str, list[tuple[str, str]]]] | str:
     """[(name, [(type, field)])] in written order, or an error string."""
     defs, pos = [], 0
     while pos < len(text):
@@ -1478,7 +1510,7 @@ def _abi_word(value: int) -> bytes:
     return value.to_bytes(32, "big")
 
 
-def eip712_typehash(payload: dict) -> dict:
+def eip712_typehash(payload: dict[str, Any]) -> dict[str, Any]:
     """EIP-712 constants as a contract would hold them: typeHash = keccak256(encodeType) and the domain separator =
     keccak256(abi.encode(domainTypeHash, keccak256(name), keccak256(version), chainId, verifyingContract, salt)) over
     the domain fields supplied, in the fixed order name, version, chainId, verifyingContract, salt. encodeType must be the
@@ -1486,7 +1518,7 @@ def eip712_typehash(payload: dict) -> dict:
     types. A declared hash that differs is a blocker (neither declared value is echoed). EIP-712 makes every domain field optional:
     requiring chainId and verifyingContract (major when missing, replay across chains or contracts) is this agent's policy."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         text = payload["encode_type"]
         parsed = _parse_encode_type(text)
         if isinstance(parsed, str):
@@ -1495,7 +1527,7 @@ def eip712_typehash(payload: dict) -> dict:
         if len(set(names)) != len(names):
             return _invalid("encode_type", "a struct type is defined twice")
         defs = dict(parsed)
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         for name, fields in parsed:
             field_names = [f for _, f in fields]
             if len(set(field_names)) != len(field_names):

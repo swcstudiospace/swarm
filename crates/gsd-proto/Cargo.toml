@@ -1,0 +1,31 @@
+[package]
+name = "gsd-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Protobuf definitions for GSD-Core internal messages and types"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["network-programming", "serialization", "development-tools"]
+keywords = ["protobuf", "grpc", "prost"]
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dependencies]
+prost = { workspace = true, features = ["derive", "std"] }
+prost-types = { workspace = true }
+prost-reflect = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true, features = ["v4", "v7", "serde", "fast-rng"] }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+time = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+prost-build = "0.13"
+proptest = "1.2"

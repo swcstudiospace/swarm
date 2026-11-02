@@ -8,6 +8,8 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Prompts containing these (case-insensitive) are owned by other plugins or explicitly opt out.
 NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
@@ -55,8 +57,9 @@ def classify(prompt: str) -> bool:
         from swarm.signal_detector import classify as _sd_classify
         res = _sd_classify(prompt)
         return res == "sdlc"
-    except Exception:
-        # fail-open fallback to original logic
+    except Exception as exc:
+        # fail-open fallback to original logic; the reason goes to stderr so a broken import is visible, not silent
+        print(f"user_prompt_submit: swarm.signal_detector unavailable ({exc!r}); using fallback classifier", file=sys.stderr)
         trimmed = prompt.strip()
         low = trimmed.lower()
         if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):

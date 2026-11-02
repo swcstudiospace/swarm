@@ -31,8 +31,10 @@ import hashlib
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -51,15 +53,15 @@ class _Invalid(Exception):
         self.field, self.message = field, message
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _guarded(payload: dict, fn):
+def _guarded(payload: dict[str, Any], fn: Callable[[dict[str, Any]], dict[str, Any]]) -> Callable[[], dict[str, Any]]:
     """Work function for `respond`: runs fn(payload) and turns a raised _Invalid into the INVALID_INPUT shape."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             return fn(payload)
         except _Invalid as exc:
@@ -68,7 +70,13 @@ def _guarded(payload: dict, fn):
     return work
 
 
-def _dec(value) -> Decimal:
+def _respond(payload: dict[str, Any], fn: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    """`support.respond` is untyped, so its result is Any; this restates it as the handler's result type."""
+    result: dict[str, Any] = respond(payload, _guarded(payload, fn))
+    return result
+
+
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
@@ -94,26 +102,26 @@ def _norm(text: str) -> str:
     return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", text).casefold()).strip()
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, Any]:
     return {"id": fid, "severity": severity, "summary": summary}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Worst first, then by id, so the same input always lists the same way."""
     return sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
 
 
-def _verdict(findings: list[dict]) -> str:
+def _verdict(findings: list[dict[str, Any]]) -> str:
     worst = max((SEVERITY_RANK[f["severity"]] for f in findings), default=0)
     return "fail" if worst >= SEVERITY_RANK["major"] else "warn" if worst == SEVERITY_RANK["minor"] else "pass"
 
 
-def _capped(findings: list[dict]) -> tuple[list[dict], int]:
+def _capped(findings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     ordered = _ordered(findings)
     return ordered[:MAX_FINDINGS], max(0, len(ordered) - MAX_FINDINGS)
 
 
-def _min_groups(sizes, target: int) -> int:
+def _min_groups(sizes: Iterable[int], target: int) -> int:
     """Fewest groups whose sizes add up to at least `target` (largest first is optimal for a sum)."""
     total = 0
     ordered = sorted(sizes, reverse=True)
@@ -342,7 +350,7 @@ def _is_wif(token: str) -> bool:
     return len(payload) == 33 or (len(payload) == 34 and payload[-1] == 0x01)
 
 
-def _mnemonic_matches(text: str):
+def _mnemonic_matches(text: str) -> Iterator[tuple[int, int]]:
     """(start, length) of each mnemonic assignment in `text` whose phrase has a valid BIP-39 word count and word shapes
     (3-8 letters). A run that swallowed the words of the next line is cut back to a line break that gives a valid count."""
     for match in _MNEMONIC_RE.finditer(text):
@@ -400,14 +408,14 @@ def _ident(field: str, value: str) -> str:
 HOT_DEVICES = frozenset(("software", "mobile"))
 
 
-def _multisig_policy(payload: dict) -> dict:
+def _multisig_policy(payload: dict[str, Any]) -> dict[str, Any]:
     threshold, signers = payload["threshold"], payload["signers"]
     n = len(signers)
     if threshold > n:
         raise _Invalid("threshold", f"threshold {threshold} exceeds the {n} signer(s)")
     seen: set[str] = set()
-    entities: Counter = Counter()
-    regions: Counter = Counter()
+    entities: Counter[str] = Counter()
+    regions: Counter[str] = Counter()
     hot = 0
     for index, signer in enumerate(signers):
         sid = _norm(_ident("signers", signer["signer_id"]))
@@ -419,7 +427,7 @@ def _multisig_policy(payload: dict) -> dict:
         hot += signer["device"] in HOT_DEVICES
     min_entities = _min_groups(entities.values(), threshold)
     min_regions = _min_groups(regions.values(), threshold)
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     if n == 1:
         findings.append(_finding("single-signer", "blocker", "one signer is not a multisig: its key alone moves funds"))
     elif threshold == 1:
@@ -461,17 +469,17 @@ def _multisig_policy(payload: dict) -> dict:
     }
 
 
-def multisig_policy(payload: dict) -> dict:
+def multisig_policy(payload: dict[str, Any]) -> dict[str, Any]:
     """m-of-n sanity (1-of-n, n-of-n, minority quorum), signer diversity (the fewest entities, and the fewest regions, that can
     reach the threshold; software keys) and value-tiered signature requirements (gaps, non-monotonic, unsatisfiable). The rules
     are this lane's policy, not a standard; names and regions are compared NFKC-normalised, trimmed and case-folded."""
-    return respond(payload, _guarded(payload, _multisig_policy))
+    return _respond(payload, _multisig_policy)
 
 
 # --- 2. timelock check -----------------------------------------------------------------------------------------------
 
 
-def _timelock_check(payload: dict) -> dict:
+def _timelock_check(payload: dict[str, Any]) -> dict[str, Any]:
     delay, value = payload["delay_seconds"], _dec(payload["value_at_risk_usd"])
     response = payload["response_seconds"]
     bands = sorted(((_dec(b["min_value_usd"]), b["min_delay_seconds"]) for b in payload["delay_bands"]), key=lambda b: b[0])
@@ -481,7 +489,7 @@ def _timelock_check(payload: dict) -> dict:
     for low, min_delay in bands:
         if value >= low:
             required = max(required, min_delay)
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     if bands and bands[0][0] != 0:
         findings.append(_finding("band-gap-below-lowest", "major", f"values below {bands[0][0]} USD fall under no delay band"))
     if delay == 0:
@@ -506,12 +514,12 @@ def _timelock_check(payload: dict) -> dict:
     }
 
 
-def timelock_check(payload: dict) -> dict:
+def timelock_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Delay >= the longest band delay among the bands whose min_value_usd <= the value at risk, and >= the response time
     (detect + decide + cancel); needs a cancel path (canceller or guardian), a renounced admin and an expiry window. House
     policy, with these references: OpenZeppelin TimelockController says its optional admin "should be subsequently renounced"
     (an admin acts outside the delay), and has no expiry; Compound's Timelock hard-codes a 14-day GRACE_PERIOD after the eta."""
-    return respond(payload, _guarded(payload, _timelock_check))
+    return _respond(payload, _timelock_check)
 
 
 # --- 3. key-ceremony checklist ---------------------------------------------------------------------------------------
@@ -543,10 +551,10 @@ _WITNESSED = frozenset((
 ))
 
 
-def _ceremony_checklist(payload: dict) -> dict:
+def _ceremony_checklist(payload: dict[str, Any]) -> dict[str, Any]:
     required = _CEREMONY_ITEMS[payload["ceremony_type"]]
     min_witnesses = payload["min_witnesses"]
-    given: dict[str, dict] = {}
+    given: dict[str, dict[str, Any]] = {}
     for index, entry in enumerate(payload["items"]):
         name = entry["item"]
         if name not in required:
@@ -555,7 +563,7 @@ def _ceremony_checklist(payload: dict) -> dict:
             raise _Invalid("items", f"items[{index}] repeats an earlier item")
         _label("items", entry["evidence_ref"], strict=False)
         given[name] = entry
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     missing: list[str] = []
     for name in required:
         entry = given.get(name)
@@ -577,24 +585,24 @@ def _ceremony_checklist(payload: dict) -> dict:
     }
 
 
-def ceremony_checklist(payload: dict) -> dict:
+def ceremony_checklist(payload: dict[str, Any]) -> dict[str, Any]:
     """An item counts as complete when it is done, has a non-blank evidence reference and, for in-room steps, at least
     min_witnesses witnesses. Items outside the ceremony type's catalogue and duplicates are refused."""
-    return respond(payload, _guarded(payload, _ceremony_checklist))
+    return _respond(payload, _ceremony_checklist)
 
 
 # --- 4. shard distribution -------------------------------------------------------------------------------------------
 
 
-def _shard_distribution(payload: dict) -> dict:
+def _shard_distribution(payload: dict[str, Any]) -> dict[str, Any]:
     threshold, shards = payload["threshold"], payload["shards"]
     n = len(shards)
     if threshold > n:
         raise _Invalid("threshold", f"threshold {threshold} exceeds the {n} shard(s)")
     ids: set[str] = set()
-    custodians: Counter = Counter()
-    orgs: Counter = Counter()
-    countries: Counter = Counter()
+    custodians: Counter[str] = Counter()
+    orgs: Counter[str] = Counter()
+    countries: Counter[str] = Counter()
     org_of: dict[str, str] = {}
     for index, shard in enumerate(shards):
         sid = _norm(_ident("shards", shard["shard_id"]))
@@ -613,7 +621,7 @@ def _shard_distribution(payload: dict) -> dict:
     min_custodians = _min_groups(custodians.values(), threshold)
     min_orgs = _min_groups(orgs.values(), threshold)
     min_countries = _min_groups(countries.values(), threshold)
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     if threshold == 1:
         findings.append(_finding("threshold-one", "blocker", "threshold 1: any single shard reconstructs the secret"))
     elif threshold == n:
@@ -636,16 +644,16 @@ def _shard_distribution(payload: dict) -> dict:
     }
 
 
-def shard_distribution(payload: dict) -> dict:
+def shard_distribution(payload: dict[str, Any]) -> dict[str, Any]:
     """t-of-n shard distribution: loss and compromise tolerance, and the fewest custodians, organizations and countries
     that can together reconstruct the secret (greedy by holdings, which is minimal for a sum)."""
-    return respond(payload, _guarded(payload, _shard_distribution))
+    return _respond(payload, _shard_distribution)
 
 
 # --- 5. signer policy lint -------------------------------------------------------------------------------------------
 
 
-def _signer_policy_lint(payload: dict) -> dict:
+def _signer_policy_lint(payload: dict[str, Any]) -> dict[str, Any]:
     per_tx, daily, balance = _dec(payload["per_tx_limit_usd"]), _dec(payload["daily_limit_usd"]), _dec(payload["balance_usd"])
     velocity, enforced = payload["velocity_max_tx_per_hour"], payload["allowlist_enforced"]
     cooloff, reattest = payload["allowlist_cooloff_seconds"], payload["allowlist_reattest_days"]
@@ -673,12 +681,12 @@ def _signer_policy_lint(payload: dict) -> dict:
     }
 
 
-def signer_policy_lint(payload: dict) -> dict:
+def signer_policy_lint(payload: dict[str, Any]) -> dict[str, Any]:
     """Lint a signer policy: missing or non-binding limits, unenforced allowlist, cool-off under 24 h, stale allowlist
     entries (> 365 days), approvals that never expire or outlive 24 h, and a policy-change quorum below the signing threshold.
     A limit of 0 means "none configured". The 24 h, 365 d and 24 h figures are this lane's lint defaults (internal norms,
     not a standard or a regulation)."""
-    return respond(payload, _guarded(payload, _signer_policy_lint))
+    return _respond(payload, _signer_policy_lint)
 
 
 # --- 6. wallet-tier caps ---------------------------------------------------------------------------------------------
@@ -686,7 +694,7 @@ def signer_policy_lint(payload: dict) -> dict:
 _TIER_ORDER = ("hot", "warm", "cold")
 
 
-def _wallet_tier_caps(payload: dict) -> dict:
+def _wallet_tier_caps(payload: dict[str, Any]) -> dict[str, Any]:
     seen: set[str] = set()
     for entry in payload["tiers"]:
         if entry["tier"] in seen:
@@ -694,8 +702,8 @@ def _wallet_tier_caps(payload: dict) -> dict:
         seen.add(entry["tier"])
     by_tier = {e["tier"]: e for e in payload["tiers"]}
     total = sum((_dec(e["balance_usd"]) for e in payload["tiers"]), Decimal(0))
-    findings: list[dict] = []
-    rows: list[dict] = []
+    findings: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     sweep = Decimal(0)
     for tier in _TIER_ORDER:
         entry = by_tier.get(tier)
@@ -726,10 +734,10 @@ def _wallet_tier_caps(payload: dict) -> dict:
     }
 
 
-def wallet_tier_caps(payload: dict) -> dict:
+def wallet_tier_caps(payload: dict[str, Any]) -> dict[str, Any]:
     """Each tier's balance against min(max_pct_of_total x total, max_balance_usd); a balance equal to its cap is within it.
     Cold must hold at least min_cold_pct of the total. Excess is what must be swept out of that tier."""
-    return respond(payload, _guarded(payload, _wallet_tier_caps))
+    return _respond(payload, _wallet_tier_caps)
 
 
 # --- 7. key rotation -------------------------------------------------------------------------------------------------
@@ -740,12 +748,12 @@ def _days(delta: timedelta) -> float:
     return round(delta.total_seconds() / SECONDS_PER_DAY, 2) + 0.0
 
 
-def _key_rotation(payload: dict) -> dict:
+def _key_rotation(payload: dict[str, Any]) -> dict[str, Any]:
     as_of = _ts("as_of", payload["as_of"])
     warn = timedelta(days=payload["warn_days"])
     seen: set[str] = set()
-    rows: list[dict] = []
-    findings: list[dict] = []
+    rows: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     for key in payload["keys"]:
         key_id = _ident("keys", key["key_id"])
         if _norm(key_id) in seen:
@@ -783,11 +791,11 @@ def _key_rotation(payload: dict) -> dict:
     }
 
 
-def key_rotation(payload: dict) -> dict:
+def key_rotation(payload: dict[str, Any]) -> dict[str, Any]:
     """Age (since last rotation, else creation) against max_age_days: overdue when age > maximum, due soon when the time left
     is <= warn_days, else ok. Overdue by more than twice the maximum is a blocker (a house escalation rule; the maximum itself
     is the caller's policy, NIST SP 800-57 only gives cryptoperiod guidance)."""
-    return respond(payload, _guarded(payload, _key_rotation))
+    return _respond(payload, _key_rotation)
 
 
 # --- 8. transaction policy evaluation --------------------------------------------------------------------------------
@@ -795,7 +803,7 @@ def key_rotation(payload: dict) -> dict:
 ZERO_ADDRESS = "0x" + "0" * 40
 
 
-def _tx_policy_eval(payload: dict) -> dict:
+def _tx_policy_eval(payload: dict[str, Any]) -> dict[str, Any]:
     policy = payload["policy"]
     target = _address("to", payload["to"])
     allow = {_address("policy", a) for a in policy["allowlist"]}
@@ -808,7 +816,7 @@ def _tx_policy_eval(payload: dict) -> dict:
         raise _Invalid("selector", "selector must be empty or 0x followed by 8 hex digits (4 bytes)")
     selector = selector[2:]
     value, spent = _dec(payload["value_usd"]), _dec(payload["spent_24h_usd"])
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
 
     def deny_(rule: str, text: str) -> None:
         findings.append(_finding(rule, "blocker", text))
@@ -851,25 +859,25 @@ def _tx_policy_eval(payload: dict) -> dict:
     }
 
 
-def tx_policy_eval(payload: dict) -> dict:
+def tx_policy_eval(payload: dict[str, Any]) -> dict[str, Any]:
     """Evaluate a transaction descriptor against policy. deny (blocker findings): chain not allowed, zero or denylisted
     destination, delegatecall, per-tx limit exceeded (>), rolling daily limit exceeded (>). hold (major): destination not
     allowlisted or inside its cool-off, value >= manual-review threshold, risky selector (token approvals and permits,
     ownership, role, upgrade and Safe signer-set/module/guard changes), too few approvals, velocity. Otherwise allow; an
     unlisted selector is reported as "unknown" and is not a finding. The selector table is a fixed list, not an ABI
     decoder: it cannot see calldata. It never signs."""
-    return respond(payload, _guarded(payload, _tx_policy_eval))
+    return _respond(payload, _tx_policy_eval)
 
 
 # --- 9. sanctions screening ------------------------------------------------------------------------------------------
 
 
-def _sanctions_screening(payload: dict) -> dict:
+def _sanctions_screening(payload: dict[str, Any]) -> dict[str, Any]:
     as_of = _ts("as_of", payload["as_of"])
     max_list = timedelta(hours=payload["max_list_age_hours"])
     max_screen = timedelta(hours=payload["max_screening_age_hours"])
-    findings: list[dict] = []
-    counts: Counter = Counter()
+    findings: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
     stale_lists = 0
     for entry in payload["screenings"]:
         subject, lst = _ident("screenings", entry["subject_id"]), _ident("screenings", entry["list_name"])
@@ -915,17 +923,17 @@ def _sanctions_screening(payload: dict) -> dict:
     }
 
 
-def sanctions_screening(payload: dict) -> dict:
+def sanctions_screening(payload: dict[str, Any]) -> dict[str, Any]:
     """Screening hygiene: list age at screening time (> max_list_age_hours is stale), clear results older than
     max_screening_age_hours, and the action taken per match state (errors and potential matches must not be released; a
     confirmed match must be blocked, then reported). The report finding cites OFAC 31 CFR 501.603 (10 business days from the
     date the property is blocked, US persons); other regimes' deadlines differ and are not modelled."""
-    return respond(payload, _guarded(payload, _sanctions_screening))
+    return _respond(payload, _sanctions_screening)
 
 
 # --- 10. Travel Rule --------------------------------------------------------------------------------------------------
 
-def _travel_rule(payload: dict) -> dict:
+def _travel_rule(payload: dict[str, Any]) -> dict[str, Any]:
     amount, threshold = _dec(payload["amount"]), _dec(payload["threshold"])
     applies = amount >= threshold if payload["comparison"] == "at_or_above" else amount > threshold
     kind, ident = payload["originator_identifier_kind"], payload["originator_identifier"]
@@ -959,7 +967,7 @@ def _travel_rule(payload: dict) -> dict:
 _MINIMAL_FIELDS = frozenset(("originator_name", "originator_account", "beneficiary_name", "beneficiary_account"))
 
 
-def travel_rule(payload: dict) -> dict:
+def travel_rule(payload: dict[str, Any]) -> dict[str, Any]:
     """FATF R.16 (INR.16 para 6, with para 7 for a unique transaction reference when there is no account): at or above the
     threshold the originator name, account and one identifier (address, national id, customer id, or date and place of
     birth), plus the beneficiary name and account, must accompany the transfer. Presence only, nothing is verified.
@@ -967,7 +975,7 @@ def travel_rule(payload: dict) -> dict:
     qualifying transfers as "above any applicable threshold" (equality unspecified); US 31 CFR 1010.410(f) is USD 3,000 or
     more; the EU Regulation 2023/1113 sets none for crypto-asset transfers. `comparison` selects at_or_above (>=) or above
     (>). Below the threshold the full set is not required, but a missing name or account is reported as info (para 5(a))."""
-    return respond(payload, _guarded(payload, _travel_rule))
+    return _respond(payload, _travel_rule)
 
 
 # --- 11. audit trail --------------------------------------------------------------------------------------------------
@@ -976,13 +984,13 @@ _HASH_RE = re.compile(r"[0-9a-f]{64}")
 _CHAIN_RULES = frozenset(("hash-mismatch", "chain-broken", "seq-gap", "duplicate-seq", "genesis-mismatch"))
 
 
-def _event_hash(event: dict) -> str:
+def _event_hash(event: dict[str, Any]) -> str:
     """sha256 over `seq|at|actor|action|approver1,approver2,...|prev_hash` (approvers sorted, UTF-8)."""
     body = f"{event['seq']}|{event['at']}|{event['actor']}|{event['action']}|{','.join(sorted(event['approvers']))}|{event['prev_hash']}"
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def _audit_trail(payload: dict) -> dict:
+def _audit_trail(payload: dict[str, Any]) -> dict[str, Any]:
     events = payload["events"]
     required_actions = {_norm(a) for a in payload["approval_required_actions"]} - {""}
     min_approvals = payload["min_approvals"]
@@ -999,7 +1007,7 @@ def _audit_trail(payload: dict) -> dict:
             _label("events", text)
         _ts("events", event["at"])
     ordered = sorted(events, key=lambda e: e["seq"])
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     breaks: list[int] = []
 
     def flag(rule: str, severity: str, seq: int, text: str) -> None:
@@ -1043,20 +1051,20 @@ def _audit_trail(payload: dict) -> dict:
     }
 
 
-def audit_trail(payload: dict) -> dict:
+def audit_trail(payload: dict[str, Any]) -> dict[str, Any]:
     """Verify an audit trail: contiguous sequence, SHA-256 hash chain from the genesis hash (see _event_hash), non-decreasing
     timestamps, actor and action present, and independent approvals (excluding the actor) for the listed actions."""
-    return respond(payload, _guarded(payload, _audit_trail))
+    return _respond(payload, _audit_trail)
 
 
 # --- 12. recovery drill -----------------------------------------------------------------------------------------------
 
 
-def _recovery_drill(payload: dict) -> dict:
+def _recovery_drill(payload: dict[str, Any]) -> dict[str, Any]:
     as_of = _ts("as_of", payload["as_of"])
     maximum = timedelta(days=payload["max_age_days"])
     target = _dec(payload["target_rto_minutes"])
-    by_scenario: dict[str, dict] = {}
+    by_scenario: dict[str, dict[str, Any]] = {}
     for drill in payload["drills"]:
         if drill["scenario"] in by_scenario:
             raise _Invalid("drills", f"scenario {drill['scenario']!r} appears twice")
@@ -1064,8 +1072,8 @@ def _recovery_drill(payload: dict) -> dict:
         if when > as_of:
             raise _Invalid("drills", f"the {drill['scenario']} drill is dated after as_of")
         by_scenario[drill["scenario"]] = {**drill, "when": when}
-    rows: list[dict] = []
-    findings: list[dict] = []
+    rows: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     for scenario in sorted(set(payload["required_scenarios"])):
         drill = by_scenario.get(scenario)
         age: float | None = None  # absent for a scenario never drilled: there is no age to report
@@ -1099,10 +1107,10 @@ def _recovery_drill(payload: dict) -> dict:
     }
 
 
-def recovery_drill(payload: dict) -> dict:
+def recovery_drill(payload: dict[str, Any]) -> dict[str, Any]:
     """For each required scenario: never drilled, failed, over the RTO target (>), overdue (age > max_age_days) or current,
     in that order of precedence."""
-    return respond(payload, _guarded(payload, _recovery_drill))
+    return _respond(payload, _recovery_drill)
 
 
 # --- 13. key-material leak scan ---------------------------------------------------------------------------------------
@@ -1113,7 +1121,7 @@ def _line_of(newlines: list[int], index: int) -> int:
     return bisect.bisect_left(newlines, index) + 1
 
 
-def _scan_content(path: str, content: str) -> list[dict]:
+def _scan_content(path: str, content: str) -> list[dict[str, Any]]:
     """Findings for one file. Only the location, the kind and the length of the matched text are reported."""
     hits: list[tuple[str, str, int, int]] = []  # (kind, severity, start offset, length)
     ends: list[int] | None = None
@@ -1161,8 +1169,8 @@ def _path_label(path: str, ordinal: int) -> str:
     return f"<redacted-path-{ordinal}>" if _secret_kind(path, strict=False) else path
 
 
-def _secret_scan(payload: dict) -> dict:
-    findings: list[dict] = []
+def _secret_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    findings: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, entry in enumerate(payload["files"]):
         if entry["path"] in seen:
@@ -1177,9 +1185,9 @@ def _secret_scan(payload: dict) -> dict:
     }
 
 
-def secret_scan(payload: dict) -> dict:
+def secret_scan(payload: dict[str, Any]) -> dict[str, Any]:
     """Find private-key material in supplied file contents: PEM private-key blocks, BIP32 extended private keys and WIF keys
     (both verified by their Base58Check checksum), 64-digit hex values assigned to private/secret/signing-key names,
     12/15/18/21/24-word mnemonics assigned to mnemonic/seed-phrase names, and encrypted keystore JSON. Reports location
     (path:line), kind and length only, never the value."""
-    return respond(payload, _guarded(payload, _secret_scan))
+    return _respond(payload, _secret_scan)

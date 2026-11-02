@@ -1,0 +1,37 @@
+[package]
+name = "gsd-governor"
+version = "0.1.0"
+edition = "2021"
+description = "Resource Governor for GSD-Core: token budgets, rate limits, concurrency caps, cost controls"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["concurrency", "resource-management", "development-tools"]
+keywords = ["governor", "budget", "rate-limit", "cost-control", "quota"]
+
+[dependencies]
+tokio = { workspace = true }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-proto = { path = "../gsd-proto" }
+gsd-observability = { path = "../gsd-observability" }
+gsd-security = { path = "../gsd-security" }
+prost-types = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+crossbeam = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

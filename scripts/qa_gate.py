@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A08 — run the repository's test suites and emit a signed quality gate verdict.
 
-Detects pytest / npm test / go test / cargo test, runs the tiers required by the
+Detects pytest / npm test / go test / cargo test / .NET, runs the tiers required by the
 risk class, parses pass/fail, and writes a signed `gate.verdict` envelope to
 .swarm/verdicts/<task_id>.quality.json. When --task-id is a quality gate task, one verdict
 row is recorded on each target in its Task Store notes.gate_for (swarm.verdicts).
@@ -9,6 +9,7 @@ row is recorded on each target in its Task Store notes.gate_for (swarm.verdicts)
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
 from swarm.verdicts import check_per_target_keys, gate_risk_class, gate_verdict, issue_gate, load_per_target  # noqa: E402
+from scripts._dotnet_quality import project_files, run_dotnet  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
                  "high": ["unit", "integration", "e2e", "perf"]}
@@ -42,6 +44,9 @@ def detect_runners(root: Path) -> list[dict]:
         runners.append({"name": "go test", "cmd": ["go", "test", "./..."], "pass_re": r"^ok", "fail_re": r"^FAIL|--- FAIL"})
     if (root / "Cargo.toml").exists() and which("cargo"):
         runners.append({"name": "cargo test", "cmd": ["cargo", "test", "-q"], "pass_re": r"(\d+) passed", "fail_re": r"(\d+) failed"})
+    if project_files(root):
+        # Missing dotnet is a required infrastructure failure, not an invisible workload.
+        runners.append({"name": "dotnet"})
     return runners
 
 
@@ -74,20 +79,37 @@ def run(args, ctx) -> dict:
             runs[t] = "skipped:infra"
     else:
         for r in runners:
-            proc = sh(r["cmd"], cwd=ctx.root, timeout=args.timeout)
-            out = proc.stdout + proc.stderr
-            passed, failed = _count(r["pass_re"], out), _count(r["fail_re"], out)
-            ok = proc.returncode == 0 and failed == 0
-            executed.append({"runner": r["name"], "returncode": proc.returncode, "passed": passed, "failed": failed,
-                             "tail": out[-1500:]})
-            if "unit" in tiers:
-                runs["unit"] = "pass" if ok else "fail"
-            if "integration" in tiers and runs["integration"].startswith("skipped"):
-                runs["integration"] = "pass" if ok else "fail"
-            if not ok:
-                findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "functional",
-                                             f"{r['name']} failed ({failed} failing)", evidence=out[-800:],
-                                             owner_suggestion="A05"))
+            if r["name"] == "dotnet":
+                execution = run_dotnet(
+                    ctx.root, target=getattr(args, "dotnet_target", None),
+                    configuration=getattr(args, "dotnet_configuration", "Release"),
+                    runtime_version=getattr(args, "dotnet_runtime_version", None),
+                    required_modules=getattr(args, "dotnet_required_test_module", []),
+                    timeout=args.timeout,
+                )
+                ok = execution["ok"]
+                executed.append(execution)
+                if not ok:
+                    findings.append(make_finding(
+                        f"QF-{len(findings)+1:03d}", "major",
+                        "infrastructure" if execution["returncode"] is None else "functional",
+                        f"dotnet {execution['stage']} failed: {execution['reason']}",
+                        evidence=execution["tail"][-800:], owner_suggestion="A05"))
+            else:
+                proc = sh(r["cmd"], cwd=ctx.root, timeout=args.timeout)
+                out = proc.stdout + proc.stderr
+                passed, failed = _count(r["pass_re"], out), _count(r["fail_re"], out)
+                ok = proc.returncode == 0 and failed == 0
+                executed.append({"runner": r["name"], "returncode": proc.returncode, "passed": passed, "failed": failed,
+                                 "tail": out[-1500:]})
+                if not ok:
+                    findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "functional",
+                                                 f"{r['name']} failed ({failed} failing)", evidence=out[-800:],
+                                                 owner_suggestion="A05"))
+            # A later passing runner must never overwrite an earlier tier failure.
+            for tier in ("unit", "integration"):
+                if tier in tiers:
+                    runs[tier] = "pass" if ok and runs[tier] != "fail" else "fail"
         for t in ("e2e", "perf"):
             if t in tiers:
                 runs[t] = "skipped:infra"
@@ -124,10 +146,67 @@ def add_args(p):
     p.add_argument("--tier", help="comma list overriding risk-based tier selection (unit,integration,e2e,perf)")
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--min-coverage", type=int, default=0, help="fail if pytest-cov TOTAL below this percent")
+    p.add_argument("--dotnet-target", help="explicit repository-relative project/solution/filter; required when ambiguous")
+    p.add_argument("--dotnet-runtime-version", help="runtime pin passed to locked restore/build (no SDK installation)")
+    p.add_argument("--dotnet-configuration", default="Release", help=".NET build/test configuration (default: Release)")
+    p.add_argument("--dotnet-required-test-module", action="append", default=[],
+                   help="repeatable required assembly stem; each needs positive fresh TRX execution; "
+                        "SDK10 Microsoft.Testing.Platform required in global.json; "
+                        "--timeout is shared across .NET restore/build/test")
     p.add_argument("--per-target-findings",
                    help="JSON object {target task id: [findings]}: the agent's findings; each gate target's verdict "
                         "gets the script's findings plus only its own (targets it omits get the script's findings only)")
 
 
+# Engine selector. The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::qa_gate` accepts and
+# leaves every other argv to this body. `GSD_QA_PYTHON` is this interpreter, so runner detection matches `sys.executable`.
+# The route writes (the binary records the verdict in issue_gate's transaction), so it is a write route: Python answers only a
+# binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"GSD_QA_PYTHON", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION", "XDG_CONFIG_HOME",
+                                     "SWARM_DRYRUN_FAIL"}
+    if route != "qa-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_qa(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _qa_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_args)
+    os.environ["GSD_QA_PYTHON"] = sys.executable
+    answer = None
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
+        from swarm import engine_select
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_qa, parse=lambda argv: argv if _claims_qa(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "qa-gate",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_qa_commit,
+                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
+                                          "verdicts/ before running the gate again", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
+    sys.exit(answer if answer is not None else script.main())

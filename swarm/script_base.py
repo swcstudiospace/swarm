@@ -15,14 +15,17 @@ Every script therefore gets: --task-id, --correlation-id, --json, --dry-run, exi
 """
 from __future__ import annotations
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
 import subprocess
 import traceback
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .errors import ErrorCode, SwarmError, classify
 from .runlog import emit
@@ -78,7 +81,7 @@ class Ctx:
     dry_run: bool
     root: Path = field(default_factory=lambda: Path.cwd())
 
-    def emit(self, event_type: str, payload: dict, *, task_id: str | None = None) -> dict:
+    def emit(self, event_type: str, payload: dict[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
         # a dry run (this record and the script's exit record, which AgentScript.main emits through here) stays local
         return emit(event_type, payload, source=f"{self.agent_id}@{self.script}", correlation_id=self.correlation_id,
                     task_id=task_id or self.task_id or payload.get("task_id"), root=self.root, tee=not self.dry_run)
@@ -87,7 +90,7 @@ class Ctx:
 class AgentScript:
     EXIT_OK, EXIT_FAIL, EXIT_ERROR = 0, 1, 2
 
-    def __init__(self, agent_id: str, name: str, run: Callable[[argparse.Namespace, Ctx], dict],
+    def __init__(self, agent_id: str, name: str, run: Callable[[argparse.Namespace, Ctx], dict[str, Any]],
                  *, description: str = "", add_args: Callable[[argparse.ArgumentParser], None] | None = None):
         self.agent_id, self.name, self.run, self.description, self.add_args = agent_id, name, run, description, add_args
 
@@ -138,8 +141,47 @@ class AgentScript:
             self._print(err, args.json)
             return self.EXIT_ERROR
 
+    def record_external_reply(self, argv: list[str], reply: dict[str, Any], exit_code: int) -> None:
+        """Writes the run-log record `main` would have written for this call, for a reply another engine produced (D1).
+
+        `argv` is parsed with this script's own parser (usage text is swallowed: a rejected argv, `--help` included, raises
+        SwarmError E-INPUT and writes nothing), `Ctx` is built as in `main`, and the record is emitted through `ctx.emit`
+        (so `tee=not dry_run`, redaction and the run-log format are the Python path's own) as `script.<name>`, or
+        `script.<name>.error` when `exit_code` is 2. `reply` is not mutated: a copy gets `setdefault` of agent, script
+        and status, so a key the reply already carries is kept.
+
+        Returns None once the record is written. It raises, and has written nothing, for a rejected argv, an exit code
+        other than 0, 1, 2, or (exit 0 or 1 only) a task or correlation id that fails `check_task_id`; `main` answers those
+        with its own error record, so the caller is expected to fall back to it. For exit 2 an invalid id is dropped from
+        the record as `main` does. The only write is the one `emit` makes, a single appended line, so a raise from
+        `emit` (state dir not writable) leaves no half-written record that this method could undo; errors are never swallowed.
+        """
+        if exit_code not in (self.EXIT_OK, self.EXIT_FAIL, self.EXIT_ERROR):
+            raise SwarmError(ErrorCode.E_INPUT, f"exit code {exit_code} has no run-log record; expected 0, 1 or 2")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = self.parser().parse_args(argv)
+        except SystemExit as exc:
+            raise SwarmError(ErrorCode.E_INPUT, f"argv rejected by the {self.name} parser (exit {exc.code})") from exc
+        ctx = Ctx(self.agent_id, self.name, args.task_id, args.correlation_id, args.dry_run, Path(args.root).resolve())
+        record = dict(reply)
+        if exit_code == self.EXIT_ERROR:
+            ctx.task_id, ctx.correlation_id = _logged_id(ctx.task_id), _logged_id(ctx.correlation_id)
+        else:
+            if ctx.task_id is not None:
+                check_task_id(ctx.task_id)
+            if ctx.correlation_id is not None:
+                check_task_id(ctx.correlation_id, "correlation id")
+        record.setdefault("agent", self.agent_id)
+        record.setdefault("script", self.name)
+        record.setdefault("status", "error" if exit_code == self.EXIT_ERROR else "ok")
+        if exit_code == self.EXIT_ERROR:
+            ctx.emit(f"script.{self.name}.error", record)
+        else:
+            ctx.emit(f"script.{self.name}", record)
+
     @staticmethod
-    def _print(obj: dict, as_json: bool) -> None:
+    def _print(obj: dict[str, Any], as_json: bool) -> None:
         if as_json:
             print(json.dumps(obj, indent=2, default=str))
             return
@@ -155,7 +197,7 @@ class AgentScript:
             print("  error:", json.dumps(obj["error"], indent=2, default=str))
 
 
-def sh(cmd: list[str] | str, *, cwd: Path | None = None, timeout: int = 600, check: bool = False) -> subprocess.CompletedProcess:
+def sh(cmd: list[str] | str, *, cwd: Path | None = None, timeout: int = 600, check: bool = False) -> subprocess.CompletedProcess[str]:
     """Run a command, capturing output; never raises unless check=True."""
     shell = isinstance(cmd, str)
     return subprocess.run(cmd, cwd=cwd, shell=shell, capture_output=True, text=True, timeout=timeout, check=check)
@@ -166,8 +208,8 @@ def which(binary: str) -> bool:
     return _w(binary) is not None
 
 
-def iter_files(root: Path, *, exts: tuple[str, ...] = (), skip_dirs=(".git", "node_modules", ".venv", "venv",
-                                                                     "dist", "build", "__pycache__", ".swarm")):
+def iter_files(root: Path, *, exts: tuple[str, ...] = (), skip_dirs: tuple[str, ...] = (".git", "node_modules", ".venv", "venv",
+                                                                                         "dist", "build", "__pycache__", ".swarm")) -> Iterator[Path]:
     for p in root.rglob("*"):
         if any(part in skip_dirs for part in p.parts):
             continue

@@ -489,8 +489,9 @@ def test_one_failing_task_keeps_the_parallelism_and_follows_the_retry_ladder(tmp
 def test_three_failures_in_a_row_halve_the_parallelism_once_and_successes_restore_it(tmp_path):
     bads = [_task(f"b{i}") for i in range(3)]
     oks = [_task(f"s{i}") for i in range(5)]
-    cfg = {**{f"T-b{i}": {"fail": True} for i in range(3)}, "*": {"sleep": 2.5}}
-    rig = Rig(tmp_path, bads + oks, cfg, SWARM_RATE_COOLDOWN_S="0")
+    permanent = {"fail": True}  # a plain failure, retried as the scenario was written: near-immediately
+    cfg = {**{f"T-b{i}": permanent for i in range(3)}, "*": {"sleep": 2.5}}
+    rig = Rig(tmp_path, bads + oks, cfg, SWARM_RATE_COOLDOWN_S="0", SWARM_RETRY_BASE_S="0.001", SWARM_RETRY_CAP_S="0.01")
     for t in bads:
         rig.set_priority("T-" + t["id"], "P0")
     for t in oks:
@@ -516,8 +517,9 @@ def test_three_failures_in_a_row_halve_the_parallelism_once_and_successes_restor
 ])
 def test_a_success_between_failures_resets_the_streak(tmp_path, order, trips):
     tasks = [_task(n) for n in ("b0", "b1", "g0", "g1")]
-    cfg = {"T-b0": {"fail": True}, "T-b1": {"fail": True}, "*": {"sleep": 0.1}}
-    rig = Rig(tmp_path, tasks, cfg, SWARM_FAIL_STREAK="2", SWARM_RATE_COOLDOWN_S="0")
+    permanent = {"fail": True}  # a plain failure, retried as the scenario was written: near-immediately
+    cfg = {"T-b0": permanent, "T-b1": permanent, "*": {"sleep": 0.1}}
+    rig = Rig(tmp_path, tasks, cfg, SWARM_FAIL_STREAK="2", SWARM_RATE_COOLDOWN_S="0", SWARM_RETRY_BASE_S="0.001", SWARM_RETRY_CAP_S="0.01")
     for name, prio in zip(order, ("P0", "P1", "P2", "P3")):
         rig.set_priority("T-" + name, prio)
         rig.set_notes("T-" + name, claims=["src/**"])  # one at a time, in priority order

@@ -1,0 +1,365 @@
+{
+  "mode": {
+    "rust": false,
+    "backend": null
+  },
+  "cases_passed": 11,
+  "cases_total": 11,
+  "served_by_counts": {
+    "python": 42
+  },
+  "pending": [],
+  "cases": [
+    {
+      "name": "happy_path",
+      "route": "orch_status + swarm_tool",
+      "description": "Seeded task read back; catalog lists the caller's tools; call returns a registry result.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "orch_status reads the seeded task",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "catalog lists the caller's tools",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "call returns the registry result",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "transition_legal_illegal",
+      "route": "orch_status",
+      "description": "Legal CREATED -> CANCELLED succeeds; illegal CREATED -> DONE is refused with E-CONTRACT.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "legal transition CREATED -> CANCELLED",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "illegal transition CREATED -> DONE refused",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "gate_pass_fail_major",
+      "route": "orch_status",
+      "description": "Signed review verdicts read back via --history: a clean pass, and a fail carrying a major finding.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "gate pass verdict reads back as pass",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "gate fail-major verdict reads back as fail with its major finding",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "boundary_100kb",
+      "route": "swarm_tool",
+      "description": "--input of exactly the cap is accepted; one byte more is refused as E-INPUT.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "boundary payloads are exactly 100000 and 100001 bytes",
+          "ok": true,
+          "detail": "100000 and 100001 bytes",
+          "served_by": "python"
+        },
+        {
+          "label": "100000 bytes is accepted (unregistered name gives INVALID_INPUT)",
+          "ok": true,
+          "detail": "exit 1",
+          "served_by": "python"
+        },
+        {
+          "label": "100001 bytes is refused as E-INPUT",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "validation_error",
+      "route": "orch_status + swarm_tool",
+      "description": "Bad task id, unknown task and unknown caller each exit 2 with E-INPUT.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "task id containing '..' is refused before any work",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "history of an unknown task is refused",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "unknown caller is refused",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "empty",
+      "route": "orch_status + swarm_tool",
+      "description": "Empty store and a catalog query matching nothing are success-empty, not a crash.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "empty store reads as success with no tasks",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "catalog query matching nothing returns an empty list",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "large",
+      "route": "orch_status + swarm_tool",
+      "description": "200 tasks in one correlation and the full A01 catalog both read back.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "orch_status reads 200 tasks in one correlation",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "full catalog for A01 (tools and skills)",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "malformed",
+      "route": "swarm_tool",
+      "description": "Non-JSON input, non-object input and a missing --name are each E-INPUT with exit 2.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "input that is not JSON is E-INPUT, never uncaught",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "input that is not a JSON object is E-INPUT",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "call without --name is E-INPUT",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "timeout",
+      "route": "swarm_tool",
+      "description": "A handler that outlives its timeout_s reports state TIMEOUT (status fail, exit 1).",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "handler past timeout_s is reported as TIMEOUT (status fail, exit 1)",
+          "ok": true,
+          "detail": "exit 1",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "policy",
+      "route": "orch_status + swarm_tool",
+      "description": "Plan mode refuses a WRITE tool; a hand move of a gate task is refused; both as E-POLICY with no paths leaked.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "plan mode refuses a WRITE tool before its handler is imported",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "hand move of a gate task to IN_REVIEW is refused with a scrubbed message",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "classifier_quadruple_mirror",
+      "route": "errors + retry + omp bridge",
+      "description": "ErrorCode, retry partitions, bridge.ts, classify() and the selector's fallback set agree.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "retry TRANSIENT and PERMANENT sets are disjoint",
+          "ok": true,
+          "detail": "shared []",
+          "served_by": "python"
+        },
+        {
+          "label": "retry partitions plus E-INTERNAL equal ErrorCode",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "omp/src/bridge.ts ERROR_CODES keys equal ErrorCode",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "omp/src/bridge.ts ErrorCode union equals ErrorCode",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-CAPACITY)) keeps E-CAPACITY",
+          "ok": true,
+          "detail": "got E-CAPACITY",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-CONTRACT)) keeps E-CONTRACT",
+          "ok": true,
+          "detail": "got E-CONTRACT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-DEP)) keeps E-DEP",
+          "ok": true,
+          "detail": "got E-DEP",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-INPUT)) keeps E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-INTERNAL)) keeps E-INTERNAL",
+          "ok": true,
+          "detail": "got E-INTERNAL",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-POLICY)) keeps E-POLICY",
+          "ok": true,
+          "detail": "got E-POLICY",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-TIMEOUT)) keeps E-TIMEOUT",
+          "ok": true,
+          "detail": "got E-TIMEOUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(TimeoutError) is E-TIMEOUT",
+          "ok": true,
+          "detail": "got E-TIMEOUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(FileNotFoundError) is E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(ValueError) is E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(KeyError) is E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(ConnectionError) is E-DEP",
+          "ok": true,
+          "detail": "got E-DEP",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(RuntimeError) is E-INTERNAL",
+          "ok": true,
+          "detail": "got E-INTERNAL",
+          "served_by": "python"
+        },
+        {
+          "label": "scripts/orch_status.py RUST_FALLBACK_CODES equals the harness copy",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "scripts/orch_status.py DEFAULT_ENGINE equals route_table.rs ORCH_STATUS_READ_DEFAULT",
+          "ok": true,
+          "detail": "selector 'python', route table 'python'",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    }
+  ]
+}

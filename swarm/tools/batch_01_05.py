@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from swarm.errors import SwarmError
 from swarm.blast_radius import parallel_rows
@@ -12,8 +13,8 @@ from swarm.taskstore import TaskStore, GATES_BY_RISK  # prior unit for orchestra
 from swarm.results import reconcile as do_reconcile  # prior unit: reassign on failure + aggregate
 
 
-def dag_order(payload: dict) -> dict:
-    def work() -> dict:
+def dag_order(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         nodes = payload["nodes"]
         if not isinstance(nodes, list) or not nodes:
             return {"state": "INVALID_INPUT", "field": "nodes", "message": "nodes must be a non-empty list"}
@@ -34,8 +35,8 @@ def dag_order(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def budget_class(payload: dict) -> dict:
-    def work() -> dict:
+def budget_class(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         budget = script("orch_plan")._budget(payload["risk"])
         return {
             "state": "SUCCESS",
@@ -47,8 +48,8 @@ def budget_class(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def gwt_check(payload: dict) -> dict:
-    def work() -> dict:
+def gwt_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         blocks = script("req_lint")._blocks_from_markdown(payload["text"])
         missing = 0
         for block in blocks:
@@ -60,15 +61,15 @@ def gwt_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def adr_slug(payload: dict) -> dict:
-    def work() -> dict:
+def adr_slug(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         return {"state": "SUCCESS", "slug": script("arch_adr").slugify(payload["title"])}
 
     return respond(payload, work)
 
 
-def contract_ops(payload: dict) -> dict:
-    def work() -> dict:
+def contract_ops(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         document = payload["document"]
         if not isinstance(document, dict):
             return {"state": "INVALID_INPUT", "field": "document", "message": "document must be an object"}
@@ -77,8 +78,8 @@ def contract_ops(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def contrast(payload: dict) -> dict:
-    def work() -> dict:
+def contrast(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         tokens = script("ux_tokens")
         for field in ("fg", "bg"):
             try:
@@ -90,8 +91,8 @@ def contrast(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def route_norm(payload: dict) -> dict:
-    def work() -> dict:
+def route_norm(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         return {"state": "SUCCESS", "normalized": script("be_contract_conformance").norm_path(payload["path"])}
 
     return respond(payload, work)
@@ -100,8 +101,8 @@ def route_norm(payload: dict) -> dict:
 # Orchestrator unit (A01 core): DAG decompose (plan), assign tasks, monitor (status),
 # reassign on failure (rework), aggregate results. Acceptance: DAG + assign/monitor/reassign/aggregate.
 # Spec: plan/run/reconcile. Uses prior units (taskstore, results, manifest). Thin wrappers for registered-tool contract.
-def plan(payload: dict) -> dict:
-    def work() -> dict:
+def plan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         brief = payload.get("brief")
         if not isinstance(brief, str) or not brief:
             return {"state": "INVALID_INPUT", "field": "brief", "message": "brief required string"}
@@ -138,8 +139,8 @@ def plan(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def run(payload: dict) -> dict:
-    def work() -> dict:
+def run(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         # Dispatch is scripts/swarm_run.py: it spawns runtimes, signs, and holds leases. This handler does not drive
         # it, so it reports the dependency as unavailable instead of claiming that any task was dispatched.
         return {
@@ -150,15 +151,15 @@ def run(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def reconcile(payload: dict) -> dict:
-    def work() -> dict:
+def reconcile(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         root = target_root()
         corr = payload.get("correlation_id") or latest_correlation(root)
         if not corr:
             return {"state": "INVALID_INPUT", "field": "correlation_id",
                     "message": "correlation_id required: this workspace has no latest correlation"}
 
-        def emit(event_type: str, event: dict):
+        def emit(event_type: str, event: dict[str, Any]) -> dict[str, Any]:
             return log_emit(event_type, event, source="A01@orch_reconcile", correlation_id=corr,
                             task_id=event.get("task_id"), root=root)
 
@@ -178,8 +179,8 @@ def reconcile(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def assign(payload: dict) -> dict:
-    def work() -> dict:
+def assign(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         tid = payload.get("task_id")
         if not isinstance(tid, str):
             return {"state": "INVALID_INPUT", "field": "task_id", "message": "task_id required"}

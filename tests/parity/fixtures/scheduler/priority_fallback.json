@@ -1,0 +1,33 @@
+{
+"behaviour": "priority_fallback",
+"seed": 20261028,
+"schema": 1,
+"oracle": "scripts/swarm_run.py PRIORITY_RANK.get(priority, P2) through order_ready",
+"cases": [
+  {"id": "hand-000", "input": {"priority": "P0"}, "expected": {"rank": 0, "probe": [0, 4, 1, 2, 3]}},
+  {"id": "hand-001", "input": {"priority": "P1"}, "expected": {"rank": 1, "probe": [0, 1, 4, 2, 3]}},
+  {"id": "hand-002", "input": {"priority": "P2"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-003", "input": {"priority": "P3"}, "expected": {"rank": 3, "probe": [0, 1, 2, 3, 4]}},
+  {"id": "hand-004", "input": {"priority": null}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-005", "input": {"priority": ""}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-006", "input": {"priority": "P4"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-007", "input": {"priority": "P9"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-008", "input": {"priority": "P10"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-009", "input": {"priority": "P-1"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-010", "input": {"priority": "p0"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-011", "input": {"priority": "p2"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-012", "input": {"priority": "p3"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-013", "input": {"priority": " P0"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-014", "input": {"priority": "P0 "}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-015", "input": {"priority": "P2\n"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-016", "input": {"priority": "P02"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-017", "input": {"priority": "0"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-018", "input": {"priority": "2"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-019", "input": {"priority": "high"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-020", "input": {"priority": "urgent"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-021", "input": {"priority": "PO"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-022", "input": {"priority": "\uff30\uff12"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-023", "input": {"priority": "P\u00b2"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}},
+  {"id": "hand-024", "input": {"priority": "\u00e9"}, "expected": {"rank": 2, "probe": [0, 1, 2, 4, 3]}}
+]
+}

@@ -11,8 +11,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from collections.abc import Iterator
 
-from .paths import swarm_dir
+from .atomic_file import write_text_atomic
+from .paths import append_text, swarm_dir
 
 
 def _db_path(root: str | Path | None) -> Path:
@@ -25,16 +27,14 @@ def claude_state_dir(default: Path) -> Path:
     return Path(override) if override else default
 
 
-def gsd_state_path(base: Path) -> Path | None:
-    """STATE.md mirror under base. SWARM_GSD_STATE_FILE replaces it (read per call); empty disables the mirror."""
+def gsd_state_path() -> Path | None:
+    """GSD STATE.md mirror target. Off unless SWARM_GSD_STATE_FILE names a file: unset and empty both mean off."""
     override = os.environ.get("SWARM_GSD_STATE_FILE")
-    if override is None:
-        return base / ".planning" / "STATE.md"
     return Path(override) if override else None
 
 
 @contextmanager
-def _tx(conn: sqlite3.Connection):
+def _tx(conn: sqlite3.Connection) -> Iterator[None]:
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -51,7 +51,7 @@ class TriggerStore:
         self.path = Path(path) if path else _db_path(root)
         self._init_schema()
 
-    def _init_schema(self):
+    def _init_schema(self) -> None:
         conn = sqlite3.connect(self.path)
         try:
             conn.execute("""
@@ -98,8 +98,8 @@ class SwarmStateStore:
             self.root = Path(root) if root else Path(".")
             self.claude_path = claude_state_dir(self.root / ".claude") / "swarm-state.json"
             self.swarm_path = swarm_dir(root, create=True) / "swarm-state.json"
-            self.claude_path.parent.mkdir(parents=True, exist_ok=True)
-            if not self.claude_path.exists():
+            if not self.claude_path.exists():  # an existing file means an existing directory: the mkdir syscall is only for a first write
+                self.claude_path.parent.mkdir(parents=True, exist_ok=True)
                 self._write(self.claude_path, {"version": "1.0", "swarm_state": "INITIALIZING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
             if not self.swarm_path.exists():
                 self._write(self.swarm_path, {"version": "1.0", "swarm_state": "INITIALIZING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
@@ -109,15 +109,14 @@ class SwarmStateStore:
             self.claude_path = claude_state_dir(self.root / ".claude") / "swarm-state.json"
             self.swarm_path = self.root / "swarm-state.json"
 
-    def _write(self, p: Path, data: dict) -> None:
+    def _write(self, p: Path, data: dict[str, Any], text: str | None = None) -> None:
+        """Atomically write `data` as JSON (or `text`, its rendering when the caller already has it); failures are isolated."""
         try:
-            tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(data, indent=2) + "\n")
-            tmp.replace(p)
+            write_text_atomic(p, json.dumps(data, indent=2) + "\n" if text is None else text)
         except Exception:
             pass  # isolate
 
-    def update(self, state: str, *, corr: str | None = None, progress: dict | None = None, extra: dict | None = None, gsd_state: str | None = None) -> dict:
+    def update(self, state: str, *, corr: str | None = None, progress: dict[str, Any] | None = None, extra: dict[str, Any] | None = None, gsd_state: str | None = None) -> dict[str, Any]:
         """Extend update to support gsd states (LOADING IN_PROGRESS etc), immediate state transitions for OMP gsd.
         Support error_agg, perID partial when state FAILED/ERROR.
         """
@@ -130,6 +129,7 @@ class SwarmStateStore:
                     "COMPLETED": "COMPLETE",
                     "EMPTY": "PENDING",
                     "ERROR": "FAILED",
+                    "STREAMING": "RUNNING",
                 }
                 state = gsd_state_map.get(state, state if state in self.STATES else "INITIALIZING")
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -145,8 +145,12 @@ class SwarmStateStore:
                 data["error_partial"] = {"subagent_id": (extra or {}).get("subagent_id"), "agg": extra.get("error_agg")}
             if extra and extra.get("error_agg"):
                 data["error_agg"] = extra.get("error_agg")
-            self._write(self.claude_path, data)
-            self._write(self.swarm_path, data)
+            try:
+                text: str | None = json.dumps(data, indent=2) + "\n"  # rendered once for both files
+            except Exception:
+                text = None  # unserialisable: each _write isolates it itself, nothing is written
+            self._write(self.claude_path, data, text)
+            self._write(self.swarm_path, data, text)
             sub_id = (extra or {}).get("subagent_id")
             slc = (extra or {}).get("slice_id") or (extra or {}).get("task_slice")
             try:
@@ -157,18 +161,18 @@ class SwarmStateStore:
         except Exception:
             return {"swarm_state": state, "error": "update_isolated"}
 
-    def get(self) -> dict:
+    def get(self) -> dict[str, Any]:
         try:
             if self.claude_path.exists():
-                return json.loads(self.claude_path.read_text())
+                loaded: dict[str, Any] = json.loads(self.claude_path.read_text())
+                return loaded
             return {}
         except Exception:
             return {}
 
     def append_gsd_line(self, line: str, *, root: str | Path | None = None, state: str | None = None) -> None:
         try:
-            base = Path(root) if root else self.root
-            state_md = gsd_state_path(base)
+            state_md = gsd_state_path()
             if state_md is not None and state_md.exists():
                 with state_md.open("a") as f:
                     suffix = f" state={state}" if state else ""
@@ -187,8 +191,7 @@ class SwarmStateStore:
             st = (state or "").replace("\n", " ")[:32]
             idt = (identity or "").replace("\n", " ")[:100]
             entry = f"{ts} event={event} subagent_id={sub} task_slice={slc} state={st} identity={idt}\n"
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(entry)
+            append_text(log_path, entry)
         except Exception:
             pass  # isolate
 

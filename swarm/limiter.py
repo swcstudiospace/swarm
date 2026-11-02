@@ -13,7 +13,7 @@ import threading
 from .clock import SYSTEM_CLOCK, Clock
 
 DEFAULT_COOLDOWN_S = 60.0
-DEFAULT_RETRY_CAP_S = 120.0  # keep equal to swarm.retry.DEFAULT_CAP_S (retry imports this module, so it cannot be shared)
+DEFAULT_RETRY_CAP_S = 120.0  # Retry-After hold cap, not the backoff cap (swarm.retry.DEFAULT_CAP_S, 5 s, follows the gsd-failure contract)
 
 _UNIT_SECONDS = {
     "": 1.0, "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,

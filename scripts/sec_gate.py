@@ -15,6 +15,7 @@ from collections import Counter
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -90,7 +91,7 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
                 if name == "generic-credential" and (_entropy(val) < 3.2 or val.isalpha()):
                     continue
                 add(name, "critical", "secrets", "credential material committed (value redacted)", loc,
-                    evidence=val[:4] + "…" + f" ({len(val)} chars)", cwe="CWE-798")
+                    evidence=f"value not recorded ({len(val)} chars)", cwe="CWE-798")
             if ext in CODE_EXTS and not COMMENT_RE.match(line):
                 for name, rx, exts, sev in SAST_RULES:
                     if ext in exts and rx.search(line):
@@ -137,7 +138,9 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
             crit = data.get("vulnerabilities", {}).get("count", 0)
         elif name == "govulncheck":
             high = sum(1 for ln in out.splitlines() if '"finding"' in ln and '"trace"' in ln)
-        elif proc.returncode != 0:
+        if proc.returncode != 0 and not (crit or high or other):
+            # P4-01/P4-02: a non-zero exit that counts no vulnerability did not complete the audit (npm's {"error": ...}
+            # JSON, a govulncheck load failure with no finding lines): fail closed, as an unparseable run does.
             high = 1
         runs[name] = "pass" if not (crit or high or other) else "fail"
         if kev or crit:
@@ -213,5 +216,53 @@ def add_args(p):
                         "gets the scan's findings plus only its own (targets it omits get the script's findings only)")
 
 
+# Engine selector (swarm/engine_select.py). The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::sec_gate`
+# accepts (`--json`, not `--dry-run`) and leaves every other argv to this body. `ENGINE_ROUTES` is the seam a route registers in.
+# The route writes (the binary records the security gate's verdict in issue_gate's transaction), so it is a write route: Python
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"XDG_CONFIG_HOME", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION"}
+    if route != "sec-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_sec(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _sec_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A10", "sec_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A10", "sec_gate", run, description=__doc__, add_args=add_args)
+    answer = None
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
+        from swarm import engine_select
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_sec, parse=lambda argv: argv if _claims_sec(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "sec-gate",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_sec_commit,
+                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
+                                          "verdicts/ before running the gate again", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
+                sys.argv[1:],
+            )
+    sys.exit(answer if answer is not None else script.main())
