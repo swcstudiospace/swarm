@@ -145,7 +145,9 @@ class Governor:
         self, session_id: str, thread_id: str, tokens: int, wall_time_ms: int, tool_calls: int, cost_usd: float
     ) -> dict[str, object]:
         """Wire reservation. The grant as a dict (``granted``, ``tokens_granted``, ``wall_time_ms_granted``,
-        ``tool_calls_granted``, ``cost_usd_granted``); a refusal is ``granted`` False and never raises."""
+        ``tool_calls_granted``, ``cost_usd_granted``); a refusal is ``granted`` False and never raises. ``ValueError``
+        (``E-INTERNAL``) is raised only if the governor call does not complete on its first poll, which the governor's reserve
+        path never does."""
         ...
     def reserve_budget_checked(
         self, session_id: str, thread_id: str, tokens: int, wall_time_ms: int, tool_calls: int, cost_usd: float
@@ -195,10 +197,10 @@ class ChatPool:
         warm_pool_size: int = 5,
         drop_grace_ms: int = 2000,
     ) -> Self:
-        """``ValueError`` (``E-INPUT``) when a count or ``drop_grace_ms`` is zero; ``E-INTERNAL`` when the OS refuses a worker
-        thread. ``drop_grace_ms`` is the milliseconds dropping the pool waits for its workers before detaching the ones still
-        running; a dropped pool returns within that bound. A ``dedupe_window`` that is not greater than
-        ``per_thread_queue`` is refused as an invalid configuration (``ValueError``, ``E-INPUT``), per DD-16."""
+        """``ValueError`` (``E-INPUT``) when a count or ``drop_grace_ms`` is zero, when ``workers`` is above 256, or when
+        ``dedupe_window`` is not greater than ``per_thread_queue`` (DD-16); ``E-INTERNAL`` when the OS refuses a worker thread.
+        ``drop_grace_ms`` is the milliseconds dropping the pool waits for its workers before detaching the ones still running;
+        a dropped pool returns within that bound."""
         ...
     def open_thread(self, thread_id: str, subagent_type: str) -> None:
         """Opens a live thread. ``E-INPUT`` when a live thread holds the id; ``E-CAPACITY`` at ``max_threads`` and after ``shutdown``."""

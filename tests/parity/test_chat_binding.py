@@ -169,6 +169,11 @@ def test_dedupe_window_not_above_per_thread_queue_is_refused_from_python() -> No
         native.ChatPool(native.Governor(), per_thread_queue=8, dedupe_window=8)
 
 
+def test_pool_refuses_more_workers_than_the_bound() -> None:
+    with pytest.raises(ValueError, match=r"^E-INPUT: "):
+        native.ChatPool(native.Governor(), workers=257)
+
+
 def test_leaving_the_with_block_shuts_the_pool_down() -> None:
     with native.ChatPool(native.Governor()) as pool:
         pool.open_thread("a", "w")

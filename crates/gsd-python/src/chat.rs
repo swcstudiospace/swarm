@@ -312,7 +312,8 @@ impl PyGovernor {
 
     /// Wire reservation. Returns the grant as a dict; a refusal returns `granted` False with zero amounts and never raises.
     ///
-    /// `ValueError` is never raised by this call. Use `reserve_budget_checked` to learn why a reservation was refused.
+    /// A refusal never raises. `ValueError` (`E-INTERNAL`) is raised only if the governor call does not complete on its first
+    /// poll, which the governor's reserve path never does. Use `reserve_budget_checked` to learn why a reservation was refused.
     #[allow(clippy::too_many_arguments)] // reason: the Python signature is flat by design, one parameter per amount.
     #[pyo3(signature = (session_id, thread_id, tokens, wall_time_ms, tool_calls, cost_usd))]
     fn reserve_budget<'py>(
@@ -440,9 +441,10 @@ pub(crate) struct PyChatPool {
 impl PyChatPool {
     /// Creates a pool over `governor` and starts `workers` worker threads.
     ///
-    /// `drop_grace_ms` bounds how long dropping the pool waits for its workers, in milliseconds. It defaults to 2000 and zero is
-    /// refused. Raises `ValueError` with `E-INPUT` when any count or `drop_grace_ms` is zero, and with `E-INTERNAL` when the OS
-    /// refuses a worker thread.
+    /// `workers` is at most 256. `dedupe_window` must be greater than `per_thread_queue`. `drop_grace_ms` bounds how long
+    /// dropping the pool waits for its workers, in milliseconds. It defaults to 2000. Raises `ValueError` with `E-INPUT` when a
+    /// count or `drop_grace_ms` is zero, when `workers` is above 256, or when `dedupe_window` is not greater than
+    /// `per_thread_queue`; and with `E-INTERNAL` when the OS refuses a worker thread.
     #[new]
     #[pyo3(signature = (
         governor,
