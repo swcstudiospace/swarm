@@ -194,7 +194,7 @@ class ChatPool:
         ``per_thread_queue`` is refused as an invalid configuration (``ValueError``, ``E-INPUT``), per DD-16."""
         ...
     def open_thread(self, thread_id: str, subagent_type: str) -> None:
-        """Opens a live thread. ``E-INPUT`` when a live thread holds the id; ``E-CAPACITY`` at ``max_threads``."""
+        """Opens a live thread. ``E-INPUT`` when a live thread holds the id; ``E-CAPACITY`` at ``max_threads`` and after ``shutdown``."""
         ...
     def close_thread(self, thread_id: str) -> None:
         """Closes a live thread. ``E-INPUT`` for an id that is not live; ``E-CAPACITY`` while it has queued or running work."""

@@ -248,6 +248,7 @@ impl ChatPool {
     /// discarded once the open succeeds. Returns [`ChatError::Capacity`] when `max_threads` live
     /// threads already exist. A failed call changes nothing.
     /// A live id is refused with [`ChatError::ThreadExists`] even when the cap is also full.
+    /// Returns [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`].
     pub fn open_thread(&self, id: &str, subagent_type: SubagentType) -> Result<(), ChatError> {
         let _lifecycle = self.lifecycle.lock();
         if self.registry.get(id).is_some() {
