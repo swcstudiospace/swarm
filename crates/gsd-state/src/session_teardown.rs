@@ -797,4 +797,26 @@ mod tests {
         assert_eq!(reused, "th1");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn release_unused_of_a_pair_with_no_reservation_refunds_nothing() -> TestResult {
+        let governor = Governor::new(GovernorConfig::default());
+        let unused = Amounts {
+            tokens: 500,
+            wall_time_ms: 1000,
+            tool_calls: 3,
+            cost_usd: 0.25,
+        };
+
+        // The pair (s-none, th-none) holds no reservation, so the governor refuses the release as
+        // UnknownReservation. release_unused maps that refusal to a zero refund, not an error.
+        let result = release_unused(&governor, "s-none", "th-none", unused).await;
+        assert!(result.is_ok(), "{result:?}");
+        let freed = result?;
+        assert_eq!(freed.tokens, 0);
+        assert_eq!(freed.wall_time_ms, 0);
+        assert_eq!(freed.tool_calls, 0);
+        assert_eq!(freed.cost_usd, 0.0);
+        Ok(())
+    }
 }
