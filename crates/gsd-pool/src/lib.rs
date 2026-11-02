@@ -1,30 +1,46 @@
 //! Thread Pool Manager for GSD-Core
 //!
 //! Manages lifecycle, pooling, reuse, and isolation for chat-thread subagents.
+//!
+//! The public surface is the chat facade in [`chat`], its data types, the thread state machine,
+//! and [`PoolError`], [`PoolConfig`] and [`PoolResult`]. The pool machinery (`ThreadPool`, the
+//! warm pool, the handle registry and the lifecycle dispatcher) is crate-private (D-1).
 
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use gsd_codes::ErrorCode;
-use gsd_proto::gsd::v1::{ChatThreadId, SubagentType, ThreadStateKind};
+use gsd_proto::gsd::v1::{ChatThreadId, SubagentType};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-pub mod handle_registry;
-pub mod hook_dispatch;
+use crate::handle_registry::ChatThreadHandle;
+use crate::hook_dispatch::{LifecycleDispatcher, LifecycleEvent};
+use crate::warm_reuse::WarmPool;
+
+mod cancel;
+pub mod chat;
+mod chat_runtime;
+mod fair_queue;
+mod handle_registry;
+mod hook_dispatch;
 pub mod thread_state_machine;
 pub mod thread_state_transition_table;
-pub mod warm_reuse;
+mod warm_reuse;
 
-pub use handle_registry::{ChatThreadHandle, HandleRegistry};
-pub use hook_dispatch::{LifecycleDispatcher, LifecycleEvent, LifecycleObserver};
+pub use cancel::{CancelOutcome, CancelReport};
+pub use chat::{
+    BudgetPort, BudgetRefusal, BudgetReservation, ChatError, ChatPool, ChatRuntimeConfig, Placement,
+};
+pub use chat_runtime::{
+    ChatMessage, Completed, MessageRef, ShutdownReport, SubmitOutcome, Submitted, Ticket,
+};
 pub use thread_state_machine::transition;
 pub use thread_state_transition_table::{
     allowed_successors, is_legal_transition, ThreadPhase, BLOCK_REASON_KEY,
 };
-pub use warm_reuse::{CheckpointHook, WarmPool};
 
 /// Result type for pool operations
 pub type PoolResult<T> = std::result::Result<T, PoolError>;
@@ -78,142 +94,185 @@ impl Default for PoolConfig {
     }
 }
 
-/// Thread pool manager
-pub struct ThreadPool {
-    config: PoolConfig,
-    /// Keyed by `ChatThreadId::value`: the generated proto id type has no `Eq`/`Hash`.
-    threads: Arc<DashMap<String, Arc<parking_lot::Mutex<ThreadEntry>>>>,
-    warm_pool: Arc<RwLock<WarmPool>>,
+/// Crate-private thread lifecycle machinery behind [`ChatPool`].
+///
+/// Admission is not checked here: [`handle_registry::HandleRegistry`] owns the live-thread cap.
+/// The thread map holds only live threads. A parked thread leaves it in both placements, so the
+/// map and the warm pool never hold the same id.
+pub(crate) struct ThreadPool {
+    /// Live threads and the subagent type each runs. Keyed by `ChatThreadId::value`: the
+    /// generated proto id type has no `Eq`/`Hash`.
+    threads: DashMap<String, SubagentType>,
+    warm_pool: RwLock<WarmPool>,
     lifecycle: LifecycleDispatcher,
-    metrics: Arc<PoolMetrics>,
+    metrics: PoolMetrics,
 }
 
 impl ThreadPool {
-    pub fn new(config: PoolConfig) -> Self {
+    /// Creates an empty pool sized by `config.warm_pool_size` and its eviction grace period.
+    pub(crate) fn new(config: &PoolConfig) -> Self {
         let warm_pool = WarmPool::new(
             config.warm_pool_size,
             Duration::from_secs(config.eviction_grace_secs),
         );
         Self {
-            config,
-            threads: Arc::new(DashMap::new()),
-            warm_pool: Arc::new(RwLock::new(warm_pool)),
+            threads: DashMap::new(),
+            warm_pool: RwLock::new(warm_pool),
             lifecycle: LifecycleDispatcher::default(),
-            metrics: Arc::new(PoolMetrics::new()),
+            metrics: PoolMetrics::new(),
         }
     }
 
-    pub async fn acquire(&self, subagent_type: SubagentType) -> PoolResult<ChatThreadHandle> {
-        // Try to get from warm pool first
-        let warm = self
-            .warm_pool
-            .write()
-            .pop(&subagent_type, gsd_runtime::clock::now());
-        if let Some(handle) = warm {
-            self.metrics.inc_acquired_from_warm();
-            return Ok(handle);
-        }
-
-        // Create new thread
-        let handle = self.create_thread(subagent_type).await?;
-        self.metrics.inc_created();
-        Ok(handle)
-    }
-
-    pub async fn release(&self, handle: ChatThreadHandle) -> PoolResult<()> {
-        let thread_id = handle.id().clone();
-
-        if let Some(entry) = self.threads.get(thread_id.value.as_str()) {
-            let mut entry = entry.lock();
-            entry.state = ThreadStateKind::Idle;
-
-            // Park in the warm pool; the pool refuses it when full.
-            self.warm_pool
-                .write()
-                .push(&entry.subagent_type, handle, gsd_runtime::clock::now());
-        }
-
-        self.metrics.inc_released();
-        Ok(())
-    }
-
-    pub async fn scale(&self, target: usize) -> PoolResult<()> {
-        if target > self.config.max_threads {
-            return Err(PoolError::Exhausted(
-                "Target exceeds max_threads".to_string(),
-            ));
-        }
-        // Implementation for dynamic scaling
-        Ok(())
-    }
-
-    async fn create_thread(&self, subagent_type: SubagentType) -> PoolResult<ChatThreadHandle> {
-        let thread_id = ChatThreadId {
+    /// Creates a live thread with a generated id and returns the id.
+    pub(crate) fn create_thread(&self, subagent_type: SubagentType) -> ChatThreadId {
+        let id = ChatThreadId {
             value: Uuid::new_v4().to_string(),
         };
-        let handle = ChatThreadHandle::new(thread_id.clone(), subagent_type.clone());
-
-        let entry = ThreadEntry {
-            subagent_type,
-            state: ThreadStateKind::Initializing,
-        };
-
-        self.threads.insert(
-            thread_id.value.clone(),
-            Arc::new(parking_lot::Mutex::new(entry)),
-        );
-
-        // Notify observers of creation
-        self.lifecycle
-            .dispatch(&LifecycleEvent::OnCreate(thread_id.clone()));
-
-        // Initialize thread
-        {
-            let entry = self
-                .threads
-                .get(thread_id.value.as_str())
-                .ok_or_else(|| PoolError::NotFound(thread_id.value.clone()))?;
-            entry.lock().state = ThreadStateKind::Running;
-        }
-
-        Ok(handle)
+        self.threads.insert(id.value.clone(), subagent_type);
+        self.announce_created(&id);
+        id
     }
 
-    pub fn metrics(&self) -> &PoolMetrics {
+    /// Creates a live thread with the caller's `id`.
+    ///
+    /// Returns `PoolError::AlreadyExists` when `id` is already a live thread.
+    pub(crate) fn open_with_id(&self, id: &str, subagent_type: SubagentType) -> PoolResult<()> {
+        match self.threads.entry(id.to_string()) {
+            Entry::Occupied(_) => Err(PoolError::AlreadyExists(id.to_string())),
+            Entry::Vacant(slot) => {
+                slot.insert(subagent_type);
+                self.announce_created(&ChatThreadId {
+                    value: id.to_string(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Takes the most recently parked live handle for `subagent_type`, counting a warm hit.
+    pub(crate) fn pop_warm(
+        &self,
+        subagent_type: &SubagentType,
+        now: Instant,
+    ) -> Option<ChatThreadHandle> {
+        let handle = self.warm_pool.write().pop(subagent_type, now);
+        if handle.is_some() {
+            self.metrics.inc_acquired_from_warm();
+        }
+        handle
+    }
+
+    /// Makes a handle taken from the warm pool live again under its own id.
+    pub(crate) fn reopen_parked(&self, handle: &ChatThreadHandle) {
+        self.threads
+            .insert(handle.id().value.clone(), handle.subagent_type().clone());
+        self.lifecycle
+            .dispatch(&LifecycleEvent::OnResume(handle.id().clone()));
+    }
+
+    /// Removes any warm entry for thread `id`. Used when a parked id is opened fresh (DD-13).
+    pub(crate) fn discard_warm(&self, id: &str) {
+        self.warm_pool.write().remove_id(id);
+    }
+
+    /// Parks a released handle in the warm pool, aging it from `now`.
+    ///
+    /// The thread leaves the live set in both outcomes. Ids that the push evicted are removed
+    /// from the live set as well. When the pool is full the thread is closed: observers receive
+    /// `OnTerminate` and the caller gets [`Placement::Closed`]. The handle is never dropped
+    /// without a placement.
+    pub(crate) fn park_handle(&self, handle: ChatThreadHandle, now: Instant) -> Placement {
+        let id = handle.id().value.clone();
+        let subagent_type = handle.subagent_type().clone();
+        let outcome = self.warm_pool.write().push(&subagent_type, handle, now);
+        for evicted in &outcome.evicted {
+            self.threads.remove(evicted);
+        }
+        self.threads.remove(&id);
+        self.metrics.inc_released();
+        if outcome.parked {
+            Placement::Parked
+        } else {
+            self.lifecycle
+                .dispatch(&LifecycleEvent::OnTerminate(ChatThreadId { value: id }));
+            Placement::Closed
+        }
+    }
+
+    /// Removes live thread `id` from the thread map and reports its termination.
+    pub(crate) fn forget(&self, id: &str) {
+        if self.threads.remove(id).is_some() {
+            self.lifecycle
+                .dispatch(&LifecycleEvent::OnTerminate(ChatThreadId {
+                    value: id.to_string(),
+                }));
+        }
+    }
+
+    /// Reports a newly created thread and counts it.
+    fn announce_created(&self, id: &ChatThreadId) {
+        self.lifecycle
+            .dispatch(&LifecycleEvent::OnCreate(id.clone()));
+        self.metrics.inc_created();
+    }
+
+    /// Counters for created, warm-reused and released threads.
+    #[cfg(test)]
+    pub(crate) fn metrics(&self) -> &PoolMetrics {
         &self.metrics
     }
+
+    /// Number of parked handles in the warm pool.
+    #[cfg(test)]
+    pub(crate) fn warm_len(&self) -> usize {
+        self.warm_pool.read().len()
+    }
 }
 
-struct ThreadEntry {
-    subagent_type: SubagentType,
-    state: ThreadStateKind,
-}
-
-pub struct PoolMetrics {
-    created: std::sync::atomic::AtomicU64,
-    acquired_from_warm: std::sync::atomic::AtomicU64,
-    released: std::sync::atomic::AtomicU64,
+/// Counters kept by the pool. Crate-private.
+pub(crate) struct PoolMetrics {
+    created: AtomicU64,
+    acquired_from_warm: AtomicU64,
+    released: AtomicU64,
 }
 
 impl PoolMetrics {
     fn new() -> Self {
         Self {
-            created: std::sync::atomic::AtomicU64::new(0),
-            acquired_from_warm: std::sync::atomic::AtomicU64::new(0),
-            released: std::sync::atomic::AtomicU64::new(0),
+            created: AtomicU64::new(0),
+            acquired_from_warm: AtomicU64::new(0),
+            released: AtomicU64::new(0),
         }
     }
-}
 
-impl PoolMetrics {
     fn inc_created(&self) {
         self.created.fetch_add(1, Ordering::Relaxed);
     }
+
     fn inc_acquired_from_warm(&self) {
         self.acquired_from_warm.fetch_add(1, Ordering::Relaxed);
     }
+
     fn inc_released(&self) {
         self.released.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Threads created since the pool started.
+    #[cfg(test)]
+    pub(crate) fn created(&self) -> u64 {
+        self.created.load(Ordering::Relaxed)
+    }
+
+    /// Threads taken from the warm pool.
+    #[cfg(test)]
+    pub(crate) fn acquired_from_warm(&self) -> u64 {
+        self.acquired_from_warm.load(Ordering::Relaxed)
+    }
+
+    /// Threads released or parked, including those closed because the warm pool was full.
+    #[cfg(test)]
+    pub(crate) fn released(&self) -> u64 {
+        self.released.load(Ordering::Relaxed)
     }
 }
 

@@ -9,7 +9,9 @@
 //! native work detaches the GIL, while callbacks attach it without holding a Rust lock.
 //! A scheduler loop exception can leave detached jobs owning Python callbacks; returning
 //! from the entry is not a witness that those references are gone (see `sched_run`).
+//! The chat-thread binding (`chat`, Phase 14.6 CR-04) adds `Governor`, `ChatPool` and `ChatTicket`.
 
+mod chat;
 pub mod sched;
 mod sched_run;
 
@@ -368,6 +370,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sched_run::NativeCleanupFence>()?;
     m.add_class::<PyClaimTable>()?;
     m.add_class::<PyAimdLimiter>()?;
+    m.add_class::<chat::PyGovernor>()?;
+    m.add_class::<chat::PyChatPool>()?;
+    m.add_class::<chat::PyChatTicket>()?;
     Ok(())
 }
 

@@ -9,7 +9,8 @@
 //!   [`SESSION_CAP_CLAMP`] (30) per session. The effective cap is the AIMD limiter's current value.
 //!   Per-agent `max_parallel` and resource claims are enforced by [`ready_frontier`].
 //! - A worker failure fails only that task: a panic or an `Exception` yields `E-INTERNAL` for that
-//!   task alone. A rate-limit signal halves the AIMD limiter once per provider burst ([`RateLimitGate`]) and is reported for that task.
+//!   task alone. A rate-limit signal halves the AIMD limiter once per provider burst (`RateLimitGate`)
+//!   and is reported for that task.
 //! - [`DispatchMode::Rounds`] is the barrier fallback (`SWARM_SCHEDULER=rounds`): a new frontier is
 //!   admitted only once every task of the previous round has finished.
 

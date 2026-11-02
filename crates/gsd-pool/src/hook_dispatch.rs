@@ -11,7 +11,14 @@ use parking_lot::RwLock;
 
 /// A lifecycle transition for one chat thread.
 #[derive(Debug, Clone)]
-pub enum LifecycleEvent {
+// Dead-code: only create, resume and terminate are dispatched today. Lint: the `On` prefix is the
+// event vocabulary that the lifecycle contract names, so the variants keep it.
+#[expect(
+    dead_code,
+    clippy::enum_variant_names,
+    reason = "the On prefix is the lifecycle contract's vocabulary; not every variant is dispatched yet"
+)]
+pub(crate) enum LifecycleEvent {
     /// Thread was created.
     OnCreate(ChatThreadId),
     /// Thread was assigned work.
@@ -50,19 +57,20 @@ impl LifecycleEvent {
 ///
 /// The only input is `&LifecycleEvent` and the return type is `()`, so an observer cannot
 /// return a value into the pool or obtain a mutable reference to pool state.
-pub trait LifecycleObserver: Send + Sync {
+pub(crate) trait LifecycleObserver: Send + Sync {
     /// Handles one event. Called once per dispatch, in registration order.
     fn on_event(&self, event: &LifecycleEvent);
 }
 
 /// Registry of observers and the dispatch point for lifecycle events.
 #[derive(Default)]
-pub struct LifecycleDispatcher {
+pub(crate) struct LifecycleDispatcher {
     observers: RwLock<Vec<Arc<dyn LifecycleObserver>>>,
 }
 
 impl LifecycleDispatcher {
     /// Appends `observer`; it receives every event dispatched after this call returns.
+    #[cfg(test)]
     pub fn register(&self, observer: Arc<dyn LifecycleObserver>) {
         self.observers.write().push(observer);
     }
@@ -70,6 +78,7 @@ impl LifecycleDispatcher {
     /// Delivers `event` to every observer registered when dispatch began, in registration
     /// order. No lock is held while an observer runs.
     pub fn dispatch(&self, event: &LifecycleEvent) {
+        tracing::trace!(thread_id = %event.thread_id().value, "chat thread lifecycle event");
         // The temporary read guard is dropped at the end of this statement.
         let snapshot = self.observers.read().clone();
         for observer in &snapshot {

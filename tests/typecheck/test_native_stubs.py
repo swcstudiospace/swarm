@@ -20,6 +20,7 @@ EXPECTED_NAMES = frozenset(
         "wire_codes", "code_from_wire", "retry_policy", "orch_status_invoke", "decode_reply_wire", "redact_spans",
         "sched_order_ready", "sched_normalize_claim", "sched_claims_overlap", "sched_backoff_s", "sched_drain_plan", "ClaimTable", "AimdLimiter",
         "run_scheduler", "NativeCleanupFence",
+        "Governor", "ChatPool", "ChatTicket",
     }
 )
 STUB_PATH = Path(__file__).resolve().parents[2] / "swarm" / "_native.pyi"

@@ -7,6 +7,7 @@ keep it in step. Every scheduler call that is given an invalid value raises ``Va
 (``E-INPUT: <operation> failed: ...``); a Rust panic is ``E-INTERNAL`` and never a ``PanicException``.
 """
 
+from types import TracebackType
 from typing import Self, final
 
 __all__ = [
@@ -25,6 +26,9 @@ __all__ = [
     "AimdLimiter",
     "run_scheduler",
     "NativeCleanupFence",
+    "Governor",
+    "ChatPool",
+    "ChatTicket",
 ]
 
 def wire_codes() -> list[str]: ...
@@ -126,4 +130,109 @@ class AimdLimiter:
         ...
     def on_burst_hit(self, submitted_at: float, now: float, retry_after_s: float | None = None) -> bool:
         """A rate-limit hit through the once-per-burst gate. True when the limit dropped; False for the same burst and for a hit at the floor."""
+        ...
+
+@final
+class Governor:
+    """Resource governor shared by every ``ChatPool`` built over it, with the default configuration. Thread-safe.
+
+    ``reserve_budget`` is the wire call: a refusal returns ``granted`` False with zero amounts and never raises.
+    ``reserve_budget_checked`` raises ``ValueError`` with the wire code of the refusal. Amounts that are negative or
+    non-finite are ``E-INPUT``."""
+
+    def __new__(cls) -> Self: ...
+    def reserve_budget(
+        self, session_id: str, thread_id: str, tokens: int, wall_time_ms: int, tool_calls: int, cost_usd: float
+    ) -> dict[str, object]:
+        """Wire reservation. The grant as a dict (``granted``, ``tokens_granted``, ``wall_time_ms_granted``,
+        ``tool_calls_granted``, ``cost_usd_granted``); a refusal is ``granted`` False and never raises."""
+        ...
+    def reserve_budget_checked(
+        self, session_id: str, thread_id: str, tokens: int, wall_time_ms: int, tool_calls: int, cost_usd: float
+    ) -> dict[str, object]:
+        """Checked reservation. The grant as a dict on success. ``ValueError`` on refusal: ``E-INPUT`` for a missing id
+        or a bad amount, ``E-TIMEOUT`` when a session, thread or global cap would be exceeded, ``E-CAPACITY`` for a rate
+        limit. No budget changes on a refusal."""
+        ...
+    def release_budget(
+        self, session_id: str, thread_id: str, tokens: int, wall_time_ms: int, tool_calls: int, cost_usd: float
+    ) -> None:
+        """Returns an earlier reservation's amounts. ``ValueError`` (``E-INPUT``) for a negative or non-finite amount, and
+        ``ValueError`` (``E-INTERNAL``) when the session and thread pair holds no reservation. A refused release changes nothing."""
+        ...
+    def budget_snapshot(self, session_id: str) -> dict[str, object]:
+        """The used and remaining amounts of ``session_id`` (``tokens_used``, ``wall_time_ms_used``, ``tool_calls_used``,
+        ``cost_usd_used`` and the four ``*_remaining`` keys). ``ValueError`` (``E-INPUT``) before the session's first
+        reservation."""
+        ...
+
+@final
+class ChatPool:
+    """Chat-thread pool over a ``Governor``: a bounded queue per thread and a fixed set of workers.
+
+    Each thread has one message in flight at a time, so its messages run in FIFO order. Message ids are unique per thread:
+    a queued or in-flight id is always refused as already accepted, and a finished id is refused inside ``dedupe_window``;
+    a message id reused on another thread is a new message. Warm parked threads do not count
+    against ``max_threads``. Only the built-in executor runs; no Python callable runs on a worker (DEC-5). This binding does
+    not reach the scheduler, so it takes no lease (DEC-4). Every error is a ``ValueError`` whose text starts with its wire
+    code. Dropping the last reference stops the pool, waiting at most ``drop_grace_ms`` (default 2000) for its workers; ``shutdown`` reports
+    instead."""
+
+    def __new__(
+        cls,
+        governor: Governor,
+        workers: int = 4,
+        per_thread_queue: int = 64,
+        dedupe_window: int = 256,
+        max_threads: int = 30,
+        warm_pool_size: int = 5,
+        drop_grace_ms: int = 2000,
+    ) -> Self:
+        """``ValueError`` (``E-INPUT``) when a count or ``drop_grace_ms`` is zero; ``E-INTERNAL`` when the OS refuses a worker
+        thread. ``drop_grace_ms`` is the milliseconds dropping the pool waits for its workers before detaching the ones still
+        running; a dropped pool returns within that bound."""
+        ...
+    def open_thread(self, thread_id: str, subagent_type: str) -> None:
+        """Opens a live thread. ``E-INPUT`` when a live thread holds the id; ``E-CAPACITY`` at ``max_threads``."""
+        ...
+    def close_thread(self, thread_id: str) -> None:
+        """Closes a live thread. ``E-INPUT`` for an id that is not live; ``E-CAPACITY`` while it has queued or running work."""
+        ...
+    def submit(self, thread_id: str, msg_id: str, session_id: str, payload: bytes) -> tuple[str, int, ChatTicket | None]:
+        """Queues one message and returns ``(outcome, seq, ticket)``. ``outcome`` is ``"enqueued"`` with a ticket, or
+        ``"already_accepted"`` with ``None`` when ``msg_id`` is queued or in flight on the thread, or inside its dedupe window. ``E-CAPACITY`` when the queue
+        is full (nothing is enqueued) or the pool is shutting down; ``E-INPUT`` when the thread is not live."""
+        ...
+    def cancel_message(self, thread_id: str, msg_id: str) -> str:
+        """``"removed_queued"`` when the message was queued and never runs; ``"signalled_in_flight"`` when a worker is running
+        it, and its ticket completes ``cancelled``. ``E-INPUT`` for an unknown thread or a message that is neither queued nor
+        running (including one already completed)."""
+        ...
+    def cancel_thread(self, thread_id: str) -> dict[str, list[tuple[str, str]]]:
+        """Cancels every message of a thread: ``{"removed": [...], "signalled": [...]}`` as ``(thread_id, msg_id)`` pairs.
+        ``E-INPUT`` for a thread that is not live."""
+        ...
+    def shutdown(self, grace_ms: int) -> dict[str, list[tuple[str, str]]]:
+        """Stops intake and reports every message queued or in flight at the call, as ``(thread_id, msg_id)`` pairs under
+        ``"flushed"`` (finished within ``grace_ms``), ``"dropped"`` (still queued at the deadline), ``"abandoned"`` (still
+        running at the deadline) and ``"cancelled"`` (queued messages cancelled while shutdown waited). Dropped and abandoned
+        tickets complete ``failed`` with ``E-CAPACITY``. Releases the GIL while it waits."""
+        ...
+    def __enter__(self) -> Self:
+        """Returns the pool, so that ``with ChatPool(...) as pool:`` binds it."""
+        ...
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None
+    ) -> bool:
+        """Shuts the pool down with ``drop_grace_ms``, as ``shutdown`` does. Returns ``False``, so an exception propagates."""
+        ...
+
+@final
+class ChatTicket:
+    """Outcome handle of one accepted message. ``ChatPool.submit`` returns it; Python cannot build one."""
+
+    def wait(self, timeout_ms: int) -> dict[str, object]:
+        """Waits up to ``timeout_ms`` and returns ``{"status", "payload", "code"}``: ``status`` is ``"ok"`` (``payload`` bytes,
+        ``code`` None), ``"failed"`` (``code`` the wire code), ``"cancelled"`` or ``"pending"``. A timeout does not cancel
+        the message. Releases the GIL while it waits."""
         ...

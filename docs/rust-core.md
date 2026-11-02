@@ -23,9 +23,9 @@ Workspace members (`Cargo.toml`, `[workspace] members`, 22 crates). Excluded: `c
 | `gsd-proto` | Protobuf definitions for internal messages and types. |
 | `gsd-serde` | prost-reflect and bincode persistence for checkpoints and artifacts. |
 | `gsd-runtime` | Deterministic clock, async primitives, I/O utilities. |
-| `gsd-pool` | Thread pool manager for chat-thread subagents. |
-| `gsd-scheduler` | DAG-aware, priority-driven concurrent executor. |
-| `gsd-governor` | Token budgets, rate limits, concurrency caps, cost controls. |
+| `gsd-pool` | Chat-thread runtime: the public `ChatPool` facade (`chat` module), with caller-supplied thread ids (`open_thread`) or generated ones (`acquire`), bounded per-thread queues, round-robin fairness, per-thread dedupe, cancellation and a shutdown report. The pool machinery is crate-private (section 1.3). |
+| `gsd-scheduler` | DAG-aware, priority-driven concurrent executor. `MatrixScheduler::complete` releases a task's chat-thread lease and returns its budget reservation (DEC-4; section 1.3). |
+| `gsd-governor` | Token budgets, rate limits, concurrency caps, cost controls. `reserve_budget_checked` returns typed `GovernorError` reasons; the wire `reserve_budget` is unchanged (section 1.3). |
 | `gsd-observability` | Structured logging, tracing, metrics, replay. |
 | `gsd-security` | Thread isolation, capability tokens, audit logging, PII redaction. |
 | `gsd-nexus` | Pub/sub, request/response, shared-memory CRDT, broadcast. |
@@ -35,21 +35,52 @@ The `gsd_engine` binary is built from `crates/gsd-adapter/src/bin/gsd_engine.rs`
 
 ### 1.1 Governor release accounting
 
-`crates/gsd-governor/src/lib.rs` keeps outstanding amounts by the exact session/thread pair, under the global accounting lock. A release returns at most that pair's outstanding tokens, wall time, tool calls and cost. It clamps local used counters at zero and refunds only the corresponding capacity. Unknown or mismatched pairs and repeats after a pair is fully returned do not refund another pair's reservations. Reservation and release take local locks in the same order (session, thread, global); no public signature or default is changed.
+`crates/gsd-governor/src/lib.rs` keeps outstanding amounts by the exact session/thread pair, under the global accounting lock. A release returns at most that pair's outstanding tokens, wall time, tool calls and cost. It clamps local used counters at zero and refunds only the corresponding capacity. A release that matches no reservation (unknown or mismatched pair, or a repeat after the pair is fully returned) is refused with `GovernorError::UnknownReservation` and changes nothing, so it never refunds another pair's reservations. Reservation and release take local locks in the same order (session, thread, global); no public signature or default is changed.
 
-Global cost remains integer USD micros, rounded separately for each reservation. Partial cost refunds cannot exceed the micros still charged to the pair; returning all of its cost refunds exactly those remaining micros. Local USD counters still use floating point. This does not introduce exact-decimal pricing, configurable global-cap enforcement, rate limiting or scheduler integration: the existing global check is still hard-coded to 1,000,000 tokens and USD 100, and the rate-limit hook still returns true. The amount-based API has no reservation identity, so it cannot distinguish a delayed duplicate from a legitimate release after new reservations on the same pair.
+`Governor::release_freed(session_id, thread_id, tokens, wall_time_ms, tool_calls, cost_usd) -> GovernorResult<ReleasedAmounts>` (async) performs the release and returns the amounts it actually freed: `ReleasedAmounts { tokens, wall_time_ms, tool_calls, cost_usd }`. Each amount is clamped to what the pair holds, so a request above the pair's reservation frees only what the pair holds. `release_budget` keeps its signature and delegates to `release_freed`, discarding the amounts: it returns `GovernorResult<()>`, which is `Ok(())` on success and carries the same refusals otherwise. The `gsd-state` teardown (`session_teardown.rs`, `release_unused`) calls `release_freed` and reports the freed amount as `refunded`.
 
-Behavioral regressions are authored in `crates/gsd-governor/tests/release_accounting.rs`: repeated and oversized returns, unknown and mismatched pairs, shared sessions/threads, partial multi-resource returns, and separately rounded cost charges. They use the public reserve/release API, snapshots, and subsequent grant/refusal decisions. The existing in-module `release_without_matching_reservation_frees_no_global_usage` regression is retained. Neither the governor edit-only lane nor this documentation lane ran verification. Main subsequently reports a scoped workspace run (section 11); that is not a final-tree gate or proof that the amount-based duplicate ambiguity above is solved.
+Global cost remains integer USD micros, rounded separately for each reservation. Partial cost refunds cannot exceed the micros still charged to the pair; returning all of its cost refunds exactly those remaining micros. Local USD counters still use floating point. The global check reads `GovernorConfig::global_token_limit` and `global_cost_limit_usd` (defaults 1,000,000 tokens and USD 100). This does not introduce exact-decimal pricing or rate limiting: the rate-limit hook still returns true. The amount-based API has no reservation identity, so it cannot distinguish a delayed duplicate from a legitimate release after new reservations on the same pair.
+
+Behavioral regressions are authored in `crates/gsd-governor/tests/release_accounting.rs`: repeated and oversized returns, unknown and mismatched pairs, shared sessions/threads, partial multi-resource returns, and separately rounded cost charges. They use the public reserve/release API, snapshots, and subsequent grant/refusal decisions. Each repeat or unmatched release is asserted as `UnknownReservation`. The in-module `release_without_matching_reservation_frees_no_global_usage` regression asserts the same refusal. Neither the governor edit-only lane nor this documentation lane ran verification. Main subsequently reports a scoped workspace run (section 11); that is not a final-tree gate or proof that the amount-based duplicate ambiguity above is solved.
 
 ### 1.2 AsyncBarrier generation correction
 
 The recovery edit in `crates/gsd-runtime/src/sync.rs` replaces independent atomic count/reset/notify state with `Arc<tokio::sync::Barrier>`. It preserves `Clone`, `new`, `wait`, `wait_timeout`, the nonzero-count assertion and timeout wrapper. Six public generation-invariant tests in `crates/gsd-runtime/tests/barrier_generations.rs` cover cohort/leader behavior through manual polling; they are not a deterministic failing-before proof of the old private reset/notify interleaving. Cancellation-unsafety remains: no arrival rollback, poison/reset semantics or cancellation-safe API is introduced. This primitive correction does not implement or start the native scheduler binding/facade.
 
+### 1.3 Chat-thread runtime
+
+Phase 14.6 makes `gsd-pool`, `gsd-governor` and `gsd-scheduler` the chat-thread runtime. The public surface of `gsd-pool` is the chat facade in `gsd_pool::chat` (also re-exported at the crate root) and the data types it returns, plus `PoolError`, `PoolConfig`, `PoolResult` and the state-machine items that `gsd-state` and `gsd-adapter` import. The pool machinery (`ThreadPool`, the warm pool, the handle registry, the lifecycle dispatcher, the fair queue and the runtime) is crate-private (D-1). `ChatThreadHandle` is crate-private (DEC-7), so `park` and `release` take a thread id.
+
+- `ChatPool::new(config: ChatRuntimeConfig, budget: Arc<dyn BudgetPort>) -> Result<ChatPool, ChatError>` (DEC-2). `open_thread(id, SubagentType)` and `close_thread(id)` take a caller-supplied id. `acquire(SubagentType)` (async) reuses a warm thread or opens one with a generated id. `release(id)` (async) and `park(id, now: Instant)` both return `Placement`. `park_fresh(id, SubagentType, now: Instant)` opens and parks in one step: a live id is refused and nothing changes, and no submit can enqueue to the thread in between. Teardown uses it. `submit(ChatMessage)`, `cancel_message(thread_id, msg_id)`, `cancel_thread(thread_id)` and `shutdown(grace: Duration)` complete the facade.
+- Dropping a `ChatPool` closes intake, wakes the workers, and returns within `drop_grace_ms`. It completes queued and in-flight tickets as `Failed(ShuttingDown)` and produces no report.
+- `ChatRuntimeConfig { workers, per_thread_queue, dedupe_window, max_threads, warm_pool_size, drop_grace_ms }`. Defaults 4, 64, 256, 30, 5 and 2000. A zero in any field is `ChatError::InvalidConfig`, naming the field.
+- `ChatMessage { msg_id, thread_id, session_id, payload: Vec<u8> }` and `ChatMessage::new(msg_id, thread_id, session_id, payload)`. `Submitted { outcome, ticket: Option<Ticket> }` with `SubmitOutcome::{Enqueued { seq }, AlreadyAccepted { seq }}`; `ticket` is `None` for `AlreadyAccepted`.
+- `Ticket::wait(&self, timeout: Duration) -> Option<Completed>`: `None` while the message is pending. A timeout does not cancel the message. `Completed::{Ok(Vec<u8>), Failed(ChatError), Cancelled}`.
+- `CancelOutcome::{RemovedQueued, SignalledInFlight}`; `CancelReport { removed: Vec<MessageRef>, signalled: Vec<MessageRef> }`.
+- `ShutdownReport { flushed, dropped, abandoned, cancelled }`, each a `Vec<MessageRef>`. `MessageRef { thread_id, msg_id }`.
+- `Placement::{Parked, Closed}`, the result of `release` and `park`. The `gsd-state` teardown report has its own `Placement` enum; the two are different types.
+- `ChatError`: `UnknownThread(String)`, `ThreadExists(String)`, `ThreadBusy(String)`, `QueueFull { thread_id, capacity }`, `UnknownMessage { thread_id, msg_id }`, `BudgetDenied(String)`, `RateLimited(String)`, `InvalidBudget(String)`, `ShuttingDown`, `Panicked(String)`, `Governor(String)`, `InvalidConfig(String)`, `Capacity { max_threads }`, `WorkerSpawn(String)`. The codes are in section 2.1.
+- `BudgetPort` (trait, `reserve` and `release`), `BudgetReservation { session_id, thread_id, wall_time_ms }`, `BudgetRefusal::{Exceeded, Invalid, RateLimited, Other}` (each a `String`). A refused reservation completes the message with `BudgetDenied`, `RateLimited` or `InvalidBudget`, or `Governor` for `Other`. It never runs and is never dropped silently.
+- Each thread has at most one message in flight, so its messages run in FIFO order. Ready threads are served round-robin (GA-4).
+- Queues are bounded. A full queue returns `QueueFull` and records nothing.
+- Dedupe is per thread (DEC-6). A message id that is queued or in flight on a thread is always refused as `AlreadyAccepted`, whatever the window holds, so eviction cannot queue a second copy. An id that has left the thread is refused while it is inside `dedupe_window`. The same `msg_id` on another thread is a new message. `ChatRuntimeConfig::validate` still refuses a `dedupe_window` at or below `per_thread_queue` with `ChatError::InvalidConfig` naming both fields. That is a config rule (DD-16), no longer a dedupe correctness requirement. The window records each id when it is accepted. A closed or parked thread forgets its window, so a reopened thread is fresh (DD-13) and an id accepted before the close can be accepted again.
+- Warm parked threads do not count against `max_threads`, which bounds live threads only. A parked thread's id is not live: `submit` to a parked or closed thread returns `UnknownThread`, and `open_thread` on that id is a fresh open. `ThreadExists` is returned only while a live thread holds the id.
+- `park` and `release` on a thread with queued or in-flight work return `ThreadBusy` and change nothing.
+- Cancellation: a queued message is removed and never runs. A running message gets a cooperative token and completes `Cancelled`; the executor's value is discarded. No thread is killed.
+- Shutdown stops intake and reports the messages queued or in flight at the call. `flushed` lists those that finish before the grace deadline, in completion order. `dropped` lists those still queued at the deadline, in queue order. `abandoned` lists those still running at the deadline; their tokens are set and their workers are detached. Dropped and abandoned tickets complete `Failed(ShuttingDown)`. Messages that finished before the call are not listed.
+- `cancelled` lists queued messages that a cancel removed while shutdown waited, in cancel order. Each such ticket completes `Cancelled`, and the message is in none of the other three lists. A cancelled in-flight message is not listed there: its worker still runs it, so it is reported under `flushed` or `abandoned` by how it ended.
+- The executor is built-in only. No Python callable runs on a worker (DEC-5), and `hold_ms` is `pub(crate)`.
+- `gsd-pool` has no governor edge (DEC-1). Its workers are `std::thread` workers, and it calls only `BudgetPort`.
+
+`gsd-governor`: `reserve_budget_checked(request: BudgetRequest) -> GovernorResult<BudgetGrant>` (async, no await point) returns typed `GovernorError` refusals. `BudgetExceeded` covers a session, thread or global cap. `InvalidBudget` covers a missing id or a negative or non-finite amount. `RateLimitExceeded` is reachable only if the rate limiter refuses, and the stub does not (Q-5). `QuotaExceeded`, `CostLimitExceeded`, `Unauthorized` and `Other` are the remaining reservation variants. A refused checked reservation changes no budget. The wire `reserve_budget` keeps its signature and behaviour: a refusal returns `granted` false with zero amounts. `UnknownReservation(String)` is returned only by `release_budget` and `release_freed`, when the (session, thread) pair holds no reservation, and then nothing changes. `check_release(session_id, thread_id, tokens, wall_time_ms, tool_calls, cost_usd)` is a read-only pre-check: it validates the amounts and refuses with the errors `release_budget` would return at that moment, changing nothing. A concurrent release can drain the pair after a passing check, so `release_budget` can still return `UnknownReservation`. Entries drained to zero are removed (`GlobalUsage::release` in `crates/gsd-governor/src/lib.rs`). The global token and cost limits come from `GovernorConfig::global_token_limit` and `global_cost_limit_usd` (defaults 1,000,000 tokens and USD 100), which `Governor::new` passes to `GlobalUsage::new`. Release accounting is in section 1.1.
+
+`gsd-scheduler`: `GovernorBudget` implements `BudgetPort` over `gsd_governor::Governor`. It reserves wall time only; tokens, tool calls and cost are reserved as zero. `MatrixScheduler::submit` reserves the task budget on a per-task budget thread id, so `complete` returns exactly that reservation. A reservation the governor refuses fails `submit` with `SchedulerError::BudgetExhausted` and reserves nothing. If `submit` fails after reserving (`add_task`, the cycle check or `ChatPool::acquire`), it returns the reservation. A task is pending from its DAG insert until its `acquire` finishes. A task that depends on a pending task is refused as `TaskNotFound`, so a failed admission removes its node with no edge to drop, and `get_frontier` leaves pending tasks out. A failure after the DAG insert (the cycle check or `acquire`) removes the DAG node, so the same id can be submitted again. A successful `submit` takes a chat-thread lease. `MatrixScheduler::complete(&TaskId, LeaseOutcome)` (async) releases the lease through `ChatPool::release`, with `LeaseOutcome::{Succeeded, Failed, Cancelled}`, then returns the task reservation. On `ThreadBusy` it keeps both the lease and the reservation and returns an error, so the caller can retry. On any other release error the lease is removed, the reservation is still returned, and the error is returned. An unknown task returns `SchedulerError::TaskNotFound`. Each submitted task needs one `complete` call. This is a behaviour change (DEC-4): before Phase 14.6 nothing released the lease.
+
 ## 2. Python binding: `swarm._native`
 
 **Build.** `pyproject.toml` `[tool.maturin]`: `manifest-path = "crates/gsd-python/Cargo.toml"`, `module-name = "swarm._native"`, `bindings = "pyo3"`, `features = ["extension-module"]`, `python-source = "."`. `requires-python >= 3.12`. The PyO3 build is `abi3-py312` (`Cargo.toml` workspace dependency `pyo3`). maturin is `>=1.15,<2.0` in `pyproject.toml`; CI installs `maturin==1.15.0` (`.github/workflows/ci.yml`, `rust` job; `.github/workflows/wheel.yml`, job `wheel`). `pip install .` builds the extension (`swarm/_native_loader.py`, `_INSTALL_HINT`). The output `swarm/_native*.so` is gitignored (`.gitignore`, line 10).
 
-**Exports** (`crates/gsd-python/src/lib.rs`, `fn _native`): functions `code_from_wire`, `wire_codes`, `retry_policy`, `orch_status_invoke`, `decode_reply_wire`, `redact_spans`, `sched_order_ready`, `sched_normalize_claim`, `sched_claims_overlap`, `sched_backoff_s`, `sched_drain_plan`; classes `ClaimTable` and `AimdLimiter`. Type stub: `swarm/_native.pyi`, checked by `mypy.stubtest` in `wheel.yml`.
+**Exports** (`crates/gsd-python/src/lib.rs`, `fn _native`): functions `code_from_wire`, `wire_codes`, `retry_policy`, `orch_status_invoke`, `decode_reply_wire`, `redact_spans`, `sched_order_ready`, `sched_normalize_claim`, `sched_claims_overlap`, `sched_backoff_s`, `sched_drain_plan`, and `run_scheduler` (a `PyCFunction` named `run_scheduler`, built by `sched_run::run_scheduler_function`); classes `ClaimTable`, `AimdLimiter`, `Governor`, `ChatPool`, `ChatTicket` and `NativeCleanupFence` (`#[pyclass(name = "NativeCleanupFence")]` in `sched_run.rs`). Type stub: `swarm/_native.pyi`, checked by `mypy.stubtest` in `wheel.yml`. The chat binding runs only the built-in executor: no Python callable runs on a worker, and the binding exposes no `hold_ms` argument. No engine switch, route or default was changed by the chat binding.
 
 **Runtime callers in Python** (grep of `swarm/` and `scripts/`):
 
@@ -65,6 +96,45 @@ The recovery edit in `crates/gsd-runtime/src/sync.rs` replaces independent atomi
 - With `SWARM_PURE_PYTHON=1` the import is skipped. `SWARM_REDACT_ENGINE=rust` and `SWARM_CLAIMS_ENGINE=rust` each warn once (reason `pure-python`) and use Python (`redact._rust_engine_selected`, `claims._rust_engine_selected`).
 - Stale extension: redaction uses Python for that call; the claim table is built as Python at construction. One warning per reason per process (`redact._native_spans`, `claims.make_claim_table`).
 - A native exception: redaction uses Python for that call (`redact._native_spans`); a claim table falls back to a Python `ClaimTable` that holds the claims so far (`claims.NativeClaimTable._fall_back`).
+
+### 2.1 Chat binding
+
+The chat binding is `Governor`, `ChatPool` and `ChatTicket`, in `crates/gsd-python/src/chat.rs`, registered in `crates/gsd-python/src/lib.rs` (`fn _native`). The stub is `swarm/_native.pyi`. Tests: `tests/parity/test_chat_binding.py` and `tests/typecheck/test_native_stubs.py`. The binding is opt-in: no Python module under `swarm/` or `scripts/` uses these names, and no engine switch, route or default depends on them.
+
+- `Governor()`: `reserve_budget` is the wire call and never raises (a refusal returns `granted` False with zero amounts). `reserve_budget_checked` raises `ValueError` with the refusal's wire code and changes no budget. `release_budget` returns an earlier reservation; an unknown or repeated session/thread pair raises `ValueError` with `E-INTERNAL` and changes nothing, and a negative or non-finite amount raises `E-INPUT`. `budget_snapshot(session_id)` raises `E-INPUT` before the session's first reservation.
+- `ChatPool(governor, workers=4, per_thread_queue=64, dedupe_window=256, max_threads=30, warm_pool_size=5, drop_grace_ms=2000)`. A zero count or a zero `drop_grace_ms` raises `E-INPUT`. An OS refusal to start a worker raises `E-INTERNAL`. The pool's budget port is a `GovernorBudget` over the `Governor` object passed in (DEC-1).
+- `ChatPool` methods: `open_thread(thread_id, subagent_type)`, which raises `E-INPUT` for a live id even at full capacity and `E-CAPACITY` for a new id when `max_threads` is reached; `close_thread(thread_id)`; `submit(thread_id, msg_id, session_id, payload)`, which returns `(outcome, seq, ticket)` with `outcome` `"enqueued"` and a ticket, or `"already_accepted"` and `None` when the id is queued or in flight on the thread or inside its dedupe window; `cancel_message(thread_id, msg_id)`, which returns `"removed_queued"` or `"signalled_in_flight"`; `cancel_thread(thread_id)`, which returns `{"removed": [...], "signalled": [...]}`; `shutdown(grace_ms)`, which returns `{"flushed", "dropped", "abandoned", "cancelled"}` as `(thread_id, msg_id)` pairs.
+- `ChatTicket.wait(timeout_ms)` returns `{"status", "payload", "code"}`, with `status` `ok`, `failed`, `cancelled` or `pending`. A timeout does not cancel the message.
+- The binding has no `acquire`, `release` or `park`, and takes no scheduler lease (DEC-4). It runs only the built-in executor: no Python callable runs on a worker (DEC-5), and `hold_ms` is `pub(crate)` in `gsd-pool`, so the binding has no such argument.
+- Dropping the last reference to a `ChatPool` waits at most `drop_grace_ms` for its workers, then detaches any still running and returns. `shutdown` reports instead.
+- Not testable from Python without a deterministic slow worker, so covered in Rust only: `QueueFull`, cross-thread fairness, cancel of a queued message, cancel of an in-flight message, and shutdown with an abandoned message.
+- The adapters drive the governor's async methods with a single poll. A future that is not ready on its first poll is refused with `E-INTERNAL` (`governor call did not complete on its first poll`). The governor's reserve and release futures contain no await point, so this does not happen today.
+
+Python errors are `ValueError`s whose text starts with the wire code, then the operation: `E-TIMEOUT: reserve_budget_checked failed: ...`. `ChatError` codes (`chat_code` in `chat.rs`):
+
+| `ChatError` | Wire code |
+|---|---|
+| `InvalidConfig`, `UnknownThread`, `ThreadExists`, `UnknownMessage`, `InvalidBudget` | `E-INPUT` |
+| `ThreadBusy`, `QueueFull`, `Capacity`, `ShuttingDown`, `RateLimited` | `E-CAPACITY` |
+| `BudgetDenied` | `E-TIMEOUT` |
+| `Governor`, `Panicked`, `WorkerSpawn` | `E-INTERNAL` |
+
+`ShuttingDown` maps to `E-CAPACITY` because `gsd-codes` has no shutdown code; `E-CAPACITY` is the nearest fit.
+
+`GovernorError` codes (`governor_code` in `chat.rs`):
+
+| `GovernorError` | Wire code |
+|---|---|
+| `BudgetExceeded`, `CostLimitExceeded` | `E-TIMEOUT` |
+| `InvalidBudget` | `E-INPUT` |
+| `RateLimitExceeded`, `QuotaExceeded` | `E-CAPACITY` |
+| `Unauthorized` | `E-POLICY` |
+| `Other` | `E-INTERNAL` |
+| `UnknownReservation` | `E-INTERNAL` |
+
+`RateLimitExceeded` is not produced today: the rate-limiter stub returns true (Q-5).
+
+At the budget port, `refusal_of` maps `UnknownReservation` to `BudgetRefusal::Other`, as it maps `Other`.
 
 ## 3. Engine switches
 
@@ -192,7 +262,7 @@ A typed decline can hand the call to Python. Matching output from such a fallbac
 
 Main performed the precise targeted `Cargo.lock` update and canonical pin generation without changing the pin-hash algorithm. Parent-reported `scripts/pins.sha256` digest: `ab46999ec7d08c473a9b7329c326662825e33453d4968d3563b0787855ea966c`; **13 pin tests passed**. This digest covers the canonical toolchain/metadata inputs, not a guest or executable identity.
 
-Main reports postpatch cargo-deny **advisories, bans, licenses and sources passed**, with the **unchanged six approved ignores and deny policy**. Preserve the original repository `deny-report.txt` and failed `/root/.cache/gsd-redact-work/resume-gates/deny-report.txt`; the passing report is `resume-gates/deny-after-wasmtime.txt` in the same cache directory. No advisory waiver or new ignore is claimed.
+Main reports postpatch cargo-deny **advisories, bans, licenses and sources passed**, with the **unchanged six approved ignores and deny policy**. The two `resume-gates` deny reports this line used to cite (`/root/.cache/gsd-redact-work/resume-gates/deny-report.txt` and `deny-after-wasmtime.txt`) were removed by the 2026-11-02 disk cleanup, so this line is the only record of the result. The repository-root `deny-report.txt` is untracked and is kept. No advisory waiver or new ignore is claimed.
 
 Main also reports Wasmtime 50.0.1 workspace **1247 passed, 2 ignored, 74 suites, 0 failed**. Current served gate parity, release harness/build parity, reproducible guest identity and any required new sign-offs are not established by those scoped results. No guest/web pin or backend/default change is authorized or claimed by this host-runtime patch.
 

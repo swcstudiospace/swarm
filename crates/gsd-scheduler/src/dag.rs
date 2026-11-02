@@ -60,6 +60,42 @@ impl TaskDag {
         Ok(node)
     }
 
+    /// Removes the task `id`, every edge into or out of it, and its completion mark.
+    ///
+    /// The other tasks keep their insertion order and their edges. Returns `false` and changes
+    /// nothing when `id` is not in the DAG.
+    pub fn remove_task(&mut self, id: &str) -> bool {
+        let Some(removed) = self.index.remove(id) else {
+            return false;
+        };
+        self.completed.remove(id);
+
+        // Rebuild the graph without the node. `petgraph` moves the last node into a freed slot,
+        // which would reorder `get_ready_tasks`, so the surviving nodes keep their existing order.
+        let (nodes, edges) = std::mem::take(&mut self.graph).into_nodes_edges();
+        let mut remap: Vec<Option<NodeIndex>> = vec![None; nodes.len()];
+        let mut graph = DiGraph::with_capacity(nodes.len() - 1, edges.len());
+        for (old, node) in nodes.into_iter().enumerate() {
+            if old != removed.index() {
+                remap[old] = Some(graph.add_node(node.weight));
+            }
+        }
+        for edge in edges {
+            let source = remap[edge.source().index()];
+            let target = remap[edge.target().index()];
+            if let (Some(source), Some(target)) = (source, target) {
+                graph.add_edge(source, target, ());
+            }
+        }
+        for node in self.index.values_mut() {
+            if let Some(new) = remap[node.index()] {
+                *node = new;
+            }
+        }
+        self.graph = graph;
+        true
+    }
+
     /// Returns the ids of a task on a cycle, or `None` when the graph is acyclic.
     pub fn detect_cycles(&self) -> Option<Vec<String>> {
         toposort(&self.graph, None)
@@ -127,5 +163,74 @@ impl TaskDag {
             .id
             .as_ref()
             .map_or("", |id| id.value.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, deps: &[&str]) -> Task {
+        Task {
+            id: Some(TaskId {
+                value: id.to_string(),
+            }),
+            dependencies: deps
+                .iter()
+                .map(|dep| TaskId {
+                    value: dep.to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ready_ids(dag: &TaskDag) -> Vec<String> {
+        dag.get_ready_tasks()
+            .into_iter()
+            .map(|id| id.value)
+            .collect()
+    }
+
+    /// Removing a task that is not last moves every later node to a new index. The surviving
+    /// nodes keep their ids, their edges and their readiness.
+    #[test]
+    fn removing_an_early_task_keeps_the_later_tasks_usable() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &[]))?;
+        dag.add_task(task("C", &["B"]))?;
+        assert!(dag.remove_task("A"));
+        assert_eq!(ready_ids(&dag), vec!["B".to_string()]);
+        dag.mark_complete(&TaskId {
+            value: "B".to_string(),
+        })?;
+        assert_eq!(ready_ids(&dag), vec!["C".to_string()]);
+        assert_eq!(dag.critical_path_len("B"), 2);
+        assert_eq!(dag.critical_path_len("C"), 1);
+        assert!(!dag.remove_task("A"), "a second removal changes nothing");
+        Ok(())
+    }
+
+    /// `remove_task` drops the removed task's edges and keeps every other edge across the index
+    /// remap. C loses its only parent B, and D keeps its parent A.
+    #[test]
+    fn removing_a_task_drops_its_edges_and_keeps_the_others() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &[]))?;
+        dag.add_task(task("C", &["B"]))?;
+        dag.add_task(task("D", &["A"]))?;
+        assert!(dag.remove_task("B"));
+        assert_eq!(ready_ids(&dag), vec!["A".to_string(), "C".to_string()]);
+        dag.mark_complete(&TaskId {
+            value: "A".to_string(),
+        })?;
+        assert_eq!(ready_ids(&dag), vec!["C".to_string(), "D".to_string()]);
+        assert_eq!(dag.critical_path_len("A"), 2);
+        // D's only parent A stays complete, so removing D leaves C as the only ready task.
+        assert!(dag.remove_task("D"));
+        assert_eq!(ready_ids(&dag), vec!["C".to_string()]);
+        Ok(())
     }
 }

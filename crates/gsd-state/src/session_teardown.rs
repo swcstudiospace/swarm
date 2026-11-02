@@ -7,7 +7,7 @@
 //!
 //! Settlement returns the unused part of the bind-time reservation, which is the reservation minus the
 //! consumed amounts the caller supplies. The repo has no usage meter, so the caller measures consumption.
-//! The refund goes back to the governor through `release_budget` and to the session's budget snapshot.
+//! The refund goes back to the governor through `release_freed` and to the session's budget snapshot.
 //! An overrun (consumed above reserved) refunds nothing and is reported.
 //!
 //! Checkpoint writing and branch or merge lineage (`SESSION_BRANCHED` / `SESSION_MERGED`) are not
@@ -16,8 +16,8 @@
 use std::time::Instant;
 
 use gsd_governor::{Governor, GovernorError};
-use gsd_pool::{ChatThreadHandle, ThreadPhase, WarmPool};
-use gsd_proto::gsd::v1::{BudgetRequest, BudgetSnapshot, SessionState, ThreadState};
+use gsd_pool::{ChatPool, Placement as PoolPlacement, ThreadPhase};
+use gsd_proto::gsd::v1::{BudgetRequest, BudgetSnapshot, SessionState, SubagentType, ThreadState};
 
 use crate::session_dispatch::DispatchError;
 use crate::session_join::phase_of;
@@ -57,6 +57,9 @@ pub enum TeardownError {
     /// The governor refused the settlement.
     #[error("governor: {0}")]
     Governor(#[from] GovernorError),
+    /// The chat pool refused an open, close or park. Carries the pool error text.
+    #[error("pool: {0}")]
+    Pool(String),
 }
 
 /// Where a torn-down thread goes.
@@ -129,16 +132,24 @@ pub struct TeardownReport {
     pub overrun: bool,
 }
 
-/// Tears down thread `request.thread_id`: settles its unused reservation, then releases its handle to
-/// `pool` or destroys it, then removes the thread from the session.
+/// Tears down thread `request.thread_id`: parks its handle in `pool` (or destroys it), returns its
+/// unused reservation through `governor`, then removes the thread from the session.
 ///
-/// Every refusal happens before any change, so a refused call leaves the session, the governor and the
-/// pool untouched. A second call for the same thread is refused as [`TeardownError::UnknownThread`] and
+/// Every refusal before the pool step changes nothing: `InvalidAmounts`, `MissingSessionId`,
+/// `MissingBudget`, `UnknownThread`, `Dispatch`, `Live`, `NoHandle`, the governor check (`Governor`
+/// holding `UnknownReservation` when the session and thread pair holds no reservation), and the pool
+/// refusal (`Pool`). The governor check runs before the pool step, so a thread is never parked for a
+/// release that is already known to be refused.
+///
+/// After the pool step the teardown completes. The release is refused as `UnknownReservation` only when
+/// a concurrent release drained the pair after the check. Then nothing is left to refund: the report
+/// shows zero, no snapshot refund is applied, and the teardown still succeeds, because the thread is
+/// already parked. A second call for a removed thread is refused as [`TeardownError::UnknownThread`] and
 /// settles nothing again.
 pub async fn teardown_thread(
     state: &mut SessionState,
     governor: &Governor,
-    pool: &mut WarmPool,
+    pool: &ChatPool,
     request: Teardown<'_>,
 ) -> TeardownResult<TeardownReport> {
     if is_invalid(request.reserved) || is_invalid(request.consumed) {
@@ -164,39 +175,44 @@ pub async fn teardown_thread(
             phase: phase.as_str(),
         });
     }
-    let handle = match request.disposition {
-        Disposition::ReleaseToPool => Some(handle_of(thread, thread_id)?),
+    let identity = match request.disposition {
+        Disposition::ReleaseToPool => Some(thread_identity(thread, thread_id)?),
         Disposition::Destroy => None,
     };
-
-    let (refunded, overrun) = settle_amounts(request.reserved, request.consumed);
-    if refunded != Amounts::default() {
-        governor
-            .release_budget(
-                &session_id,
-                thread_id,
-                refunded.tokens,
-                refunded.wall_time_ms,
-                refunded.tool_calls,
-                refunded.cost_usd,
-            )
-            .await?;
+    let (unused, overrun) = settle_amounts(request.reserved, request.consumed);
+    // The check is read-only, so a refusal here changes nothing. It runs before the pool step, so no
+    // thread is parked for a release that is already known to be refused.
+    if unused != Amounts::default() {
+        governor.check_release(
+            &session_id,
+            thread_id,
+            unused.tokens,
+            unused.wall_time_ms,
+            unused.tool_calls,
+            unused.cost_usd,
+        )?;
     }
+    // The pool step refuses without changing anything; it runs before the release.
+    let pool_placement = match &identity {
+        Some((pool_thread_id, subagent_type)) => Some(
+            pool.park_fresh(pool_thread_id, subagent_type.clone(), request.now)
+                .map_err(|err| TeardownError::Pool(err.to_string()))?,
+        ),
+        None => None,
+    };
+    let refunded = if unused == Amounts::default() {
+        Amounts::default()
+    } else {
+        release_unused(governor, &session_id, thread_id, unused).await?
+    };
     if let Some(snapshot) = state.budget_snapshot.as_mut() {
         refund(snapshot, refunded);
     }
     state.threads.remove(thread_id);
 
-    let placement = match handle {
-        Some(handle) => {
-            let subagent_type = handle.subagent_type().clone();
-            if pool.push(&subagent_type, handle, request.now) {
-                Placement::ReleasedToPool
-            } else {
-                Placement::Destroyed
-            }
-        }
-        None => Placement::Destroyed,
+    let placement = match pool_placement {
+        Some(PoolPlacement::Parked) => Placement::ReleasedToPool,
+        Some(PoolPlacement::Closed) | None => Placement::Destroyed,
     };
     Ok(TeardownReport {
         thread_id: thread_id.to_string(),
@@ -252,17 +268,52 @@ fn refund(snapshot: &mut BudgetSnapshot, refunded: Amounts) {
     snapshot.cost_usd_remaining += refunded.cost_usd;
 }
 
-/// Builds the pool handle for `thread`, from its id and subagent type.
-fn handle_of(thread: &ThreadState, thread_id: &str) -> TeardownResult<ChatThreadHandle> {
+/// Releases `unused` through the governor and returns the amount it freed. The governor clamps the
+/// release to what the pair holds, so the result can be less than `unused`. A release refused as
+/// `UnknownReservation` means a concurrent release drained the pair after the check, so nothing is
+/// left to refund and the result is zero. Every other refusal is returned.
+async fn release_unused(
+    governor: &Governor,
+    session_id: &str,
+    thread_id: &str,
+    unused: Amounts,
+) -> TeardownResult<Amounts> {
+    let released = governor
+        .release_freed(
+            session_id,
+            thread_id,
+            unused.tokens,
+            unused.wall_time_ms,
+            unused.tool_calls,
+            unused.cost_usd,
+        )
+        .await;
+    match released {
+        Ok(freed) => Ok(Amounts {
+            tokens: freed.tokens,
+            wall_time_ms: freed.wall_time_ms,
+            tool_calls: freed.tool_calls,
+            cost_usd: freed.cost_usd,
+        }),
+        Err(GovernorError::UnknownReservation(_)) => Ok(Amounts::default()),
+        Err(err) => Err(TeardownError::Governor(err)),
+    }
+}
+
+/// Returns the pool thread id and subagent type of `thread`, which a pool handle needs.
+fn thread_identity(
+    thread: &ThreadState,
+    thread_id: &str,
+) -> TeardownResult<(String, SubagentType)> {
     let id = thread
         .id
-        .clone()
+        .as_ref()
         .ok_or_else(|| TeardownError::NoHandle(thread_id.to_string()))?;
     let subagent_type = thread
         .subagent_type
         .clone()
         .ok_or_else(|| TeardownError::NoHandle(thread_id.to_string()))?;
-    Ok(ChatThreadHandle::new(id, subagent_type))
+    Ok((id.value.clone(), subagent_type))
 }
 
 #[cfg(test)]
@@ -272,10 +323,35 @@ mod tests {
     use crate::session_join::test_fixtures::bound_state_with;
     use crate::session_join::{apply_terminal, Terminal};
     use gsd_governor::GovernorConfig;
+    use gsd_pool::{BudgetPort, BudgetRefusal, BudgetReservation, ChatRuntimeConfig};
     use gsd_proto::gsd::v1::SubagentType;
-    use std::time::Duration;
+    use std::sync::Arc;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Budget port for teardown tests. Teardown settles through the governor, never the port.
+    struct NoBudget;
+
+    impl BudgetPort for NoBudget {
+        fn reserve(&self, _reservation: &BudgetReservation) -> Result<(), BudgetRefusal> {
+            Ok(())
+        }
+
+        fn release(&self, _reservation: &BudgetReservation) -> Result<(), BudgetRefusal> {
+            Ok(())
+        }
+    }
+
+    /// A chat pool with `warm_pool_size` warm slots and the default live-thread cap.
+    fn test_pool(warm_pool_size: usize) -> Result<ChatPool, gsd_pool::ChatError> {
+        ChatPool::new(
+            ChatRuntimeConfig {
+                warm_pool_size,
+                ..ChatRuntimeConfig::default()
+            },
+            Arc::new(NoBudget),
+        )
+    }
 
     /// Binds `th1` reserving `tokens` through `governor`, and runs it to `SUCCEEDED`.
     async fn finished(
@@ -322,13 +398,13 @@ mod tests {
     async fn teardown_returns_the_thread_to_the_warm_pool() -> TestResult {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = finished(&governor, 1000).await?;
-        let mut pool = WarmPool::new(4, Duration::from_secs(60));
+        let pool = test_pool(4)?;
         let now = Instant::now();
 
         let report = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(
                 Disposition::ReleaseToPool,
                 reserved(1000),
@@ -340,16 +416,13 @@ mod tests {
 
         assert_eq!(report.placement, Placement::ReleasedToPool);
         assert!(!state.threads.contains_key("th1"));
-        assert_eq!(pool.len(), 1);
-        let handle = pool
-            .pop(
-                &SubagentType {
-                    value: "w".to_string(),
-                },
-                now,
-            )
-            .ok_or("no handle parked in the pool")?;
-        assert_eq!(handle.id().value, "th1");
+        // A warm hit returns the parked id; a new thread would have a generated id.
+        let reused = pool
+            .acquire(SubagentType {
+                value: "w".to_string(),
+            })
+            .await?;
+        assert_eq!(reused, "th1");
         Ok(())
     }
 
@@ -357,12 +430,12 @@ mod tests {
     async fn teardown_destroys_the_thread_when_asked() -> TestResult {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = finished(&governor, 1000).await?;
-        let mut pool = WarmPool::new(4, Duration::from_secs(60));
+        let pool = test_pool(4)?;
 
         let report = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(
                 Disposition::Destroy,
                 reserved(1000),
@@ -374,7 +447,13 @@ mod tests {
 
         assert_eq!(report.placement, Placement::Destroyed);
         assert!(!state.threads.contains_key("th1"));
-        assert!(pool.is_empty());
+        assert_ne!(
+            pool.acquire(SubagentType {
+                value: "w".to_string(),
+            })
+            .await?,
+            "th1"
+        );
         Ok(())
     }
 
@@ -382,12 +461,19 @@ mod tests {
     async fn release_into_a_full_pool_destroys_the_handle() -> TestResult {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = finished(&governor, 1000).await?;
-        let mut pool = WarmPool::new(0, Duration::from_secs(60));
+        let pool = test_pool(1)?;
+        pool.open_thread(
+            "th0",
+            SubagentType {
+                value: "w".to_string(),
+            },
+        )?;
+        assert_eq!(pool.park("th0", Instant::now())?, PoolPlacement::Parked);
 
         let report = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(
                 Disposition::ReleaseToPool,
                 reserved(1000),
@@ -398,7 +484,52 @@ mod tests {
         .await?;
 
         assert_eq!(report.placement, Placement::Destroyed);
-        assert!(pool.is_empty());
+        assert_ne!(
+            pool.acquire(SubagentType {
+                value: "w".to_string(),
+            })
+            .await?,
+            "th1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_pool_step_changes_nothing() -> TestResult {
+        let governor = Governor::new(GovernorConfig::default());
+        let mut state = finished(&governor, 1000).await?;
+        let pool = test_pool(1)?;
+        // A live thread already holds the id this teardown would park, so the pool step refuses first.
+        pool.open_thread(
+            "th1",
+            SubagentType {
+                value: "w".to_string(),
+            },
+        )?;
+        let before = state.budget_snapshot;
+
+        let refused = teardown_thread(
+            &mut state,
+            &governor,
+            &pool,
+            request(
+                Disposition::ReleaseToPool,
+                reserved(1000),
+                consumed(1000),
+                Instant::now(),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(refused, Err(TeardownError::Pool(_))),
+            "{refused:?}"
+        );
+        assert!(
+            state.threads.contains_key("th1"),
+            "the session still holds its thread"
+        );
+        assert_eq!(state.budget_snapshot, before, "no refund was applied");
         Ok(())
     }
 
@@ -411,13 +542,13 @@ mod tests {
             state.budget_snapshot.as_ref().map(|s| s.tokens_remaining),
             Some(9_000)
         );
-        let mut pool = WarmPool::new(4, Duration::from_secs(60));
+        let pool = test_pool(4)?;
         let now = Instant::now();
 
         let report = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(Disposition::Destroy, reserved(1000), consumed(400), now),
         )
         .await?;
@@ -433,7 +564,7 @@ mod tests {
         let again = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(Disposition::Destroy, reserved(1000), consumed(400), now),
         )
         .await;
@@ -446,12 +577,12 @@ mod tests {
     async fn overrun_refunds_nothing_and_is_reported() -> TestResult {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = finished(&governor, 1000).await?;
-        let mut pool = WarmPool::new(4, Duration::from_secs(60));
+        let pool = test_pool(4)?;
 
         let report = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(
                 Disposition::Destroy,
                 reserved(1000),
@@ -468,17 +599,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refund_above_the_held_reservation_reports_only_the_freed_amount() -> TestResult {
+        let governor = Governor::new(GovernorConfig::default());
+        // The governor holds 400 for (s1, th1); the caller claims 1000 was reserved at bind time.
+        let mut state = finished(&governor, 400).await?;
+        let pool = test_pool(4)?;
+
+        let report = teardown_thread(
+            &mut state,
+            &governor,
+            &pool,
+            request(
+                Disposition::Destroy,
+                reserved(1000),
+                consumed(0),
+                Instant::now(),
+            ),
+        )
+        .await?;
+
+        assert_eq!(report.refunded.tokens, 400);
+        assert!(!report.overrun);
+        let snapshot = state.budget_snapshot.ok_or("snapshot missing")?;
+        assert_eq!(snapshot.tokens_used, 0);
+        assert_eq!(snapshot.tokens_remaining, 10_000);
+        assert_eq!(governor.get_budget_snapshot("s1")?.tokens_used, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_thread_is_refused_and_nothing_settles() -> TestResult {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = bound_state_with(&governor, &[("th1", "t1")], 1000).await?;
         admit_thread(&mut state, "th1")?;
         handoff_thread(&mut state, "th1")?;
-        let mut pool = WarmPool::new(4, Duration::from_secs(60));
+        let pool = test_pool(4)?;
 
         let refused = teardown_thread(
             &mut state,
             &governor,
-            &mut pool,
+            &pool,
             request(
                 Disposition::ReleaseToPool,
                 reserved(1000),
@@ -490,8 +650,151 @@ mod tests {
 
         assert!(matches!(refused, Err(TeardownError::Live { .. })));
         assert!(state.threads.contains_key("th1"));
-        assert!(pool.is_empty());
+        assert_ne!(
+            pool.acquire(SubagentType {
+                value: "w".to_string(),
+            })
+            .await?,
+            "th1"
+        );
         assert_eq!(governor.get_budget_snapshot("s1")?.tokens_used, 1000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_governor_without_the_reservation_refuses_before_the_pool_step() -> TestResult {
+        let governor_a = Governor::new(GovernorConfig::default());
+        let mut state = finished(&governor_a, 1000).await?;
+        // A governor that never reserved this pair cannot return its budget.
+        let governor_b = Governor::new(GovernorConfig::default());
+        let pool = test_pool(4)?;
+        let before = state.budget_snapshot;
+
+        let refused = teardown_thread(
+            &mut state,
+            &governor_b,
+            &pool,
+            request(
+                Disposition::ReleaseToPool,
+                reserved(1000),
+                consumed(0),
+                Instant::now(),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(TeardownError::Governor(GovernorError::UnknownReservation(
+                    _
+                )))
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            state.threads.contains_key("th1"),
+            "the session still holds its thread"
+        );
+        assert_eq!(state.budget_snapshot, before, "no refund was applied");
+
+        // The pool never parked the id, so a live thread can open it.
+        pool.open_thread(
+            "th1",
+            SubagentType {
+                value: "w".to_string(),
+            },
+        )?;
+
+        // The check still refuses before the pool step, so a retry settles nothing either.
+        let again = teardown_thread(
+            &mut state,
+            &governor_b,
+            &pool,
+            request(
+                Disposition::ReleaseToPool,
+                reserved(1000),
+                consumed(0),
+                Instant::now(),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                again,
+                Err(TeardownError::Governor(GovernorError::UnknownReservation(
+                    _
+                )))
+            ),
+            "{again:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_live_cap_does_not_block_teardown() -> TestResult {
+        let governor = Governor::new(GovernorConfig::default());
+        let mut state = finished(&governor, 1000).await?;
+        let pool = ChatPool::new(
+            ChatRuntimeConfig {
+                max_threads: 1,
+                ..ChatRuntimeConfig::default()
+            },
+            Arc::new(NoBudget),
+        )?;
+        // th1 is never opened in the pool, so it holds no live slot.
+        // Opening th2 fills the one-thread live cap.
+        pool.open_thread(
+            "th2",
+            SubagentType {
+                value: "w".to_string(),
+            },
+        )?;
+        let full = pool.open_thread(
+            "th3",
+            SubagentType {
+                value: "w".to_string(),
+            },
+        );
+        assert!(
+            matches!(full, Err(gsd_pool::ChatError::Capacity { .. })),
+            "{full:?}"
+        );
+
+        let report = teardown_thread(
+            &mut state,
+            &governor,
+            &pool,
+            request(
+                Disposition::ReleaseToPool,
+                reserved(1000),
+                consumed(1000),
+                Instant::now(),
+            ),
+        )
+        .await?;
+
+        assert_eq!(report.placement, Placement::ReleasedToPool);
+        assert!(!state.threads.contains_key("th1"));
+        // th2 is still live, so a fresh open of its id is refused.
+        let still_live = pool.open_thread(
+            "th2",
+            SubagentType {
+                value: "w".to_string(),
+            },
+        );
+        assert!(
+            matches!(still_live, Err(gsd_pool::ChatError::ThreadExists(_))),
+            "{still_live:?}"
+        );
+        // Closing th2 frees the only slot. The next acquire takes th1 back from the
+        // warm pool, which shows th1 was parked and not live.
+        pool.close_thread("th2")?;
+        let reused = pool
+            .acquire(SubagentType {
+                value: "w".to_string(),
+            })
+            .await?;
+        assert_eq!(reused, "th1");
         Ok(())
     }
 }

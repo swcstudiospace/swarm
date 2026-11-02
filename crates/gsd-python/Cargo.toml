@@ -21,3 +21,7 @@ gsd-failure = { path = "../gsd-failure" }
 gsd-route = { path = "../gsd-route" }
 gsd-redact = { path = "../gsd-redact" }
 gsd-sched-core = { path = "../gsd-sched-core" }
+# chat-thread binding (Phase 14.6 CR-04, D-7)
+gsd-pool = { path = "../gsd-pool" }
+gsd-governor = { path = "../gsd-governor" }
+gsd-proto = { path = "../gsd-proto" }

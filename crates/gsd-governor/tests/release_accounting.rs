@@ -97,11 +97,21 @@ async fn repeated_release_preserves_unrelated_tokens_and_cost() {
     );
     let other_before = governor.get_budget_snapshot("other").unwrap();
 
-    for _ in 0..3 {
-        governor
+    // The first release returns the reservation. Each repeat matches nothing, so it is refused and changes
+    // nothing: the unrelated session stays as it was.
+    governor
+        .release_budget("s", "t", 400_000, 500, 2, 40.0)
+        .await
+        .unwrap();
+    assert_empty(governor.get_budget_snapshot("s").unwrap(), &config);
+    for _ in 0..2 {
+        let repeat = governor
             .release_budget("s", "t", 400_000, 500, 2, 40.0)
-            .await
-            .unwrap();
+            .await;
+        assert!(matches!(
+            repeat,
+            Err(gsd_governor::GovernorError::UnknownReservation(_))
+        ));
         assert_empty(governor.get_budget_snapshot("s").unwrap(), &config);
         assert_eq!(governor.get_budget_snapshot("other").unwrap(), other_before);
     }
@@ -180,10 +190,16 @@ async fn unknown_or_mismatched_release_cannot_free_existing_reservations() {
         ("s1", "t2"),
         ("s2", "t1"),
     ] {
-        governor
+        let refused = governor
             .release_budget(session, thread, i64::MAX, i64::MAX, i32::MAX, f64::MAX)
-            .await
-            .unwrap();
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(gsd_governor::GovernorError::UnknownReservation(_))
+            ),
+            "{session}/{thread} matches no reservation, got {refused:?}"
+        );
         assert_eq!(governor.get_budget_snapshot("s1").unwrap(), first_before);
         assert_eq!(governor.get_budget_snapshot("s2").unwrap(), second_before);
         assert!(
@@ -228,17 +244,23 @@ async fn oversized_release_cannot_drain_another_thread_in_the_same_session() {
             .granted
     );
 
-    for _ in 0..2 {
-        governor
-            .release_budget("s", "t1", i64::MAX, i64::MAX, i32::MAX, f64::MAX)
-            .await
-            .unwrap();
-        let snapshot = governor.get_budget_snapshot("s").unwrap();
-        assert_eq!(snapshot.tokens_used, 600_000);
-        assert_eq!(snapshot.wall_time_ms_used, 700);
-        assert_eq!(snapshot.tool_calls_used, 3);
-        assert_eq!(snapshot.cost_usd_used, 60.0);
-    }
+    governor
+        .release_budget("s", "t1", i64::MAX, i64::MAX, i32::MAX, f64::MAX)
+        .await
+        .unwrap();
+    // The reservation is gone, so a repeat is refused and changes nothing.
+    let refused = governor
+        .release_budget("s", "t1", i64::MAX, i64::MAX, i32::MAX, f64::MAX)
+        .await;
+    assert!(matches!(
+        refused,
+        Err(gsd_governor::GovernorError::UnknownReservation(_))
+    ));
+    let snapshot = governor.get_budget_snapshot("s").unwrap();
+    assert_eq!(snapshot.tokens_used, 600_000);
+    assert_eq!(snapshot.wall_time_ms_used, 700);
+    assert_eq!(snapshot.tool_calls_used, 3);
+    assert_eq!(snapshot.cost_usd_used, 60.0);
     assert_global_remainder(&governor, 400_000, 40.0).await;
 }
 
@@ -259,13 +281,18 @@ async fn oversized_release_cannot_drain_another_session_on_the_same_thread() {
     );
     let other_before = governor.get_budget_snapshot("s2").unwrap();
 
-    for _ in 0..2 {
-        governor
-            .release_budget("s1", "t", i64::MAX, i64::MAX, i32::MAX, f64::MAX)
-            .await
-            .unwrap();
-        assert_eq!(governor.get_budget_snapshot("s2").unwrap(), other_before);
-    }
+    governor
+        .release_budget("s1", "t", i64::MAX, i64::MAX, i32::MAX, f64::MAX)
+        .await
+        .unwrap();
+    let refused = governor
+        .release_budget("s1", "t", i64::MAX, i64::MAX, i32::MAX, f64::MAX)
+        .await;
+    assert!(matches!(
+        refused,
+        Err(gsd_governor::GovernorError::UnknownReservation(_))
+    ));
+    assert_eq!(governor.get_budget_snapshot("s2").unwrap(), other_before);
     assert_global_remainder(&governor, 400_000, 40.0).await;
 
     // Global room exists after the probe is released, but the shared thread still holds s2.
@@ -365,17 +392,25 @@ async fn full_cost_release_refunds_only_the_micros_charged_to_its_pair() {
                 .granted
         );
     }
-    for _ in 0..2 {
-        governor
-            .release_budget("s", "t", 0, 0, 0, f64::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            governor.get_budget_snapshot("s").unwrap().cost_usd_used,
-            0.0
-        );
-        assert_eq!(governor.get_budget_snapshot("other").unwrap(), other_before);
-    }
+    governor
+        .release_budget("s", "t", 0, 0, 0, f64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        governor.get_budget_snapshot("s").unwrap().cost_usd_used,
+        0.0
+    );
+    assert_eq!(governor.get_budget_snapshot("other").unwrap(), other_before);
+    let refused = governor.release_budget("s", "t", 0, 0, 0, f64::MAX).await;
+    assert!(matches!(
+        refused,
+        Err(gsd_governor::GovernorError::UnknownReservation(_))
+    ));
+    assert_eq!(
+        governor.get_budget_snapshot("s").unwrap().cost_usd_used,
+        0.0
+    );
+    assert_eq!(governor.get_budget_snapshot("other").unwrap(), other_before);
     assert!(
         !governor
             .reserve_budget(request("probe", "probe", 0, 0, 0, 0.000_003))
@@ -388,4 +423,24 @@ async fn full_cost_release_refunds_only_the_micros_charged_to_its_pair() {
             .await
             .granted
     );
+}
+
+#[tokio::test]
+async fn a_clamped_release_reports_the_freed_amount() {
+    let config = config();
+    let governor = Governor::new(config.clone());
+    assert!(
+        governor
+            .reserve_budget(request("s", "t", 300, 0, 0, 0.0))
+            .await
+            .granted
+    );
+
+    let freed = governor
+        .release_freed("s", "t", 500, 0, 0, 0.0)
+        .await
+        .unwrap();
+    assert_eq!(freed.tokens, 300);
+    assert_eq!(governor.get_budget_snapshot("s").unwrap().tokens_used, 0);
+    assert_empty(governor.get_budget_snapshot("s").unwrap(), &config);
 }
