@@ -132,20 +132,22 @@ pub struct TeardownReport {
     pub overrun: bool,
 }
 
-/// Tears down thread `request.thread_id`: parks its handle in `pool` (or destroys it), returns its
-/// unused reservation through `governor`, then removes the thread from the session.
+/// Tears down thread `request.thread_id`: checks the release, parks its handle in `pool` (or destroys
+/// it), returns its unused reservation through `governor`, then removes the thread from the session.
 ///
-/// Every refusal before the pool step changes nothing: `InvalidAmounts`, `MissingSessionId`,
-/// `MissingBudget`, `UnknownThread`, `Dispatch`, `Live`, `NoHandle`, the governor check (only when
-/// something is unused: `Governor` holding `UnknownReservation` when the pair has no reservation),
-/// and the pool refusal (`Pool`). The governor check runs before the pool step, so a thread is
-/// never parked for a release that is already known to be refused.
+/// A refusal before the pool step changes nothing. Those refusals are `InvalidAmounts`,
+/// `MissingSessionId`, `MissingBudget`, `UnknownThread`, `Dispatch`, `Live` and `NoHandle`, and the
+/// governor's `check_release` refusal, which runs only when something is unused and surfaces as
+/// `Governor(UnknownReservation)` when the pair has no reservation. The check runs before the pool
+/// step, so a thread is never parked for a release already known to be refused. A pool refusal
+/// (`Pool`) also changes nothing: nothing is parked and no release is made.
 ///
-/// After the pool step the teardown completes. The release is refused as `UnknownReservation` only when
-/// a concurrent release drained the pair after the check. Then nothing is left to refund: the report
-/// shows zero, no snapshot refund is applied, and the teardown still succeeds, because the thread is
-/// already parked. A second call for a removed thread is refused as [`TeardownError::UnknownThread`] and
-/// settles nothing again.
+/// `release_unused` runs after the park, so a refusal there does not undo the park. An
+/// `UnknownReservation` from the release means a concurrent release drained the pair after the check:
+/// the report shows zero, no snapshot refund is applied, and the teardown succeeds. Any other governor
+/// refusal is returned after the park: with `ReleaseToPool` the handle stays parked, the thread stays
+/// in the session, and no refund is applied. A second call for a removed thread is refused as
+/// [`TeardownError::UnknownThread`] and settles nothing again.
 pub async fn teardown_thread(
     state: &mut SessionState,
     governor: &Governor,

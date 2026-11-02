@@ -53,7 +53,9 @@ pub enum DispatchError {
     Scheduler(#[from] SchedulerError),
 }
 
-/// Admits thread `thread_id` from IDLE to QUEUED: its task is admitted to the dispatcher.
+/// Moves thread `thread_id` from IDLE to QUEUED through the B1 transition table. The body only
+/// moves the phase; it does not hand the task to the dispatcher. The worker wrapper in
+/// [`dispatch_session`] calls this for an IDLE thread, before [`handoff_thread`].
 ///
 /// Legality is decided by [`gsd_pool::transition`]; any other starting phase is refused.
 pub fn admit_thread(state: &mut SessionState, thread_id: &str) -> DispatchResult<()> {

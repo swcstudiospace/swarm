@@ -21,7 +21,8 @@ use gsd_scheduler::build_dag;
 pub const PHASE_KEY: &str = "phase";
 /// Metadata key on a [`ThreadState`] holding the workflow task id the thread serves.
 pub const TASK_KEY: &str = "task_id";
-/// Most threads one session may bind. Equal to the pool's `max_threads` default.
+/// Most tasks one workflow may carry, so most threads one session may bind: a thread serves one
+/// task and a task is served by at most one thread. Equal to the pool's `max_threads` default.
 pub const MAX_THREADS_PER_SESSION: usize = 30;
 
 /// Result type for session creation and thread binding.
@@ -45,9 +46,14 @@ pub enum CreateError {
     /// The thread was already bound; a thread binds once.
     #[error("thread {0} is already bound")]
     AlreadyBound(String),
-    /// The session already binds the maximum number of threads.
-    #[error("session already binds {0} threads; the per-session cap is 30")]
-    ThreadCapExceeded(usize),
+    /// The workflow has more tasks than a session serves; each task is served by one thread.
+    #[error("workflow has {tasks} tasks; a session serves at most {cap}")]
+    WorkflowTooLarge {
+        /// Number of tasks in the workflow.
+        tasks: usize,
+        /// Most tasks one session serves.
+        cap: usize,
+    },
     /// The bound task is not a task of the workflow.
     #[error("task {0} is not in the workflow")]
     UnknownTask(String),
@@ -89,6 +95,7 @@ pub struct ThreadBinding {
 }
 
 /// Returns the budget snapshot with nothing used and every limit of `budget` remaining.
+#[must_use]
 pub fn initial_snapshot(budget: &Budget) -> BudgetSnapshot {
     BudgetSnapshot {
         tokens_remaining: budget.max_tokens,
@@ -100,10 +107,17 @@ pub fn initial_snapshot(budget: &Budget) -> BudgetSnapshot {
 }
 
 /// Initialises a session for `workflow`: empty threads and branches, and a budget snapshot that
-/// starts at the workflow budget. The workflow is validated with the B3 DAG builder.
+/// starts at the workflow budget. The workflow is validated with the B3 DAG builder, and refused
+/// when it has more than [`MAX_THREADS_PER_SESSION`] tasks.
 pub fn create_session(session_id: SessionId, workflow: WorkflowDef) -> CreateResult<SessionState> {
     if session_id.value.is_empty() {
         return Err(CreateError::MissingSessionId);
+    }
+    if workflow.tasks.len() > MAX_THREADS_PER_SESSION {
+        return Err(CreateError::WorkflowTooLarge {
+            tasks: workflow.tasks.len(),
+            cap: MAX_THREADS_PER_SESSION,
+        });
     }
     build_dag(&workflow).map_err(|e| CreateError::InvalidWorkflow(e.to_string()))?;
     let snapshot = initial_snapshot(
@@ -124,8 +138,9 @@ pub fn create_session(session_id: SessionId, workflow: WorkflowDef) -> CreateRes
 /// charges the session snapshot, and inserts the thread in phase `IDLE`.
 ///
 /// Refuses, without reserving and without changing `state`, a second bind of the same thread, a
-/// thirty-first thread, a task that is absent or already served, a manifest whose subagent type
-/// differs from the task's, and a reservation the snapshot or the governor refuses.
+/// task that is absent or already served, a manifest whose subagent type differs from the task's,
+/// a reservation with a negative or non-finite amount, and a reservation the snapshot or the
+/// governor refuses.
 pub async fn bind_thread(
     state: &mut SessionState,
     governor: &Governor,
@@ -145,13 +160,13 @@ pub async fn bind_thread(
     validate_reservation(&request)?;
     check_within_snapshot(&snapshot, &request, &thread_key)?;
 
-    let grant = governor.reserve_budget(request).await;
-    if !grant.granted {
-        return Err(CreateError::BudgetRefused {
-            thread: thread_key,
-            reason: "the governor refused the reservation".to_string(),
-        });
-    }
+    let grant = governor
+        .reserve_budget_checked(request)
+        .await
+        .map_err(|err| CreateError::BudgetRefused {
+            thread: thread_key.clone(),
+            reason: err.to_string(),
+        })?;
 
     let mut charged = snapshot;
     charge(&mut charged, &grant);
@@ -173,9 +188,6 @@ fn check_bind_allowed(state: &SessionState, binding: &ThreadBinding) -> CreateRe
     let thread = binding.thread_id.value.as_str();
     if state.threads.contains_key(thread) {
         return Err(CreateError::AlreadyBound(thread.to_string()));
-    }
-    if state.threads.len() >= MAX_THREADS_PER_SESSION {
-        return Err(CreateError::ThreadCapExceeded(state.threads.len()));
     }
 
     let workflow = state
@@ -466,23 +478,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thirty_first_thread_is_refused() -> CreateResult<()> {
-        let tasks: Vec<Task> = (0..=MAX_THREADS_PER_SESSION)
-            .map(|i| task(&format!("t{i}"), "w"))
-            .collect();
-        let governor = Governor::new(GovernorConfig::default());
-        let mut state = session(tasks, 1_000)?;
-        for i in 0..MAX_THREADS_PER_SESSION {
-            bind_thread(
-                &mut state,
-                &governor,
-                binding(&format!("c{i}"), &format!("t{i}"), "w", 0),
-            )
-            .await?;
-        }
-        let refused = bind_thread(&mut state, &governor, binding("c30", "t30", "w", 0)).await;
-        assert!(matches!(refused, Err(CreateError::ThreadCapExceeded(30))));
-        assert_eq!(state.threads.len(), MAX_THREADS_PER_SESSION);
+    async fn governor_refusal_reason_reaches_the_caller() -> CreateResult<()> {
+        let mut config = GovernorConfig::default();
+        config.default_thread_budget.max_tokens = 100;
+        let governor = Governor::new(config);
+        let mut state = session(vec![task("a", "w")], 1_000)?;
+        let refused = bind_thread(&mut state, &governor, binding("t1", "a", "w", 500)).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(CreateError::BudgetRefused { reason, .. }) if reason.contains("thread budget")
+            ),
+            "governor refusal reason was not forwarded: {refused:?}"
+        );
+        assert!(state.threads.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn create_session_refuses_a_workflow_over_the_thread_cap() -> CreateResult<()> {
+        let tasks_of =
+            |n: usize| -> Vec<Task> { (0..n).map(|i| task(&format!("t{i}"), "w")).collect() };
+        session(tasks_of(30), 1_000)?;
+        let refused = session(tasks_of(31), 1_000);
+        assert!(matches!(
+            refused,
+            Err(CreateError::WorkflowTooLarge { tasks: 31, cap: 30 })
+        ));
         Ok(())
     }
 

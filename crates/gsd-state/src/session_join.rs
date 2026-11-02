@@ -146,6 +146,7 @@ impl CompletionLedger {
     }
 
     /// Stores `log` under `key` if the key is new. A second emission under the same key is dropped.
+    #[must_use]
     pub fn emit(&mut self, key: JoinKey, log: CompletionLog) -> Emit {
         if self.collected.contains_key(&key) {
             return Emit::Deduplicated;
@@ -634,7 +635,10 @@ fn fail_running_threads(session: &Mutex<SessionState>, ids: &[String]) {
             .get(&thread_id)
             .is_some_and(|thread| matches!(phase_of(thread, &thread_id), Ok(ThreadPhase::Running)));
         if running {
-            let _ = apply_terminal(&mut guard, &thread_id, Terminal::Failed);
+            apply_terminal(&mut guard, &thread_id, Terminal::Failed).expect(
+                "thread id is a key of the session's threads map and the lock is held across the \
+                 RUNNING check and this write, so RUNNING -> FAILED cannot be refused",
+            );
         }
     }
 }
