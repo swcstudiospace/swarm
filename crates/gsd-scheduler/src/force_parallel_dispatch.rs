@@ -220,29 +220,48 @@ fn dag_depths(tasks: &[Task]) -> Vec<usize> {
         .collect()
 }
 
+/// Depth of task `start`, computed with an explicit stack instead of recursion, so a long chain cannot
+/// overflow the thread stack. A dependency on a task still on the stack (a cycle) contributes 0 + 1, so
+/// the cycle is cut. Memo and visiting entries are written in the same order as the recursive walk.
 fn depth_of(
-    i: usize,
+    start: usize,
     tasks: &[Task],
     index: &HashMap<&str, usize>,
-    memo: &mut Vec<Option<usize>>,
-    visiting: &mut Vec<bool>,
+    memo: &mut [Option<usize>],
+    visiting: &mut [bool],
 ) -> usize {
-    if let Some(depth) = memo[i] {
+    if let Some(depth) = memo[start] {
         return depth;
     }
-    if visiting[i] {
-        return 0;
-    }
-    visiting[i] = true;
-    let mut depth = 0;
-    for dep in &tasks[i].dependencies {
-        if let Some(&j) = index.get(dep.value.as_str()) {
-            depth = depth.max(depth_of(j, tasks, index, memo, visiting) + 1);
+    visiting[start] = true;
+    // Each frame is (task, index of the next dependency to visit, deepest dependency seen so far + 1).
+    let mut stack = vec![(start, 0usize, 0usize)];
+    loop {
+        let top = stack.len() - 1;
+        let (i, next, depth) = stack[top];
+        let Some(dep) = tasks[i].dependencies.get(next) else {
+            visiting[i] = false;
+            memo[i] = Some(depth);
+            stack.pop();
+            match stack.last_mut() {
+                Some(parent) => parent.2 = parent.2.max(depth + 1),
+                None => return depth,
+            }
+            continue;
+        };
+        stack[top].1 += 1;
+        let Some(&j) = index.get(dep.value.as_str()) else {
+            continue;
+        };
+        if let Some(known) = memo[j] {
+            stack[top].2 = depth.max(known + 1);
+        } else if visiting[j] {
+            stack[top].2 = depth.max(1);
+        } else {
+            visiting[j] = true;
+            stack.push((j, 0, 0));
         }
     }
-    visiting[i] = false;
-    memo[i] = Some(depth);
-    depth
 }
 
 fn task_key(task: &Task) -> &str {
@@ -350,10 +369,12 @@ where
         self.report.max_in_flight = self.report.max_in_flight.max(self.in_flight.len());
     }
 
-    /// Runs the worker as its own task, so a panic is isolated and attributable to `id`. The `JoinSet`
+    /// Runs the worker as its own task, so a panic is isolated and attributable to `id`. The worker is
+    /// called inside that task, so a panic in its synchronous prefix is isolated too. The `JoinSet`
     /// owns the task, so dropping the run aborts it.
     fn spawn_worker(&mut self, id: String, task: Task) {
-        let abort = self.set.spawn((*self.worker)(task));
+        let worker = Arc::clone(&self.worker);
+        let abort = self.set.spawn(async move { (*worker)(task).await });
         self.task_ids.insert(abort.id(), id);
     }
 
@@ -665,6 +686,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_prefix_panic_fails_only_that_task() {
+        let bad = String::from("bad");
+        let tasks = vec![task("bad", 0, "w", &[]), task("good", 0, "w", &[])];
+        let report = run_force_parallel(built(tasks), serial(2), move |t: Task| {
+            // The panic happens inside the worker call itself, before any future exists.
+            if task_key(&t) == bad.as_str() {
+                panic!("sync boom");
+            }
+            async move { Ok::<(), TaskFailure>(()) }
+        })
+        .await
+        .expect("dispatch");
+        let outcome = |id: &str| {
+            report
+                .outcomes
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, o)| o.clone())
+        };
+        match outcome("bad") {
+            Some(TaskOutcome::Failed { code, .. }) => assert_eq!(code, "E-INTERNAL"),
+            other => panic!("expected E-INTERNAL failure, got {other:?}"),
+        }
+        assert_eq!(outcome("good"), Some(TaskOutcome::Completed));
+        assert!(report.undispatched.is_empty());
+    }
+
+    #[tokio::test]
     async fn panic_message_is_identical_across_dispatches() {
         async fn panic_text() -> String {
             let tasks = vec![task("b", 0, "w", &[])];
@@ -903,5 +952,36 @@ mod tests {
         assert!(pos(&cont, "start:c") < pos(&cont, "end:a"));
         let rounds = events(DispatchMode::Rounds).await;
         assert!(pos(&rounds, "end:a") < pos(&rounds, "start:c"));
+    }
+
+    #[test]
+    fn dag_depths_handles_a_long_dependency_chain_without_recursion() {
+        // Run alone with `--exact`: the recursive depth walk overflows this 2 MiB stack, and a stack
+        // overflow aborts the whole test binary.
+        const LEN: usize = 100_000;
+        let tasks: Vec<Task> = (0..LEN)
+            .map(|i| Task {
+                id: Some(TaskId {
+                    value: format!("t{i}"),
+                }),
+                dependencies: if i + 1 < LEN {
+                    vec![TaskId {
+                        value: format!("t{}", i + 1),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            })
+            .collect();
+        let depths = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || dag_depths(&tasks))
+            .expect("spawn depth thread")
+            .join()
+            .expect("depth thread");
+        assert_eq!(depths.len(), LEN);
+        assert_eq!(depths[0], LEN - 1);
+        assert_eq!(depths[LEN - 1], 0);
     }
 }

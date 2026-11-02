@@ -208,7 +208,7 @@ pub async fn replay_matrix_join<W, Fut>(
     worker: W,
 ) -> SchedulerResult<MatrixJoinReport>
 where
-    W: Fn(Task) -> Fut,
+    W: Fn(Task) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), TaskFailure>> + Send + 'static,
 {
     let built = build_dag_from(&batch.tasks, &[])?;
@@ -247,13 +247,17 @@ where
         seen.insert(id.clone());
     }
 
+    let worker = Arc::new(worker);
+
     let mut records = Vec::with_capacity(recorded_order.len());
     let mut arrival_order = Vec::with_capacity(recorded_order.len());
     for id in recorded_order {
         let Some(task) = pool.get(id).cloned() else {
             return Err(SchedulerError::TaskNotFound(id.clone()));
         };
-        let outcome = outcome_of(run_isolated(worker(task)).await);
+        let attempt_worker = Arc::clone(&worker);
+        let attempt = async move { (*attempt_worker)(task).await };
+        let outcome = outcome_of(run_isolated(attempt).await);
         let meta = metas
             .get(id)
             .ok_or_else(|| SchedulerError::TaskNotFound(id.clone()))?;
@@ -783,5 +787,28 @@ mod tests {
             "pool exceeded after cancel: peak {}",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    async fn replay_sync_prefix_panic_fails_only_that_task(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bad = String::from("bad");
+        let tasks = vec![task("bad", &[]), task("good", &[])];
+        let order = vec!["bad".to_string(), "good".to_string()];
+        let report = replay_matrix_join(batch(0, tasks), &order, move |t: Task| {
+            // The panic happens inside the worker call itself, before any future exists.
+            if task_id_of(&t) == bad.as_str() {
+                panic!("sync boom");
+            }
+            async move { Ok::<(), TaskFailure>(()) }
+        })
+        .await?;
+        match &record(&report.log, "bad").outcome {
+            TaskOutcome::Failed { code, .. } => assert_eq!(*code, "E-INTERNAL"),
+            other => panic!("expected E-INTERNAL failure, got {other:?}"),
+        }
+        assert_eq!(record(&report.log, "good").outcome, TaskOutcome::Completed);
+        assert!(report.undispatched.is_empty());
+        Ok(())
     }
 }

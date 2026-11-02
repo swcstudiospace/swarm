@@ -7,6 +7,15 @@
 //! A task is ready when all its dependencies are completed, it is neither completed nor in flight,
 //! its agent has a free `max_parallel` slot, and its requested claims do not conflict with any
 //! active claim or with a claim of a task admitted earlier in the same frontier.
+//!
+//! At most `free_slots` ids are returned, because each admitted task takes one slot.
+//!
+//! A task removed from `dag.tasks` is never in the frontier, because the frontier is built only
+//! from the tasks listed there. The dispatcher in `force_parallel_dispatch` removes each task it
+//! dispatches and records it in `active_claims` in the same step, so a dispatched task is not
+//! offered again.
+//!
+//! An agent's `max_parallel` of 0 is treated as 1, and so is an agent with no entry.
 
 use std::collections::{HashMap, HashSet};
 

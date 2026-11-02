@@ -83,28 +83,6 @@ impl From<gsd_sched_core::LimiterError> for SchedulerError {
     }
 }
 
-/// Scheduler configuration
-#[derive(Debug, Clone)]
-pub struct SchedulerConfig {
-    pub max_concurrent_tasks: usize,
-    pub default_policy: SchedulingPolicy,
-    pub enable_deadlock_detection: bool,
-    pub deadlock_check_interval_ms: u64,
-    pub preemption_timeout_ms: u64,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent_tasks: 30,
-            default_policy: gsd_proto::gsd::v1::SchedulingPolicy::CriticalPathThroughputHybrid,
-            enable_deadlock_detection: true,
-            deadlock_check_interval_ms: 1000,
-            preemption_timeout_ms: 30000,
-        }
-    }
-}
-
 /// How a submitted task ended. Every outcome releases its chat-thread lease (DEC-4).
 ///
 /// Named `LeaseOutcome` because `TaskOutcome` is already exported from this crate root by
@@ -172,14 +150,13 @@ impl MatrixScheduler {
     }
 
     /// Reserves the task budget, admits the task and takes a chat-thread lease for it. On `Err`,
-    /// the reservation is refunded and no DAG node remains, so the same id can be submitted again.
+    /// any reservation is refunded and no DAG node remains, so the same id can be submitted again.
     /// On `Ok`, the task holds a lease until `complete` is called for it.
     pub async fn submit(&self, task: gsd_proto::gsd::v1::Task) -> SchedulerResult<TaskId> {
         // Reserve budget on a thread id of its own, so `complete` returns exactly this reservation.
         let budget_thread = Uuid::new_v4().to_string();
-        let grant = self
-            .governor
-            .reserve_budget(gsd_proto::gsd::v1::BudgetRequest {
+        self.governor
+            .reserve_budget_checked(gsd_proto::gsd::v1::BudgetRequest {
                 session_id: Some(gsd_proto::gsd::v1::SessionId {
                     value: SESSION_ID.to_string(),
                 }),
@@ -191,12 +168,8 @@ impl MatrixScheduler {
                 tool_calls: TASK_TOOL_CALLS,
                 cost_usd: TASK_COST_USD,
             })
-            .await;
-        if !grant.granted {
-            return Err(SchedulerError::BudgetExhausted(
-                "Budget not granted".to_string(),
-            ));
-        }
+            .await
+            .map_err(|err| SchedulerError::BudgetExhausted(err.to_string()))?;
 
         match self.admit(task).await {
             Ok((task_id, thread_id)) => {
@@ -217,7 +190,7 @@ impl MatrixScheduler {
         }
     }
 
-    /// Adds `task` to the DAG as a pending node, checks for cycles and acquires its chat thread.
+    /// Adds `task` to the DAG as a pending node and acquires its chat thread.
     ///
     /// The node is pending from its DAG insert until its chat thread is acquired. Nothing can
     /// depend on a pending node, so a refused admission leaves no edge behind. A refusal removes
@@ -267,17 +240,8 @@ impl MatrixScheduler {
         }
     }
 
-    /// Checks for cycles and acquires a chat thread for `task`, which is already in the DAG.
+    /// Acquires a chat thread for `task`, which is already in the DAG.
     async fn check_and_acquire(&self, task: &gsd_proto::gsd::v1::Task) -> SchedulerResult<String> {
-        // Check for cycles
-        self.check_cycles()?;
-
-        // Submit to policy for scheduling
-        let _priority = {
-            let policy = self.policy.read();
-            policy.priority(task, &self.dag.read())
-        };
-
         // Submit to thread pool
         self.chat_pool
             .acquire(gsd_proto::gsd::v1::SubagentType {
@@ -410,17 +374,6 @@ impl MatrixScheduler {
             ?placement,
             "chat-thread lease released"
         );
-        Ok(())
-    }
-
-    fn check_cycles(&self) -> SchedulerResult<()> {
-        let dag = self.dag.read();
-        if let Some(cycle) = dag.detect_cycles() {
-            return Err(SchedulerError::CycleDetected(format!(
-                "Cycle detected: {:?}",
-                cycle
-            )));
-        }
         Ok(())
     }
 
@@ -899,6 +852,27 @@ mod lease_tests {
             .complete(&task_id("a"), LeaseOutcome::Cancelled)
             .await?;
         assert!(scheduler.get_frontier().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_refusal_reason_reaches_the_caller() -> Result<(), Box<dyn std::error::Error>> {
+        // The session holds 1 s of wall time, so the 60 s task reservation is refused by the session.
+        let mut config = gsd_governor::GovernorConfig::default();
+        config.default_session_budget.max_wall_time_ms = 1_000;
+        let governor = Arc::new(gsd_governor::Governor::new(config));
+        let budget = Arc::new(GovernorBudget::new(Arc::clone(&governor)));
+        let pool = gsd_pool::ChatPool::new(gsd_pool::ChatRuntimeConfig::default(), budget)?;
+        let scheduler = MatrixScheduler::new(Arc::new(pool), governor);
+        match scheduler.submit(task("a")).await {
+            Err(SchedulerError::BudgetExhausted(reason)) => {
+                assert!(
+                    reason.contains("session budget"),
+                    "refusal reason was {reason:?}"
+                );
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
         Ok(())
     }
 }
