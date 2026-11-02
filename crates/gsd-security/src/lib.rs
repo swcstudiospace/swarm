@@ -348,46 +348,104 @@ pub struct RedactionResult {
 }
 
 /// PII redaction
+///
+/// Each rule's pattern is compiled once, by [`Redactor::new`]. [`Redactor::redact`]
+/// matches every rule against the original input, so offsets index that input.
 pub struct Redactor {
-    rules: Vec<PiiRule>,
+    rules: Vec<CompiledRule>,
+}
+
+struct CompiledRule {
+    regex: regex::Regex,
+    replacement: String,
+    description: String,
+}
+
+/// One match of a rule, as byte offsets into the original input.
+struct PendingRedaction {
+    start: usize,
+    end: usize,
+    rule: usize,
 }
 
 impl Redactor {
-    pub fn new(rules: Vec<PiiRule>) -> Self {
-        Self { rules }
+    /// Compiles every rule. A pattern that does not compile is refused as
+    /// [`SecurityError::InvalidConfig`], naming the rule's description.
+    pub fn new(rules: Vec<PiiRule>) -> SecurityResult<Self> {
+        let rules = rules
+            .into_iter()
+            .map(|rule| -> SecurityResult<CompiledRule> {
+                let regex = regex::Regex::new(&rule.pattern).map_err(|err| {
+                    SecurityError::InvalidConfig(format!(
+                        "PII rule {:?} has an invalid pattern: {err}",
+                        rule.description
+                    ))
+                })?;
+                Ok(CompiledRule {
+                    regex,
+                    replacement: rule.replacement,
+                    description: rule.description,
+                })
+            })
+            .collect::<SecurityResult<Vec<_>>>()?;
+        Ok(Self { rules })
     }
 
+    /// Replaces every PII match with its rule's replacement text.
+    ///
+    /// Matches of all rules are found in the original input. Where matches overlap,
+    /// the one that starts first wins; at the same start, the longer one. Each
+    /// redaction's `start` and `end` are byte offsets into `input`. Empty matches
+    /// are not redacted.
     pub fn redact(&self, input: &str) -> RedactionResult {
-        let mut output = input.to_string();
-        let mut redactions = Vec::new();
+        let mut pending: Vec<PendingRedaction> = self
+            .rules
+            .iter()
+            .enumerate()
+            .flat_map(|(rule, compiled)| {
+                compiled
+                    .regex
+                    .find_iter(input)
+                    .filter(|mat| !mat.is_empty())
+                    .map(move |mat| PendingRedaction {
+                        start: mat.start(),
+                        end: mat.end(),
+                        rule,
+                    })
+            })
+            .collect();
+        pending.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then(b.end.cmp(&a.end))
+                .then(a.rule.cmp(&b.rule))
+        });
 
-        for rule in &self.rules {
-            let Ok(regex) = regex::Regex::new(&rule.pattern) else {
-                continue;
-            };
-            let mut start = 0;
-            while start <= output.len() {
-                let Some(mat) = regex.find_at(&output, start) else {
-                    break;
-                };
-                let start_pos = mat.start();
-                let end_pos = mat.end();
-                if start_pos == end_pos {
-                    // Empty match: step over one character so the scan always advances.
-                    start =
-                        start_pos + output[start_pos..].chars().next().map_or(1, char::len_utf8);
-                    continue;
-                }
-                redactions.push(Redaction {
-                    start: start_pos as i32,
-                    end: end_pos as i32,
-                    type_: rule.description.clone(),
-                    reason: "PII redaction".to_string(),
-                });
-                output.replace_range(start_pos..end_pos, &rule.replacement);
-                start = start_pos + rule.replacement.len();
+        let mut kept: Vec<PendingRedaction> = Vec::with_capacity(pending.len());
+        let mut covered_until = 0;
+        for candidate in pending {
+            if candidate.start >= covered_until {
+                covered_until = candidate.end;
+                kept.push(candidate);
             }
         }
+
+        let mut output = String::with_capacity(input.len());
+        let mut redactions = Vec::with_capacity(kept.len());
+        let mut cursor = 0;
+        for found in kept {
+            let rule = &self.rules[found.rule];
+            output.push_str(&input[cursor..found.start]);
+            output.push_str(&rule.replacement);
+            redactions.push(Redaction {
+                start: found.start as i32,
+                end: found.end as i32,
+                type_: rule.description.clone(),
+                reason: "PII redaction".to_string(),
+            });
+            cursor = found.end;
+        }
+        output.push_str(&input[cursor..]);
 
         RedactionResult { output, redactions }
     }
@@ -678,6 +736,33 @@ mod tests {
             0,
             "audit log mode {mode:o} grants group or other access"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn redaction_offsets_index_input() -> SecurityResult<()> {
+        let rules = vec![
+            PiiRule {
+                pattern: "a1".to_string(),
+                replacement: "XXXX".to_string(),
+                description: "first".to_string(),
+            },
+            PiiRule {
+                pattern: "b2".to_string(),
+                replacement: "YY".to_string(),
+                description: "second".to_string(),
+            },
+        ];
+        let redactor = Redactor::new(rules)?;
+        let input = "a1 b2";
+        let result = redactor.redact(input);
+
+        assert_eq!(result.redactions.len(), 2);
+        let second = &result.redactions[1];
+        let start = second.start as usize;
+        let end = second.end as usize;
+        assert_eq!(start, 3, "offset must index the original input");
+        assert_eq!(&input[start..end], "b2");
         Ok(())
     }
 }
