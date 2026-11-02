@@ -512,3 +512,5 @@ Each id below is a `vectors.json` record of kind `constant` (ids `S-*`). The Rus
 - `S-BAR-IDLE-POLL-MAX` (`omp/src/swarm_bar.ts:2510`): upper clamp of the idle poll interval, 30_000 ms.
 
 Not pinned here: the multi-line `DEPTH_REASON` and the `/swarm` dispatch prompt bodies, which are large template literals with computed parts.
+
+**Addendum (2026-11-02, lanes merge `135d12b`).** The QA-gate lane changed `omp/src/tools.ts`: the QA timeout is now `QA_GATE_TIMEOUT_S = 1800` and `QA_GATE_CLEANUP_S = 60` (lines 43 to 44), and the per-call timeout is computed at lines 445 to 447 for the `quality` gate only. Records `C-QA-GATE-TIMEOUT-MS-01` and `A-GATE-07` were re-spelled to match; `QA_GATE_CLEANUP_S` is not a separate record, which keeps the 211-record count the replay test pins. The rest of this snapshot's line numbers are as read before the merge; `test_vectors_replay.py` is the authority for current citations.
