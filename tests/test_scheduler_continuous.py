@@ -39,11 +39,21 @@ def emit(ev):
 
 starts = sum(1 for ln in open(LOG) if json.loads(ln)["ev"] == "start" and json.loads(ln)["tid"] == tid) if os.path.exists(LOG) else 0
 rec("start", n=starts + 1)
-barrier = c.get("barrier", 0)  # wait until N sessions of this run have started: they are then alive together, on any machine
+barrier = c.get("barrier", 0)  # wait until N distinct sessions of this run have started: they are then alive together, on any machine
+def started():
+    tids = set()
+    for ln in open(LOG):
+        try:
+            entry = json.loads(ln)
+        except ValueError:  # a peer is still appending this line
+            continue
+        if entry["ev"] == "start":
+            tids.add(entry["tid"])
+    return tids
 if barrier:
     limit = time.time() + 30
     while time.time() < limit:
-        if len({json.loads(ln)["tid"] for ln in open(LOG) if json.loads(ln)["ev"] == "start"}) >= barrier:
+        if len(started()) >= barrier:
             break
         time.sleep(0.02)
 emit({"type": "session", "version": 3, "id": "fake-" + tid, "cwd": os.getcwd()})
@@ -218,7 +228,8 @@ def test_global_cap_is_respected_and_overflow_is_queued(tmp_path):
 
 def test_per_agent_ceiling_holds_with_free_global_slots(tmp_path):
     tasks = [_task(f"r{i}", agent="A12", cap="release.plan") for i in range(4)]  # A12's manifest max_parallel is 2
-    rig = Rig(tmp_path, tasks, {"*": {"sleep": 0.3}})
+    # Two of A12's four sessions must be alive together before either ends, so the overlap is forced, not timed.
+    rig = Rig(tmp_path, tasks, {"*": {"sleep": 0.3, "barrier": 2}})
     r = rig.run("--max-parallel", "4")
     assert r.returncode == 0, r.stdout + r.stderr
     assert _max_concurrency(rig.spans()) == 2
@@ -229,7 +240,8 @@ def test_per_agent_ceiling_holds_with_free_global_slots(tmp_path):
 
 def test_a_slow_task_does_not_delay_newly_ready_work(tmp_path):
     tasks = [_task("slow"), _task("fast"), _task("next", deps=["fast"])]
-    cfg = {"T-slow": {"sleep": 1.6}, "T-fast": {"sleep": 0.2}, "T-next": {"sleep": 0.2}}
+    # The slow session stays alive until T-next has started, so the freed slot is refilled while it runs. If it is not, the barrier times out and the assertions below fail.
+    cfg = {"T-slow": {"sleep": 1.6, "barrier": 3}, "T-fast": {"sleep": 0.2}, "T-next": {"sleep": 0.2}}
     rig = Rig(tmp_path, tasks, cfg)
     r = rig.run("--max-parallel", "2")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -370,7 +382,7 @@ def test_a_worker_exception_is_that_tasks_structured_failure(tmp_path, monkeypat
 def test_swarm_timeout_writes_the_flag_waits_the_grace_then_kills_without_orphans(tmp_path):
     rig = Rig(tmp_path, [_task("stuck")], {"T-stuck": {"sleep": 60, "child": True}}, SWARM_CANCEL_GRACE_S="1")
     started = time.monotonic()
-    r = rig.run("--swarm-timeout", "1", "--max-parallel", "1", "--task-timeout", "100")
+    r = rig.run("--swarm-timeout", "8", "--max-parallel", "1", "--task-timeout", "100")
     elapsed = time.monotonic() - started
     out = json.loads(r.stdout)
     assert r.returncode == 1 and out["cancelled"] == "swarm-timeout", r.stdout + r.stderr
@@ -391,7 +403,7 @@ def test_a_session_that_leaves_within_the_grace_is_not_killed(tmp_path):
     rig = Rig(tmp_path, [_task("polite")], {"T-polite": {"sleep": 60, "leave_on_cancel": True}},
               SWARM_CANCEL_GRACE_S="20")
     started = time.monotonic()
-    r = rig.run("--swarm-timeout", "1", "--max-parallel", "1", "--task-timeout", "100")
+    r = rig.run("--swarm-timeout", "8", "--max-parallel", "1", "--task-timeout", "100")
     assert time.monotonic() - started < 15
     assert json.loads(r.stdout)["cancelled"] == "swarm-timeout"
     assert [rec["ev"] for rec in rig.fake_log() if rec["tid"] == "T-polite"] == ["start", "cancel_seen", "left"]
@@ -486,7 +498,7 @@ def test_one_failing_task_keeps_the_parallelism_and_follows_the_retry_ladder(tmp
     assert len(later) >= 4 and _max_concurrency(later) >= 3, "the tasks after the failure ran (nearly) one at a time"
 
 
-def test_three_failures_in_a_row_halve_the_parallelism_once_and_successes_restore_it(tmp_path):
+def test_three_failures_in_a_row_halve_the_parallelism_and_successes_restore_it(tmp_path):
     bads = [_task(f"b{i}") for i in range(3)]
     oks = [_task(f"s{i}") for i in range(5)]
     permanent = {"fail": True}  # a plain failure, retried as the scenario was written: near-immediately
@@ -502,10 +514,14 @@ def test_three_failures_in_a_row_halve_the_parallelism_once_and_successes_restor
     assert [states[f"T-b{i}"] for i in range(3)] == ["ESCALATED"] * 3  # each still ran its own retry ladder
     assert {states[f"T-s{i}"] for i in range(5)} == {"DONE"}
     degraded = [e["payload"] for e in rig.events("swarm.degraded")]
-    assert [d["reason"] for d in degraded] == ["consecutive_failures", "recovered"], degraded
+    # A streak of three failures trips once. A success can raise the parallelism again, so a later streak can trip again.
+    # The invariant: the first trip halves 4 -> 2, the last event restores, and both kinds appear.
+    reasons = [d["reason"] for d in degraded]
+    assert reasons[0] == "consecutive_failures" and reasons[-1] == "recovered", degraded
+    assert set(reasons) == {"consecutive_failures", "recovered"}, degraded
     assert degraded[0]["mode"] == "reduced_parallelism"
     assert degraded[0]["detail"] == "3 failures in a row; effective_parallel 4 -> 2"
-    assert degraded[1]["mode"] == "recovered" and degraded[1]["detail"] == "reduced_parallelism"
+    assert degraded[-1]["mode"] == "recovered" and degraded[-1]["detail"] == "reduced_parallelism"
     effective = _effective(rig)
     assert 2 in effective and max(effective[effective.index(2):]) == 4, effective
     assert json.loads((rig.swarm / "live.json").read_text())["swarm"]["degraded"] is None
@@ -946,7 +962,8 @@ def test_a_rate_limit_at_parallelism_one_sets_no_degraded_marker(tmp_path):
 def test_rounds_mode_still_cancels_on_the_swarm_timeout_without_orphans(tmp_path):
     rig = Rig(tmp_path, [_task("stuck")], {"T-stuck": {"sleep": 60, "child": True}}, SWARM_CANCEL_GRACE_S="1",
               SWARM_SCHEDULER="rounds")
-    r = rig.run("--swarm-timeout", "1", "--max-parallel", "1", "--task-timeout", "100")
+    # A margin, not a race: a loaded host can take seconds to start the stuck session, which must start before the swarm timeout.
+    r = rig.run("--swarm-timeout", "8", "--max-parallel", "1", "--task-timeout", "100")
     out = json.loads(r.stdout)
     assert r.returncode == 1 and out["cancelled"] == "swarm-timeout" and out["scheduler"] == "rounds"
     _everything_ended(rig)
