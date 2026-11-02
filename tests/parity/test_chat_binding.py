@@ -151,6 +151,12 @@ def test_shutdown_report_has_an_empty_cancelled_list() -> None:
     assert report["cancelled"] == []
 
 
+def test_shutdown_report_has_exactly_the_four_lists() -> None:
+    pool = native.ChatPool(native.Governor())
+    report = pool.shutdown(10000)
+    assert set(report) == {"flushed", "dropped", "abandoned", "cancelled"}
+
+
 def test_open_thread_after_shutdown_is_refused_with_e_capacity() -> None:
     pool = native.ChatPool(native.Governor())
     pool.shutdown(10000)

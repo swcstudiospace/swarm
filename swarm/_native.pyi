@@ -8,7 +8,7 @@ keep it in step. Every scheduler call that is given an invalid value raises ``Va
 """
 
 from types import TracebackType
-from typing import Self, final
+from typing import Self, TypedDict, final
 
 __all__ = [
     "wire_codes",
@@ -166,6 +166,13 @@ class Governor:
         reservation."""
         ...
 
+class _ShutdownReport(TypedDict):
+    """The report returned by ``ChatPool.shutdown``."""
+    flushed: list[tuple[str, str]]
+    dropped: list[tuple[str, str]]
+    abandoned: list[tuple[str, str]]
+    cancelled: list[tuple[str, str]]
+
 @final
 class ChatPool:
     """Chat-thread pool over a ``Governor``: a bounded queue per thread and a fixed set of workers.
@@ -213,7 +220,7 @@ class ChatPool:
         """Cancels every message of a thread: ``{"removed": [...], "signalled": [...]}`` as ``(thread_id, msg_id)`` pairs.
         ``E-INPUT`` for a thread that is not live."""
         ...
-    def shutdown(self, grace_ms: int) -> dict[str, list[tuple[str, str]]]:
+    def shutdown(self, grace_ms: int) -> _ShutdownReport:
         """Stops intake and reports every message queued or in flight at the call, as ``(thread_id, msg_id)`` pairs under
         ``"flushed"`` (finished within ``grace_ms``), ``"dropped"`` (still queued at the deadline), ``"abandoned"`` (still
         running at the deadline) and ``"cancelled"`` (queued messages cancelled while shutdown waited). Dropped and abandoned
