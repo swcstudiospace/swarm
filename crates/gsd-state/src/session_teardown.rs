@@ -136,10 +136,10 @@ pub struct TeardownReport {
 /// unused reservation through `governor`, then removes the thread from the session.
 ///
 /// Every refusal before the pool step changes nothing: `InvalidAmounts`, `MissingSessionId`,
-/// `MissingBudget`, `UnknownThread`, `Dispatch`, `Live`, `NoHandle`, the governor check (`Governor`
-/// holding `UnknownReservation` when the session and thread pair holds no reservation), and the pool
-/// refusal (`Pool`). The governor check runs before the pool step, so a thread is never parked for a
-/// release that is already known to be refused.
+/// `MissingBudget`, `UnknownThread`, `Dispatch`, `Live`, `NoHandle`, the governor check (only when
+/// something is unused: `Governor` holding `UnknownReservation` when the pair has no reservation),
+/// and the pool refusal (`Pool`). The governor check runs before the pool step, so a thread is
+/// never parked for a release that is already known to be refused.
 ///
 /// After the pool step the teardown completes. The release is refused as `UnknownReservation` only when
 /// a concurrent release drained the pair after the check. Then nothing is left to refund: the report

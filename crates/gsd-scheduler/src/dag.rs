@@ -108,10 +108,17 @@ impl TaskDag {
 
     /// Marks `id` complete so that its dependents become eligible.
     ///
-    /// Returns `TaskNotFound` when `id` is not in the DAG.
+    /// Returns `TaskNotFound` when `id` is not in the DAG, and `InvalidDag` when `id` is already
+    /// marked failed.
     pub fn mark_complete(&mut self, id: &TaskId) -> SchedulerResult<()> {
         if !self.index.contains_key(&id.value) {
             return Err(SchedulerError::TaskNotFound(id.value.clone()));
+        }
+        if self.failed.contains(&id.value) {
+            return Err(SchedulerError::InvalidDag(format!(
+                "task {} is already failed",
+                id.value
+            )));
         }
         self.completed.insert(id.value.clone());
         Ok(())
@@ -120,10 +127,17 @@ impl TaskDag {
     /// Marks `id` as failed. A failed task is never ready again, and its dependents stay blocked,
     /// because a task becomes ready only when every dependency is complete.
     ///
-    /// Returns `TaskNotFound` when `id` is not in the DAG.
+    /// Returns `TaskNotFound` when `id` is not in the DAG, and `InvalidDag` when `id` is already
+    /// marked complete.
     pub fn mark_failed(&mut self, id: &TaskId) -> SchedulerResult<()> {
         if !self.index.contains_key(&id.value) {
             return Err(SchedulerError::TaskNotFound(id.value.clone()));
+        }
+        if self.completed.contains(&id.value) {
+            return Err(SchedulerError::InvalidDag(format!(
+                "task {} is already complete",
+                id.value
+            )));
         }
         self.failed.insert(id.value.clone());
         Ok(())
@@ -269,6 +283,51 @@ mod tests {
             dag.mark_failed(&unknown),
             Err(SchedulerError::TaskNotFound(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_cannot_be_both_completed_and_failed() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &[]))?;
+        let a = TaskId {
+            value: "A".to_string(),
+        };
+        dag.mark_complete(&a)?;
+        assert!(matches!(
+            dag.mark_failed(&a),
+            Err(SchedulerError::InvalidDag(_))
+        ));
+        let b = TaskId {
+            value: "B".to_string(),
+        };
+        dag.mark_failed(&b)?;
+        assert!(matches!(
+            dag.mark_complete(&b),
+            Err(SchedulerError::InvalidDag(_))
+        ));
+        assert!(ready_ids(&dag).is_empty());
+        Ok(())
+    }
+
+    /// `remove_task` forgets both outcome marks, so an id added again starts clean.
+    #[test]
+    fn a_removed_task_forgets_its_completion_and_failure_marks() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &[]))?;
+        dag.mark_complete(&TaskId {
+            value: "A".to_string(),
+        })?;
+        dag.mark_failed(&TaskId {
+            value: "B".to_string(),
+        })?;
+        assert!(dag.remove_task("A"));
+        assert!(dag.remove_task("B"));
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &[]))?;
+        assert_eq!(ready_ids(&dag), vec!["A".to_string(), "B".to_string()]);
         Ok(())
     }
 }

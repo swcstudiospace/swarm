@@ -171,6 +171,9 @@ impl MatrixScheduler {
         }
     }
 
+    /// Reserves the task budget, admits the task and takes a chat-thread lease for it. On `Err`,
+    /// the reservation is refunded and no DAG node remains, so the same id can be submitted again.
+    /// On `Ok`, the task holds a lease until `complete` is called for it.
     pub async fn submit(&self, task: gsd_proto::gsd::v1::Task) -> SchedulerResult<TaskId> {
         // Reserve budget on a thread id of its own, so `complete` returns exactly this reservation.
         let budget_thread = Uuid::new_v4().to_string();
@@ -319,9 +322,11 @@ impl MatrixScheduler {
     /// A reservation the governor no longer holds has nothing left to refund. `complete` logs that
     /// and succeeds, as the teardown does for a final `UnknownReservation`.
     ///
-    /// Once the thread is released, the DAG records the outcome. `Succeeded` marks the task
-    /// complete, so its dependents become ready. `Failed` and `Cancelled` mark it failed, so it is
-    /// never ready again and its dependents stay blocked.
+    /// Once the thread is released, the DAG records the outcome: `Succeeded` marks the task
+    /// complete, so its dependents become ready, and `Failed` or `Cancelled` mark it failed, so it
+    /// is never ready again. A refusal other than `ThreadBusy`, such as `UnknownThread`, still
+    /// settles the DAG and refunds the reservation, and then returns that refusal. While a
+    /// `complete` for an id is in flight, a second call for that id returns `TaskNotFound`.
     pub async fn complete(&self, task_id: &TaskId, outcome: LeaseOutcome) -> SchedulerResult<()> {
         // The guard is a temporary of this statement, so it is released before the await.
         let lease = self
@@ -355,9 +360,8 @@ impl MatrixScheduler {
                 TASK_COST_USD,
             )
             .await;
-        let placement = released.map_err(|err| SchedulerError::Other(err.to_string()))?;
-        match refunded {
-            Ok(_) => {}
+        let refund = match refunded {
+            Ok(_) => Ok(()),
             Err(gsd_governor::GovernorError::UnknownReservation(detail)) => {
                 tracing::warn!(
                     task = %task_id.value,
@@ -365,8 +369,38 @@ impl MatrixScheduler {
                     %detail,
                     "scheduler budget refund found no reservation; nothing to refund"
                 );
+                Ok(())
             }
-            Err(err) => return Err(SchedulerError::Other(err.to_string())),
+            Err(err) => Err(SchedulerError::Other(err.to_string())),
+        };
+        let placement = match released {
+            Ok(placement) => placement,
+            Err(err) => {
+                // The release refusal is the error returned. A refund or settle failure that
+                // comes with it is logged, not dropped.
+                for failure in [refund.as_ref().err(), settled.as_ref().err()]
+                    .into_iter()
+                    .flatten()
+                {
+                    tracing::error!(
+                        task = %task_id.value,
+                        error = %failure,
+                        "companion failure of a refused chat-thread release"
+                    );
+                }
+                return Err(SchedulerError::Other(err.to_string()));
+            }
+        };
+        // The refund error is returned first. A settle error that comes with it is logged.
+        if let Err(err) = refund {
+            if let Err(settle) = &settled {
+                tracing::error!(
+                    task = %task_id.value,
+                    error = %settle,
+                    "companion failure of a failed budget refund"
+                );
+            }
+            return Err(err);
         }
         settled?;
         tracing::debug!(
@@ -390,6 +424,7 @@ impl MatrixScheduler {
         Ok(())
     }
 
+    /// Returns the ready task ids that are not pending. Completed and failed tasks never appear.
     pub async fn get_frontier(&self) -> Vec<TaskId> {
         let pending = self.pending.lock();
         let dag = self.dag.read();
@@ -856,8 +891,10 @@ mod lease_tests {
 
     #[tokio::test]
     async fn a_cancelled_task_is_never_ready_again() -> Result<(), Box<dyn std::error::Error>> {
-        let scheduler = scheduler(1)?;
+        let scheduler = scheduler(2)?;
         scheduler.submit(task("a")).await?;
+        scheduler.submit(task_on("b", &["a"])).await?;
+        assert_eq!(scheduler.get_frontier().await, vec![task_id("a")]);
         scheduler
             .complete(&task_id("a"), LeaseOutcome::Cancelled)
             .await?;
