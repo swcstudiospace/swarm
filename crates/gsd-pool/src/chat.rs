@@ -294,13 +294,18 @@ impl ChatPool {
 
     /// Takes a thread for `subagent_type`, reusing a warm one when available, and returns its id.
     ///
-    /// A new thread gets a generated id. Admission is checked first, so a call refused for
-    /// capacity takes no warm entry. A call refused after a warm entry was popped, by a registry
-    /// admission failure or by shutdown, forgets that parked thread and returns its slot; the
-    /// entry is not restored. Returns [`ChatError::Capacity`] when `max_threads` live threads
-    /// already exist, and [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`].
+    /// A new thread gets a generated id. A call after shutdown changes nothing. Admission is
+    /// checked first, so a call refused for capacity takes no warm entry. A call refused after a
+    /// warm entry was popped, by a registry admission failure or by a shutdown that began
+    /// meanwhile, discards that parked thread and returns its slot; the entry is not restored.
+    /// Returns [`ChatError::Capacity`] when `max_threads` live threads already exist, and
+    /// [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`].
     pub async fn acquire(&self, subagent_type: SubagentType) -> Result<String, ChatError> {
         let _lifecycle = self.lifecycle.lock();
+        // A call after shutdown takes no slot and pops no warm entry.
+        if self.runtime.state().is_closed() {
+            return Err(ChatError::ShuttingDown);
+        }
         self.registry.reserve().map_err(|_| self.capacity_error())?;
         if let Some(handle) = self
             .pool
@@ -325,9 +330,11 @@ impl ChatPool {
             return Ok(id);
         }
         let id = self.pool.create_thread(subagent_type.clone());
-        self.registry
-            .register_reserved(id.clone(), subagent_type)
-            .map_err(|err| self.admission_error(err, &id.value))?;
+        if let Err(err) = self.registry.register_reserved(id.clone(), subagent_type) {
+            // The created thread was never admitted, so report its termination and drop it.
+            self.pool.forget(&id.value);
+            return Err(self.admission_error(err, &id.value));
+        }
         if let Err(err) = self.open_queue(&id.value) {
             // Refused during shutdown. Undo the admission.
             let _released = self.registry.release(&id.value);
@@ -354,15 +361,19 @@ impl ChatPool {
     /// means the warm pool was full: the thread was closed and its termination was reported to
     /// the lifecycle observers.
     ///
-    /// Returns [`ChatError::UnknownThread`] for an id that is not live, and
+    /// Returns [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`],
+    /// [`ChatError::UnknownThread`] for an id that is not live, and
     /// [`ChatError::ThreadBusy`] while the thread has queued or in-flight work. Nothing changes
-    /// on either refusal.
+    /// on any refusal.
     pub fn park(&self, thread_id: &str, now: Instant) -> Result<Placement, ChatError> {
         let _lifecycle = self.lifecycle.lock();
         {
-            // The busy check and the close share one runtime lock, so no submit can enqueue
-            // between them.
+            // The closed check, the busy check and the close share one runtime lock, so no submit
+            // can enqueue between them and no thread parks after shutdown.
             let mut state = self.runtime.state();
+            if state.is_closed() {
+                return Err(ChatError::ShuttingDown);
+            }
             if state.queue.is_busy(thread_id)? {
                 return Err(ChatError::ThreadBusy(thread_id.to_string()));
             }
@@ -379,6 +390,7 @@ impl ChatPool {
     /// a caller can never submit to it, and it holds no live slot: a parked thread does not
     /// count against `max_threads`, so this succeeds even when every live slot is taken.
     /// Teardown uses it to hand a retiring thread to the warm pool. Returns
+    /// [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`] and
     /// [`ChatError::ThreadExists`] while a live thread holds `id`. A refused call changes
     /// nothing.
     pub fn park_fresh(
@@ -388,6 +400,9 @@ impl ChatPool {
         now: Instant,
     ) -> Result<Placement, ChatError> {
         let _lifecycle = self.lifecycle.lock();
+        if self.runtime.state().is_closed() {
+            return Err(ChatError::ShuttingDown);
+        }
         if self.registry.get(id).is_some() {
             return Err(ChatError::ThreadExists(id.to_string()));
         }
@@ -911,6 +926,48 @@ mod tests {
         // Neither refused call left a live thread, a reserved slot or a thread-map entry.
         assert_eq!(pool.registry.len(), 0);
         assert_eq!(pool.pool.threads.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_acquire_after_shutdown_takes_no_warm_entry_and_creates_nothing(
+    ) -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        pool.open_thread("a", kind("w"))?;
+        assert_eq!(pool.release("a").await?, Placement::Parked);
+        let created = pool.pool.metrics().created();
+        pool.shutdown(Duration::ZERO);
+        assert_eq!(pool.acquire(kind("w")).await, Err(ChatError::ShuttingDown));
+        // The refused call pops no warm entry and creates no thread.
+        assert_eq!(pool.pool.warm_len(), 1);
+        assert_eq!(pool.pool.metrics().created(), created);
+        assert_eq!(pool.pool.metrics().acquired_from_warm(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_release_after_shutdown_is_refused_and_parks_nothing() -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        pool.open_thread("a", kind("w"))?;
+        pool.shutdown(Duration::ZERO);
+        assert_eq!(pool.release("a").await, Err(ChatError::ShuttingDown));
+        // The thread stays where it was: still open, and nothing parked.
+        assert_eq!(pool.registry.len(), 1);
+        assert_eq!(pool.pool.warm_len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fresh_park_after_shutdown_is_refused_and_creates_nothing() -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        pool.shutdown(Duration::ZERO);
+        assert_eq!(
+            pool.park_fresh("a", kind("w"), Instant::now()),
+            Err(ChatError::ShuttingDown)
+        );
+        assert_eq!(pool.pool.warm_len(), 0);
+        assert_eq!(pool.pool.metrics().created(), 0);
+        assert_eq!(pool.registry.len(), 0);
         Ok(())
     }
 }
