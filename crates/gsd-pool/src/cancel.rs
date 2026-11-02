@@ -2,11 +2,12 @@
 //!
 //! A queued message is removed from its thread's queue and its ticket completes
 //! [`Completed::Cancelled`](crate::Completed::Cancelled). An in-flight message gets a cooperative
-//! [`CancelToken`]: the executor checks it, and the ticket completes `Cancelled` even when the
-//! executor returns a value. No thread is ever killed (GA-9).
+//! [`CancelToken`]: the executor checks it, and the ticket completes `Cancelled` when its worker
+//! finishes, even when the executor returns a value. A shutdown that abandons the message first
+//! completes the ticket with `Failed(ShuttingDown)` instead. No thread is ever killed (GA-9).
 //!
-//! The token and the decision to set it live in `chat_runtime.rs`, under the runtime lock. This
-//! module holds the token type and the public result types.
+//! The decision to set a token lives in `chat_runtime.rs`, under the runtime lock. This module
+//! holds the token type and the public result types.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -38,14 +39,16 @@ pub enum CancelOutcome {
     /// `Cancelled`. The executor never ran it.
     RemovedQueued,
     /// The message was running on a worker. Its cancel token is set, and its ticket completes
-    /// `Cancelled` when the worker finishes. A value the executor returns is discarded.
+    /// `Cancelled` when the worker finishes, unless a shutdown abandons it first. A value the
+    /// executor returns is discarded.
     SignalledInFlight,
 }
 
 /// What [`crate::ChatPool::cancel_thread`] did to one thread.
 ///
 /// Every message named here is accounted for: each `removed` ticket completed `Cancelled`, and
-/// each `signalled` ticket completes `Cancelled` once its worker observes the token.
+/// each `signalled` ticket completes `Cancelled` when its worker finishes the message, unless a
+/// shutdown abandons it first.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CancelReport {
     /// Queued messages removed from the thread, in queue order.

@@ -62,7 +62,8 @@ impl WarmPool {
 
     /// Takes the most recently parked live handle for `subagent_type`.
     ///
-    /// Stale entries of that type are dropped first. A successful pop counts as a hit.
+    /// Stale entries of that type are dropped first, without being reported. A successful pop
+    /// counts as a hit. Callers that report terminations sweep with `evict_expired` before popping.
     pub(crate) fn pop(
         &mut self,
         subagent_type: &SubagentType,

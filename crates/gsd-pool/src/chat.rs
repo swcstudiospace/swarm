@@ -21,10 +21,16 @@ use crate::chat_runtime::{
 use crate::handle_registry::{ChatThreadHandle, HandleRegistry};
 use crate::{PoolConfig, PoolError, ThreadPool};
 
-/// Configuration for [`ChatPool::new`]. Every field must be greater than zero.
+/// Largest accepted [`ChatRuntimeConfig::workers`]. Each worker is an operating-system thread,
+/// and the default is 4, so the bound stops a mistyped count from exhausting the process's
+/// thread limit.
+pub const MAX_WORKERS: usize = 256;
+
+/// Configuration for [`ChatPool::new`]. Every field must be greater than zero, and `workers`
+/// must not exceed [`MAX_WORKERS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatRuntimeConfig {
-    /// Number of worker threads.
+    /// Number of worker threads, at most [`MAX_WORKERS`].
     pub workers: usize,
     /// Capacity of each thread's message queue.
     pub per_thread_queue: usize,
@@ -57,8 +63,9 @@ impl Default for ChatRuntimeConfig {
 }
 
 impl ChatRuntimeConfig {
-    /// Refuses a config with any zero field, naming the first such field, and a
-    /// `dedupe_window` not greater than `per_thread_queue`.
+    /// Refuses a config with any zero field, naming the first such field; a `workers` count
+    /// above [`MAX_WORKERS`], naming the bound; and a `dedupe_window` not greater than
+    /// `per_thread_queue`.
     pub(crate) fn validate(&self) -> Result<(), ChatError> {
         let zero = [
             ("workers", self.workers == 0),
@@ -71,6 +78,9 @@ impl ChatRuntimeConfig {
         match zero.iter().find(|(_, is_zero)| *is_zero) {
             Some((name, _)) => Err(ChatError::InvalidConfig(format!(
                 "{name} must be greater than zero"
+            ))),
+            None if self.workers > MAX_WORKERS => Err(ChatError::InvalidConfig(format!(
+                "workers must be at most {MAX_WORKERS}"
             ))),
             None if self.dedupe_window <= self.per_thread_queue => Err(ChatError::InvalidConfig(
                 "dedupe_window must be greater than per_thread_queue".to_string(),
@@ -243,37 +253,43 @@ impl ChatPool {
     /// Opens a live thread with the caller's `id` and the given subagent type. Its message queue
     /// opens with it.
     ///
-    /// Returns [`ChatError::ThreadExists`] while a live thread holds `id`. A parked id is not
-    /// live, so it opens as a fresh thread with a new handle; any warm entry for that id is
-    /// discarded once the open succeeds. Returns [`ChatError::Capacity`] when `max_threads` live
-    /// threads already exist. A failed call changes nothing.
-    /// A live id is refused with [`ChatError::ThreadExists`] even when the cap is also full.
-    /// Returns [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`].
+    /// Returns [`ChatError::ThreadExists`] while a live thread holds `id`. A live id is refused
+    /// that way even when the cap is also full. Returns [`ChatError::ShuttingDown`] after
+    /// [`ChatPool::shutdown`], checked before capacity, so a closed pool refuses even when every
+    /// live slot is taken. Returns [`ChatError::Capacity`] when `max_threads` live threads
+    /// already exist.
+    ///
+    /// A parked id is not live, so it opens as a fresh thread with a new handle. Any warm entry
+    /// for that id is discarded before the new thread is registered and created, so its
+    /// termination is reported first. A refused call changes nothing.
     pub fn open_thread(&self, id: &str, subagent_type: SubagentType) -> Result<(), ChatError> {
         let _lifecycle = self.lifecycle.lock();
         if self.registry.get(id).is_some() {
             return Err(ChatError::ThreadExists(id.to_string()));
         }
-        self.registry
-            .register(
-                ChatThreadId {
-                    value: id.to_string(),
-                },
-                subagent_type.clone(),
-            )
-            .map_err(|err| self.admission_error(err, id))?;
-        if let Err(err) = self.open_queue(id) {
-            // Undo the admission so the failed call leaves no slot behind.
-            let _released = self.registry.release(id);
-            return Err(err);
+        // The queue opens first. Its open observes shutdown, so a refusal here takes no slot.
+        self.open_queue(id)?;
+        if let Err(err) = self.registry.reserve() {
+            self.close_queue(id);
+            return Err(self.admission_error(err, id));
+        }
+        let thread_id = ChatThreadId {
+            value: id.to_string(),
+        };
+        if let Err(err) = self
+            .registry
+            .register_reserved(thread_id, subagent_type.clone())
+        {
+            // Cannot happen: the lifecycle lock is held and `get` found no handle for `id`.
+            self.close_queue(id);
+            return Err(self.admission_error(err, id));
         }
         if let Err(err) = self.pool.open_with_id(id, subagent_type) {
+            // Cannot happen for the same reason: the live thread map holds only registered ids.
             self.close_queue(id);
             let _released = self.registry.release(id);
             return Err(self.admission_error(err, id));
         }
-        // Any warm entry under this id is stale now. Removing it cannot fail.
-        self.pool.discard_warm(id);
         Ok(())
     }
 
@@ -409,8 +425,6 @@ impl ChatPool {
         self.pool
             .open_with_id(id, subagent_type.clone())
             .map_err(|err| self.admission_error(err, id))?;
-        // Any warm entry under this id is stale now. Removing it cannot fail.
-        self.pool.discard_warm(id);
         let handle = ChatThreadHandle::new(
             ChatThreadId {
                 value: id.to_string(),
@@ -464,6 +478,8 @@ impl ChatPool {
     /// their tickets completes with [`ChatError::ShuttingDown`]. `cancelled` lists the queued
     /// messages cancelled while shutdown waited. Messages that completed before the call are not
     /// listed.
+    ///
+    /// The wait lasts at most 24 hours, so a longer `grace` is waited for as 24 hours.
     pub fn shutdown(&self, grace: Duration) -> ShutdownReport {
         self.runtime.shutdown(grace)
     }
@@ -530,6 +546,7 @@ mod tests {
 
     use super::*;
     use crate::chat_runtime::tests::{settle, Probe};
+    use crate::hook_dispatch::{LifecycleEvent, LifecycleObserver};
     use crate::Completed;
     use std::sync::atomic::Ordering;
 
@@ -968,6 +985,64 @@ mod tests {
         assert_eq!(pool.pool.warm_len(), 0);
         assert_eq!(pool.pool.metrics().created(), 0);
         assert_eq!(pool.registry.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_pool_refuses_an_open_with_shutting_down_after_shutdown() -> Result<(), ChatError> {
+        let pool = make_pool(1, 5)?;
+        pool.open_thread("a", kind("w"))?;
+        pool.shutdown(Duration::ZERO);
+        // The one live slot is taken, but shutdown is the reason the open must be refused.
+        assert_eq!(
+            pool.open_thread("b", kind("w")),
+            Err(ChatError::ShuttingDown)
+        );
+        assert_eq!(pool.registry.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_count_above_the_maximum_is_refused() {
+        let cfg = ChatRuntimeConfig {
+            workers: 257,
+            ..ChatRuntimeConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ChatError::InvalidConfig(_))));
+    }
+
+    /// Records `create:<id>` and `terminate:<id>` for the lifecycle events it sees.
+    #[derive(Default)]
+    struct TerminationLog {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl LifecycleObserver for TerminationLog {
+        fn on_event(&self, event: &LifecycleEvent) {
+            let label = match event {
+                LifecycleEvent::OnCreate(_) => "create",
+                LifecycleEvent::OnTerminate(_) => "terminate",
+                _ => return,
+            };
+            self.events
+                .lock()
+                .push(format!("{label}:{}", event.thread_id().value));
+        }
+    }
+
+    #[test]
+    fn open_thread_terminates_a_parked_warm_thread_before_creating_the_new_one(
+    ) -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        let log = Arc::new(TerminationLog::default());
+        pool.pool.lifecycle.register(log.clone());
+        pool.open_thread("a", kind("w"))?;
+        assert_eq!(pool.park("a", Instant::now())?, Placement::Parked);
+        // Reopening "a" displaces its parked entry: that thread must end before the new one starts.
+        pool.open_thread("a", kind("w"))?;
+        let events: Vec<String> = log.events.lock().clone();
+        assert_eq!(events, ["create:a", "terminate:a", "create:a"]);
+        assert_eq!(pool.pool.warm_len(), 0);
         Ok(())
     }
 }

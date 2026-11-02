@@ -79,6 +79,7 @@ impl HandleRegistry {
     ///
     /// Returns `PoolError::Exhausted` when the registry is at capacity and
     /// `PoolError::AlreadyExists` when `id` is already registered. Neither failure consumes a slot.
+    #[cfg(test)]
     pub(crate) fn register(
         &self,
         id: ChatThreadId,

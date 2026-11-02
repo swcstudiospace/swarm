@@ -27,6 +27,20 @@ use crate::fair_queue::{FairQueue, OfferOutcome};
 /// Milliseconds the built-in executor sleeps between checks of its hold time.
 const HOLD_SLICE_MS: u64 = 10;
 
+/// Longest a wait may last. A requested timeout above this is clamped to it, so that
+/// `Instant::now() + timeout` cannot overflow.
+pub(crate) const MAX_WAIT: Duration = Duration::from_secs(86_400);
+
+/// The wait used for a requested `timeout`: `timeout` clamped to [`MAX_WAIT`].
+pub(crate) fn bounded_wait(timeout: Duration) -> Duration {
+    timeout.min(MAX_WAIT)
+}
+
+/// Fallback text for a caught executor panic whose payload is not a string.
+const EXECUTOR_PANIC_TEXT: &str = "executor panicked";
+/// Fallback text for a caught budget-port panic whose payload is not a string.
+const BUDGET_PANIC_TEXT: &str = "budget port panicked";
+
 /// One message to run on a chat thread. Build it with [`ChatMessage::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -120,26 +134,16 @@ impl Ticket {
         true
     }
 
-    /// Waits up to `timeout` for the outcome and returns a copy of it.
+    /// Waits up to `timeout`, clamped to a 24-hour maximum, for the outcome and returns a copy of it.
     ///
-    /// Returns `None` if the message is still pending when the timeout elapses (GA-5). A timeout
+    /// Returns `None` if the message is still pending when that wait elapses (GA-5). A timeout
     /// does not cancel the message.
     pub fn wait(&self, timeout: Duration) -> Option<Completed> {
+        let deadline = Instant::now() + bounded_wait(timeout);
         let mut slot = self.slot.outcome.lock();
-        if slot.is_none() {
-            match Instant::now().checked_add(timeout) {
-                Some(deadline) => {
-                    while slot.is_none() {
-                        if self.slot.done.wait_until(&mut slot, deadline).timed_out() {
-                            break;
-                        }
-                    }
-                }
-                None => {
-                    while slot.is_none() {
-                        self.slot.done.wait(&mut slot);
-                    }
-                }
+        while slot.is_none() {
+            if self.slot.done.wait_until(&mut slot, deadline).timed_out() {
+                break;
             }
         }
         slot.clone()
@@ -375,6 +379,8 @@ impl Runtime {
     /// and its ticket completes with `Failed(ShuttingDown)`. Workers exit once the closed queue
     /// is empty, and a worker still running an abandoned job is detached. A queued message that a
     /// cancel removes while the wait runs leaves the wait and is listed as `cancelled`.
+    ///
+    /// The wait lasts at most [`MAX_WAIT`]: a longer `grace` is waited for as `MAX_WAIT`.
     pub(crate) fn shutdown(&self, grace: Duration) -> ShutdownReport {
         let shared = &self.shared;
         let mut state = shared.state.lock();
@@ -397,19 +403,14 @@ impl Runtime {
         });
         shared.work.notify_all();
 
-        let deadline = Instant::now().checked_add(grace);
+        let deadline = Instant::now() + bounded_wait(grace);
         while state
             .watch
             .as_ref()
             .is_some_and(|watch| !watch.pending.is_empty())
         {
-            match deadline {
-                Some(deadline) => {
-                    if shared.progress.wait_until(&mut state, deadline).timed_out() {
-                        break;
-                    }
-                }
-                None => shared.progress.wait(&mut state),
+            if shared.progress.wait_until(&mut state, deadline).timed_out() {
+                break;
             }
         }
 
@@ -443,13 +444,21 @@ impl Runtime {
     }
 
     /// Joins the workers. When no job is running, every worker exits promptly and is joined.
-    /// Otherwise a worker that is still running is detached and exits on its own.
+    /// Otherwise a worker that is still running is detached and exits on its own. A worker whose
+    /// join reports a panic is logged at error level.
     fn reap_workers(&self, none_running: bool) {
         let handles = std::mem::take(&mut *self.workers.lock());
         for handle in handles {
             if none_running || handle.is_finished() {
-                // The worker loop does not panic: executor panics are caught in `run_job`.
-                let _joined = handle.join();
+                // `run_job` catches executor and budget panics, so a worker loop should not
+                // unwind. If one does, the join reports it here.
+                match handle.join() {
+                    Ok(()) => {}
+                    Err(payload) => tracing::error!(
+                        error = %panic_text(payload.as_ref(), "worker panicked"),
+                        "chat worker thread panicked"
+                    ),
+                }
             }
         }
     }
@@ -521,8 +530,8 @@ impl Runtime {
 
     /// Stops the runtime for its owner's drop. Nothing is reported. Closes intake, fails every
     /// queued message and every in-flight ticket with `ShuttingDown`, sets each running job's
-    /// token, and wakes the workers. Waits up to `grace` for them to exit. Returns how many are
-    /// still running. Those are detached and exit on their own.
+    /// token, and wakes the workers. Waits up to `grace`, at most [`MAX_WAIT`], for them to
+    /// exit. Returns how many are still running. Those are detached and exit on their own.
     pub(crate) fn abort(&self, grace: Duration) -> usize {
         let shared = &self.shared;
         let mut state = shared.state.lock();
@@ -538,15 +547,10 @@ impl Runtime {
                 .complete(Completed::Failed(ChatError::ShuttingDown));
         }
         shared.work.notify_all();
-        let deadline = Instant::now().checked_add(grace);
+        let deadline = Instant::now() + bounded_wait(grace);
         while shared.live.load(Ordering::Acquire) > 0 {
-            match deadline {
-                Some(deadline) => {
-                    if shared.progress.wait_until(&mut state, deadline).timed_out() {
-                        break;
-                    }
-                }
-                None => shared.progress.wait(&mut state),
+            if shared.progress.wait_until(&mut state, deadline).timed_out() {
+                break;
             }
         }
         let running = shared.live.load(Ordering::Acquire);
@@ -609,7 +613,8 @@ fn next_job(shared: &Shared) -> Option<(MessageRef, Ticket, CancelToken, ChatMes
 
 /// Reserves budget, runs the executor with `cancel`, and releases budget. Every refusal and
 /// fault becomes a typed failure; nothing is dropped silently (GA-7). A panic in the budget port
-/// is caught too, so it cannot unwind the worker and strand its job (G5).
+/// is caught too, so it cannot unwind the worker and strand its job (G5). A panic in the
+/// executor is caught the same way, and is reported as `Panicked`.
 fn run_job(shared: &Shared, msg: &ChatMessage, cancel: &CancelToken) -> Completed {
     let reservation = BudgetReservation {
         session_id: msg.session_id.clone(),
@@ -624,13 +629,17 @@ fn run_job(shared: &Shared, msg: &ChatMessage, cancel: &CancelToken) -> Complete
     let completed = match catch_unwind(AssertUnwindSafe(|| (shared.executor)(msg, cancel))) {
         Ok(Ok(payload)) => Completed::Ok(payload),
         Ok(Err(message)) => Completed::Failed(ChatError::Panicked(message)),
-        Err(payload) => Completed::Failed(ChatError::Panicked(panic_text(payload.as_ref()))),
+        Err(payload) => Completed::Failed(ChatError::Panicked(panic_text(
+            payload.as_ref(),
+            EXECUTOR_PANIC_TEXT,
+        ))),
     };
     match catch_unwind(AssertUnwindSafe(|| shared.budget.release(&reservation))) {
         Ok(Ok(())) => completed,
-        // A failed release is a governor fault and replaces the outcome. So is a panic.
-        Ok(Err(refusal)) => Completed::Failed(ChatError::Governor(refusal_text(refusal))),
-        Err(payload) => budget_panic(payload.as_ref()),
+        // A failed release is a governor fault, and so is a panic in it. When the executor also
+        // failed, its text is kept after the release text (see `release_failed`).
+        Ok(Err(refusal)) => release_failed(refusal_text(refusal), completed),
+        Err(payload) => release_failed(panic_text(payload.as_ref(), BUDGET_PANIC_TEXT), completed),
     }
 }
 
@@ -700,20 +709,33 @@ fn refusal_text(refusal: BudgetRefusal) -> String {
     }
 }
 
-/// The message carried by a caught panic payload.
-fn panic_text(payload: &(dyn Any + Send)) -> String {
+/// The message carried by a caught panic payload. A payload that is neither a `&str` nor a
+/// `String` yields `fallback`, which names the component that panicked.
+fn panic_text(payload: &(dyn Any + Send), fallback: &str) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_string()
     } else if let Some(text) = payload.downcast_ref::<String>() {
         text.clone()
     } else {
-        "executor panicked".to_string()
+        fallback.to_string()
     }
 }
 
 /// The governor fault that a caught panic in the budget port completes its message with.
 fn budget_panic(payload: &(dyn Any + Send)) -> Completed {
-    Completed::Failed(ChatError::Governor(panic_text(payload)))
+    Completed::Failed(ChatError::Governor(panic_text(payload, BUDGET_PANIC_TEXT)))
+}
+
+/// The governor fault that a failed release completes its message with. When the executor had
+/// also failed, its text is kept after the release text, so neither failure is lost.
+fn release_failed(release_error: String, completed: Completed) -> Completed {
+    let text = match completed {
+        Completed::Failed(ChatError::Panicked(executor_error)) => {
+            format!("{release_error}; executor: {executor_error}")
+        }
+        _ => release_error,
+    };
+    Completed::Failed(ChatError::Governor(text))
 }
 
 #[cfg(test)]
@@ -852,11 +874,18 @@ pub(crate) mod tests {
         refusal: Mutex<Option<BudgetRefusal>>,
         reserved: Mutex<Vec<BudgetReservation>>,
         released: Mutex<Vec<BudgetReservation>>,
+        /// When set, `release` refuses with this text as an `Other` refusal.
+        release_refusal: Option<String>,
+        /// When set, `reserve` panics with a non-string payload after it records the reservation.
+        non_string_reserve_panic: bool,
     }
 
     impl BudgetPort for ScriptedBudget {
         fn reserve(&self, reservation: &BudgetReservation) -> Result<(), BudgetRefusal> {
             self.reserved.lock().push(reservation.clone());
+            if self.non_string_reserve_panic {
+                std::panic::panic_any(7_u32);
+            }
             let refusal = self.refusal.lock().clone();
             match refusal {
                 Some(refusal) => Err(refusal),
@@ -866,7 +895,10 @@ pub(crate) mod tests {
 
         fn release(&self, reservation: &BudgetReservation) -> Result<(), BudgetRefusal> {
             self.released.lock().push(reservation.clone());
-            Ok(())
+            match &self.release_refusal {
+                Some(text) => Err(BudgetRefusal::Other(text.clone())),
+                None => Ok(()),
+            }
         }
     }
 
@@ -1417,5 +1449,58 @@ pub(crate) mod tests {
         assert!(runtime.state().in_flight.is_empty());
         runtime.shutdown(WAIT);
         Ok(())
+    }
+
+    #[test]
+    fn non_string_budget_panic_is_attributed_to_the_budget_port() -> Result<(), Box<dyn Error>> {
+        let probe = Probe::new(true);
+        let budget = Arc::new(ScriptedBudget {
+            non_string_reserve_panic: true,
+            ..ScriptedBudget::default()
+        });
+        let runtime = start(1, 64, budget, &probe)?;
+        open(&runtime, "a");
+        let p1 = enqueue(&runtime, "a", "p1")?;
+        assert_eq!(
+            settle(&p1),
+            Completed::Failed(ChatError::Governor("budget port panicked".to_string()))
+        );
+        // The reserve panic happened before the executor, so the executor never started.
+        assert!(probe.started().is_empty());
+        runtime.shutdown(WAIT);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_release_keeps_executor_failure_text() -> Result<(), Box<dyn Error>> {
+        let budget = Arc::new(ScriptedBudget {
+            release_refusal: Some("release refused".to_string()),
+            ..ScriptedBudget::default()
+        });
+        let executor: Executor = Arc::new(
+            |_msg: &ChatMessage, _cancel: &CancelToken| -> Result<Vec<u8>, String> {
+                panic!("executor boom")
+            },
+        );
+        let runtime = Runtime::start(&config(1, 64), budget, executor)?;
+        open(&runtime, "a");
+        let failed = enqueue(&runtime, "a", "e1")?;
+        let Completed::Failed(error) = settle(&failed) else {
+            return Err("expected a failed completion".into());
+        };
+        let text = error.to_string();
+        assert!(text.contains("release refused"), "{text}");
+        assert!(text.contains("executor boom"), "{text}");
+        runtime.shutdown(WAIT);
+        Ok(())
+    }
+
+    #[test]
+    fn wait_clamps_duration_max_to_named_maximum() {
+        assert_eq!(bounded_wait(Duration::MAX), MAX_WAIT);
+        assert_eq!(
+            bounded_wait(Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
     }
 }
