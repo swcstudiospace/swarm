@@ -37,25 +37,44 @@ const PAGE = `<!doctype html>
 export function startServer({ isolated = true, port = 0 } = {}) {
   const extra = isolated ? config.headers : {};
   const server = createServer(async (request, response) => {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    if (url.pathname === "/") {
-      response.writeHead(200, { ...extra, "content-type": TYPES[".html"] });
-      response.end(PAGE);
-      return;
-    }
-    const target = resolve(here, `.${normalize(decodeURIComponent(url.pathname))}`);
-    if (!target.startsWith(here + sep)) {
-      response.writeHead(403);
-      response.end();
-      return;
-    }
     try {
-      const body = await readFile(target);
-      response.writeHead(200, { ...extra, "content-type": TYPES[extname(target)] ?? "application/octet-stream" });
-      response.end(body);
-    } catch {
-      response.writeHead(404, extra);
-      response.end();
+      const url = new URL(request.url ?? "/", "http://localhost");
+      if (url.pathname === "/") {
+        response.writeHead(200, { ...extra, "content-type": TYPES[".html"] });
+        response.end(PAGE);
+        return;
+      }
+      let path;
+      try {
+        path = decodeURIComponent(url.pathname);
+      } catch (error) {
+        if (!(error instanceof URIError)) throw error;
+        response.writeHead(400, { ...extra, "content-type": "text/plain; charset=utf-8" });
+        response.end("malformed percent-escape in request path\n");
+        return;
+      }
+      const target = resolve(here, `.${normalize(path)}`);
+      if (!target.startsWith(here + sep)) {
+        response.writeHead(403);
+        response.end();
+        return;
+      }
+      try {
+        const body = await readFile(target);
+        response.writeHead(200, { ...extra, "content-type": TYPES[extname(target)] ?? "application/octet-stream" });
+        response.end(body);
+      } catch {
+        response.writeHead(404, extra);
+        response.end();
+      }
+    } catch (error) {
+      console.error(`request ${request.method} ${request.url} failed:`, error);
+      if (response.headersSent) {
+        response.destroy();
+      } else {
+        response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+        response.end("internal server error\n");
+      }
     }
   });
   return new Promise((resolvePromise) => {
