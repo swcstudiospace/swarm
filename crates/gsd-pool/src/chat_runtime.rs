@@ -237,6 +237,12 @@ struct Watch {
 }
 
 impl RuntimeState {
+    /// Whether shutdown or abort has closed intake. Callers read it under the runtime lock they
+    /// already hold, so the answer is consistent with the queue they touch.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     /// Takes a queued message that a cancel removed out of the shutdown's pending set, so the
     /// wait does not hold for it, and lists it as cancelled. Does nothing when no shutdown is
     /// waiting. The caller notifies the shutdown.

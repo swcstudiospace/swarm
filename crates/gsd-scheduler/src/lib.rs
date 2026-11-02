@@ -131,6 +131,9 @@ const TASK_COST_USD: f64 = 0.01;
 struct Lease {
     thread_id: String,
     budget_thread: String,
+    /// Set once the chat thread has been released, so a retry after a failed refund does not
+    /// release it again.
+    thread_released: bool,
 }
 
 /// Matrix Scheduler
@@ -202,6 +205,7 @@ impl MatrixScheduler {
                     Lease {
                         thread_id,
                         budget_thread,
+                        thread_released: false,
                     },
                 );
                 Ok(task_id)
@@ -315,24 +319,37 @@ impl MatrixScheduler {
     /// Returns `SchedulerError::TaskNotFound` when no lease is held for `task_id`, and changes
     /// nothing. When the thread still has queued or in-flight chat work, the call fails and the
     /// lease is kept, so the caller can retry.
+    ///
+    /// A refund failure keeps the lease, and a retry refunds without releasing the chat thread
+    /// again.
     pub async fn complete(&self, task_id: &TaskId, outcome: LeaseOutcome) -> SchedulerResult<()> {
         // The guard is a temporary of this statement, so it is released before the await.
-        let lease = self
+        let mut lease = self
             .leases
             .lock()
             .remove(&task_id.value)
             .ok_or_else(|| SchedulerError::TaskNotFound(task_id.value.clone()))?;
-        let released = self.chat_pool.release(&lease.thread_id).await;
-        if let Err(err) = &released {
-            if matches!(err, gsd_pool::ChatError::ThreadBusy(_)) {
-                // The task still runs on its thread, so it keeps its lease and its reservation.
-                let message = err.to_string();
-                self.leases.lock().insert(task_id.value.clone(), lease);
-                return Err(SchedulerError::Other(message));
+        let mut placement = None;
+        let mut release_error = None;
+        if !lease.thread_released {
+            match self.chat_pool.release(&lease.thread_id).await {
+                Ok(released) => {
+                    lease.thread_released = true;
+                    placement = Some(released);
+                }
+                Err(err) => {
+                    if matches!(err, gsd_pool::ChatError::ThreadBusy(_)) {
+                        // The task still runs on its thread, so it keeps its lease.
+                        let message = err.to_string();
+                        self.leases.lock().insert(task_id.value.clone(), lease);
+                        return Err(SchedulerError::Other(message));
+                    }
+                    release_error = Some(err);
+                }
             }
         }
-        // The lease is gone, so its reservation returns whether or not the thread release succeeded.
-        let refunded = self
+        // The lease stays until its reservation is refunded, so a refusal can be retried.
+        if let Err(err) = self
             .governor
             .release_budget(
                 SESSION_ID,
@@ -342,9 +359,16 @@ impl MatrixScheduler {
                 TASK_TOOL_CALLS,
                 TASK_COST_USD,
             )
-            .await;
-        let placement = released.map_err(|err| SchedulerError::Other(err.to_string()))?;
-        refunded.map_err(|err| SchedulerError::Other(err.to_string()))?;
+            .await
+        {
+            // A retry skips the thread release and only refunds.
+            let message = err.to_string();
+            self.leases.lock().insert(task_id.value.clone(), lease);
+            return Err(SchedulerError::Other(message));
+        }
+        if let Some(err) = release_error {
+            return Err(SchedulerError::Other(err.to_string()));
+        }
         tracing::debug!(
             task = %task_id.value,
             thread = %lease.thread_id,

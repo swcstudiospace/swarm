@@ -209,6 +209,15 @@ impl ThreadPool {
         }
     }
 
+    /// Reports the termination of a parked thread that acquire discards because it cannot hand
+    /// the thread out. `forget` cannot report it, because a parked thread is not in `threads`.
+    pub(crate) fn discard_parked(&self, id: &str) {
+        self.lifecycle
+            .dispatch(&LifecycleEvent::OnTerminate(ChatThreadId {
+                value: id.to_string(),
+            }));
+    }
+
     /// Reports a newly created thread and counts it.
     fn announce_created(&self, id: &ChatThreadId) {
         self.lifecycle

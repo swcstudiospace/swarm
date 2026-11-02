@@ -1532,22 +1532,16 @@ name = "gsd-pool"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "dashmap",
  "gsd-codes",
  "gsd-proto",
  "gsd-runtime",
  "parking_lot",
  "proptest",
- "serde",
- "serde_json",
- "serde_with",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
  "tracing",
- "tracing-subscriber",
- "ulid",
  "uuid",
 ]
 

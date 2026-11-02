@@ -190,7 +190,8 @@ class ChatPool:
     ) -> Self:
         """``ValueError`` (``E-INPUT``) when a count or ``drop_grace_ms`` is zero; ``E-INTERNAL`` when the OS refuses a worker
         thread. ``drop_grace_ms`` is the milliseconds dropping the pool waits for its workers before detaching the ones still
-        running; a dropped pool returns within that bound."""
+        running; a dropped pool returns within that bound. A ``dedupe_window`` that is not greater than
+        ``per_thread_queue`` is refused as an invalid configuration (``ValueError``, ``E-INPUT``), per DD-16."""
         ...
     def open_thread(self, thread_id: str, subagent_type: str) -> None:
         """Opens a live thread. ``E-INPUT`` when a live thread holds the id; ``E-CAPACITY`` at ``max_threads``."""
