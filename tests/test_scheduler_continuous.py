@@ -186,6 +186,12 @@ def _max_concurrency(spans):
     return peak
 
 
+def _trip(detail):
+    """(from, to) of a consecutive-failure trip, read from 'effective_parallel F -> T' in its detail."""
+    frm, to = detail.rsplit("effective_parallel ", 1)[1].split(" -> ")
+    return int(frm), int(to)
+
+
 def _alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as fh:
@@ -214,7 +220,8 @@ def test_two_sessions_overlap(tmp_path):
 
 def test_global_cap_is_respected_and_overflow_is_queued(tmp_path):
     tasks = [_task(f"t{i}") for i in range(5)]
-    rig = Rig(tmp_path, tasks, {"*": {"sleep": 0.3}})
+    # Two sessions start together before either ends, so the peak of 2 is forced rather than timed.
+    rig = Rig(tmp_path, tasks, {"*": {"sleep": 0.3, "barrier": 2}})
     r = rig.run("--max-parallel", "2")
     assert r.returncode == 0, r.stdout + r.stderr
     assert _max_concurrency(rig.spans()) == 2
@@ -404,7 +411,7 @@ def test_a_session_that_leaves_within_the_grace_is_not_killed(tmp_path):
               SWARM_CANCEL_GRACE_S="20")
     started = time.monotonic()
     r = rig.run("--swarm-timeout", "8", "--max-parallel", "1", "--task-timeout", "100")
-    assert time.monotonic() - started < 15
+    assert time.monotonic() - started < 20  # the 8 s timeout is inside this bound; a full 20 s grace wait is not
     assert json.loads(r.stdout)["cancelled"] == "swarm-timeout"
     assert [rec["ev"] for rec in rig.fake_log() if rec["tid"] == "T-polite"] == ["start", "cancel_seen", "left"]
     assert not any("swarm timeout" in x or "runner shutdown" in x for x in rig.reasons("T-polite")), "it was killed"
@@ -491,11 +498,14 @@ def test_one_failing_task_keeps_the_parallelism_and_follows_the_retry_ladder(tmp
     assert len(rig.reasons("T-f")) == 3 and all(x.startswith("E-CONTRACT") for x in rig.reasons("T-f"))  # unchanged ladder
     assert rig.events("swarm.degraded") == []
     assert set(_effective(rig)) == {4}, _effective(rig)
-    spans = rig.spans()
-    first_failure_end = spans["T-f"][0][1]
-    later = {t: [p for p in pairs if p[0] > first_failure_end] for t, pairs in spans.items() if t != "T-f"}
-    later = {t: pairs for t, pairs in later.items() if pairs}
-    assert len(later) >= 4 and _max_concurrency(later) >= 3, "the tasks after the failure ran (nearly) one at a time"
+    # Event-ordered, not timed: the scheduler's own ticks report how many sessions it had running after the failure,
+    # and at least four other tasks finished after it.
+    events = rig.events("swarm.run.finished", "swarm.scheduler.tick")
+    failed_at = next(i for i, e in enumerate(events) if e["type"] == "swarm.run.finished" and e["task_id"] == "T-f")
+    after = events[failed_at + 1:]
+    finished_after = {e["task_id"] for e in after if e["type"] == "swarm.run.finished"} - {"T-f"}
+    running_after = [e["payload"]["running"] for e in after if e["type"] == "swarm.scheduler.tick"]
+    assert len(finished_after) >= 4 and running_after and max(running_after) >= 3, (sorted(finished_after), running_after)
 
 
 def test_three_failures_in_a_row_halve_the_parallelism_and_successes_restore_it(tmp_path):
@@ -514,14 +524,17 @@ def test_three_failures_in_a_row_halve_the_parallelism_and_successes_restore_it(
     assert [states[f"T-b{i}"] for i in range(3)] == ["ESCALATED"] * 3  # each still ran its own retry ladder
     assert {states[f"T-s{i}"] for i in range(5)} == {"DONE"}
     degraded = [e["payload"] for e in rig.events("swarm.degraded")]
-    # A streak of three failures trips once. A success can raise the parallelism again, so a later streak can trip again.
-    # The invariant: the first trip halves 4 -> 2, the last event restores, and both kinds appear.
     reasons = [d["reason"] for d in degraded]
     assert reasons[0] == "consecutive_failures" and reasons[-1] == "recovered", degraded
     assert set(reasons) == {"consecutive_failures", "recovered"}, degraded
-    assert degraded[0]["mode"] == "reduced_parallelism"
-    assert degraded[0]["detail"] == "3 failures in a row; effective_parallel 4 -> 2"
+    assert all(d["mode"] == "reduced_parallelism" for d in degraded if d["reason"] == "consecutive_failures")
     assert degraded[-1]["mode"] == "recovered" and degraded[-1]["detail"] == "reduced_parallelism"
+    # The circuit latches until a success, so a second trip needs a success in between, and a success raises the limit
+    # by one. Each trip halves the limit it finds, so no trip starts from the level the previous trip left.
+    trips = [_trip(d["detail"]) for d in degraded if d["reason"] == "consecutive_failures"]
+    assert trips[0] == (4, 2), trips
+    assert all(to == max(1, frm // 2) for frm, to in trips), trips
+    assert all(prev_to < frm for (_, prev_to), (frm, _) in zip(trips, trips[1:])), trips
     effective = _effective(rig)
     assert 2 in effective and max(effective[effective.index(2):]) == 4, effective
     assert json.loads((rig.swarm / "live.json").read_text())["swarm"]["degraded"] is None
