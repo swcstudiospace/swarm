@@ -5,6 +5,7 @@
 //! - Bincode encoding for efficient binary storage
 //! - Checkpoint serialization for deterministic replay
 
+use bincode::Options;
 use prost_reflect::{DynamicMessage, MessageDescriptor};
 use std::sync::Arc;
 
@@ -53,6 +54,20 @@ impl Default for SerdeConfig {
     }
 }
 
+/// Decodes the bincode framing of one storage record into its protobuf bytes.
+///
+/// Trailing bytes are an error: a record must consume its whole input, so
+/// concatenated or padded input is refused rather than silently ignored. The
+/// options match `bincode::serialize` (fixint, little-endian), so the encoder's
+/// wire format is unchanged.
+fn decode_storage_bytes(bytes: &[u8]) -> SerdeResult<Vec<u8>> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize::<Vec<u8>>(bytes)
+        .map_err(Into::into)
+}
+
 /// Serializer for GSD-Core messages
 pub struct Serializer {
     config: SerdeConfig,
@@ -95,7 +110,7 @@ impl Serializer {
     /// Deserialize from bincode bytes to Protobuf message
     pub fn deserialize<M: prost::Message + Default>(&self, bytes: &[u8]) -> SerdeResult<M> {
         if self.config.use_bincode {
-            let protobuf_bytes: Vec<u8> = bincode::deserialize::<Vec<u8>>(bytes)?;
+            let protobuf_bytes: Vec<u8> = decode_storage_bytes(bytes)?;
             M::decode(&*protobuf_bytes).map_err(Into::into)
         } else {
             M::decode(bytes).map_err(Into::into)
@@ -120,7 +135,7 @@ impl Serializer {
         bytes: &[u8],
     ) -> SerdeResult<DynamicMessage> {
         let protobuf_bytes: Vec<u8> = if self.config.use_bincode {
-            bincode::deserialize::<Vec<u8>>(bytes)?
+            decode_storage_bytes(bytes)?
         } else {
             bytes.to_vec()
         };
@@ -169,7 +184,7 @@ impl Deserializer {
     /// Deserialize a Protobuf message from bincode bytes
     pub fn deserialize<M: prost::Message + Default>(&self, bytes: &[u8]) -> SerdeResult<M> {
         if self.config.use_bincode {
-            let protobuf_bytes: Vec<u8> = bincode::deserialize::<Vec<u8>>(bytes)?;
+            let protobuf_bytes: Vec<u8> = decode_storage_bytes(bytes)?;
             M::decode(&*protobuf_bytes).map_err(Into::into)
         } else {
             M::decode(bytes).map_err(Into::into)
@@ -183,7 +198,7 @@ impl Deserializer {
         bytes: &[u8],
     ) -> SerdeResult<prost_reflect::DynamicMessage> {
         let protobuf_bytes: Vec<u8> = if self.config.use_bincode {
-            bincode::deserialize::<Vec<u8>>(bytes)?
+            decode_storage_bytes(bytes)?
         } else {
             bytes.to_vec()
         };
@@ -468,5 +483,24 @@ mod tests {
         let mut short_header = encoded.clone();
         short_header.extend_from_slice(&[0, 0]);
         assert!(deserialize_batch::<gsd_proto::gsd::v1::Task>(&short_header).is_err());
+    }
+
+    #[test]
+    fn deserialize_from_storage_rejects_trailing_bytes() {
+        let task = Task {
+            id: Some(TaskId {
+                value: "trailing".to_string(),
+            }),
+            ..Default::default()
+        };
+        let encoded = serialize_for_storage(&task).unwrap();
+        assert!(deserialize_from_storage::<Task>(&encoded).is_ok());
+
+        let doubled = [encoded.as_slice(), encoded.as_slice()].concat();
+        let result = deserialize_from_storage::<Task>(&doubled);
+        assert!(
+            result.is_err(),
+            "storage decoder accepted two concatenated records and ignored the trailing bytes"
+        );
     }
 }
