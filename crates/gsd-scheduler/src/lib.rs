@@ -318,6 +318,10 @@ impl MatrixScheduler {
     ///
     /// A reservation the governor no longer holds has nothing left to refund. `complete` logs that
     /// and succeeds, as the teardown does for a final `UnknownReservation`.
+    ///
+    /// Once the thread is released, the DAG records the outcome. `Succeeded` marks the task
+    /// complete, so its dependents become ready. `Failed` and `Cancelled` mark it failed, so it is
+    /// never ready again and its dependents stay blocked.
     pub async fn complete(&self, task_id: &TaskId, outcome: LeaseOutcome) -> SchedulerResult<()> {
         // The guard is a temporary of this statement, so it is released before the await.
         let lease = self
@@ -334,6 +338,11 @@ impl MatrixScheduler {
                 return Err(SchedulerError::Other(message));
             }
         }
+        // The task has finished on its thread, so the DAG records how it ended.
+        let settled = match outcome {
+            LeaseOutcome::Succeeded => self.dag.write().mark_complete(task_id),
+            LeaseOutcome::Failed | LeaseOutcome::Cancelled => self.dag.write().mark_failed(task_id),
+        };
         // The lease is gone, so its reservation returns whether or not the thread release succeeded.
         let refunded = self
             .governor
@@ -359,6 +368,7 @@ impl MatrixScheduler {
             }
             Err(err) => return Err(SchedulerError::Other(err.to_string())),
         }
+        settled?;
         tracing::debug!(
             task = %task_id.value,
             thread = %lease.thread_id,
@@ -813,6 +823,45 @@ mod lease_tests {
         scheduler.begin_admission(&task_on("y", &["x"]))?;
         scheduler.finish_admission("y", true);
         assert_eq!(scheduler.get_frontier().await, vec![task_id("x")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_succeeded_task_leaves_the_frontier_and_unblocks_its_dependents(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = scheduler(2)?;
+        scheduler.submit(task("a")).await?;
+        scheduler.submit(task_on("b", &["a"])).await?;
+        assert_eq!(scheduler.get_frontier().await, vec![task_id("a")]);
+        scheduler
+            .complete(&task_id("a"), LeaseOutcome::Succeeded)
+            .await?;
+        assert_eq!(scheduler.get_frontier().await, vec![task_id("b")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_is_never_ready_again_and_keeps_its_dependents_blocked(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = scheduler(2)?;
+        scheduler.submit(task("a")).await?;
+        scheduler.submit(task_on("b", &["a"])).await?;
+        assert_eq!(scheduler.get_frontier().await, vec![task_id("a")]);
+        scheduler
+            .complete(&task_id("a"), LeaseOutcome::Failed)
+            .await?;
+        assert!(scheduler.get_frontier().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_is_never_ready_again() -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = scheduler(1)?;
+        scheduler.submit(task("a")).await?;
+        scheduler
+            .complete(&task_id("a"), LeaseOutcome::Cancelled)
+            .await?;
+        assert!(scheduler.get_frontier().await.is_empty());
         Ok(())
     }
 }

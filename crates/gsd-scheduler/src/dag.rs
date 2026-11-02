@@ -19,6 +19,8 @@ pub struct TaskDag {
     graph: DiGraph<Task, ()>,
     index: HashMap<String, NodeIndex>,
     completed: HashSet<String>,
+    /// Tasks that ended as failed or cancelled: never ready again; their dependents stay blocked.
+    failed: HashSet<String>,
 }
 
 impl TaskDag {
@@ -60,7 +62,7 @@ impl TaskDag {
         Ok(node)
     }
 
-    /// Removes the task `id`, every edge into or out of it, and its completion mark.
+    /// Removes the task `id`, every edge into or out of it, and its completion and failure marks.
     ///
     /// The other tasks keep their insertion order and their edges. Returns `false` and changes
     /// nothing when `id` is not in the DAG.
@@ -69,6 +71,7 @@ impl TaskDag {
             return false;
         };
         self.completed.remove(id);
+        self.failed.remove(id);
 
         // Rebuild the graph without the node. `petgraph` moves the last node into a freed slot,
         // which would reorder `get_ready_tasks`, so the surviving nodes keep their existing order.
@@ -114,13 +117,27 @@ impl TaskDag {
         Ok(())
     }
 
-    /// Returns tasks that are not complete and whose dependencies are all complete,
+    /// Marks `id` as failed. A failed task is never ready again, and its dependents stay blocked,
+    /// because a task becomes ready only when every dependency is complete.
+    ///
+    /// Returns `TaskNotFound` when `id` is not in the DAG.
+    pub fn mark_failed(&mut self, id: &TaskId) -> SchedulerResult<()> {
+        if !self.index.contains_key(&id.value) {
+            return Err(SchedulerError::TaskNotFound(id.value.clone()));
+        }
+        self.failed.insert(id.value.clone());
+        Ok(())
+    }
+
+    /// Returns tasks that are neither complete nor failed and whose dependencies are all complete,
     /// in insertion order.
     pub fn get_ready_tasks(&self) -> Vec<TaskId> {
         self.graph
             .node_indices()
             .filter(|&node| {
-                !self.completed.contains(self.key_of(node))
+                let key = self.key_of(node);
+                !self.completed.contains(key)
+                    && !self.failed.contains(key)
                     && self
                         .graph
                         .neighbors_directed(node, Direction::Incoming)
@@ -231,6 +248,27 @@ mod tests {
         // D's only parent A stays complete, so removing D leaves C as the only ready task.
         assert!(dag.remove_task("D"));
         assert_eq!(ready_ids(&dag), vec!["C".to_string()]);
+        Ok(())
+    }
+
+    /// A failed task is never ready again, and its dependents stay blocked until it completes.
+    #[test]
+    fn a_failed_task_is_never_ready_and_keeps_its_dependents_blocked() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &["A"]))?;
+        assert_eq!(ready_ids(&dag), vec!["A".to_string()]);
+        dag.mark_failed(&TaskId {
+            value: "A".to_string(),
+        })?;
+        assert!(ready_ids(&dag).is_empty());
+        let unknown = TaskId {
+            value: "nope".to_string(),
+        };
+        assert!(matches!(
+            dag.mark_failed(&unknown),
+            Err(SchedulerError::TaskNotFound(_))
+        ));
         Ok(())
     }
 }
