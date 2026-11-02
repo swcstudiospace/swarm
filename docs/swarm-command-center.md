@@ -6,8 +6,9 @@ agents, one telemetry channel feeds the logs and the UI, and the omp swarm bar (
 shows every subagent's state and elapsed time and the session's token savings. Nothing here changes the Task Store state machine, the signed envelopes, the gates or the classifier: the new
 runtime state is a projection over them.
 
-Each statement below was checked against the code and, where it names a command, run in a scratch copy with a
-temporary `SWARM_DIR`. Section 13 lists the known limits, and why.
+The descriptions below follow repository code. Explicit historical command exercises used a scratch copy
+with a temporary `SWARM_DIR`; interface documentation is not evidence of runtime activation or an executed
+long quality run. Section 13 lists the known limits, and why.
 
 v2.3 grows the roster from 15 to 30 agents (A16 to A30) on the same runtime. The counts below are the 30-agent
 state; section 9.1 is the checklist for adding an agent and section 16 lists what v2.3 changed.
@@ -208,6 +209,52 @@ slow task never holds back newly ready work.
   backoff) still applies. A value other than `continuous` or `rounds` exits 2 with E-INPUT before anything is claimed.
 
 `swarm_run.py --json` reports `scheduler`, `max_parallel`, `effective_parallel`, `rounds`, `counts` and `cancelled`.
+
+### 4.1 Per-invocation quality deadlines in omp
+
+The normal owner-only `swarm_gate` tool accepts optional `timeout_s` **only for `gate: "quality"`** (A08).
+It is an integer number of seconds in **1..7200 inclusive**. A supplied null, boolean, string, nonfinite
+number, fraction, zero, negative number or value above 7200 is refused with E-INPUT. Supplying the field
+to review, security or release is also refused. Validation occurs before a findings file, bridge child,
+Task Store write or verdict effect; owner-only and plan-mode refusals remain in force.
+
+For example, an appropriately authorized, leased quality task may call:
+
+```json
+{"gate":"quality","task_id":"T-example-qa","correlation_id":"c-example","timeout_s":7200}
+```
+
+This forwards `--timeout=7200` to the normal canonical `qa_gate.py` runner and supervises the **whole
+bridge request** for 7260 seconds: the requested runner seconds plus the existing 60-second cleanup
+margin. Canonical runner selection, risk-derived tiers, parsing, signing, per-target findings and current
+task/correlation/lease checks are unchanged. The outer timer is per request, not a shared or renewed
+allowance; concurrent or later calls do not inherit another invocation's deadline. On cancellation or
+outer timeout the existing bridge terminates the child's process group, escalating to SIGKILL when
+needed. A timeout/cancelled run is not a successful gate: inspect the actual Task Store and signed rows
+before retrying. In the canonical Python path, a runner's `subprocess.TimeoutExpired` currently maps to
+E-INTERNAL with no quality verdict; outer supervision and session deadline aborts report E-TIMEOUT.
+
+Omitting `timeout_s` sends no CLI override: the runner still defaults to **1800 seconds** and its outer
+supervisor to **1860 seconds**. Other gates retain their existing deadlines and behavior. This is not an
+arbitrary command/argv interface, a review API, or a global timeout configuration.
+
+**Independent limits still apply.** This field does not extend a signed task's wall budget, its lease,
+an omp session deadline, or the headless runner's `--task-timeout`/`--swarm-timeout`. A shorter enclosing
+limit can end the call first. Approval of a longer quality run, or an annotation of that approval, does
+not itself change the signed assignment or Task Store budget. Align those prerequisites through the
+normal authorized controller/budget/lease route before executing the long run; do not reset history or
+disable guards, session identity, signing or gate policies.
+
+**Activation is session-scoped and must be proved separately.** Load the intended extension source
+through the supported CLI/extension/resume path, with guards and signing active, and inspect the
+resulting session's actual tool schema for `timeout_s` before claiming it is available. `SWARM_ROOT`
+only selects the Python script root for the bridge; changing it does **not** reload the TypeScript
+extension or prove which schema is loaded. No active/global runtime or configuration change is implied.
+The canonical headless runner currently re-runs gate scripts after the agent session with its own keys
+(`scripts/swarm_run.py:run_gate_script`) and does **not** pass CLI `--timeout`; this tool option does not
+change that recording path. A long owner invocation therefore still needs legitimate scoped activation
+and alignment of the recording path and independent execution limits; this API alone is not evidence
+that a long headless run can complete or record a verdict.
 
 ## 5. Handover protocol
 

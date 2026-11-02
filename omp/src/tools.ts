@@ -39,8 +39,9 @@ GATE_AGENTS satisfies Record<Gate, string>;
 
 /** Finding severities (copied from swarm/gates.py:10 SEVERITIES); BLOCKING_SEVERITY = "major". */
 const SEVERITIES = ["info", "minor", "major", "critical", "blocker"] as const;
-/** qa_gate's own --timeout default (1800 s) plus a margin, so the bridge never kills a test run first. */
-const QA_GATE_TIMEOUT_MS = (1800 + 60) * 1000;
+/** qa_gate's runner default plus time for canonical cleanup before the bridge kills its process group. */
+const QA_GATE_TIMEOUT_S = 1800;
+const QA_GATE_CLEANUP_S = 60;
 
 /** A finding (swarm/gates.py make_finding fields). No verdict field anywhere: severities decide (D-09). */
 const FINDING = {
@@ -94,6 +95,8 @@ export type GateParams = {
   task_id: string;
   correlation_id: string;
   per_target_findings?: Record<string, Finding[]>;
+  /** Quality only: per-invocation runner seconds, integer 1..7200; does not extend the task/session budget. */
+  timeout_s?: number;
   dry_run?: boolean;
 };
 export type CatalogParams = { kind?: (typeof CATALOG_KINDS)[number]; query?: string };
@@ -382,8 +385,9 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       "that is not a target of the gate task is refused (E-INPUT). " +
       "To fail a target, include at least " +
       "one finding of severity major or higher (major, critical or blocker); minor and info findings pass. " +
-      "A failing verdict is returned as text starting `FAIL:`, not as an error. Call this before swarm_ingest of " +
-      "the gate task's result.",
+      "A failing verdict is returned as text starting `FAIL:`, not as an error. Quality alone accepts timeout_s " +
+      "(integer 1..7200 seconds); omission preserves the runner's 1800-second default. It does not extend task, " +
+      "lease or session limits. Call this before swarm_ingest of the gate task's result.",
     parameters: {
       type: "object",
       properties: {
@@ -396,6 +400,11 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
           description:
             "review, quality and security gates: {target task id: [finding]}. To fail a target include at least " +
             "one finding of severity major, critical or blocker; an empty list adds nothing to it.",
+        },
+        timeout_s: {
+          type: "integer", minimum: 1, maximum: 7200,
+          description: "Quality only: runner deadline in seconds, plus 60 seconds of outer cleanup supervision; " +
+            "omitted: 1800-second runner, 1860-second supervisor. Independent task/lease/session limits still apply.",
         },
         dry_run: { type: "boolean", description: "Canned dry-run verdict (per_target_findings is ignored)" },
       },
@@ -414,16 +423,28 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
             `not ${agent === undefined ? "an unidentified session" : JSON.stringify(agent)}`,
         );
       }
+      if ("timeout_s" in params) {
+        if (params.gate !== "quality") {
+          throw new SwarmToolError("E-INPUT", "timeout_s is accepted only by the quality gate");
+        }
+        if (typeof params.timeout_s !== "number" || !Number.isInteger(params.timeout_s) ||
+            params.timeout_s < 1 || params.timeout_s > 7200) {
+          throw new SwarmToolError("E-INPUT", "timeout_s must be an integer from 1 to 7200 seconds");
+        }
+      }
       if (params.per_target_findings !== undefined && params.gate === "release") {
         throw new SwarmToolError("E-INPUT", "per_target_findings is not accepted by the release gate");
       }
       // argv from whitelisted fields only: extra model keys (e.g. a forged verdict) never reach python (T-03-06)
       const args = [rootArg(ctx), `--task-id=${params.task_id}`, `--correlation-id=${params.correlation_id}`];
+      if (params.timeout_s !== undefined) args.push(`--timeout=${params.timeout_s}`);
       if (params.per_target_findings !== undefined) {
         args.push(`--per-target-findings=${writeInputFile(ctx.cwd, "findings", toolCallId, params.per_target_findings)}`);
       }
       if (params.dry_run) args.push("--dry-run");
-      const timeoutMs = params.gate === "quality" ? QA_GATE_TIMEOUT_MS : undefined;
+      const timeoutMs = params.gate === "quality"
+        ? ((params.timeout_s ?? QA_GATE_TIMEOUT_S) + QA_GATE_CLEANUP_S) * 1000
+        : undefined;
       return toolResult(await bridge({ script, args, cwd: ctx.cwd, signal, timeoutMs }));
     },
   });
