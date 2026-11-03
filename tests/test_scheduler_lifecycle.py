@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import ROOT
+from swarm.errors import ErrorCode, SwarmError
 from swarm.subagent_lifecycle import SubagentLifecycleManager
 from swarm.taskstore import TaskStore, TaskState as S
 from swarm.telemetry import Telemetry
@@ -479,3 +480,16 @@ def test_dot_and_dotdot_correlation_ids_are_refused_and_write_no_flag(lifecycle,
         with pytest.raises(rig.mod.SwarmError):
             rig.mod.clear_cancel_flag(sdir, corr)
     assert not (sdir / "cancel").exists()
+
+
+def test_acquire_after_release_is_refused_and_takes_no_slot(lifecycle):
+    rig = lifecycle
+    sid = rig.mgr.new_subagent_id("T-helper")
+    rig.mgr.acquire(sid)
+    assert rig.mgr.release(sid) is not None
+    free = rig.mgr._sem._value  # free slots, read from the semaphore (the manager exposes no count)
+    assert free == rig.mgr.max_concurrent
+    with pytest.raises(SwarmError) as refused:
+        rig.mgr.acquire(sid)
+    assert refused.value.code is ErrorCode.E_CONTRACT
+    assert rig.mgr._sem._value == free

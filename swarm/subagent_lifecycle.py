@@ -261,7 +261,14 @@ class SubagentLifecycleManager:
 
     def acquire(self, sid: str, *, timeout: float | None = None) -> None:
         """Take a slot for sid, waiting at most `timeout` (default ACQUIRE_TIMEOUT_S) seconds. A full manager raises
-        E-CAPACITY: there is no unbounded wait. Execution begins once the slot is held."""
+        E-CAPACITY: there is no unbounded wait. Execution begins once the slot is held.
+        A sid that is not active (never spawned, or already released) is refused with E-CONTRACT before any slot is taken."""
+        with self._lock:
+            known = sid in self._active
+        if not known:
+            raise SwarmError(ErrorCode.E_CONTRACT,
+                             f"{sid} is not an active subagent: acquire takes an id from new_subagent_id that was not released",
+                             subagent_id=sid)
         root, corr, task_id = self._ctx_of(sid)
         wait = ACQUIRE_TIMEOUT_S if timeout is None else timeout
         if not self._sem.acquire(timeout=wait):

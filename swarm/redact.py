@@ -1202,6 +1202,24 @@ def redact_text(s: str) -> str:
     return "".join(out)
 
 
+_BARE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _bare_credential_key(name: object) -> bool:
+    """Whether `name` is a credential name as a whole (`api_key`), not a key redacted for a token inside its text (`Authorization: Bearer x`)."""
+    return isinstance(name, str) and _BARE_NAME_RE.fullmatch(name) is not None and is_sensitive_key(name)
+
+
+def _dict_value(name: object, value: object, level: int, max_depth: int, sensitive: bool) -> object:
+    """A dict entry's value. A number or bool is a credential only when its key is a credential name as a whole (`{"api_key": 4821937}`),
+    so a key redacted only because it embeds a token (`"Authorization: Bearer x": 1`) keeps its number or bool; None stays None.
+    Strings and containers go through `_walk`, so list items keep its rules."""
+    credential = sensitive or _credential_pair(name, value)
+    if isinstance(value, (int, float)) and (sensitive or _bare_credential_key(name)):
+        return REDACTED
+    return _walk(value, level + 1, max_depth, credential)
+
+
 def _walk(value: object, level: int, max_depth: int, sensitive: bool) -> object:
     if isinstance(value, str):
         return REDACTED if sensitive and value else redact_text(value)
@@ -1209,13 +1227,13 @@ def _walk(value: object, level: int, max_depth: int, sensitive: bool) -> object:
         if level > max_depth:
             return REDACTED  # depth cap: never recurse unbounded (cycles included), never pass an unexamined subtree
         if isinstance(value, dict):
-            return {(redact_text(k) if isinstance(k, str) else k): _walk(v, level + 1, max_depth, sensitive or _credential_pair(k, v))
+            return {(redact_text(k) if isinstance(k, str) else k): _dict_value(k, v, level, max_depth, sensitive)
                     for k, v in value.items()}
         return [_walk(v, level + 1, max_depth, sensitive) for v in value]
     return value
 
 
 def redact(value: object, *, max_depth: int = 12) -> object:
-    """A redacted copy of `value` (dict/list/tuple/str recursed, tuples become lists, other scalars unchanged).
+    """A redacted copy of `value` (dict/list/tuple/str recursed, tuples become lists; a number or bool that is a dict value under a credential name becomes `[REDACTED]`; other scalars unchanged).
     Containers nested more than `max_depth` levels deep are replaced by `[REDACTED]`."""
     return _walk(value, 1, max_depth, False)
