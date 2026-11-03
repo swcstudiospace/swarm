@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Prompts containing these (case-insensitive) are owned by other plugins or explicitly opt out.
 NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
+# Uplift wrappers, mirrored from swarm/signal_detector.py UPLIFT_ROOT. This file must run without that import, so the fallback
+# below uses it: a wrapped prompt is silent, since the fallback cannot unescape <ORIGINAL> the way the primary classifier does.
+UPLIFT_ROOT = re.compile(r"^<(BUILD_PROMPT|FIX_PROMPT|RESEARCH_PROMPT|CHANGE_PROMPT|UPLIFTED_PROMPT|uplifted|ultrathink)\b", re.I | re.A)
 
 # Tags the /swarm dispatch prompt so the hook never re-steers the swarm's own dispatch.
 DISPATCH_MARKER = "[agent-swarm:dispatch]"
@@ -63,6 +66,8 @@ def classify(prompt: str) -> bool:
         trimmed = prompt.strip()
         low = trimmed.lower()
         if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
+            return False
+        if UPLIFT_ROOT.match(trimmed):
             return False
         if DISPATCH_MARKER in low or any(n in low for n in NEGATIVE):
             return False

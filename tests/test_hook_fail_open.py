@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "hooks" / "autonomous_run.py"
 ON_A01 = ROOT / "hooks" / "on_a01_complete.py"
@@ -56,10 +58,15 @@ def test_on_a01_complete_exits_zero_when_hook_trigger_unimportable(tmp_path):
     assert r.stdout.strip() == "{}"
 
 
-def test_fallback_does_not_inject_for_uplift_wrapped_question(tmp_path):
-    """With the classifier unavailable, the fallback must judge the original question inside the uplift wrapper, not the
-    SDLC verb in the uplifted text, so no orchestration context is injected."""
-    prompt = "<UPLIFTED_PROMPT>Implement the cache layer.<original>how does the cache work?</original></UPLIFTED_PROMPT>"
+@pytest.mark.parametrize("wrapper", ["BUILD_PROMPT", "ultrathink"])
+def test_fallback_stays_silent_on_uplift_wrapped_prompts(tmp_path, wrapper):
+    """With the classifier unavailable, a question wrapped in an uplift tag must stay silent though the outer text says "Implement".
+    The plain control runs first under the same poisoning and must inject, so silence cannot come from a dead fallback."""
+    control = _run_hook_with_blocked_module(PROMPT_HOOK, "swarm.signal_detector",
+                                            json.dumps({"prompt": "Implement the cache layer."}), tmp_path)
+    assert control.returncode == 0, control.stderr
+    assert "additionalContext" in control.stdout, control.stdout
+    prompt = f"<{wrapper}>Implement the cache layer.<ORIGINAL>how does the cache work?</ORIGINAL></{wrapper}>"
     r = _run_hook_with_blocked_module(PROMPT_HOOK, "swarm.signal_detector", json.dumps({"prompt": prompt}), tmp_path)
     assert r.returncode == 0, r.stderr
     assert "additionalContext" not in r.stdout, r.stdout
