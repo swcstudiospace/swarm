@@ -51,6 +51,14 @@ jobs:
             tests/parity/test_extension_threads.py
             scripts/orch_status.py
           if-no-files-found: error
+      - name: upload the catalog gate sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-catalog-sources
+          path: |
+            scripts/swarm_tool.py
+            agents.json
+          if-no-files-found: error
 
   install-and-gate:
     needs: wheel
@@ -85,3 +93,26 @@ jobs:
         run: |
           cd /tmp/gate
           python -m pytest -o addopts="" -q tests/parity/test_extension_parity.py tests/parity/test_extension_threads.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-catalog-sources
+          path: /tmp/catalog-src
+      # Catalog gate, run from /tmp/catalog outside the repository: swarm_tool.py and agents.json are copied out of the
+      # artifact, SWARM_AGENTS_FILE points at the copy, and the installed wheel supplies the swarm package.
+      - name: swarm_tool catalog gate (installed wheel)
+        run: |
+          rm -rf /tmp/catalog
+          mkdir -p /tmp/catalog
+          cp /tmp/catalog-src/scripts/swarm_tool.py /tmp/catalog-src/agents.json /tmp/catalog/
+          cd /tmp/catalog
+          code=0
+          SWARM_AGENTS_FILE=/tmp/catalog/agents.json python3 swarm_tool.py catalog --caller A05 --json > catalog.json || code=$?
+          cat catalog.json
+          test "$code" -eq 0
+          python3 - <<'PY'
+          import json
+          with open("catalog.json", encoding="utf-8") as fh:
+              report = json.load(fh)
+          if report.get("status") != "ok":
+              raise SystemExit(f"catalog gate: status is {report.get('status')!r}, expected 'ok'")
+          PY
