@@ -89,13 +89,13 @@ CREATE TABLE IF NOT EXISTS artifacts (
 _VERIFIED = {"ok", "fail", "expired"}  # a verified, current envelope; reconcile acts only on these
 _JSON_COLS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
 
-# Every `tasks` column except the primary key task_id (mirrors _SCHEMA). update() interpolates its keys into SQL,
-# so only these names may reach it.
+# Every `tasks` column except task_id (the key) and updated_at (update() sets it itself). Mirrors _SCHEMA.
+# update() interpolates its keys into SQL, so only these names may reach it.
 _UPDATABLE_COLS = frozenset((
     "correlation_id", "parent_id", "dag_depth", "capability", "agent_id", "title",
     "inputs", "outputs", "acceptance", "budget", "risk_class", "priority", "state",
     "attempt", "max_attempts", "rework_loops", "depends_on", "assigned_to", "notes",
-    "created_at", "updated_at",
+    "created_at",
 ))
 
 
@@ -204,7 +204,7 @@ class TaskStore:
         q += " ORDER BY dag_depth, created_at"
         return [self._row(r) for r in self.conn.execute(q, args)]
 
-    def update(self, task_id: str, **fields) -> dict:
+    def update(self, task_id: str, /, **fields) -> dict:
         bad = sorted(k for k in fields if k not in _UPDATABLE_COLS)
         if bad:
             raise ValueError(f"TaskStore.update: not an updatable tasks column: {', '.join(bad)}")

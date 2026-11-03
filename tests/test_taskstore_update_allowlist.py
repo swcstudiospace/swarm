@@ -16,6 +16,7 @@ def _store(swarm_dir):
     "title=? OR 1=1 --",
     "title; DROP TABLE tasks",
     "no_such_column",
+    "updated_at",
 ])
 def test_hostile_key_rejected_and_row_unchanged(swarm_dir, hostile):
     store = _store(swarm_dir)
@@ -37,8 +38,8 @@ def test_mixed_call_with_hostile_key_applies_nothing(swarm_dir):
 def test_primary_key_is_not_updatable(swarm_dir):
     store = _store(swarm_dir)
     before = store.get("U-1")
-    # task_id binds to update()'s own positional parameter, so Python rejects it before any SQL is built.
-    with pytest.raises(TypeError):
+    # task_id is positional-only, so a task_id keyword lands in fields and the allowlist rejects it before any SQL is built.
+    with pytest.raises(ValueError, match="not an updatable tasks column: task_id"):
         store.update("U-1", **{"task_id": "U-2"})
     assert store.get("U-1") == before
 
