@@ -7,8 +7,10 @@
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gsd_envelope::KeyMaterial;
@@ -593,6 +595,51 @@ fn node_ok(code: i32, evidence: &NodeEvidence) -> bool {
     code == 0 && evidence.complete && evidence.passed > 0 && evidence.failed == 0
 }
 
+/// Grace for the pipes to reach EOF once a runner exits 0 and its process group is killed.
+const PIPE_GRACE: Duration = Duration::from_secs(1);
+
+/// Bytes one runner pipe delivered; `failed` once a read errored.
+#[derive(Default)]
+struct PipeCapture {
+    bytes: Vec<u8>,
+    failed: bool,
+}
+
+/// Reads a pipe to its end on a thread. The bytes read so far stay in the shared capture, so a read cut short by the
+/// grace keeps what it captured.
+fn drain_pipe<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> (Arc<Mutex<PipeCapture>>, std::thread::JoinHandle<()>) {
+    let sink = Arc::new(Mutex::new(PipeCapture::default()));
+    let writer = Arc::clone(&sink);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => writer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .bytes
+                    .extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    writer.lock().unwrap_or_else(PoisonError::into_inner).failed = true;
+                    break;
+                }
+            }
+        }
+    });
+    (sink, reader)
+}
+
+/// Kills the process group led by `leader`, the runner spawned with `process_group(0)`. An empty group is not an error.
+fn kill_group(leader: u32) {
+    if let Some(group) = i32::try_from(leader).ok().and_then(rustix::process::Pid::from_raw) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+}
+
 fn run_cmd_streams(
     cmd: &[String],
     cwd: &Path,
@@ -603,6 +650,9 @@ fn run_cmd_streams(
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        // The runner leads its own process group, so a daemon it leaves behind can be killed with it.
+        .process_group(0)
         .spawn()
         .map_err(|_| {
             before_any_write(SeamError::new(
@@ -612,8 +662,7 @@ fn run_cmd_streams(
         })?;
     // Both pipes are drained while the child runs. A runner that writes more than a pipe buffer would otherwise block
     // on the write and be reported as a timeout.
-    let (Some(mut out_pipe), Some(mut err_pipe)) = (child.stdout.take(), child.stderr.take())
-    else {
+    let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         child.kill().ok();
         child.wait().ok();
         return Err(before_any_write(SeamError::new(
@@ -621,16 +670,11 @@ fn run_cmd_streams(
             "a runner's output pipe is missing; Python answers",
         )));
     };
-    let out_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        out_pipe.read_to_end(&mut buffer).map(|_| buffer)
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        err_pipe.read_to_end(&mut buffer).map(|_| buffer)
-    });
+    let (out_sink, out_reader) = drain_pipe(out_pipe);
+    let (err_sink, err_reader) = drain_pipe(err_pipe);
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout.max(1));
     let mut exited = None;
+    let mut grace_until = None;
     loop {
         if exited.is_none() {
             exited = child.try_wait().map_err(|_| {
@@ -639,11 +683,20 @@ fn run_cmd_streams(
                     "a runner could not be waited; Python answers",
                 ))
             })?;
+            // A runner that exits 0 before the deadline may leave a daemon holding the pipes: the group is killed.
+            if exited.is_some_and(|status| status.code() == Some(0))
+                && std::time::Instant::now() <= deadline
+            {
+                kill_group(child.id());
+                grace_until = Some(std::time::Instant::now() + PIPE_GRACE);
+            }
         }
         if let Some(status) = exited {
-            if out_reader.is_finished() && err_reader.is_finished() {
-                let stdout = read_pipe(out_reader)?;
-                let stderr = read_pipe(err_reader)?;
+            let pipes_done = out_reader.is_finished() && err_reader.is_finished();
+            let grace_over = grace_until.is_some_and(|until| std::time::Instant::now() >= until);
+            if pipes_done || grace_over {
+                let stdout = read_pipe(&out_sink)?;
+                let stderr = read_pipe(&err_sink)?;
                 return Ok((
                     status.code().unwrap_or(1),
                     String::from_utf8_lossy(&stdout).into_owned(),
@@ -651,7 +704,8 @@ fn run_cmd_streams(
                 ));
             }
         }
-        if std::time::Instant::now() > deadline {
+        // A runner that exited 0 has its grace running instead of the deadline.
+        if grace_until.is_none() && std::time::Instant::now() > deadline {
             child.kill().ok();
             child.wait().ok();
             // The reader threads are left to finish on their own once the pipes close.
@@ -670,19 +724,15 @@ fn run_cmd(cmd: &[String], cwd: &Path, timeout: u64) -> Result<(i32, String), Se
     Ok((code, stdout))
 }
 
-fn read_pipe(
-    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> Result<Vec<u8>, SeamError> {
-    reader
-        .join()
-        .ok()
-        .and_then(|read| read.ok())
-        .ok_or_else(|| {
-            before_any_write(SeamError::new(
-                ErrorCode::Dep,
-                "a runner's output could not be read; Python answers",
-            ))
-        })
+fn read_pipe(sink: &Mutex<PipeCapture>) -> Result<Vec<u8>, SeamError> {
+    let capture = sink.lock().unwrap_or_else(PoisonError::into_inner);
+    if capture.failed {
+        return Err(before_any_write(SeamError::new(
+            ErrorCode::Dep,
+            "a runner's output could not be read; Python answers",
+        )));
+    }
+    Ok(capture.bytes.clone())
 }
 
 fn finding(
@@ -1725,6 +1775,76 @@ esac
         assert!(
             matches!(field(runs, "unit"), Some(Json::Str(state)) if state == "fail"),
             "a failing runner must fail the unit tier; runs: {runs:?}"
+        );
+    }
+
+    /// True once `/proc/<pid>` is gone, or the process has exited and awaits reaping (state `Z` or `X`).
+    fn process_has_exited(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                .is_some_and(|state| matches!(state, 'Z' | 'X')),
+        }
+    }
+
+    #[test]
+    fn runner_exiting_zero_with_daemon_holding_pipe_completes_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("runner.sh");
+        let pid_file = dir.path().join("daemon.pid");
+        // The runner leaves a daemon behind that inherits both pipes and would hold them for 30 seconds. It records
+        // the daemon's pid, prints one line and exits 0.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\necho runner-ok\nexit 0\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write the fixture");
+        let timeout: u64 = 5;
+        let cmd = vec![
+            "/bin/sh".to_string(),
+            script.to_str().expect("utf-8 path").to_string(),
+        ];
+        let started = std::time::Instant::now();
+        let outcome = super::run_cmd_streams(&cmd, dir.path(), timeout);
+        let elapsed = started.elapsed();
+        let daemon: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the runner recorded the daemon pid")
+            .trim()
+            .parse()
+            .expect("the recorded daemon pid is a number");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !process_has_exited(daemon) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let daemon_gone = process_has_exited(daemon);
+        if !daemon_gone {
+            // Do not leave the daemon running behind a failing test.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &daemon.to_string()])
+                .status();
+        }
+        let bound = std::time::Duration::from_secs(timeout - 1);
+        assert!(
+            elapsed < bound,
+            "the runner returned after {elapsed:?}; it must return before the {timeout}s timeout"
+        );
+        let (code, stdout, _stderr) = match outcome {
+            Ok(parts) => parts,
+            Err(error) => panic!(
+                "a runner that exited 0 must not be a timeout: {}",
+                error.message()
+            ),
+        };
+        assert_eq!(code, 0);
+        assert!(stdout.contains("runner-ok"), "stdout: {stdout:?}");
+        assert!(
+            daemon_gone,
+            "the daemon holding the pipe must be killed with the runner's process group"
         );
     }
 }

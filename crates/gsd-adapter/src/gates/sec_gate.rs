@@ -22,9 +22,10 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gsd_envelope::KeyMaterial;
@@ -818,46 +819,54 @@ enum AuditRun {
     TimedOut,
 }
 
+/// Grace for the pipes to reach EOF once a direct child exits 0 and its process group is killed.
+const PIPE_GRACE: Duration = Duration::from_secs(1);
+
 /// `subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=t)`: inherited environment and stdin, both
-/// pipes read while the child runs, and a direct-child kill at the deadline.
+/// pipes read while the child runs, and a direct-child kill at the deadline. The child leads its own process group.
+/// When it exits 0 before the deadline, the group is killed, so a daemon it left behind cannot hold the pipes; the
+/// pipes then get [`PIPE_GRACE`] to reach EOF, and the output read so far is kept.
 fn run_audit(argv: &[&str], cwd: &Path, timeout: u64) -> Result<AuditRun, SeamError> {
     let mut child = Command::new(argv[0])
         .args(&argv[1..])
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|_| decline("an audit tool could not be started; Python answers"))?;
-    let mut out_pipe = child
+    let out_pipe = child
         .stdout
         .take()
         .ok_or_else(|| decline("no stdout pipe"))?;
-    let mut err_pipe = child
+    let err_pipe = child
         .stderr
         .take()
         .ok_or_else(|| decline("no stderr pipe"))?;
-    let out_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buffer);
-        buffer
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buffer);
-        buffer
-    });
+    let (out_sink, out_reader) = drain_pipe(out_pipe);
+    let (err_sink, err_reader) = drain_pipe(err_pipe);
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut status = None;
+    let mut grace_until = None;
     loop {
         if status.is_none() {
             status = child
                 .try_wait()
                 .map_err(|_| decline("an audit tool could not be waited; Python answers"))?;
+            // A tool that exits 0 before the deadline may leave a daemon holding the pipes: the group is killed.
+            if status.is_some_and(|value| value.code() == Some(0)) && Instant::now() < deadline {
+                kill_group(child.id());
+                grace_until = Some(Instant::now() + PIPE_GRACE);
+            }
         }
-        if status.is_some() && out_reader.is_finished() && err_reader.is_finished() {
+        let pipes_done = out_reader.is_finished() && err_reader.is_finished();
+        let grace_over = grace_until.is_some_and(|until| Instant::now() >= until);
+        if status.is_some() && (pipes_done || grace_over) {
             break;
         }
-        if Instant::now() >= deadline {
+        // A tool that exited 0 has its grace running instead of the deadline.
+        if grace_until.is_none() && Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             // The reader threads are left to finish on their own, as Python leaves a grandchild's open pipe.
@@ -867,9 +876,47 @@ fn run_audit(argv: &[&str], cwd: &Path, timeout: u64) -> Result<AuditRun, SeamEr
     }
     Ok(AuditRun::Done {
         code: status.and_then(|value| value.code()),
-        stdout: out_reader.join().unwrap_or_default(),
-        stderr: err_reader.join().unwrap_or_default(),
+        stdout: take_bytes(&out_sink),
+        stderr: take_bytes(&err_sink),
     })
+}
+
+/// Reads a pipe to its end on a thread. The bytes read so far stay in the shared buffer, so a read cut short by the
+/// grace keeps what it captured.
+fn drain_pipe<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&sink);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => writer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (sink, reader)
+}
+
+fn take_bytes(sink: &Mutex<Vec<u8>>) -> Vec<u8> {
+    sink.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Kills the process group led by `leader`, the audit tool spawned with `process_group(0)`. An empty group is not an
+/// error.
+fn kill_group(leader: u32) {
+    if let Some(group) = i32::try_from(leader).ok().and_then(rustix::process::Pid::from_raw) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
 }
 
 /// `json.loads` branches of `dep_audit`, read with the shapes the Python branches accept. Any other shape is an
@@ -1965,6 +2012,70 @@ mod tests {
             incomplete,
             vec!["big.py"],
             "expected one scan-incomplete finding naming big.py"
+        );
+    }
+
+    /// True once `/proc/<pid>` is gone, or the process has exited and awaits reaping (state `Z` or `X`).
+    fn process_has_exited(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                .is_some_and(|state| matches!(state, 'Z' | 'X')),
+        }
+    }
+
+    #[test]
+    fn audit_tool_exiting_zero_with_daemon_holding_pipe_completes_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("audit.sh");
+        let pid_file = dir.path().join("daemon.pid");
+        // The tool leaves a daemon behind that inherits both pipes and would hold them for 30 seconds. It records the
+        // daemon's pid, prints one line and exits 0.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\necho audit-ok\nexit 0\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write the fixture");
+        let timeout: u64 = 5;
+        let script_arg = script.to_str().expect("utf-8 path");
+        let started = std::time::Instant::now();
+        let run = super::run_audit(&["/bin/sh", script_arg], dir.path(), timeout);
+        let elapsed = started.elapsed();
+        let daemon: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the tool recorded the daemon pid")
+            .trim()
+            .parse()
+            .expect("the recorded daemon pid is a number");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !process_has_exited(daemon) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let daemon_gone = process_has_exited(daemon);
+        if !daemon_gone {
+            // Do not leave the daemon running behind a failing test.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &daemon.to_string()])
+                .status();
+        }
+        let bound = std::time::Duration::from_secs(timeout - 1);
+        assert!(
+            elapsed < bound,
+            "the audit run returned after {elapsed:?}; it must return before the {timeout}s timeout"
+        );
+        let run = run.expect("the audit tool starts");
+        let super::AuditRun::Done { code, stdout, .. } = run else {
+            panic!("an audit tool that exited 0 must not be reported as timed out");
+        };
+        assert_eq!(code, Some(0));
+        assert_eq!(stdout, b"audit-ok\n".to_vec());
+        assert!(
+            daemon_gone,
+            "the daemon holding the pipe must be killed with the audit tool's process group"
         );
     }
 }
