@@ -425,16 +425,16 @@ const SPLIT_STRING = /^(?:-[A-Za-z]*S\s*|--split-string(?:=|\s+))/;
 /** Nesting cap for `sh -c "sh -c '…'"` recursion: past it a shell body is refused as unjudged (nested-shell-depth), never dropped. */
 const MAX_LITERAL_DEPTH = 3;
 
-/** The value of the `$'…'` escape whose letter is at `word[i]`, and the index of its last character. */
-function ansiEscape(word: string, i: number): [string, number] {
+/** The value of the `$'…'` escape whose letter is at `word[i]`, and the index of its last character; read within `word[..end)`. */
+function ansiEscape(word: string, i: number, end = word.length): [string, number] {
   const c = word[i];
   if (Object.hasOwn(ANSI_ESCAPE, c)) return [ANSI_ESCAPE[c], i];
-  const code = /^(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3}))/.exec(word.slice(i, i + 9));
+  const code = /^(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3}))/.exec(word.slice(i, Math.min(i + 9, end)));
   if (code !== null) {
     const value = Number.parseInt(code[1] ?? code[2] ?? code[3] ?? code[4], code[4] === undefined ? 16 : 8);
     return [String.fromCodePoint(Math.min(value, 0x10ffff)), i + code[0].length - 1];
   }
-  if (c === "c" && i + 1 < word.length) return [String.fromCharCode(word.charCodeAt(i + 1) & 31), i + 1];
+  if (c === "c" && i + 1 < end) return [String.fromCharCode(word.charCodeAt(i + 1) & 31), i + 1];
   return [`\\${c}`, i];
 }
 const ANSI_ESCAPE: Record<string, string> = {
@@ -442,36 +442,45 @@ const ANSI_ESCAPE: Record<string, string> = {
 };
 
 /**
+ * `word[start, end)` read with dequote's rules: its plain text is pushed onto `out` when one is given (a caller joins
+ * them), and the result says whether every quote it opens is closed. One pass; no string is made per character.
+ */
+function scanQuoted(word: string, start: number, end: number, out: string[] | undefined): boolean {
+  let quote: string | undefined;
+  for (let i = start; i < end; i++) {
+    const c = word[i];
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      else out?.push(c);
+    } else if (quote === "$'") {
+      if (c === "'") quote = undefined;
+      else if (c === "\\" && i + 1 < end) {
+        const [value, at] = ansiEscape(word, i + 1, end);
+        out?.push(value);
+        i = at;
+      } else out?.push(c);
+    } else if (c === "\\" && i + 1 < end) {
+      const next = word[++i];
+      out?.push(quote === '"' && !/[$`"\\\n]/.test(next) ? c + next : next);
+    } else if (quote === '"') {
+      if (c === '"') quote = undefined;
+      else out?.push(c);
+    } else if (c === "$" && i + 1 < end && (word[i + 1] === "'" || word[i + 1] === '"')) quote = word[++i] === "'" ? "$'" : '"';
+    else if (c === "'" || c === '"') quote = c;
+    else out?.push(c);
+  }
+  return quote === undefined;
+}
+
+/**
  * A shell word without its quoting (`'…'` literal; `"…"` and `$"…"` where `\` escapes only `$`, backtick, `"`, `\`
  * and newline; `$'…'` with its C escapes decoded; a bare `\x` is x), and whether every quote it opens is closed.
  */
 function dequote(word: string): { text: string; closed: boolean } {
   if (!/["'\\]/.test(word)) return { text: word, closed: true };
-  let text = "";
-  let quote: string | undefined;
-  for (let i = 0; i < word.length; i++) {
-    const c = word[i];
-    if (quote === "'") {
-      if (c === "'") quote = undefined;
-      else text += c;
-    } else if (quote === "$'") {
-      if (c === "'") quote = undefined;
-      else if (c === "\\" && i + 1 < word.length) {
-        const [value, end] = ansiEscape(word, i + 1);
-        text += value;
-        i = end;
-      } else text += c;
-    } else if (c === "\\" && i + 1 < word.length) {
-      const next = word[++i];
-      text += quote === '"' && !/[$`"\\\n]/.test(next) ? c + next : next;
-    } else if (quote === '"') {
-      if (c === '"') quote = undefined;
-      else text += c;
-    } else if (c === "$" && (word[i + 1] === "'" || word[i + 1] === '"')) quote = word[++i] === "'" ? "$'" : '"';
-    else if (c === "'" || c === '"') quote = c;
-    else text += c;
-  }
-  return { text, closed: quote === undefined };
+  const out: string[] = [];
+  const closed = scanQuoted(word, 0, word.length, out);
+  return { text: out.join(""), closed };
 }
 const unquote = (word: string): string => dequote(word).text;
 
@@ -556,6 +565,7 @@ const simplifyWords = (text: string): string => {
   // holding a quote or backslash is unquoted. Per-token matches allocate per token and go superlinear on a long line.
   let out = "";
   let copied = 0; // text before `copied` is already in `out`
+  const plain: string[] = []; // one accumulator for every token: the pieces of the token's unquoted text
   const n = text.length;
   let i = 0;
   while (i < n) {
@@ -570,12 +580,15 @@ const simplifyWords = (text: string): string => {
       if (c === 34 || c === 39 || c === 92) special = true; // `"`, `'`, `\`
     }
     if (!special) continue;
-    const token = text.slice(start, i);
-    const { text: plain, closed } = dequote(token);
-    const word = closed && plain !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(plain) ? plain : token;
-    if (word !== token) {
-      out += text.slice(copied, start) + word;
-      copied = i;
+    // a token that leaves a quote open is kept as written: that is found with nothing built (no array push, no string)
+    if (scanQuoted(text, start, i, undefined)) {
+      plain.length = 0;
+      scanQuoted(text, start, i, plain);
+      const unquoted = plain.join("");
+      if (unquoted !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(unquoted)) {
+        out += text.slice(copied, start) + unquoted;
+        copied = i;
+      }
     }
   }
   return copied === 0 ? text : out + text.slice(copied);
