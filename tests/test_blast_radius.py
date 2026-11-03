@@ -9,7 +9,7 @@ import pytest
 from conftest import ROOT, run_script
 
 from swarm.blast_radius import merge_branches, normalize_slices, parallel_rows, prepare_slice_worktree
-from swarm.errors import SwarmError
+from swarm.errors import ErrorCode, SwarmError
 from swarm.taskstore import TaskStore
 
 
@@ -194,6 +194,25 @@ def test_lanes_get_worktrees_and_the_join_merges_them(tmp_path):
         raise AssertionError("conflicting lane merged")
     assert not (clash / ".git" / "MERGE_HEAD").exists()
     assert (clash / "same.txt").read_text(encoding="utf-8") == "left\n"
+
+
+def test_prepare_slice_worktree_refuses_existing_worktree_on_other_branch(tmp_path):
+    """SA-06: a lane path that already holds a worktree on another branch is refused, not reused. The lane's edits would
+    otherwise land on that branch and the join would merge it."""
+    repo = _repo(tmp_path)
+    dest = tmp_path / "wt-api"
+    prepare_slice_worktree(repo, dest, "swarm/X/other")
+    with pytest.raises(SwarmError) as refused:
+        prepare_slice_worktree(repo, dest, "swarm/X/api")
+    assert refused.value.code == ErrorCode.E_CONTRACT
+
+
+def test_prepare_slice_worktree_reuses_a_worktree_on_its_own_branch(tmp_path):
+    """CONTROL (passes today): a second call for the branch the worktree already has returns the same path."""
+    repo = _repo(tmp_path)
+    dest = tmp_path / "wt-api"
+    first = prepare_slice_worktree(repo, dest, "swarm/X/api")
+    assert prepare_slice_worktree(repo, dest, "swarm/X/api") == first == dest.resolve()
 
 
 def test_runner_join_merges_without_a_model(tmp_path, monkeypatch):

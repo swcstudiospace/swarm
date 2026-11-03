@@ -241,6 +241,15 @@ def test_scratchpad_value_size_limit_is_8_kib():
     assert put(key="notjson", value={"v": {1, 2}})["field"] == "value"
 
 
+def test_scratchpad_refuses_a_non_finite_number_inside_the_value():
+    """SW-02: json.dumps writes NaN and Infinity as bare tokens, which are not JSON. The whole value is refused, the
+    refusal names the value field, and nothing is stored under the key."""
+    for key, bad in (("nan", float("nan")), ("inf", float("inf"))):
+        out = put(key=key, value={"x": bad})
+        assert out["state"] == "INVALID_INPUT" and out["field"] == "value", key
+        assert get(key=key)["found"] is False, key
+
+
 def test_scratchpad_key_count_limit_is_64_per_correlation_and_per_correlation_only():
     for i in range(64):
         assert put(key=f"k{i}")["state"] == "SUCCESS"

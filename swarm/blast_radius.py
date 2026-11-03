@@ -291,6 +291,11 @@ def prepare_slice_worktree(repo: Path, dest: Path, branch: str) -> Path:
         raise SwarmError(ErrorCode.E_DEP, f"{repo} is not a git checkout; blast-radius lanes need worktrees")
     dest = dest.resolve()
     if (dest / ".git").exists():
+        head = _git(dest, "symbolic-ref", "--quiet", "HEAD")
+        current = head.stdout.strip().removeprefix("refs/heads/") if head.returncode == 0 else ""
+        if current != branch:
+            raise SwarmError(ErrorCode.E_CONTRACT,
+                             f"worktree {dest} is on {current or 'no branch'}, not {branch}; refusing to reuse it")
         return dest
     if dest.exists():
         raise SwarmError(ErrorCode.E_CONTRACT, f"worktree path {dest} exists and is not a worktree")

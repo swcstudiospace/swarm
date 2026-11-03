@@ -1238,6 +1238,19 @@ def test_one_unreadable_file_does_not_abort_the_check(env, monkeypatch):
     assert result["failed"] == 2 and result["ok"] is False
 
 
+def test_artifact_check_reports_a_nul_uri_as_unchecked_and_keeps_other_outputs(env):
+    """SW-03: Path.resolve() raises ValueError on a NUL byte inside _local_path, which no guard catches. One bad uri failed
+    the whole check and the good output beside it was lost."""
+    (env.root / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    digest = "sha256:" + hashlib.sha256(b"print(1)\n").hexdigest()
+    outputs = [{"kind": "file", "uri": "out\x00.txt", "producer": "A05"},
+               {"kind": "file", "uri": "ok.py", "digest": digest, "producer": "A05"}]
+    result = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "agent": "A05", "outputs": outputs})
+    assert result["state"] == "SUCCESS", result
+    bad, good = result["results"]
+    assert bad["status"] == "unchecked" and good["status"] == "ok"
+
+
 def test_validate_sizes_a_draft_with_the_id_the_write_will_use(env, monkeypatch):
     """RV-I P3-2: the pre-check used `pending.999999`, so a document near the cap of a long task id was declared fine and
     then summarized by the write (which sizes with `<task_id>.999999`)."""

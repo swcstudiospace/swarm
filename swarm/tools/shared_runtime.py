@@ -333,7 +333,7 @@ def scratchpad_put(payload: dict[str, Any]) -> dict[str, Any]:
             raise _invalid("if_version", "if_version must be an integer >= 0 (0 means the key must not exist yet)")
         caller = _caller()
         try:
-            raw_bytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            raw_bytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
         except (TypeError, ValueError) as exc:
             raise _invalid("value", f"value is not JSON serializable: {exc}") from exc
         if raw_bytes > SCRATCH_VALUE_MAX_BYTES:

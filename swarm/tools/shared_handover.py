@@ -516,12 +516,16 @@ def _local_path(uri: str, kind: str = "") -> tuple[Path | None, str]:
     """The workspace file a uri names, else (None, why it is not checked). Only the workspace and the swarm dir are read.
     `kind` is the output's declared kind: it marks a scheme-less uri as a registry or package reference."""
     text = uri.strip()
+    if "\x00" in text:
+        return None, "uri contains a NUL byte"
     root = target_root()
     if text.startswith("file://"):
         parsed = urlparse(text)
         if parsed.netloc not in ("", "localhost"):
             return None, "file uri on a remote host"
         text = unquote(parsed.path)
+        if "\x00" in text:  # %00 decodes to a NUL that resolve() cannot take
+            return None, "uri contains a NUL byte"
     elif _SCHEME_RE.match(text):
         return None, f"not a local file ({text.split(':', 1)[0]})"
     elif _is_reference(text, kind, root):
