@@ -6,7 +6,7 @@
 //! The Python text rules are reproduced where this module answers: the universal newlines of `subprocess` text mode and of
 //! `read_text`, `str.splitlines` on its ASCII separators, `str.strip` on ASCII whitespace (which includes U+001C to U+001F),
 //! `\b`, `\w` and `\s` on ASCII, and each regex as a hand-written matcher that returns the leftmost match. Those rules are
-//! the Python rules only for ASCII text, so every git output and every scanned file must be ASCII: a non-ASCII byte declines
+//! the Python rules only for ASCII text, so every git diff output and every scanned file must be ASCII: a non-ASCII byte declines
 //! the whole call, because `splitlines` also splits on U+0085, U+2028 and U+2029 and `\w`, `\s` and case folding are Unicode.
 //!
 //! Everything else that Python would answer differently is `E-DEP` `not_started`, and the selector runs the Python body: a
@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -222,13 +223,14 @@ fn add(
     });
 }
 
-/// One changed file: `{added, deleted, lines, binary}` of `collect_changes`.
+/// One changed file: `{added, deleted, lines, binary}` of `collect_changes`; `incomplete` names an unanalysed file.
 #[derive(Debug, Default)]
 struct Change {
     added: i64,
     deleted: i64,
     lines: Vec<(usize, String)>,
     binary: bool,
+    incomplete: Option<String>,
 }
 
 fn is_word(byte: u8) -> bool {
@@ -461,6 +463,7 @@ fn akia(bytes: &[u8]) -> Option<&[u8]> {
         tail.iter()
             .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
             .then(|| &bytes[start..start + 20])
+            .filter(|value| !placeholder_value(value))
     })
 }
 
@@ -481,7 +484,9 @@ fn github_token(bytes: &[u8]) -> Option<&[u8]> {
             .iter()
             .take_while(|b| b.is_ascii_alphanumeric())
             .count();
-        (run >= 36).then(|| &bytes[start..start + 4 + run])
+        (run >= 36)
+            .then(|| &bytes[start..start + 4 + run])
+            .filter(|value| !placeholder_value(value))
     })
 }
 
@@ -503,6 +508,7 @@ fn private_key_header(bytes: &[u8]) -> Option<&[u8]> {
             .rev()
             .find(|&at| bytes[at..].starts_with(END))
             .map(|at| &bytes[start..at + END.len()])
+            .filter(|value| !placeholder_value(value))
     })
 }
 
@@ -523,7 +529,9 @@ fn slack_token(bytes: &[u8]) -> Option<&[u8]> {
             .iter()
             .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
             .count();
-        (run >= 10).then(|| &bytes[start..start + 5 + run])
+        (run >= 10)
+            .then(|| &bytes[start..start + 5 + run])
+            .filter(|value| !placeholder_value(value))
     })
 }
 
@@ -552,7 +560,7 @@ fn jwt(bytes: &[u8]) -> Option<&[u8]> {
             return None;
         }
         let third_end = segment_end(second_end + 1)?;
-        Some(&bytes[start..third_end])
+        Some(&bytes[start..third_end]).filter(|value| !placeholder_value(value))
     })
 }
 
@@ -608,7 +616,10 @@ fn key_value_secret(bytes: &[u8]) -> Option<&[u8]> {
             .take_while(|&&b| !matches!(b, b'\'' | b'"') && !is_py_space(b))
             .count();
         let value_end = value_start + run;
-        if run >= 16 && matches!(bytes.get(value_end), Some(b'\'' | b'"')) {
+        if run >= 16
+            && matches!(bytes.get(value_end), Some(b'\'' | b'"'))
+            && !placeholder_value(&bytes[value_start..value_end])
+        {
             return Some(&bytes[value_start..value_end]);
         }
     }
@@ -623,11 +634,13 @@ fn unrecorded_value(value: &[u8]) -> String {
     )
 }
 
+/// `placeholder` on one captured secret value, not on its line (ADG-02). Scanned text is ASCII, so the value is UTF-8.
+fn placeholder_value(value: &[u8]) -> bool {
+    std::str::from_utf8(value).is_ok_and(placeholder)
+}
+
 /// The evidence of every secret pattern that hits `text`, in `SECRET_RES` order.
 fn secret_evidence(text: &str) -> Vec<String> {
-    if placeholder(text) {
-        return Vec::new();
-    }
     let bytes = text.as_bytes();
     let mut hits: Vec<String> = [
         akia(bytes),
@@ -660,6 +673,17 @@ fn mechanical_checks(changes: &BTreeMap<String, Change>, max_lines: usize) -> Ve
         let is_test = test_path(rel);
         src_changed |= is_code && !is_test;
         tests_changed |= is_test;
+        if let Some(reason) = &change.incomplete {
+            add(
+                &mut out,
+                "major",
+                "scan-incomplete",
+                "scan-incomplete: an in-scope file was not analysed; status is fail until it is",
+                reason,
+                rel,
+            );
+            continue;
+        }
         if change.binary {
             add(
                 &mut out,
@@ -775,17 +799,54 @@ fn ascii_text(bytes: &[u8]) -> Result<String, SeamError> {
     Ok(translate_newlines(text))
 }
 
-/// One file read as `whole()` does: UTF-8 with universal newlines; a read or decode failure is a binary entry.
-fn whole(path: &Path) -> Result<Change, SeamError> {
-    let binary = Change {
-        binary: true,
+/// The read cap of an analysed file: the 2,000,000-byte cap `sec_gate` applies to the same inputs (`MAX_SCAN_BYTES`).
+const SCAN_LIMIT: u64 = 2_000_000;
+
+/// A changed file the scan does not analyse. One major `scan-incomplete` finding names it (AGENTS.md scanner doctrine).
+fn unscanned(reason: String, binary: bool) -> Change {
+    Change {
+        binary,
+        incomplete: Some(reason),
         ..Change::default()
-    };
-    let Ok(bytes) = fs::read(path) else {
-        return Ok(binary);
-    };
+    }
+}
+
+/// One untracked path (ADG-04). Its metadata is read without following a link; only a regular file is opened, so a
+/// FIFO, a device or a link is never read.
+fn scanned(path: &Path) -> Result<Change, SeamError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => whole(path),
+        Ok(_) => Ok(unscanned(
+            "not a regular file (a link, pipe, device or directory); not read".to_string(),
+            true,
+        )),
+        Err(error) => Ok(unscanned(
+            format!("metadata could not be read: {error}"),
+            false,
+        )),
+    }
+}
+
+/// One file read as `whole()` does: at most `SCAN_LIMIT` bytes, UTF-8 with universal newlines. A read failure or an
+/// oversized file is not analysed; a decode failure is a binary entry.
+fn whole(path: &Path) -> Result<Change, SeamError> {
+    let mut bytes = Vec::new();
+    let read =
+        fs::File::open(path).and_then(|file| file.take(SCAN_LIMIT + 1).read_to_end(&mut bytes));
+    if let Err(error) = read {
+        return Ok(unscanned(format!("read failed: {error}"), false));
+    }
+    if bytes.len() as u64 > SCAN_LIMIT {
+        return Ok(unscanned(
+            format!("over the {SCAN_LIMIT}-byte scan cap"),
+            false,
+        ));
+    }
     let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Ok(binary);
+        return Ok(Change {
+            binary: true,
+            ..Change::default()
+        });
     };
     if !text.is_ascii() {
         return Err(decline("non-ASCII file content; Python answers"));
@@ -801,6 +862,7 @@ fn whole(path: &Path) -> Result<Change, SeamError> {
         deleted: 0,
         lines,
         binary: false,
+        incomplete: None,
     })
 }
 
@@ -947,13 +1009,23 @@ fn collect_changes(root: &Path, base: Option<&str>) -> Result<BTreeMap<String, C
     };
     let (_, diff) = git(root, &["diff", "-U0", "--no-color", base, "--", "."])?;
     parse_diff(&ascii_text(&diff)?, &mut changes)?;
-    let (_, others) = git(root, &["ls-files", "--others", "--exclude-standard", "."])?;
-    let others = ascii_text(&others)?;
-    for rel in py_splitlines(&others) {
-        if rel.is_empty() || has_part(rel, &DIFF_SKIP) {
+    let (_, others) = git(
+        root,
+        &["ls-files", "-z", "--others", "--exclude-standard", "."],
+    )?;
+    for raw in others.split(|&byte| byte == 0) {
+        if raw.is_empty() {
             continue;
         }
-        changes.insert(rel.to_string(), whole(&root.join(rel))?);
+        let name = String::from_utf8_lossy(raw).into_owned();
+        if has_part(&name, &DIFF_SKIP) {
+            continue;
+        }
+        let change = match std::str::from_utf8(raw) {
+            Ok(rel) => scanned(&root.join(rel))?,
+            Err(_) => unscanned("the name is not UTF-8; not read".to_string(), false),
+        };
+        changes.insert(name, change);
     }
     Ok(changes)
 }
@@ -1546,7 +1618,15 @@ mod tests {
             secret_evidence(&key).as_slice(),
             [evidence] if !evidence.contains(&key) && !evidence.contains(&key[..4])
         ));
-        assert!(secret_evidence(&format!("{key} example")).is_empty());
+        assert_eq!(
+            secret_evidence(&format!("{key} example")).len(),
+            1,
+            "the placeholder test runs on the matched value, not on the line"
+        );
+        assert!(
+            secret_evidence(&format!("AKIA{}", "X".repeat(16))).is_empty(),
+            "a placeholder token is not a secret"
+        );
         let low = "password = 'aaaaaaaaaaaaaaaaaaaa'";
         assert!(
             secret_evidence(low).is_empty(),
@@ -1659,5 +1739,122 @@ mod tests {
             Json::Obj(vec![("verdict".into(), jstr("pass"))]),
         )]);
         assert_eq!(committed_verdict(&passed).expect("verdict"), "pass");
+    }
+
+    fn text_field(value: &Json) -> &str {
+        match value {
+            Json::Str(text) => text.as_str(),
+            _ => "",
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// ADG-02 mirror: `placeholder` is tested on the whole line, so a real token on a line that says `example` in a
+    /// comment is dropped. The placeholder test belongs on the matched token, not the line.
+    #[test]
+    fn github_token_with_example_comment_is_still_reported() {
+        let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        let line = format!("TOKEN = \"{token}\"  # example");
+        let changes = BTreeMap::from([(
+            "src/config.py".to_string(),
+            Change {
+                added: 1,
+                lines: vec![(1, line)],
+                ..Change::default()
+            },
+        )]);
+        let findings = mechanical_checks(&changes, DEFAULT_MAX_LINES);
+        assert!(
+            findings
+                .iter()
+                .any(|f| text_field(&f.kind) == "secret" && f.blocking()),
+            "a real token next to a comment that says 'example' is still a secret: {findings:?}"
+        );
+    }
+
+    /// ADG-03: `git ls-files --others` runs without `-z`, so git quotes the non-ASCII name as an octal-escaped ASCII
+    /// string. `whole()` then fails to read that name, maps the failure to `binary`, and the content is never scanned.
+    /// The port may instead decline (Python answers); it must not silently skip the scan.
+    #[test]
+    fn untracked_non_ascii_name_is_content_scanned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let name = "secrets_é.env";
+        fs::write(
+            root.join(name),
+            "TOKEN=ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8\n",
+        )
+        .expect("write the untracked file");
+        match collect_changes(root, Some("HEAD")) {
+            Err(error) => assert_eq!(error.code(), ErrorCode::Dep, "only a decline is acceptable"),
+            Ok(changes) => {
+                let findings = mechanical_checks(&changes, DEFAULT_MAX_LINES);
+                assert!(
+                    findings.iter().any(|f| {
+                        text_field(&f.kind) == "secret"
+                            && f.blocking()
+                            && text_field(&f.location).starts_with(name)
+                    }),
+                    "the untracked non-ASCII file's token must be reported: {findings:?}"
+                );
+            }
+        }
+    }
+
+    /// ADG-04: `whole(&root.join(rel))` follows an untracked symlink before the symlink decline runs. The target here is
+    /// a named pipe with no writer, not `/dev/zero`: a read that follows the link blocks, and the guard below fails the
+    /// test in 20 s. `/dev/zero` would grow the buffer until the host's memory is exhausted.
+    #[test]
+    #[cfg(unix)]
+    fn untracked_symlink_to_dev_zero_declines_without_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        git_ok(&root, &["init", "-q"]);
+        git_ok(&root, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        // The pipe lives outside the tree, so `ls-files` lists only the symlink.
+        let pipe_dir = tempfile::tempdir().expect("tempdir");
+        let pipe = pipe_dir.path().join("endless");
+        let made = Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo failed");
+        std::os::unix::fs::symlink(&pipe, root.join("probe")).expect("create the symlink");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let walked = root.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(collect_changes(&walked, Some("HEAD")));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("collect_changes returned within 20 s; it blocked reading the symlink target");
+        match outcome {
+            Err(error) => assert_eq!(error.code(), ErrorCode::Dep, "only a decline is acceptable"),
+            Ok(changes) => assert!(
+                !changes
+                    .get("probe")
+                    .is_some_and(|change| !change.binary || !change.lines.is_empty()),
+                "the symlink's target must not be read"
+            ),
+        }
     }
 }
