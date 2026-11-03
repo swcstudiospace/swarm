@@ -125,6 +125,7 @@ def fire_if_ready(payload: str | dict[str, Any], *, session_id: str = "unknown",
     ss.update("INITIALIZING", corr=corr, extra={"last_trigger": tid, "swarm_id": swarm_id})
     mgr = None
     sid = None
+    launched = False
     try:
         target_repo = Path(root).resolve() if root else Path.cwd().resolve()
         omp_ext = Path(__file__).resolve().parent.parent / "omp"
@@ -152,10 +153,13 @@ def fire_if_ready(payload: str | dict[str, Any], *, session_id: str = "unknown",
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        launched = True
         _release_when_ended(mgr, sid, proc, root=root)
     except Exception as exc:
         if mgr is not None and sid is not None:
             mgr.release(sid)
+        if not launched:  # the row claimed above is released so an identical retry can fire
+            store.forget(tid)
         emit_hook_fired("a01_complete", corr=corr, deduped=False, root=root,
                         reason="spawn-failed", error=type(exc).__name__)
         return {"fired": False, "reason": "spawn-failed", "id": tid}

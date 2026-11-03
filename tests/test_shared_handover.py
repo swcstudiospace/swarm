@@ -394,6 +394,15 @@ def test_dod_check_never_guesses_met(env):
     assert refused["state"] == "INVALID_INPUT" and refused["field"] == "criteria"
 
 
+def test_dod_check_does_not_mark_a_contradicted_criterion_met(env):
+    """'remains unfixed' contradicts 'No critical vulnerabilities remain'. _NEGATIVE lacks remains/unfixed/still/open,
+    so the summary line counts as affirmative evidence and the criterion is marked met."""
+    out = env.call("shared_dod_check", "A08", {"criteria": ["No critical vulnerabilities remain"], "result": {
+        "summary_md": "Critical vulnerability found in parser; remains unfixed."}})
+    assert out["results"][0]["status"] == "unknown"
+    assert out["all_met"] is False
+
+
 def test_dod_check_takes_the_tasks_acceptance_criteria(env):
     make_world(env)
     out = env.call("shared_dod_check", "A08", {"task_id": "T-be", "result": {"summary_md": "The export endpoint returns CSV"}})

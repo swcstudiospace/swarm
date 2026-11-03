@@ -86,6 +86,15 @@ class TriggerStore:
     def record(self, trigger_id: str, **kw: Any) -> None:
         self.seen_trigger(trigger_id, **kw)
 
+    def forget(self, trigger_id: str) -> None:
+        """Delete one firing row so an identical retry can claim it again. Used when the spawn that claimed it failed."""
+        conn = sqlite3.connect(self.path)
+        try:
+            with _tx(conn):
+                conn.execute("DELETE FROM trigger_firings WHERE id = ?", (trigger_id,))
+        finally:
+            conn.close()
+
 
 class SwarmStateStore:
     """Light obs projection store for full states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR + compat) (n5/n6) + stale guard (n7). Primary .claude for advertised, .swarm mirror.

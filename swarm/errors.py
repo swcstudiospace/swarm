@@ -56,10 +56,10 @@ def classify(exc: BaseException) -> ErrorCode:
         return ErrorCode.E_INPUT
     if isinstance(exc, TimeoutError):
         return ErrorCode.E_TIMEOUT
+    if isinstance(exc, PermissionError):  # before OSError: PermissionError subclasses it
+        return ErrorCode.E_POLICY
     if isinstance(exc, (ConnectionError, OSError)):
         return ErrorCode.E_DEP
-    if isinstance(exc, PermissionError):
-        return ErrorCode.E_POLICY
     return ErrorCode.E_INTERNAL
 
 

@@ -685,7 +685,8 @@ _STOP = frozenset(
     "then so such must should shall will can may not no only all any each per via use used using when where which who what "
     "also have has had does do done make made ensure ensures".split())
 _NEGATIVE = re.compile(r"\b(not|never|without|fail(ed|s|ing|ure)?|missing|unmet|todo|pending|incomplete|blocked|unresolved|"
-                       r"skipped|broken|outstanding|remaining|cannot|can't|couldn't|isn't|aren't|didn't|wasn't)\b", re.I)
+                       r"skipped|broken|outstanding|remaining|remains|unfixed|still|open|"
+                       r"cannot|can't|couldn't|isn't|aren't|didn't|wasn't)\b", re.I)
 _PASS = frozenset({"pass", "passed", "ok", "met", "verified", "true", "success", "succeeded", "done", "green"})
 _FAIL = frozenset({"fail", "failed", "false", "unmet", "error", "red", "blocked", "missing"})
 _AC_REF = re.compile(r"\b(AC|REQ|US)[-_ ]?(\d+)\b", re.I)
