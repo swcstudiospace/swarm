@@ -532,7 +532,11 @@ describe("HOOK-02", () => {
     expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
-  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 30_000 }, () => {
+  // Budget covers the differential leg and the fresh-process scaling probe, which take about 1-2 minutes under host load.
+  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 600_000 }, () => {
+    // Nested `$(…)` chain: each level's body holds the next level's substitution, innermost body `git status`.
+    // Each level is 14 bytes; the body text is padded so every cut body carries real words.
+    const nestedSubstitution = (levels: number): string => `${"$(echo x y z ".repeat(levels)}git status${")".repeat(levels)}`;
     // Same-size differential per shape: [name, adversarial input, expected for adversarial].
     // Adversarial keeps the original 1 MB inputs, so full-scale correctness coverage is unchanged.
     const shapes: [string, string, string[] | undefined][] = [
@@ -546,6 +550,7 @@ describe("HOOK-02", () => {
       ["quoted pairs", "'a b' ".repeat(150_000), undefined],
       ["brace groups", "x { ".repeat(200_000), undefined],
       ["heredoc lines", `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`, undefined],
+      ["nested substitution", nestedSubstitution(71_000), undefined],
     ];
     // Same-shape builder for the scaling leg: rebuilds each adversarial shape
     // at an arbitrary byte size with the same repeat unit, so the small and
@@ -568,6 +573,7 @@ describe("HOOK-02", () => {
           const header = "cat <<EOF\n".repeat(1000);
           return header + "x\n".repeat(Math.max(1, Math.ceil((bytes - header.length) / 2)));
         }
+        case "nested substitution": return nestedSubstitution(Math.max(1, Math.floor((bytes - 10) / 14)));
         default: throw new Error(`scalingFor: unknown shape ${name}`);
       }
     };
@@ -621,36 +627,51 @@ describe("HOOK-02", () => {
     expect(over).toEqual([]);
     // Same-shape scaling leg: the differential above cannot catch shared-path
     // quadratic work, because both sides of an equal-size comparison grow
-    // together and their ratio stays flat (~1x) even when absolute cost is
-    // superlinear. So each adversarial shape is also timed against ITSELF at
-    // two sizes, both above the measured ~200 KB regime knee: SMALL ~400 KB
-    // vs LARGE ~800 KB, i.e. a size ratio of ~2x. Linear work scales with
-    // size (~2x time); shared-path quadratic work scales ~4x. SCALING_CAP 3x
-    // is the size ratio (2x) with 1.5x headroom: linear passes with margin,
-    // pure quadratic fails decisively. Same interleaved best-of-N protocol as
-    // the differential leg, and likewise no absolute wall-clock assertion.
-    const SMALL_BYTES = 400_000;
-    const LARGE_BYTES = 800_000;
+    // together. So each adversarial shape is timed against ITSELF at four sizes
+    // (200 KB, 400 KB, 800 KB, 1.6 MB) in a fresh bun process: earlier tests in
+    // this file leave a large heap and warm JIT state, which swung single samples
+    // several-fold on a loaded host. CPU time, best of 5 per size. Linear work
+    // doubles per doubling of input; quadratic work quadruples. The check is the
+    // MEDIAN of the three per-doubling growth factors, so one noisy size cannot
+    // fail it, and it must stay below SCALING_CAP (3x: linear reads ~2x, quadratic ~4x).
+    const SIZES = [200_000, 400_000, 800_000, 1_600_000];
     const SCALING_CAP = 3;
-    const scalingOver: string[] = [];
-    for (const [name] of shapes) {
-      const small = scalingFor(name, SMALL_BYTES);
-      const large = scalingFor(name, LARGE_BYTES);
-      let smallMs = Infinity;
-      let largeMs = Infinity;
-      for (let i = 0; i < REPS; i++) {
-        let t = performance.now();
-        normalize(small);
-        const sMs = performance.now() - t;
-        if (sMs < smallMs) smallMs = sMs;
-        t = performance.now();
-        normalize(large);
-        const lMs = performance.now() - t;
-        if (lMs < largeMs) largeMs = lMs;
+    const shapeNames = shapes.map(([name]) => name);
+    const guardPath = new URL("../src/guard.ts", import.meta.url).pathname;
+    const probe = `
+      import { readFileSync } from "node:fs";
+      import { normalize } from ${JSON.stringify(guardPath)};
+      const inputs = JSON.parse(readFileSync(0, "utf8"));
+      const cpuMs = (run) => {
+        const before = process.cpuUsage();
+        run();
+        const used = process.cpuUsage(before);
+        return (used.user + used.system) / 1000;
+      };
+      const out = {};
+      for (const [name, inputsAtSizes] of Object.entries(inputs)) {
+        out[name] = inputsAtSizes.map((input) => {
+          let best = Infinity;
+          for (let i = 0; i < 5; i++) {
+            Bun.gc(true);
+            best = Math.min(best, cpuMs(() => normalize(input)));
+          }
+          return best;
+        });
       }
-      const sizeRatio = large.length / small.length;
-      const timeRatio = largeMs / smallMs;
-      if (timeRatio >= SCALING_CAP) scalingOver.push(`${name}: ${timeRatio.toFixed(2)}x time for ${sizeRatio.toFixed(2)}x size (large ${largeMs.toFixed(1)}ms @ ${large.length}B / small ${smallMs.toFixed(1)}ms @ ${small.length}B, best of ${REPS}, cap ${SCALING_CAP}x)`);
+      console.log(JSON.stringify(out));
+    `;
+    const sizes = Object.fromEntries(shapeNames.map((name) => [name, SIZES.map((bytes) => scalingFor(name, bytes))]));
+    const probeRun = Bun.spawnSync([process.execPath, "-e", probe], { stdin: new TextEncoder().encode(JSON.stringify(sizes)), stdout: "pipe", stderr: "pipe" });
+    if (probeRun.exitCode !== 0) throw new Error(`scaling probe exited ${probeRun.exitCode}: ${probeRun.stderr.toString()}`);
+    const measuredLine = probeRun.stdout.toString().trim().split("\n").at(-1) ?? "{}";
+    const measured = JSON.parse(measuredLine) as Record<string, number[]>;
+    const scalingOver: string[] = [];
+    for (const name of shapeNames) {
+      const times = measured[name];
+      const growth = times.slice(1).map((t, i) => t / times[i]).sort((a, b) => a - b);
+      const medianGrowth = growth[Math.floor(growth.length / 2)];
+      if (medianGrowth >= SCALING_CAP) scalingOver.push(`${name}: median ${medianGrowth.toFixed(2)}x per size doubling (CPU ms at ${SIZES.join(" / ")} B: ${times.map((t) => t.toFixed(1)).join(" / ")}; cap ${SCALING_CAP}x)`);
     }
     expect(scalingOver).toEqual([]);
   });

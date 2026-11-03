@@ -475,12 +475,56 @@ function dequote(word: string): { text: string; closed: boolean } {
 }
 const unquote = (word: string): string => dequote(word).text;
 
+/** Whitespace by `\s`: ASCII runs in place, any other code unit through the regex (same set, exactly). */
+const SIMPLIFY_SPACE = /\s/;
+const isBlankCode = (c: number): boolean =>
+  c === 32 || (c >= 9 && c <= 13) || (c > 127 && SIMPLIFY_SPACE.test(String.fromCharCode(c)));
+
 /**
  * The shell words of a segment, as written: split on blanks outside quotes, a quoted run (with its blanks) or an
  * escape staying inside its word. With a quote left open (bash would reject the line) the blanks split everywhere.
  */
 function shellWords(text: string): string[] {
-  const words: string[] = [];
+  return Array.from(shellWordsEach(text));
+}
+
+/** Whether shellWords' quoting leaves a quote open at the end of `text` (the blanks then split everywhere). */
+function shellQuoteOpen(text: string): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < text.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+    } else if (c === "$" && text[i + 1] === "'") {
+      quote = "$'";
+      i++;
+    } else {
+      if (c === "'" || c === '"') quote = c;
+      else if (c === "\\" && i + 1 < text.length) i++;
+    }
+  }
+  return quote !== undefined;
+}
+
+/**
+ * The words of shellWords, one at a time: a caller that reads only the leading words never builds the array of a
+ * long line (a 1 MB segment of one-character words is a million strings).
+ */
+function* shellWordsEach(text: string): Generator<string> {
+  if (shellQuoteOpen(text)) {
+    // the blanks split everywhere (as `text.split(/\s+/)`): each run of non-blanks is a word
+    let from = -1;
+    for (let i = 0; i <= text.length; i++) {
+      if (i < text.length && !isBlankCode(text.charCodeAt(i))) {
+        if (from === -1) from = i;
+      } else if (from !== -1) {
+        yield text.slice(from, i);
+        from = -1;
+      }
+    }
+    return;
+  }
   let start = 0;
   let quote: string | undefined;
   for (let i = 0; i < text.length; i++) {
@@ -489,7 +533,7 @@ function shellWords(text: string): string[] {
       if (c === "\\" && quote !== "'" && i + 1 < text.length) i++;
       else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
     } else if (c === " " || c === "\t" || c === "\n" || c === "\r") {
-      if (start < i) words.push(text.slice(start, i));
+      if (start < i) yield text.slice(start, i);
       start = i + 1;
     } else if (c === "$" && text[i + 1] === "'") {
       quote = "$'";
@@ -499,9 +543,7 @@ function shellWords(text: string): string[] {
       else if (c === "\\" && i + 1 < text.length) i++;
     }
   }
-  if (quote !== undefined) return text.split(/\s+/).filter((w) => w !== "");
-  if (start < text.length) words.push(text.slice(start));
-  return words;
+  if (start < text.length) yield text.slice(start);
 }
 
 /**
@@ -509,12 +551,35 @@ function shellWords(text: string): string[] {
  * PREFIX, the shell `-c` parsing and the regex rows see the command bash runs. A token whose unquoted form holds a blank, quote,
  * operator, expansion, glob, `=`, `#`, `!` or `~`, or that leaves a quote open, keeps its quotes.
  */
-const simplifyWords = (text: string): string =>
-  text.replace(/\S+/g, (token) => {
-    if (!/["'\\]/.test(token)) return token;
+const simplifyWords = (text: string): string => {
+  // one forward pass over the characters, not a regex match per token: a token is a run of non-blanks, and only one
+  // holding a quote or backslash is unquoted. Per-token matches allocate per token and go superlinear on a long line.
+  let out = "";
+  let copied = 0; // text before `copied` is already in `out`
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (isBlankCode(text.charCodeAt(i))) {
+      i++;
+      continue;
+    }
+    const start = i;
+    let special = false;
+    for (; i < n && !isBlankCode(text.charCodeAt(i)); i++) {
+      const c = text.charCodeAt(i);
+      if (c === 34 || c === 39 || c === 92) special = true; // `"`, `'`, `\`
+    }
+    if (!special) continue;
+    const token = text.slice(start, i);
     const { text: plain, closed } = dequote(token);
-    return closed && plain !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(plain) ? plain : token;
-  });
+    const word = closed && plain !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(plain) ? plain : token;
+    if (word !== token) {
+      out += text.slice(copied, start) + word;
+      copied = i;
+    }
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+};
 
 /** The value of a `-c LINE` / `-cLINE` / `--command[=]LINE` option among `words` (unquoted). */
 function dashC(words: string[]): string | undefined {
@@ -532,15 +597,17 @@ function dashC(words: string[]): string | undefined {
  * `bash -cl LINE`, `sh -c -- LINE`; the words after it are `$0`, `$1` …), or — failing closed, since shells differ on
  * it — the text attached to the `c` of the cluster (`bash -c'LINE'`, `sh -ec"LINE"`), the words after that being `$0`,
  * `$1` … too. Attached text of letters only (`-cl`, `-cls`) may be more options or a line: both it and the next
- * operand count. Undefined when `words` is not a shell given `-c`.
+ * operand count. Undefined when `text` is not a shell given `-c`.
  */
-function shellDashC(words: string[]): string[] | undefined {
-  if (!SHELL_WORD.test(posix.basename(unquote(words[0] ?? "")))) return undefined;
+function shellDashC(text: string): string[] | undefined {
+  const words = shellWordsEach(text);
+  const head = words.next();
+  if (head.done === true || !SHELL_WORD.test(posix.basename(unquote(head.value)))) return undefined;
   let c = false;
   const out: string[] = [];
-  for (let i = 1; i < words.length; i++) {
-    const w = unquote(words[i]);
-    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(w)) i++;
+  for (let next = words.next(); next.done !== true; next = words.next()) {
+    const w = unquote(next.value);
+    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(w)) words.next();
     else if (/^-[A-Za-z]*c/.test(w)) {
       c = true;
       const attached = w.slice(w.indexOf("c") + 1);
@@ -565,16 +632,16 @@ function otherCommandLines(seg: string): string[] {
     const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
     return [[unquote(first), ...rest].join(" ")];
   }
-  const words = shellWords(seg);
-  const first = unquote(words[0] ?? "");
+  const first = unquote(shellWordsEach(seg).next().value ?? "");
   const cmd = posix.basename(first);
   if (first.startsWith("-c") || first.startsWith("--command") || /^(?:su|runuser|script)$/.test(cmd)) {
+    const words = shellWords(seg);
     const line = dashC(first.startsWith("-") ? words : words.slice(1));
     return line === undefined ? [] : [line];
   }
-  if (cmd === "alias") return words.slice(1).map(unquote).filter((w) => /^[^=\s-][^=\s]*=/.test(w)).map((w) => w.slice(w.indexOf("=") + 1));
+  if (cmd === "alias") return shellWords(seg).slice(1).map(unquote).filter((w) => /^[^=\s-][^=\s]*=/.test(w)).map((w) => w.slice(w.indexOf("=") + 1));
   if (cmd === "trap") {
-    const action = words.slice(1).find((w) => w !== "--");
+    const action = shellWords(seg).slice(1).find((w) => w !== "--");
     return action === undefined || /^-[lp]$/.test(action) ? [] : [unquote(action)];
   }
   return [];
@@ -582,6 +649,11 @@ function otherCommandLines(seg: string): string[] {
 
 /** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
 const HEREDOC = /<<-?[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s<>|&;()]+))/y;
+/** Hoisted out of splitTopLevel's loop: a regex literal there is a new object per evaluation. Stateless (no g/y flag). */
+const SPLIT_SPACE = /\s/;
+const SPLIT_EXTGLOB_OPEN = /[@!+*?]/;
+const SPLIT_BRACE_BEFORE = /[\s;]/;
+const SPLIT_BRACE_AFTER = /[\s;&|)]/;
 
 /** The shell operator that ends a split piece; a newline reads as `;`, the end of the text as `""`. */
 type Op = ";" | "&&" | "||" | "|" | "&" | "(" | ")" | "{" | "}" | "";
@@ -620,11 +692,14 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     blank = true;
   };
   /** The index of the newline that ends the heredoc delimiter line at or after `from` (text.length when absent). */
-  const heredocEnd = (from: number): number => {
+  const heredocEnd = (from: number, delimiter: string): number => {
     for (let j = from; j < text.length; ) {
-      const nl = text.indexOf("\n", j);
+      // the line matches once its leading tabs (`<<-`) are skipped; compared in place, so no line is copied
+      let start = j;
+      while (text[start] === "\t") start++;
+      const nl = text.indexOf("\n", start);
       const end = nl === -1 ? text.length : nl;
-      if (text.slice(j, end).replace(/^\t+/, "") === heredoc) return end;
+      if (end - start === delimiter.length && text.startsWith(delimiter, start)) return end;
       j = end + 1;
     }
     return text.length;
@@ -658,7 +733,7 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
       i++;
       to = i + 1;
       blank = false;
-    } else if (c === "#" && (blank || /\s/.test(text[i - 1]))) {
+    } else if (c === "#" && (blank || SPLIT_SPACE.test(text[i - 1]))) {
       // a comment runs to the end of the line; the newline itself is the segment boundary
       const nl = text.indexOf("\n", i);
       i = (nl === -1 ? text.length : nl) - 1;
@@ -670,7 +745,7 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     } else if (c === "\n") {
       boundary(";", i + 1);
       if (heredoc !== undefined) {
-        const end = heredocEnd(i + 1);
+        const end = heredocEnd(i + 1, heredoc);
         out[out.length - 1].body = text.slice(i + 1, end);
         i = end;
         heredoc = undefined;
@@ -679,7 +754,7 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     } else if (extglob > 0 && (c === "(" || c === ")" || c === "|")) {
       to = i + 1;
       if (c !== "|") extglob += c === "(" ? 1 : -1;
-    } else if (c === "(" && /[@!+*?]/.test(before) && !(before === "!" && text.slice(from, to).trim() === "!")) {
+    } else if (c === "(" && SPLIT_EXTGLOB_OPEN.test(before) && !(before === "!" && text.slice(from, to).trim() === "!")) {
       // an extglob group `@(…)`, `x!(…)`, `*(…)`: part of the word, not a subshell (`! (…)` negates one)
       extglob = 1;
       to = i + 1;
@@ -698,14 +773,14 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     } else if (c === "(" || c === ")") {
       // a subshell `( … )`: its body is its own segment list (`$(…)` was cut out before the split)
       boundary(c, i + 1);
-    } else if (c === "{" && blank && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
+    } else if (c === "{" && blank && (i + 1 === text.length || SPLIT_SPACE.test(text[i + 1]))) {
       // a brace group `{ …; }` opener as a word of its own (`${VAR}` and `{a,b}` are glued, never split)
       boundary("{", i + 1);
-    } else if (c === "}" && (i === 0 || /[\s;]/.test(text[i - 1])) && (i + 1 === text.length || /[\s;&|)]/.test(text[i + 1]))) {
+    } else if (c === "}" && (i === 0 || SPLIT_BRACE_BEFORE.test(text[i - 1])) && (i + 1 === text.length || SPLIT_BRACE_AFTER.test(text[i + 1]))) {
       boundary("}", i + 1);
     } else {
       to = i + 1;
-      if (blank && !/\s/.test(c)) blank = false;
+      if (blank && !SPLIT_SPACE.test(c)) blank = false;
       redirect = c === "<" || c === ">";
       plain = c;
     }
@@ -788,6 +863,67 @@ const CUT_TOKEN = /\u0001([\uE000-\uF8FF])/g;
 /** Substitutions cut per command (the private-use range holds 6400). */
 const MAX_CUTS = 4096;
 
+/** Push a substitution body onto the cut table; returns the marker that stands for it in the text. */
+function cutBody(cuts: string[], body: string): string {
+  const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
+  pushCut(cuts, body);
+  return marker;
+}
+
+/**
+ * The substitutions the cut loop takes out of `text`, in the loop's order, at most 256 here and MAX_CUTS in all. Each cut
+ * is the leftmost complete substitution of the text as it stands: a `$(` with no paren in its body, or a backtick pair with
+ * no backtick in it. One forward pass finds them all: `out` holds the cut text before `from`, and `text` from `from` on is
+ * untouched. A cut completes at most one substitution before `from`: the `$(` whose paren is the last one kept, once the
+ * paren after the cut is a `)`. That one is leftmost, so it is cut next, and so on (`$(a$(b)c)`). No text is copied per cut.
+ */
+function cutSubstitutions(text: string, cuts: string[]): { rest: string; count: number } {
+  const parens: number[] = [];
+  const paren = /[()]/g;
+  for (let m = paren.exec(text); m !== null; m = paren.exec(text)) parens.push(m.index);
+  const substitution = /\$\(([^()]*)\)|`([^`]*)`/g;
+  const out: string[] = []; // the cut text before `from`: text pieces, markers and the parens kept
+  const kept: { at: number; pos: number }[] = []; // the parens kept: `at` indexes `out`, `pos` indexes `text`
+  let from = 0;
+  let next = 0; // parens[next]: the first paren at or after `from` that is neither kept nor cut
+  let count = 0;
+  while (count < 256 && cuts.length < MAX_CUTS) {
+    const top = kept[kept.length - 1];
+    if (top !== undefined && next < parens.length && text[top.pos] === "(" && text[top.pos - 1] === "$" && text[parens[next]] === ")") {
+      // the `$(` whose paren is the last one kept now runs to a `)`: complete, and leftmost of what is left
+      const close = parens[next];
+      const body = out.slice(top.at + 1).join("") + text.slice(from, close);
+      out.length = top.at;
+      out[top.at - 1] = out[top.at - 1].slice(0, -1); // its `$`
+      out.push(cutBody(cuts, body));
+      kept.pop();
+      next++;
+      from = close + 1;
+      count++;
+      continue;
+    }
+    substitution.lastIndex = from;
+    const m = substitution.exec(text);
+    if (m === null) break;
+    const start = m.index;
+    const end = start + m[0].length;
+    let at = from;
+    while (next < parens.length && parens[next] < start) {
+      const p = parens[next++];
+      if (p > at) out.push(text.slice(at, p));
+      kept.push({ at: out.length, pos: p });
+      out.push(text[p]);
+      at = p + 1;
+    }
+    if (start > at) out.push(text.slice(at, start));
+    while (next < parens.length && parens[next] < end) next++; // the parens inside a substitution are cut with it
+    out.push(cutBody(cuts, m[1] ?? m[2] ?? ""));
+    from = end;
+    count++;
+  }
+  return { rest: out.join("") + text.slice(from), count };
+}
+
 /**
  * Normalize `command` (see normalize). A `$(…)`/backtick substitution is cut out into `cuts` and leaves CUT plus the
  * index of its body in its place; the body becomes a payload (a subshell) of the piece that holds it, so it runs in
@@ -797,15 +933,9 @@ const MAX_CUTS = 4096;
 function normalizeSegments(command: string, depth: number, cuts: string[]): Normalized[] {
   // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
   // `${IFS}` / `$IFS` separate words exactly like a blank
-  let rest = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
+  const input = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
   const first = cuts.length;
-  const sub = /\$\(([^()]*)\)|`([^`]*)`/;
-  let n = 0;
-  for (let m = sub.exec(rest); m !== null && n < 256 && cuts.length < MAX_CUTS; m = sub.exec(rest), n++) {
-    const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
-    pushCut(cuts, m[1] ?? m[2] ?? "");
-    rest = `${rest.slice(0, m.index)}${marker}${rest.slice(m.index + m[0].length)}`;
-  }
+  const { rest, count: n } = cutSubstitutions(input, cuts);
   // OSA-01: past the cut cap a substitution left in the text is unjudged: every item of this level is refused.
   // The cut loop ends on no match (none left) or on a cap, so the cap state alone says whether one was left. Exactly
   // 256 cuts also refuse, which is fail-closed (a 257th may follow unseen). Constant time per level.
@@ -845,9 +975,9 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
     // TS-04: past the depth cap a shell body is not unwrapped; the segment is marked unjudged and refused, never passed on
-    const unjudged = seg !== "" && depth >= MAX_LITERAL_DEPTH && (shellDashC(shellWords(seg)) !== undefined || otherCommandLines(seg).length > 0);
+    const shellLines = seg === "" ? undefined : shellDashC(seg);
+    const unjudged = seg !== "" && depth >= MAX_LITERAL_DEPTH && (shellLines !== undefined || otherCommandLines(seg).length > 0);
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
-      const shellLines = shellDashC(shellWords(seg));
       if (shellLines !== undefined) {
         // a literal `-c` body runs with the shell's stdin: the pipe, and `< file` / `0<file` (not `bash -c "$VAR"`)
         const suffix = stdinFileSuffix(`${prefix} ${seg}`);
