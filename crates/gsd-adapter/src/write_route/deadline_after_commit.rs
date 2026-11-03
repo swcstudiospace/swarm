@@ -136,6 +136,7 @@ fn outcome_of(result: &Result<Reply, SeamError>) -> String {
     }
 }
 
+#[cfg(test)]
 #[test]
 fn transition_manifest_survives_deadline_after_commit() -> Result<(), String> {
     let world = World::seeded()?;
