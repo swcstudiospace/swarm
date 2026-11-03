@@ -30,6 +30,8 @@
 //! carry no `write_state`. A refusal that is Rust's own and happened before the first write is `write_state = "not_started"`; a
 //! failure at or after the first write that is not Python's is `write_state = "final"`.
 pub(crate) mod assign;
+#[cfg(test)]
+mod deadline_after_commit;
 pub(crate) mod ingest;
 pub(crate) mod plan;
 #[cfg(feature = "sandbox-write")]
@@ -38,18 +40,16 @@ pub mod shadow_approval;
 pub(crate) mod shadow_ingest;
 #[cfg(feature = "sandbox-write")]
 pub(crate) mod shadow_plan;
-#[cfg(test)]
-mod deadline_after_commit;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gsd_failure::ErrorCode;
 use gsd_route::pydumps::to_python_dumps;
@@ -239,14 +239,18 @@ static POST_COMMIT_PAUSE: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
 /// Arms [`POST_COMMIT_PAUSE`] for the database at `db`.
 #[cfg(test)]
 fn arm_post_commit_pause(db: PathBuf, hold: Duration) {
-    *POST_COMMIT_PAUSE.lock().unwrap_or_else(PoisonError::into_inner) = Some((db, hold));
+    *POST_COMMIT_PAUSE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some((db, hold));
 }
 
 /// Holds the pause armed for `db`, if any, after its COMMIT. Any other database leaves it armed.
 #[cfg(test)]
 async fn pause_after_commit(db: &Path) {
     let hold = {
-        let mut armed = POST_COMMIT_PAUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut armed = POST_COMMIT_PAUSE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let hold = match &*armed {
             Some((path, hold)) if path == db => Some(*hold),
             _ => None,

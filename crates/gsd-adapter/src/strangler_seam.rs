@@ -867,7 +867,10 @@ fn count_events(swarm: &Path, correlation_id: Option<&str>) -> Result<i64, SeamE
     }
     let text = fs::read_to_string(&path).map_err(io_error)?;
     let wanted = correlation_id.filter(|c| !c.is_empty());
-    let mut lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     let torn_tail = lines.last().is_some_and(|last| parse_json(last).is_err());
     if torn_tail {
         lines.pop();

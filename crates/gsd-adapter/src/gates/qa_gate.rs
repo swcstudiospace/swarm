@@ -635,7 +635,10 @@ fn drain_pipe<R: Read + Send + 'static>(
 
 /// Kills the process group led by `leader`, the runner spawned with `process_group(0)`. An empty group is not an error.
 fn kill_group(leader: u32) {
-    if let Some(group) = i32::try_from(leader).ok().and_then(rustix::process::Pid::from_raw) {
+    if let Some(group) = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
 }

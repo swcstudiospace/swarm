@@ -906,15 +906,16 @@ fn drain_pipe<R: Read + Send + 'static>(
 }
 
 fn take_bytes(sink: &Mutex<Vec<u8>>) -> Vec<u8> {
-    sink.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
+    sink.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 /// Kills the process group led by `leader`, the audit tool spawned with `process_group(0)`. An empty group is not an
 /// error.
 fn kill_group(leader: u32) {
-    if let Some(group) = i32::try_from(leader).ok().and_then(rustix::process::Pid::from_raw) {
+    if let Some(group) = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
 }

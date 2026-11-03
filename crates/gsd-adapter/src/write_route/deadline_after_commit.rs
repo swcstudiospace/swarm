@@ -105,10 +105,7 @@ fn invocation(world: &World, effects: &Path) -> Invocation {
         .map(ToString::to_string)
         .collect(),
         root: world.root.clone(),
-        env: vec![(
-            "SWARM_DIR".to_string(),
-            world.swarm.display().to_string(),
-        )],
+        env: vec![("SWARM_DIR".to_string(), world.swarm.display().to_string())],
         deadline: DEADLINE,
         effects_path: Some(effects.to_path_buf()),
     }
@@ -178,7 +175,9 @@ fn transition_manifest_survives_deadline_after_commit() -> Result<(), String> {
         format!("the effects manifest is not written or not JSON ({e}): {manifest:?}")
     })?;
     if value["effects"][0]["type"] != "task.transition" {
-        return Err(format!("the effects manifest lacks the task.transition effect: {value}"));
+        return Err(format!(
+            "the effects manifest lacks the task.transition effect: {value}"
+        ));
     }
     Ok(())
 }
