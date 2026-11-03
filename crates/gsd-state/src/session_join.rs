@@ -1305,6 +1305,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_join_retried_under_the_same_key_applies_its_completion_once() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (control, signal) = cancel_channel();
+        let timing = CancelTiming {
+            cooperative: Duration::from_secs(3),
+        };
+        let ctx = context(&session, 20, timing, signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::clone(&calls);
+        // Each run counts itself, then stops with a failure once the cancel marker is set.
+        let cooperative = move |_task: Task, cancel: CancelSignal| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            async move {
+                cancel.cancelled().await;
+                Err::<(), TaskFailure>(TaskFailure::Exception("stopped at cancel".to_string()))
+            }
+        };
+        let request = async {
+            sleep(Duration::from_millis(10)).await;
+            control.request("corr-20", "test", 0.0, timing)
+        };
+
+        let (joined, _marker) = tokio::join!(
+            collect_matrix_completions(
+                &ctx,
+                &mut ledger,
+                batch(0, &["t1"]),
+                DispatchConfig::default(),
+                semaphores(),
+                cooperative,
+            ),
+            request
+        );
+        let cancelled = joined?;
+        let key = JoinKey {
+            task_id: "t1".to_string(),
+            stage: 0,
+            join_seq: 20,
+            attempt: 1,
+        };
+        assert_eq!(cancelled.cancelled, vec!["t1".to_string()]);
+        assert_eq!(
+            cancelled.stages,
+            vec![StageEmit {
+                key: key.clone(),
+                emit: Emit::Collected,
+            }]
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+
+        // Retry under the same (stage, join seq, attempt) with an uncancelled signal.
+        let (_fresh_control, fresh) = cancel_channel();
+        let retry_ctx = context(&session, 20, timing, fresh);
+        let retry = collect_matrix_completions(
+            &retry_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+
+        assert_eq!(
+            retry.stages,
+            vec![StageEmit {
+                key: key.clone(),
+                emit: Emit::Deduplicated,
+            }]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry must not run the worker");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.log(&key).map(|log| log.records().len()), Some(1));
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+        assert_eq!(
+            metadata_of(&session, "th1")
+                .get(TERMINAL_REASON_KEY)
+                .map(String::as_str),
+            Some("cancelled")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_join_retried_under_the_same_key_applies_its_completion_once() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (control, signal) = cancel_channel();
+        let timing = CancelTiming {
+            cooperative: Duration::from_millis(30),
+        };
+        let ctx = context(&session, 21, timing, signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::clone(&calls);
+        // The first run never stops on its own, so the cooperative window forces it.
+        let never = move |_task: Task, _cancel: CancelSignal| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<(), TaskFailure>>()
+        };
+        let request = async {
+            sleep(Duration::from_millis(10)).await;
+            control.request("corr-21", "test", 0.0, timing)
+        };
+
+        let (joined, _marker) = tokio::join!(
+            collect_matrix_completions(
+                &ctx,
+                &mut ledger,
+                batch(0, &["t1"]),
+                DispatchConfig::default(),
+                semaphores(),
+                never,
+            ),
+            request
+        );
+        let timed_out = joined?;
+        let key = JoinKey {
+            task_id: "t1".to_string(),
+            stage: 0,
+            join_seq: 21,
+            attempt: 1,
+        };
+        assert_eq!(timed_out.forced, vec!["t1".to_string()]);
+        assert_eq!(
+            timed_out.stages,
+            vec![StageEmit {
+                key: key.clone(),
+                emit: Emit::Collected,
+            }]
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+
+        // Retry under the same (stage, join seq, attempt) with an uncancelled signal.
+        let (_fresh_control, fresh) = cancel_channel();
+        let retry_ctx = context(&session, 21, timing, fresh);
+        let retry = collect_matrix_completions(
+            &retry_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+
+        assert_eq!(
+            retry.stages,
+            vec![StageEmit {
+                key: key.clone(),
+                emit: Emit::Deduplicated,
+            }]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry must not run the worker");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+        assert_eq!(
+            metadata_of(&session, "th1")
+                .get(TERMINAL_REASON_KEY)
+                .map(String::as_str),
+            Some("timed_out")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nexus_completion_applies_outcomes_and_dedups_the_rerun() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1"), ("th2", "t2")], 1).await?);
         let (_control, signal) = cancel_channel();

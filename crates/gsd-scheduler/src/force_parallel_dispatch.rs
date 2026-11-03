@@ -954,6 +954,209 @@ mod tests {
         assert!(pos(&rounds, "end:a") < pos(&rounds, "start:c"));
     }
 
+    /// Holds each worker until `expected` workers are running at once, so a peak short of `expected`
+    /// stalls the run instead of passing. Once open, later workers pass straight through.
+    #[derive(Default)]
+    struct Overlap {
+        running: AtomicUsize,
+        peak: AtomicUsize,
+        open: AtomicBool,
+        opened: Notify,
+    }
+
+    impl Overlap {
+        async fn enter(&self, expected: usize) {
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            if now >= expected {
+                self.open.store(true, Ordering::SeqCst);
+                self.opened.notify_waiters();
+            }
+            loop {
+                let notified = self.opened.notified();
+                if self.open.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn leave(&self) {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_dispatch_precedes_every_completion_when_all_fit() {
+        // Eight independent tasks and eight slots: nothing completes before the frontier is full. Each
+        // worker logs its start, then holds until all eight are running, so a dispatch that waited for a
+        // completion would stall and trip the timeout.
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let overlap = Arc::new(Overlap::default());
+        let tasks: Vec<Task> = (0..8)
+            .map(|i| task(&format!("t{i}"), 0, "w", &[]))
+            .collect();
+        let mut config = serial(8);
+        config.agent_max_parallel.insert("w".to_string(), 8);
+        let (l, o) = (Arc::clone(&log), Arc::clone(&overlap));
+        let run = run_force_parallel(built(tasks), config, move |t: Task| {
+            let (l, o) = (Arc::clone(&l), Arc::clone(&o));
+            async move {
+                let id = task_key(&t).to_string();
+                l.lock().expect("log").push(format!("dispatch:{id}"));
+                o.enter(8).await;
+                l.lock().expect("log").push(format!("complete:{id}"));
+                o.leave();
+                Ok::<(), TaskFailure>(())
+            }
+        });
+        let report = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("dispatch stalled before all eight were running")
+            .expect("dispatch");
+        let log = log.lock().expect("log").clone();
+        let last_dispatch = log
+            .iter()
+            .rposition(|e| e.starts_with("dispatch:"))
+            .expect("a dispatch event");
+        let first_complete = log
+            .iter()
+            .position(|e| e.starts_with("complete:"))
+            .expect("a completion event");
+        assert!(last_dispatch < first_complete, "{log:?}");
+        assert_eq!(log.iter().filter(|e| e.starts_with("dispatch:")).count(), 8);
+        assert_eq!(report.max_in_flight, 8);
+        assert_eq!(report.outcomes.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn refill_never_exceeds_the_cap_in_the_event_log() {
+        // Six tasks through two slots. Counting each task from its logged start to its logged completion,
+        // a new dispatch never sees two tasks still running: the refill waits for a completion first.
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let tasks: Vec<Task> = (0..6)
+            .map(|i| task(&format!("t{i}"), 0, "w", &[]))
+            .collect();
+        let mut config = serial(2);
+        config.agent_max_parallel.insert("w".to_string(), 2);
+        let l = Arc::clone(&log);
+        let report = run_force_parallel(built(tasks), config, move |t: Task| {
+            let l = Arc::clone(&l);
+            async move {
+                let id = task_key(&t).to_string();
+                l.lock().expect("log").push(format!("dispatch:{id}"));
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                l.lock().expect("log").push(format!("complete:{id}"));
+                Ok::<(), TaskFailure>(())
+            }
+        })
+        .await
+        .expect("dispatch");
+        let log = log.lock().expect("log").clone();
+        let mut running = 0usize;
+        let mut dispatched = 0usize;
+        for event in &log {
+            if event.starts_with("dispatch:") {
+                assert!(running < 2, "dispatch with {running} running: {log:?}");
+                running += 1;
+                dispatched += 1;
+            } else {
+                running -= 1;
+            }
+        }
+        assert_eq!(dispatched, 6);
+        assert_eq!(report.max_in_flight, 2);
+        let expected: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        assert_eq!(report.dispatch_order, expected);
+    }
+
+    #[tokio::test]
+    async fn chain_and_independent_task_overlap() {
+        // a -> b is a chain; c is independent. Dispatch order is a, c, b. a holds until c has started and
+        // c holds until b has started, so both overlaps are forced rather than hoped for.
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let c_started = Arc::new(Notify::new());
+        let b_started = Arc::new(Notify::new());
+        let tasks = vec![
+            task("a", 0, "w", &[]),
+            task("b", 0, "w", &["a"]),
+            task("c", 0, "w", &[]),
+        ];
+        let mut config = serial(2);
+        config.agent_max_parallel.insert("w".to_string(), 2);
+        let (l, cs, bs) = (
+            Arc::clone(&log),
+            Arc::clone(&c_started),
+            Arc::clone(&b_started),
+        );
+        let run = run_force_parallel(built(tasks), config, move |t: Task| {
+            let (l, cs, bs) = (Arc::clone(&l), Arc::clone(&cs), Arc::clone(&bs));
+            async move {
+                let id = task_key(&t).to_string();
+                l.lock().expect("log").push(format!("start:{id}"));
+                match id.as_str() {
+                    "a" => cs.notified().await,
+                    "c" => {
+                        cs.notify_one();
+                        bs.notified().await;
+                    }
+                    _ => bs.notify_one(),
+                }
+                l.lock().expect("log").push(format!("end:{id}"));
+                Ok::<(), TaskFailure>(())
+            }
+        });
+        let report = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("chain and independent task stalled")
+            .expect("dispatch");
+        let log = log.lock().expect("log").clone();
+        let at = |event: &str| log.iter().position(|e| e == event).expect(event);
+        assert_eq!(report.dispatch_order, vec!["a", "c", "b"]);
+        assert!(at("start:c") < at("end:a"), "c must start while a runs: {log:?}");
+        assert!(at("end:a") < at("start:b"), "b waits for its dependency a: {log:?}");
+        assert!(at("start:b") < at("end:c"), "b must overlap c: {log:?}");
+        assert!(report.undispatched.is_empty());
+        assert_eq!(report.max_in_flight, 2);
+    }
+
+    #[tokio::test]
+    async fn peak_concurrency_is_min_of_tasks_and_cap_for_several_sizes() {
+        // (tasks, requested parallelism). The cap is effective_global_cap(requested). Each run must reach
+        // exactly min(tasks, cap) concurrent workers: the gate stalls any run that falls short.
+        let cases: [(usize, usize); 8] = [(1, 4), (3, 8), (5, 2), (7, 1), (10, 4), (30, 30), (40, 32), (60, 64)];
+        for (n, requested) in cases {
+            let expected = n.min(effective_global_cap(requested));
+            let overlap = Arc::new(Overlap::default());
+            let tasks: Vec<Task> = (0..n)
+                .map(|i| task(&format!("t{i}"), 0, "w", &[]))
+                .collect();
+            let mut config = serial(requested);
+            config.agent_max_parallel.insert("w".to_string(), requested);
+            let o = Arc::clone(&overlap);
+            let run = run_force_parallel(built(tasks), config, move |_t: Task| {
+                let o = Arc::clone(&o);
+                async move {
+                    o.enter(expected).await;
+                    o.leave();
+                    Ok::<(), TaskFailure>(())
+                }
+            });
+            let report = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap_or_else(|_| panic!("n={n} requested={requested}: stalled short of {expected}"))
+                .expect("dispatch");
+            assert_eq!(report.max_in_flight, expected, "n={n} requested={requested}");
+            assert_eq!(
+                overlap.peak.load(Ordering::SeqCst),
+                expected,
+                "n={n} requested={requested}"
+            );
+            assert_eq!(report.outcomes.len(), n);
+            assert!(report.undispatched.is_empty());
+        }
+    }
+
     #[test]
     fn dag_depths_handles_a_long_dependency_chain_without_recursion() {
         // Run alone with `--exact`: the recursive depth walk overflows this 2 MiB stack, and a stack
