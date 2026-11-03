@@ -920,12 +920,11 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                 &root,
                 args.timeout,
             )?;
-            let _ = code;
-            if let Some(found) = regex::Regex::new(r"TOTAL.*?(\d+)%")
+            let total = regex::Regex::new(r"TOTAL.*?(\d+)%")
                 .ok()
                 .and_then(|re| re.captures(&out))
-                .and_then(|caps| caps.get(1))
-            {
+                .and_then(|caps| caps.get(1));
+            if let Some(found) = total {
                 if found.as_str().parse::<i64>().unwrap_or(100) < args.min_coverage {
                     let id = format!("QF-{:03}", findings.len() + 1);
                     findings.push(finding(
@@ -937,6 +936,28 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                         "A05",
                     ));
                 }
+            } else {
+                let id = format!("QF-{:03}", findings.len() + 1);
+                let last_lines = out
+                    .lines()
+                    .rev()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                findings.push(finding(
+                    &id,
+                    "major",
+                    "coverage",
+                    &format!(
+                        "coverage not measured: no TOTAL percent line in the coverage run; required minimum {}%; coverage run exit code {}",
+                        args.min_coverage, code
+                    ),
+                    &last_lines,
+                    "A05",
+                ));
             }
         }
     }
@@ -1536,5 +1557,90 @@ mod tests {
             !has_dotnet_project(root.path()),
             "a symlinked directory is never entered"
         );
+    }
+
+    /// `qa_gate --json --min-coverage 80` on a pytest repo whose coverage run prints no TOTAL line. The stand-in
+    /// interpreter fails `--cov` runs the way pytest does without pytest-cov, so no coverage percent is measured.
+    #[test]
+    fn min_coverage_without_total_line_adds_coverage_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"fixture\"\n",
+        )
+        .expect("write pyproject");
+        let python = dir.path().join("fake-python");
+        std::fs::write(
+            &python,
+            r#"#!/bin/sh
+case "$*" in
+  "-c import pytest") exit 0 ;;
+  *--cov*) echo "pytest: error: unrecognized arguments: --cov --cov-report=term"; exit 4 ;;
+  *) echo "1 passed in 0.01s"; exit 0 ;;
+esac
+"#,
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::env::set_var("GSD_QA_PYTHON", &python);
+        // Throwaway test value, not a real key: the gate refuses without a signing key, and tests
+        // pass a throwaway SWARM_SIGNING_KEY (AGENTS.md). Removed again after the call.
+        const THROWAWAY_SIGNING_KEY: &str =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        std::env::set_var("SWARM_SIGNING_KEY", THROWAWAY_SIGNING_KEY);
+        let call = crate::strangler_seam::Invocation {
+            agent: "A08".into(),
+            script: "qa_gate".into(),
+            argv: [
+                "--json",
+                "--root",
+                ".",
+                "--risk-class",
+                "low",
+                "--min-coverage",
+                "80",
+            ]
+            .iter()
+            .map(|item| item.to_string())
+            .collect(),
+            root: dir.path().to_path_buf(),
+            env: Vec::new(),
+            deadline: std::time::Duration::from_secs(60),
+            effects_path: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let reply = runtime.block_on(super::answer(&call));
+        std::env::remove_var("GSD_QA_PYTHON");
+        std::env::remove_var("SWARM_SIGNING_KEY");
+        let reply = reply.expect("the gate answers");
+        let body = gsd_route::parse_json(&reply.stdout).expect("stdout is one JSON object");
+        let Some(Json::Arr(findings)) = field(&body, "findings") else {
+            panic!("the reply carries a findings array: {body:?}");
+        };
+        let coverage_major = findings.iter().any(|item| {
+            matches!(
+                (field(item, "severity"), field(item, "kind")),
+                (Some(Json::Str(severity)), Some(Json::Str(kind)))
+                    if severity == "major" && kind == "coverage"
+            )
+        });
+        assert!(
+            coverage_major,
+            "--min-coverage 80 with no TOTAL line must add a major coverage finding; findings: {findings:?}"
+        );
+    }
+
+    fn field<'a>(value: &'a Json, key: &str) -> Option<&'a Json> {
+        let Json::Obj(fields) = value else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, item)| item)
     }
 }
