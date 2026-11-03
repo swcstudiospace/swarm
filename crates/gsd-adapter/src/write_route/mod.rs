@@ -1,6 +1,6 @@
 //! The host `orch_status --transition` route (phase 14.5, unit U3.2a): `scripts/orch_status.py` `run` for `--transition`, in Rust.
 //!
-//! [`transition_reply`] answers a call inside the grammar of [`TransitionArgs`] with the bytes Python prints, or refuses it. The rule
+//! [`transition_reply_with`] answers a call inside the grammar of [`TransitionArgs`] with the bytes Python prints, or refuses it. The rule
 //! of the route (Design 1 of the 14.5 plan) is that Rust answers only what it can prove byte-identical to Python, and refuses
 //! everything else BEFORE the first write with `E-DEP` and `error.details.write_state = "not_started"`, so the Python body answers.
 //! After the commit nothing is ever re-run.
@@ -57,7 +57,7 @@ use gsd_route::transition_args::TransitionArgs;
 use gsd_route::transition_plan::{PlanEffect, Request};
 use gsd_route::{check_safe_id, finish, jstr, obj_get, Fields, Json, Reply, SeamError};
 use gsd_taskwriter::{
-    open_for_write, Applied, ApplyCause, ApplyError, ApprovalVerifier, Decider, EnvApprovalSource,
+    open_for_write, Applied, ApplyCause, ApplyError, ApprovalSource, ApprovalVerifier, Decider,
     ErrorKind, TaskStoreWriter, WriteState, WriterConfig, WriterError,
 };
 
@@ -81,22 +81,17 @@ const POST_COMMIT_RESERVE: Duration = Duration::from_millis(100);
 /// decider ([`SandboxDecider`](crate::sandbox_engine::SandboxDecider)). Everything else, the checks before the write and the
 /// manifest and reply after the commit, is the same code, so the two backends differ only in who decided.
 ///
+/// `verifier` is the approval verifier of the sandboxed route (phase 14.5, pin P2): for a transition to `APPROVED` it checks the
+/// host's gate answer before the decider runs; `None` is the host route, which checks nothing more. `source` gives the keys of an
+/// APPROVED target: production passes [`EnvApprovalSource`](gsd_taskwriter::EnvApprovalSource).
+///
 /// Every `Err` is a final reply: its `details` say whether anything was written (`write_state`, see the module documentation).
-pub(crate) async fn transition_reply(
-    args: &TransitionArgs,
-    call: &Invocation,
-    decider: &dyn Decider,
-) -> Result<Reply, SeamError> {
-    transition_reply_with(args, call, decider, None).await
-}
-
-/// [`transition_reply`] with the approval verifier of the sandboxed route (phase 14.5, pin P2). For a transition to `APPROVED` the
-/// verifier checks the host's gate answer before the decider runs; `None` is the host route, which checks nothing more.
 pub(crate) async fn transition_reply_with(
     args: &TransitionArgs,
     call: &Invocation,
     decider: &dyn Decider,
     verifier: Option<&dyn ApprovalVerifier>,
+    source: Arc<dyn ApprovalSource>,
 ) -> Result<Reply, SeamError> {
     let started = tokio::time::Instant::now();
     let context_task = match &args.context_task_id {
@@ -171,9 +166,9 @@ pub(crate) async fn transition_reply_with(
             ))
         })?
         .as_secs_f64();
-    // A transition to APPROVED reads the signing keys from this process's environment, once, before the transaction opens (D-P24);
-    // every other target reads none. The route never holds a key itself: it hands the writer a source.
-    let writer = TaskStoreWriter::with_approval(store, Arc::new(EnvApprovalSource));
+    // A transition to APPROVED reads the signing keys from `source`, once, before the transaction opens (D-P24); every other target
+    // reads none. The route never holds a key itself: it hands the writer the source the caller gave (production: EnvApprovalSource).
+    let writer = TaskStoreWriter::with_approval(store, source);
     let outcome = writer
         .transition_with_verifier(&request, now, decider, verifier)
         .await;

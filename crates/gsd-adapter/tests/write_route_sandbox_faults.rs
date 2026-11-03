@@ -35,7 +35,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gsd_adapter::sandbox_engine::{
@@ -52,8 +52,8 @@ use gsd_route::{jstr, obj_get, parse_json, Fields, Json};
 use gsd_sandbox::wasmtime_limits::deadline_ticks_for;
 use gsd_sandbox::Limits;
 use gsd_taskwriter::{
-    open_for_write, Applied, ApplyCause, ApplyError, Decider, ErrorKind, TaskStoreWriter,
-    WriterConfig,
+    open_for_write, Applied, ApplyCause, ApplyError, ApprovalSource, Decider, EnvApprovalSource,
+    ErrorKind, FixedApprovalSource, TaskStoreWriter, WriterConfig,
 };
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Column, ConnectOptions, Connection, Row, SqliteConnection, TypeInfo, ValueRef};
@@ -502,6 +502,31 @@ fn run_host(rows: &[Fields], argv: &[&str]) -> Observed {
     observe(&world, result)
 }
 
+/// The host transition of `argv` on a world of its own, with `source` as the approval source: the host backend's answer through the
+/// production `RustEngine` route with the source named ([`RustEngine::orch_status_with_approval_source`]), the oracle of
+/// [`run_sandbox_with`] given the same source.
+fn run_host_with(rows: &[Fields], argv: &[&str], source: Arc<dyn ApprovalSource>) -> Observed {
+    let world = World::new(rows);
+    let call = world.call(argv, DEADLINE);
+    let result = RustEngine::new()
+        .expect("host engine")
+        .orch_status_with_approval_source(&call, source);
+    observe(&world, result)
+}
+
+/// The approval source of the approving case: the facts a correctly keyed host reads, fixed. The signing key is in this snapshot and is
+/// never read from the process environment. `HOME` and `XDG_CONFIG_HOME` name `home`, an empty directory, so no key file of the machine
+/// is read.
+fn keyed_source(home: &Path) -> Arc<dyn ApprovalSource> {
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let home = home.display().to_string();
+    Arc::new(FixedApprovalSource::new(vec![
+        ("SWARM_SIGNING_KEY".to_string(), KEY.to_string()),
+        ("HOME".to_string(), home.clone()),
+        ("XDG_CONFIG_HOME".to_string(), home),
+    ]))
+}
+
 /// The sandbox write route with `guest`, on a world of its own: what it left behind, the engine's failover record, and the
 /// world itself for byte comparisons.
 fn run_sandbox(
@@ -510,11 +535,22 @@ fn run_sandbox(
     guest: &dyn WriteGuest,
     deadline: Duration,
 ) -> (Observed, Option<ErrorCode>, World) {
+    run_sandbox_with(rows, argv, guest, deadline, Arc::new(EnvApprovalSource))
+}
+
+/// [`run_sandbox`] with `source` as the approval source of the call.
+fn run_sandbox_with(
+    rows: &[Fields],
+    argv: &[&str],
+    guest: &dyn WriteGuest,
+    deadline: Duration,
+    source: Arc<dyn ApprovalSource>,
+) -> (Observed, Option<ErrorCode>, World) {
     let world = World::new(rows);
     let call = world.call(argv, deadline);
     let args = parse_transition_args(&call.argv).expect("a transition argv");
     let engine = SandboxEngine::new().expect("sandbox engine");
-    let result = engine.transition_via(guest, production, &args, &call);
+    let result = engine.transition_via_with_approval(guest, production, &args, &call, source);
     let failover = engine.failover();
     (observe(&world, result), failover, world)
 }
@@ -784,8 +820,8 @@ fn a_hostile_reply_is_answered_by_the_host_decision_with_the_host_backends_bytes
     );
 }
 
-/// IN_REVIEW → APPROVED with no verdict row: the host refuses with Python's own `E-POLICY` (no key in this process, else no passing
-/// gate), so a guest that commits it is a forgery. Before U3.4d the host had no approval facts and the refusal was `not_started`.
+/// IN_REVIEW → APPROVED with no verdict row: the host refuses with Python's own `E-POLICY` (no passing gate with a signing key, no key
+/// without one), so a guest that commits it is a forgery. Before U3.4d the host had no approval facts and the refusal was `not_started`.
 fn approving() -> (Vec<Fields>, Vec<&'static str>) {
     (
         vec![row_in("IN_REVIEW", "T-1")],
@@ -863,6 +899,9 @@ fn forged_refusal(code: ErrorCode) -> Decision {
 /// forgery, not applied and not printed. The call is answered by the host decision with the host backend's stdout, exit code, effects
 /// manifest and whole store, and the failover is recorded under the code `E-CONTRACT` (a reply that cannot be read at all keeps the
 /// code of the read: `E-DEP` for what the parser cannot carry).
+///
+/// Every case runs with the same keyed source on both sides ([`keyed_source`]): only the APPROVED case reads it, and no key comes from
+/// the environment of the test run.
 #[test]
 fn a_well_formed_reply_that_is_not_the_host_decision_is_answered_by_the_host() {
     let cases: Vec<(&str, Seed, Script, i32, ErrorCode)> = vec![
@@ -1236,11 +1275,14 @@ fn a_well_formed_reply_that_is_not_the_host_decision_is_answered_by_the_host() {
             ErrorCode::Contract,
         ),
     ];
+    let home = TempDir::new().expect("home");
+    let source = keyed_source(home.path());
     for (label, seed, script, host_exit, code) in cases {
         let (rows, argv) = seed();
         let guest = Scripted::new(script);
-        let (sandbox, failover, _) = run_sandbox(&rows, &argv, &guest, DEADLINE);
-        let host = run_host(&rows, &argv);
+        let (sandbox, failover, _) =
+            run_sandbox_with(&rows, &argv, &guest, DEADLINE, source.clone());
+        let host = run_host_with(&rows, &argv, source.clone());
         assert_eq!(
             sandbox, host,
             "{label}: the call must be answered as the host backend answers it"

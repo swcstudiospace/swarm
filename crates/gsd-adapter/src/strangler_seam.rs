@@ -14,9 +14,11 @@ use std::future::{pending, Future};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gsd_failure::{error_code_from_python, ErrorCode};
+use gsd_route::pyline::{py_is_blank, py_splitlines};
 use gsd_route::transition_args::{parse_transition_args, TransitionArgs};
 use gsd_route::{
     check_safe_id, jstr, obj_get, orch_status_reply, parse_json, run_log_counts, to_python_json,
@@ -25,10 +27,12 @@ use gsd_route::{
 use gsd_route::{parse_orch_status_read, Reply, SeamError};
 use gsd_sdk::omp_bridge_pins::{AbortKind, BridgeError, StopReason};
 use gsd_sdk::omp_bridge_runner::{InvokeRequest, OmpBridge};
+use gsd_taskwriter::ingest::HostIngestCheck;
+use gsd_taskwriter::{ApprovalSource, EnvApprovalSource};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
-use crate::write_route::{ingest::ingest_reply, transition_reply};
+use crate::write_route::{ingest::ingest_reply_checked, transition_reply_with};
 
 /// Largest `--input` payload accepted at the seam, in UTF-8 bytes (`scripts/swarm_tool.py` `MAX_INPUT_BYTES`).
 pub const INPUT_CAP_BYTES: usize = 100_000;
@@ -515,30 +519,52 @@ impl RustEngine {
         ))
     }
 
-    /// The host `--transition` route: the caller has checked that the argv is inside its grammar.
+    /// The host `--transition` route: the caller has checked that the argv is inside its grammar. `source` gives the keys of an
+    /// APPROVED target (production: [`EnvApprovalSource`]).
     fn orch_status_transition(
         &self,
         args: &TransitionArgs,
         call: &Invocation,
+        source: Arc<dyn ApprovalSource>,
     ) -> Result<Reply, SeamError> {
         self.runtime.block_on(within_deadline(
             call.deadline,
             &call.script,
-            transition_reply(args, call, &gsd_taskwriter::HostDecider),
+            transition_reply_with(args, call, &gsd_taskwriter::HostDecider, None, source),
         ))
     }
 
-    /// The host `--ingest` route: the caller has checked that the argv is inside its grammar.
+    /// The host `--ingest` route: the caller has checked that the argv is inside its grammar. `source` gives the keys of an APPROVED step.
     fn orch_status_ingest(
         &self,
         args: &gsd_route::ingest_args::IngestArgs,
         call: &Invocation,
+        source: Arc<dyn ApprovalSource>,
     ) -> Result<Reply, SeamError> {
         self.runtime.block_on(within_deadline(
             call.deadline,
             &call.script,
-            ingest_reply(args, call),
+            ingest_reply_checked(args, call, &HostIngestCheck, source.as_ref()),
         ))
+    }
+
+    /// `orch_status` with `source` as the approval source of an APPROVED transition and of an APPROVED ingest step, in place of the
+    /// process environment. The production [`CoreBackend::orch_status`] passes [`EnvApprovalSource`]; the argv dispatch and the deadline
+    /// wrapper are the same. The read route needs no keys. Public for the integration tests only: the host oracle of a sandbox
+    /// transition given the same source.
+    #[doc(hidden)]
+    pub fn orch_status_with_approval_source(
+        &self,
+        call: &Invocation,
+        source: Arc<dyn ApprovalSource>,
+    ) -> Result<Reply, SeamError> {
+        if let Some(args) = gsd_route::ingest_args::parse_ingest_args(&call.argv) {
+            return self.orch_status_ingest(&args, call, source);
+        }
+        match parse_transition_args(&call.argv) {
+            Some(args) => self.orch_status_transition(&args, call, source),
+            None => self.orch_status_read(call),
+        }
     }
 }
 
@@ -622,13 +648,7 @@ impl CoreBackend for RustEngine {
     }
 
     fn orch_status(&self, call: &Invocation) -> Result<Reply, SeamError> {
-        if let Some(args) = gsd_route::ingest_args::parse_ingest_args(&call.argv) {
-            return self.orch_status_ingest(&args, call);
-        }
-        match parse_transition_args(&call.argv) {
-            Some(args) => self.orch_status_transition(&args, call),
-            None => self.orch_status_read(call),
-        }
+        self.orch_status_with_approval_source(call, Arc::new(EnvApprovalSource))
     }
 
     fn orch_assign(&self, call: &Invocation) -> Result<Reply, SeamError> {
@@ -857,6 +877,7 @@ async fn verdict_entry(pool: &SqlitePool, task: &Task) -> Result<Json, SeamError
 
 /// Counts run-log records for `correlation_id` in `events.jsonl`, with the parity of `runlog.read_events`.
 ///
+/// Lines are cut and blank-tested as `read_events` does (`gsd_route::pyline`: `str.splitlines()` and `str.strip()`).
 /// Every non-blank line that does not parse as JSON is skipped at any position, as Python's `read_events`
 /// skips it (`json.loads` raises `ValueError`). A crash mid-append leaves a torn line that later appends do not
 /// repair, so it can sit mid-file. A line that parses but is not a JSON object still fails with `E-INTERNAL`.
@@ -868,7 +889,10 @@ fn count_events(swarm: &Path, correlation_id: Option<&str>) -> Result<i64, SeamE
     let text = fs::read_to_string(&path).map_err(io_error)?;
     let wanted = correlation_id.filter(|c| !c.is_empty());
     let mut count = 0i64;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+    for line in py_splitlines(&text)
+        .into_iter()
+        .filter(|line| !py_is_blank(line))
+    {
         match run_log_counts(line, wanted) {
             Ok(true) => count += 1,
             Ok(false) => {}
@@ -1610,6 +1634,64 @@ mod tests {
         .map_err(|e| e.to_string())?;
         let error = count_events(dir.path(), Some("C1")).err();
         assert_eq!(error.as_ref().map(|e| e.code()), Some(ErrorCode::Internal));
+        Ok(())
+    }
+
+    #[test]
+    fn count_events_cuts_lines_where_python_read_events_cuts_them() -> TestResult {
+        let record = "{\"correlation_id\":\"C1\"}";
+        for separator in [
+            "\n", "\r", "\r\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\u{85}", "\u{2028}",
+            "\u{2029}",
+        ] {
+            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            fs::write(
+                dir.path().join("events.jsonl"),
+                format!("{record}{separator}{record}{separator}{record}"),
+            )
+            .map_err(|e| e.to_string())?;
+            let count = count_events(dir.path(), Some("C1")).map_err(message)?;
+            assert_eq!(count, 3, "separator {separator:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn count_events_skips_blank_records_python_strips_to_nothing() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        fs::write(
+            dir.path().join("events.jsonl"),
+            "{\"correlation_id\":\"C1\"}\n\u{1f}\n\u{a0}\n\u{1c}\u{1f}\u{85}\u{2028}\n\u{3000}\u{2029}\n{\"correlation_id\":\"C1\"}\n",
+        )
+        .map_err(|e| e.to_string())?;
+        let count = count_events(dir.path(), Some("C1")).map_err(message)?;
+        assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn count_events_cuts_a_line_at_u2028_inside_a_json_string() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        fs::write(
+            dir.path().join("events.jsonl"),
+            "{\"correlation_id\":\"C1\",\"note\":\"a\u{2028}b\"}\n{\"correlation_id\":\"C1\"}\n",
+        )
+        .map_err(|e| e.to_string())?;
+        let count = count_events(dir.path(), Some("C1")).map_err(message)?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn count_events_keeps_lf_and_crlf_lines_as_before() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        fs::write(
+            dir.path().join("events.jsonl"),
+            "{\"correlation_id\":\"C1\"}\n{\"correlation_id\":\"C2\"}\n\n{\"correlation_id\":\"C1\"}\r\n",
+        )
+        .map_err(|e| e.to_string())?;
+        assert_eq!(count_events(dir.path(), Some("C1")).map_err(message)?, 2);
+        assert_eq!(count_events(dir.path(), None).map_err(message)?, 3);
         Ok(())
     }
 

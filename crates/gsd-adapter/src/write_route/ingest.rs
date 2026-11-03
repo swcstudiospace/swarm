@@ -1,6 +1,6 @@
 //! The host `orch_status --ingest` route (phase 14.5, unit U3.5e part 2).
 //!
-//! [`ingest_reply`] reads the result file, calls [`TaskStoreWriter::ingest`], and hands the post-commit effects to the
+//! [`ingest_reply_checked`] reads the result file, calls [`TaskStoreWriter::ingest`], and hands the post-commit effects to the
 //! selector in the effects manifest. Rust answers only what it can prove byte-identical to Python, and refuses everything
 //! else BEFORE the first write with `E-DEP` and `write_state = "not_started"`, so the Python body answers. After the
 //! commit nothing is ever re-run.
@@ -19,9 +19,9 @@ use gsd_route::ingest_args::IngestArgs;
 use gsd_route::reconcile_plan::EmitEvent;
 use gsd_route::result_parse::{parse_result, validate_result, ResultError};
 use gsd_route::{check_safe_id, finish, jstr, obj_get, Json, Reply, SeamError};
-use gsd_taskwriter::ingest::{HostIngestCheck, IngestCheck};
+use gsd_taskwriter::ingest::IngestCheck;
 use gsd_taskwriter::{
-    open_for_write, EnvApprovalSource, IngestCause, IngestError, IngestRequest, TaskStoreWriter,
+    open_for_write, ApprovalSource, IngestCause, IngestError, IngestRequest, TaskStoreWriter,
     WriteState, WriterConfig,
 };
 
@@ -31,17 +31,14 @@ use crate::strangler_seam::{
 use crate::write_route::write_manifest;
 
 /// Answers one `--ingest` call that [`IngestArgs`] parsed on the host: the host verifies nothing, its plan is the answer. Every `Err` is
-/// a final reply, or a not-started refusal the caller hands to Python.
-pub(crate) async fn ingest_reply(args: &IngestArgs, call: &Invocation) -> Result<Reply, SeamError> {
-    ingest_reply_checked(args, call, &HostIngestCheck).await
-}
-
-/// [`ingest_reply`] with `check` run on the plan inside the write transaction, before its first write (see [`IngestCheck`]). A check
-/// that stops the call answers `E-TIMEOUT` with nothing written.
+/// a final reply, or a not-started refusal the caller hands to Python. `check` runs on the plan inside the write transaction, before its
+/// first write (see [`IngestCheck`]). A check that stops the call answers `E-TIMEOUT` with nothing written. `source` gives the keys an
+/// APPROVED step is checked with.
 pub(crate) async fn ingest_reply_checked(
     args: &IngestArgs,
     call: &Invocation,
     check: &dyn IngestCheck,
+    source: &dyn ApprovalSource,
 ) -> Result<Reply, SeamError> {
     let context_task = match &args.context_task_id {
         Some(value) => Some(value.as_str()),
@@ -117,9 +114,7 @@ pub(crate) async fn ingest_reply_checked(
         advisory: args.advisory,
     };
     let writer = TaskStoreWriter::new(store);
-    let outcome = writer
-        .ingest_with(&request, now, &EnvApprovalSource, check)
-        .await;
+    let outcome = writer.ingest_with(&request, now, source, check).await;
     writer.close().await;
     match outcome {
         Ok(applied) => {

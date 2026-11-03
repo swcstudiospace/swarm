@@ -19,7 +19,7 @@
 //! feature.
 
 use std::fmt::Display;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use gsd_failure::ErrorCode;
@@ -35,7 +35,7 @@ use gsd_sandbox::wasmtime_module_build::{MODULE_NAME, MODULE_TARGET};
 use gsd_sandbox::{
     GuestInvokeError, GuestLoader, Limits, LoadError, LoadedGuest, ModuleManifest, GUEST_MODULE,
 };
-use gsd_taskwriter::{ApprovalVerifier, Decider, HostDecider};
+use gsd_taskwriter::{ApprovalSource, ApprovalVerifier, Decider, EnvApprovalSource, HostDecider};
 
 use crate::route_table::is_read_only_route;
 use crate::strangler_seam::{
@@ -581,8 +581,8 @@ impl Decider for SandboxDecider<'_> {
 impl SandboxEngine {
     /// The `--transition` route with `guest` standing in for the engine's own guest and `make_limits` giving the guest's limits
     /// from the budget left of the call deadline. [`CoreBackend::orch_status`] calls it with the engine itself and the production
-    /// limits; a test calls it with a scripted guest. The guest is prepared here, before the writer opens its transaction. Records
-    /// the failover code for [`Self::failover`]. Public for the integration tests only.
+    /// limits; a test calls it with a scripted guest. The approval keys of an APPROVED target come from the process environment, as
+    /// in production ([`Self::transition_via_with_approval`] names the source). Public for the integration tests only.
     #[doc(hidden)]
     pub fn transition_via(
         &self,
@@ -590,6 +590,28 @@ impl SandboxEngine {
         make_limits: fn(Duration) -> Limits,
         args: &TransitionArgs,
         call: &Invocation,
+    ) -> Result<Reply, SeamError> {
+        self.transition_via_with_approval(
+            guest,
+            make_limits,
+            args,
+            call,
+            Arc::new(EnvApprovalSource),
+        )
+    }
+
+    /// [`Self::transition_via`] with `source` as the writer's approval source. The guest is prepared here, before the writer opens its
+    /// transaction. Records the failover code for [`Self::failover`]. Public for the integration tests only: a test gives a
+    /// deterministic source and compares the call with
+    /// [`crate::strangler_seam::RustEngine::orch_status_with_approval_source`] given the same one.
+    #[doc(hidden)]
+    pub fn transition_via_with_approval(
+        &self,
+        guest: &dyn WriteGuest,
+        make_limits: fn(Duration) -> Limits,
+        args: &TransitionArgs,
+        call: &Invocation,
+        source: Arc<dyn ApprovalSource>,
     ) -> Result<Reply, SeamError> {
         let started = Instant::now();
         let mut decider = SandboxDecider::new(guest, started, call.deadline);
@@ -609,7 +631,7 @@ impl SandboxEngine {
         let reply = self.runtime.block_on(within_deadline(
             call.deadline,
             &call.script,
-            transition_reply_with(args, call, &decider, verifier),
+            transition_reply_with(args, call, &decider, verifier, source),
         ));
         // The record names the first fault of the call: the approval check runs before the decider.
         #[cfg(feature = "sandbox-write")]
@@ -640,7 +662,7 @@ impl SandboxEngine {
         let reply = self.runtime.block_on(within_deadline(
             call.deadline,
             &call.script,
-            ingest_reply_checked(args, call, &check),
+            ingest_reply_checked(args, call, &check, &EnvApprovalSource),
         ));
         self.record_failover(check.failover());
         reply

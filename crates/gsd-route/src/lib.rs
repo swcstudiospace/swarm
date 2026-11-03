@@ -13,6 +13,7 @@ use gsd_codes::ErrorCode;
 
 mod orch_status_wire;
 pub mod pydumps;
+pub mod pyline;
 pub mod transition_plan;
 
 pub use orch_status_wire::{decode_reply_wire, orch_status_invoke, orch_status_reply};
