@@ -33,6 +33,33 @@ fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("cargo did not set {name} for the sandbox build"))
 }
 
+/// Ambient variables the nested guest build must not inherit. Each is removed from the nested
+/// cargo's environment and registered with `rerun-if-env-changed`.
+const AMBIENT_ENV_NAMES: [&str; 6] = [
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_INCREMENTAL",
+];
+/// Every variable with this prefix is also removed from the nested build's environment.
+const AMBIENT_ENV_PREFIX: &str = "CARGO_PROFILE_";
+
+/// The names of every ambient variable the nested guest build must not inherit.
+fn ambient_env_names() -> Vec<String> {
+    let mut names: Vec<String> = AMBIENT_ENV_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    names.extend(
+        env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| key.starts_with(AMBIENT_ENV_PREFIX)),
+    );
+    names
+}
+
 fn main() {
     let cargo = required_env("CARGO");
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
@@ -41,13 +68,13 @@ fn main() {
     let target_dir = out_dir.join("guest-target");
 
     let write_routes = env::var_os("CARGO_FEATURE_WRITE_ROUTES").is_some();
+    let ambient_env = ambient_env_names();
 
     // The outer build's encoded rustflags describe the host build; the guest must read its own
     // flags from the environment and the cargo config files.
     let mut build = Command::new(&cargo);
     build
         .current_dir(&workspace_root)
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args([
             "build",
             "--locked",
@@ -59,6 +86,9 @@ fn main() {
             "--target-dir",
         ])
         .arg(&target_dir);
+    for name in &ambient_env {
+        build.env_remove(name);
+    }
     if write_routes {
         build.args(["--features", "write-routes-2"]);
     }
@@ -147,5 +177,7 @@ fn main() {
         "cargo:rerun-if-changed={}",
         workspace_root.join(".cargo/config.toml").display()
     );
-    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+    for name in &ambient_env {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
 }
