@@ -855,11 +855,11 @@ async fn verdict_entry(pool: &SqlitePool, task: &Task) -> Result<Json, SeamError
     ]))
 }
 
-/// Counts run-log records for `correlation_id` in `events.jsonl` (`runlog.read_events`).
+/// Counts run-log records for `correlation_id` in `events.jsonl`, with the parity of `runlog.read_events`.
 ///
-/// A last non-blank line that does not parse as JSON is a torn trailing record (a writer died
-/// mid-line) and is skipped. A last line that parses but is not an object still fails, and an
-/// unparseable line before the last one still fails.
+/// Every non-blank line that does not parse as JSON is skipped at any position, as Python's `read_events`
+/// skips it (`json.loads` raises `ValueError`). A crash mid-append leaves a torn line that later appends do not
+/// repair, so it can sit mid-file. A line that parses but is not a JSON object still fails with `E-INTERNAL`.
 fn count_events(swarm: &Path, correlation_id: Option<&str>) -> Result<i64, SeamError> {
     let path = swarm.join("events.jsonl");
     if !path.exists() {
@@ -867,18 +867,14 @@ fn count_events(swarm: &Path, correlation_id: Option<&str>) -> Result<i64, SeamE
     }
     let text = fs::read_to_string(&path).map_err(io_error)?;
     let wanted = correlation_id.filter(|c| !c.is_empty());
-    let mut lines: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let torn_tail = lines.last().is_some_and(|last| parse_json(last).is_err());
-    if torn_tail {
-        lines.pop();
-    }
     let mut count = 0i64;
-    for line in lines {
-        if run_log_counts(line, wanted)? {
-            count += 1;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match run_log_counts(line, wanted) {
+            Ok(true) => count += 1,
+            Ok(false) => {}
+            // `run_log_counts` refuses an unparseable line with `E-INPUT` and a parsed non-object with `E-INTERNAL`.
+            Err(error) if error.code() == ErrorCode::Input => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(count)
@@ -1588,6 +1584,19 @@ mod tests {
         .map_err(|e| e.to_string())?;
         let count = count_events(dir.path(), Some("C1")).map_err(message)?;
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn count_events_skips_a_torn_line_before_a_valid_one() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        fs::write(
+            dir.path().join("events.jsonl"),
+            "{\"correlation_id\":\"C1\"}\n{\"correlation_id\":\"C1\n{\"correlation_id\":\"C1\"}\n",
+        )
+        .map_err(|e| e.to_string())?;
+        let count = count_events(dir.path(), Some("C1")).map_err(message)?;
+        assert_eq!(count, 2);
         Ok(())
     }
 
