@@ -18,7 +18,8 @@
 //!    `check_manual_transition` (`manual: true`), actor `A01`, reason `--reason` or `manual`: one `BEGIN IMMEDIATE` transaction from
 //!    the read of the row to the `COMMIT`;
 //! 5. after the `COMMIT`: the effects manifest is written to `Invocation::effects_path` (atomically: a temporary file in the same
-//!    directory, then a rename) and the reply is built from the committed row.
+//!    directory, then a rename) and the reply is built from the committed row. A deadline that expires after the `COMMIT` still
+//!    writes the manifest and ends the reply as `E-TIMEOUT` with `write_state = "final"` (see [`POST_COMMIT_RESERVE`]).
 //!
 //! The effects stay Python (open question 6): the manifest tells the selector what to replay, in Python's order, after the
 //! commit. See [`effects_manifest`] for its shape. A call without an `effects_path` that would commit is refused before the write,
@@ -37,12 +38,18 @@ pub mod shadow_approval;
 pub(crate) mod shadow_ingest;
 #[cfg(feature = "sandbox-write")]
 pub(crate) mod shadow_plan;
+#[cfg(test)]
+mod deadline_after_commit;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
 
 use gsd_failure::ErrorCode;
 use gsd_route::pydumps::to_python_dumps;
@@ -55,7 +62,7 @@ use gsd_taskwriter::{
 };
 
 use crate::strangler_seam::{
-    before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
+    after_commit, before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
 };
 
 /// The actor of a manual transition (`orch_status.py`: `actor="A01"`).
@@ -63,6 +70,11 @@ const ACTOR: &str = "A01";
 
 /// The audit reason of a transition whose `--reason` is empty (`args.reason or "manual"`).
 const DEFAULT_REASON: &str = "manual";
+
+/// The time kept back from the call deadline for the post-commit step: the reply must go out before the caller's own timer, which
+/// started a little before the route did. The manifest write is synchronous and the reply is built from the committed row, so
+/// nothing else needs the time.
+const POST_COMMIT_RESERVE: Duration = Duration::from_millis(100);
 
 /// Answers one `--transition` call that [`TransitionArgs`] parsed, with the decide step named by the caller: the reply Python
 /// prints, or the refusal. The host backend passes [`HostDecider`](gsd_taskwriter::HostDecider); the sandbox backend passes its guest
@@ -86,6 +98,7 @@ pub(crate) async fn transition_reply_with(
     decider: &dyn Decider,
     verifier: Option<&dyn ApprovalVerifier>,
 ) -> Result<Reply, SeamError> {
+    let started = tokio::time::Instant::now();
     let context_task = match &args.context_task_id {
         Some(value) => Some(value.as_str()),
         None => env_value(&call.env, "SWARM_TASK_ID"),
@@ -164,12 +177,40 @@ pub(crate) async fn transition_reply_with(
     let outcome = writer
         .transition_with_verifier(&request, now, decider, verifier)
         .await;
-    writer.close().await;
-    let applied = outcome.map_err(|error| apply_refusal(&error))?;
+    let applied = match outcome {
+        Ok(applied) => applied,
+        Err(error) => {
+            writer.close().await;
+            return Err(apply_refusal(&error));
+        }
+    };
 
-    // The transaction is committed: from here on nothing is refused and nothing is re-run. A manifest that cannot be written is
-    // a lost effect, the window Python has between its commit and its emit; the caller finds the file missing and says so.
+    // The transaction is committed: from here on nothing is refused and nothing is re-run. The store closes and the post-commit
+    // hold runs under the call deadline less POST_COMMIT_RESERVE, so the reply goes out before the caller's own timer drops the
+    // route. A manifest that cannot be written is a lost effect, the window Python has between its commit and its emit; the
+    // caller finds the file missing and says so.
+    #[cfg(test)]
+    let db = swarm.join("tasks.db");
+    let settled = tokio::time::timeout_at(
+        started + call.deadline.saturating_sub(POST_COMMIT_RESERVE),
+        async {
+            writer.close().await;
+            #[cfg(test)]
+            pause_after_commit(&db).await;
+        },
+    )
+    .await
+    .is_ok();
     write_manifest(call, &effects_manifest(args, &applied)).ok();
+    if !settled {
+        return Err(after_commit(SeamError::new(
+            ErrorCode::Timeout,
+            format!(
+                "the transition committed, but its post-commit step exceeded the {:?} call deadline",
+                call.deadline
+            ),
+        )));
+    }
     let Some(Json::Str(state)) = obj_get(&applied.task, "state") else {
         return Err(
             SeamError::new(ErrorCode::Internal, "the committed row has no state")
@@ -188,6 +229,36 @@ pub(crate) async fn transition_reply_with(
         &call.agent,
         &call.script,
     ))
+}
+
+/// The pause a unit test arms for one store (see `deadline_after_commit`): the route waits `hold` after the COMMIT of the transition on
+/// the database at `db`, before the effects manifest. Taken once, by the call on that database only.
+#[cfg(test)]
+static POST_COMMIT_PAUSE: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+
+/// Arms [`POST_COMMIT_PAUSE`] for the database at `db`.
+#[cfg(test)]
+fn arm_post_commit_pause(db: PathBuf, hold: Duration) {
+    *POST_COMMIT_PAUSE.lock().unwrap_or_else(PoisonError::into_inner) = Some((db, hold));
+}
+
+/// Holds the pause armed for `db`, if any, after its COMMIT. Any other database leaves it armed.
+#[cfg(test)]
+async fn pause_after_commit(db: &Path) {
+    let hold = {
+        let mut armed = POST_COMMIT_PAUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        let hold = match &*armed {
+            Some((path, hold)) if path == db => Some(*hold),
+            _ => None,
+        };
+        if hold.is_some() {
+            *armed = None;
+        }
+        hold
+    };
+    if let Some(hold) = hold {
+        tokio::time::sleep(hold).await;
+    }
 }
 
 /// `args.reason or "manual"`: the reason of the audit row and of the inline run event.
