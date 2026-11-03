@@ -707,12 +707,12 @@ pub struct Task {
     deps: Vec<Json>,
 }
 
-/// Parses one JSON text column of a task row. An out-of-range integer in `budget` is refused as Dep;
-/// every other column keeps the invalid-JSON refusal.
+/// Parses one JSON text column of a task row. An out-of-range integer is refused as Dep in every column;
+/// any other defect keeps the invalid-JSON refusal.
 fn row_json(column: &str, text: &str) -> Result<Json, SeamError> {
     match parse_json_checked(text) {
         Ok(value) => Ok(value),
-        Err(JsonFault::IntegerOutOfRange) if column == "budget" => Err(out_of_range_error(column)),
+        Err(JsonFault::IntegerOutOfRange) => Err(out_of_range_error(column)),
         Err(_) => Err(invalid_json()),
     }
 }
@@ -727,7 +727,7 @@ fn out_of_range_error(column: &str) -> SeamError {
 
 impl Task {
     /// Shapes one `tasks` row: JSON text columns are parsed, `depends_on` must be a list, and `notes` becomes an object.
-    /// An integer outside i64 in `budget` or `notes` is refused as Dep (the Python host decides), not read as invalid or emptied.
+    /// An integer outside i64 in any column, `notes` included, is refused as Dep (the Python host decides), not read as invalid or emptied.
     pub fn from_row(mut fields: Fields) -> Result<Self, SeamError> {
         for column in ["inputs", "outputs", "acceptance", "budget", "depends_on"] {
             let default = if column == "budget" { "{}" } else { "[]" };
@@ -935,9 +935,13 @@ fn outputs_len(task: &Task) -> Result<i64, SeamError> {
 }
 
 /// Whether one non-blank run-log line counts toward the `orch_status` event total for `wanted`
-/// (`None` counts every record). A line that is not a JSON object is an `E-INTERNAL` error.
+/// (`None` counts every record). A line that is not a JSON object is an `E-INTERNAL` error; an integer outside i64
+/// is a `Dep` refusal (Python decides) and other unparseable text is `Input`.
 pub fn run_log_counts(line: &str, wanted: Option<&str>) -> Result<bool, SeamError> {
-    let record = parse_json(line)?;
+    let record = parse_json_checked(line).map_err(|fault| match fault {
+        JsonFault::IntegerOutOfRange => out_of_range_error("run log record"),
+        JsonFault::Invalid => invalid_json(),
+    })?;
     let Json::Obj(fields) = &record else {
         return Err(SeamError::new(
             ErrorCode::Internal,
@@ -1483,6 +1487,19 @@ mod tests {
     }
 
     #[test]
+    fn run_log_out_of_range_integer_defers_and_torn_line_is_input() -> TestResult {
+        let line = "{\"correlation_id\":\"C1\",\"n\":10000000000000000000}";
+        let out_of_range = run_log_counts(line, Some("C1"));
+        assert_eq!(
+            out_of_range.err().map(|error| error.code()),
+            Some(ErrorCode::Dep)
+        );
+        let torn = run_log_counts("{\"correlation_id\":\"C1", Some("C1"));
+        assert_eq!(torn.err().map(|error| error.code()), Some(ErrorCode::Input));
+        Ok(())
+    }
+
+    #[test]
     fn count_state_keeps_first_seen_order() -> TestResult {
         let mut counts: Vec<(String, i64)> = Vec::new();
         for state in ["PLANNED", "DONE", "PLANNED"] {
@@ -1627,6 +1644,28 @@ mod tests {
             .err()
             .ok_or_else(|| "budget with an out-of-range integer was accepted".to_string())?;
         assert_eq!(error.code(), ErrorCode::Dep);
+        Ok(())
+    }
+
+    #[test]
+    fn task_row_with_out_of_range_inputs_defers_to_python() -> TestResult {
+        let mut fields = task_fields("{}", "{}");
+        upsert(
+            &mut fields,
+            "inputs".to_string(),
+            jstr(r#"[{"seed": 10000000000000000000}]"#),
+        );
+        let error = Task::from_row(fields)
+            .err()
+            .ok_or_else(|| "inputs with an out-of-range integer was accepted".to_string())?;
+        assert_eq!(error.code(), ErrorCode::Dep);
+
+        let mut fields = task_fields("{}", "{}");
+        upsert(&mut fields, "inputs".to_string(), jstr("nope"));
+        let error = Task::from_row(fields)
+            .err()
+            .ok_or_else(|| "inputs with invalid JSON was accepted".to_string())?;
+        assert_eq!(error.code(), ErrorCode::Input);
         Ok(())
     }
 }
