@@ -216,14 +216,31 @@ fn shortest_scientific(number: f64) -> String {
 
 /// Parses JSON text into an order-preserving [`Json`], keeping Python's int/float split.
 pub fn parse_json(text: &str) -> Result<Json, SeamError> {
+    parse_json_checked(text).map_err(|_| invalid_json())
+}
+
+/// Why [`parse_json_checked`] refused a text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonFault {
+    /// Not JSON that Python's `json` accepts.
+    Invalid,
+    /// JSON whose only defect is an integer outside i64; Python's `int` holds it, so the host decides.
+    IntegerOutOfRange,
+}
+
+fn parse_json_checked(text: &str) -> Result<Json, JsonFault> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
         pos: 0,
+        overflowed: false,
     };
-    let value = parser.value(0).ok_or_else(invalid_json)?;
+    let value = parser.value(0).ok_or(JsonFault::Invalid)?;
     parser.skip_ws();
     if parser.pos != parser.bytes.len() {
-        return Err(invalid_json());
+        return Err(JsonFault::Invalid);
+    }
+    if parser.overflowed {
+        return Err(JsonFault::IntegerOutOfRange);
     }
     Ok(value)
 }
@@ -235,6 +252,8 @@ fn invalid_json() -> SeamError {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Set when an integer literal exceeds i64; parsing goes on so that a later syntax error still reports as invalid JSON.
+    overflowed: bool,
 }
 
 impl Parser<'_> {
@@ -426,8 +445,13 @@ impl Parser<'_> {
         let text = std::str::from_utf8(self.bytes.get(start..self.pos)?).ok()?;
         if is_float {
             text.parse::<f64>().ok().map(Json::Float)
+        } else if let Ok(number) = text.parse::<i64>() {
+            Some(Json::Int(number))
         } else {
-            text.parse::<i64>().ok().map(Json::Int)
+            // The grammar above admits only digits here, so the only failure is i64 overflow. The value is
+            // not used: the text is refused once it has been checked whole.
+            self.overflowed = true;
+            text.parse::<f64>().ok().map(Json::Float)
         }
     }
 
@@ -683,14 +707,33 @@ pub struct Task {
     deps: Vec<Json>,
 }
 
+/// Parses one JSON text column of a task row. An out-of-range integer in `budget` is refused as Dep;
+/// every other column keeps the invalid-JSON refusal.
+fn row_json(column: &str, text: &str) -> Result<Json, SeamError> {
+    match parse_json_checked(text) {
+        Ok(value) => Ok(value),
+        Err(JsonFault::IntegerOutOfRange) if column == "budget" => Err(out_of_range_error(column)),
+        Err(_) => Err(invalid_json()),
+    }
+}
+
+/// The Dep refusal for a column holding an integer outside i64: Python's `int` holds it, so the Python host decides.
+fn out_of_range_error(column: &str) -> SeamError {
+    SeamError::new(
+        ErrorCode::Dep,
+        format!("{column} holds an integer outside the rust engine's range; use GSD_ENGINE=python"),
+    )
+}
+
 impl Task {
     /// Shapes one `tasks` row: JSON text columns are parsed, `depends_on` must be a list, and `notes` becomes an object.
+    /// An integer outside i64 in `budget` or `notes` is refused as Dep (the Python host decides), not read as invalid or emptied.
     pub fn from_row(mut fields: Fields) -> Result<Self, SeamError> {
         for column in ["inputs", "outputs", "acceptance", "budget", "depends_on"] {
             let default = if column == "budget" { "{}" } else { "[]" };
             let parsed = match obj_get(&fields, column) {
-                Some(Json::Str(text)) if !text.is_empty() => parse_json(text)?,
-                None | Some(Json::Null) | Some(Json::Str(_)) => parse_json(default)?,
+                Some(Json::Str(text)) if !text.is_empty() => row_json(column, text)?,
+                None | Some(Json::Null) | Some(Json::Str(_)) => row_json(column, default)?,
                 Some(_) => {
                     return Err(SeamError::new(
                         ErrorCode::Internal,
@@ -719,8 +762,9 @@ impl Task {
             }
         };
         let notes = match obj_get(&fields, "notes") {
-            Some(Json::Str(text)) if !text.is_empty() => match parse_json(text) {
+            Some(Json::Str(text)) if !text.is_empty() => match parse_json_checked(text) {
                 Ok(value @ Json::Obj(_)) => value,
+                Err(JsonFault::IntegerOutOfRange) => return Err(out_of_range_error("notes")),
                 _ => Json::Obj(Vec::new()),
             },
             _ => Json::Obj(Vec::new()),
@@ -1268,6 +1312,21 @@ mod tests {
         .map_err(message)
     }
 
+    fn task_fields(notes: &str, budget: &str) -> Fields {
+        cols(&[
+            ("task_id", jstr("T-N")),
+            ("state", jstr("PLANNED")),
+            ("agent_id", jstr("A05")),
+            ("dag_depth", Json::Int(1)),
+            ("attempt", Json::Int(0)),
+            ("rework_loops", Json::Int(0)),
+            ("risk_class", jstr("low")),
+            ("depends_on", jstr("[]")),
+            ("notes", jstr(notes)),
+            ("budget", jstr(budget)),
+        ])
+    }
+
     #[test]
     fn python_json_layout_matches_json_dumps_indent_2() -> TestResult {
         let value = Json::Obj(vec![
@@ -1548,6 +1607,26 @@ mod tests {
         assert_eq!(fields.len(), 2000);
         assert_eq!(fields[0], ("k0".to_string(), Json::Int(-1)));
         assert_eq!(fields[1999], ("k1999".to_string(), Json::Int(1999)));
+        Ok(())
+    }
+
+    #[test]
+    fn task_notes_with_out_of_range_integer_is_refused_not_emptied() -> TestResult {
+        let notes = r#"{"gates":["review"],"n":12345678901234567890}"#;
+        let error = Task::from_row(task_fields(notes, "{}"))
+            .err()
+            .ok_or_else(|| "notes with an out-of-range integer were accepted".to_string())?;
+        assert_eq!(error.code(), ErrorCode::Dep);
+        Ok(())
+    }
+
+    #[test]
+    fn task_row_with_out_of_range_budget_defers_to_python() -> TestResult {
+        let budget = r#"{"max_tokens": 10000000000000000000}"#;
+        let error = Task::from_row(task_fields("{}", budget))
+            .err()
+            .ok_or_else(|| "budget with an out-of-range integer was accepted".to_string())?;
+        assert_eq!(error.code(), ErrorCode::Dep);
         Ok(())
     }
 }
