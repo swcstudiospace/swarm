@@ -836,17 +836,23 @@ fn whole(path: &Path) -> Result<Change, SeamError> {
     if let Err(error) = read {
         return Ok(unscanned(format!("read failed: {error}"), false));
     }
-    if bytes.len() as u64 > SCAN_LIMIT {
-        return Ok(unscanned(
-            format!("over the {SCAN_LIMIT}-byte scan cap"),
-            false,
-        ));
-    }
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Ok(Change {
-            binary: true,
-            ..Change::default()
-        });
+    // An oversized binary is not in-scope text; only oversized text is scan-incomplete (AGENTS.md doctrine).
+    let over_cap = bytes.len() as u64 > SCAN_LIMIT;
+    let text = match std::str::from_utf8(&bytes) {
+        // Over the cap, an incomplete sequence at the read's end is text the cap cut, not binary.
+        Err(error) if !over_cap || error.error_len().is_some() => {
+            return Ok(Change {
+                binary: true,
+                ..Change::default()
+            });
+        }
+        Ok(text) if !over_cap => text,
+        _ => {
+            return Ok(unscanned(
+                format!("over the {SCAN_LIMIT}-byte scan cap"),
+                false,
+            ));
+        }
     };
     if !text.is_ascii() {
         return Err(decline("non-ASCII file content; Python answers"));
@@ -1856,5 +1862,41 @@ mod tests {
                 "the symlink's target must not be read"
             ),
         }
+    }
+
+    #[test]
+    fn oversized_binary_is_binary_not_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob.bin");
+        // 0xFF is never valid UTF-8, so the file is binary. The read cap must not turn it into an incomplete entry.
+        fs::write(&path, vec![0xFF_u8; 2_100_000]).expect("write blob.bin");
+        let change = whole(&path).expect("whole");
+        assert!(
+            change.binary && change.incomplete.is_none(),
+            "an oversized binary must be a binary entry: binary={} incomplete={:?}",
+            change.binary,
+            change.incomplete
+        );
+    }
+
+    #[test]
+    fn oversized_text_straddling_the_cap_is_still_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.txt");
+        // U+00E9 is two bytes at SCAN_LIMIT - 1 and SCAN_LIMIT, so the capped prefix ends inside it. The file is valid
+        // UTF-8 and over the cap: it must stay incomplete, not be analysed or taken as binary.
+        let cap = SCAN_LIMIT as usize;
+        let mut body = "x".repeat(cap - 1);
+        body.push('é');
+        body.push_str(&"a = 1\n".repeat(400_000));
+        assert!(body.len() as u64 > SCAN_LIMIT);
+        assert!(std::str::from_utf8(&body.as_bytes()[..cap]).is_err());
+        fs::write(&path, &body).expect("write big.txt");
+        let change = whole(&path).expect("whole");
+        assert!(
+            change.incomplete.is_some(),
+            "an oversized text file must stay incomplete: binary={}",
+            change.binary
+        );
     }
 }

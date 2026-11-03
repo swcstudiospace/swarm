@@ -61,6 +61,8 @@ const SKIP_DIRS: &[&str] = &[
     ".swarm",
 ];
 const MAX_SCAN_BYTES: u64 = 2_000_000;
+/// Bytes read from a file's head to decide it binary before the size check.
+const PREFIX_BYTES: u64 = 8192;
 const KINDS: [&str; 3] = ["secrets", "sast", "iac"];
 
 /// `(name, manifest globs, binary for shutil.which, argv run)`, in Python's `AUDITS` order.
@@ -679,6 +681,16 @@ fn walk_order(root: &Path) -> Result<Vec<PathBuf>, SeamError> {
     Ok(out)
 }
 
+/// True when the first [`PREFIX_BYTES`] of a file are not UTF-8 with an error that is not an incomplete sequence at the
+/// prefix end, which the prefix may have cut. A prefix that cannot be read proves nothing, so the file is not binary.
+fn binary_prefix(path: &Path) -> bool {
+    let mut prefix = Vec::new();
+    let read =
+        fs::File::open(path).and_then(|file| file.take(PREFIX_BYTES).read_to_end(&mut prefix));
+    read.is_ok()
+        && matches!(std::str::from_utf8(&prefix), Err(error) if error.error_len().is_some())
+}
+
 /// `scan_files`: the secrets, SAST and IAC findings of every scanned file, in Python's order.
 fn scan(root: &Path) -> Result<Scan, SeamError> {
     let mut scan = Scan::default();
@@ -724,6 +736,10 @@ fn scan(root: &Path) -> Result<Scan, SeamError> {
             parts.push(name);
         }
         let rel = parts.join("/");
+        // An oversized binary is not in-scope text; only oversized text is scan-incomplete (AGENTS.md doctrine).
+        if binary_prefix(&path) {
+            continue;
+        }
         // An in-scope input over the cap is not read. It is one major `scan-incomplete` finding (AGENTS.md).
         if meta.len() > MAX_SCAN_BYTES {
             let mut finding = Finding::plain(
@@ -1902,6 +1918,53 @@ mod tests {
                 .iter()
                 .map(|finding| format!("{}/{}/{}", finding.kind, finding.severity, finding.summary))
                 .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn oversized_binary_in_scope_is_skipped_not_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 0xFF is never valid UTF-8, so the file is binary. Python skips it silently; the size check must not turn it
+        // into a scan-incomplete finding.
+        std::fs::write(dir.path().join("big.py"), vec![0xFF_u8; 2_100_000]).expect("write big.py");
+        std::fs::write(dir.path().join("ok.py"), "x = 1\n").expect("write ok.py");
+        let found = scan(dir.path()).expect("scan");
+        assert!(
+            found.findings.iter().all(|finding| {
+                !finding.id.contains("scan-incomplete")
+                    && !finding.summary.contains("scan-incomplete")
+            }),
+            "an oversized binary in-scope file was reported as scan-incomplete: {:?}",
+            found
+                .findings
+                .iter()
+                .map(|finding| format!("{}/{}/{}", finding.kind, finding.severity, finding.summary))
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn oversized_text_straddling_the_prefix_is_still_scan_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // U+00E9 is two bytes (C3 A9) at bytes 8191 and 8192, so the first 8192 bytes end inside it. The file is valid
+        // UTF-8 and over the cap: it must stay one scan-incomplete finding, not be skipped as binary.
+        let mut body = "x".repeat(8191);
+        body.push('é');
+        body.push_str(&"a = 1\n".repeat(350_000));
+        assert!(body.len() as u64 > MAX_SCAN_BYTES);
+        assert!(std::str::from_utf8(&body.as_bytes()[..8192]).is_err());
+        std::fs::write(dir.path().join("big.py"), &body).expect("write big.py");
+        let found = scan(dir.path()).expect("scan");
+        let incomplete: Vec<&str> = found
+            .findings
+            .iter()
+            .filter(|finding| finding.summary.starts_with("scan-incomplete:"))
+            .filter_map(|finding| finding.location.as_deref())
+            .collect();
+        assert_eq!(
+            incomplete,
+            vec!["big.py"],
+            "expected one scan-incomplete finding naming big.py"
         );
     }
 }
