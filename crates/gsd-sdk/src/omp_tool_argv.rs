@@ -25,6 +25,10 @@ const ASSIGNMENT_HEADING: &str = "# task.assign (signed envelope)\n```json\n";
 /// Error text for an input object that is not a tool call (`tools.ts:495`).
 const CALL_SHAPE_MESSAGE: &str = "swarm_tool_call requires a tool name and an input object";
 
+/// Seconds the bridge deadline adds on top of the quality gate's runner `--timeout` for cleanup
+/// (`tools.ts:445-446`). Matches the 60 s margin in [`QA_GATE_TIMEOUT_MS`].
+const QA_GATE_MARGIN_S: u64 = 60;
+
 /// Frozen vector records replayed by this module (`tests/omp_contract/vectors.json`).
 pub const VECTOR_IDS: &[&str] = &[
     "A-ROOT-ARG",
@@ -201,12 +205,16 @@ pub fn gate_args(
     correlation_id: &str,
     per_target_findings: Option<&str>,
     dry_run: bool,
+    timeout_s: Option<u64>,
 ) -> Vec<String> {
     let mut args = vec![
         root_arg(root),
         format!("--task-id={task_id}"),
         format!("--correlation-id={correlation_id}"),
     ];
+    if let Some(n) = timeout_s {
+        args.push(format!("--timeout={n}"));
+    }
     if let Some(file) = per_target_findings {
         args.push(format!("--per-target-findings={file}"));
     }
@@ -216,10 +224,17 @@ pub fn gate_args(
     args
 }
 
-/// The bridge timeout for a gate: `QA_GATE_TIMEOUT_MS` for `quality`, the bridge default otherwise
-/// (`tools.ts:426`).
-pub fn gate_timeout_ms(gate: &str) -> Option<u64> {
-    (gate == "quality").then_some(QA_GATE_TIMEOUT_MS)
+/// The bridge timeout for a gate. For `quality` it is `QA_GATE_TIMEOUT_MS` by default, or the
+/// runner `timeout_s` plus [`QA_GATE_MARGIN_S`] when set. Other gates have no bridge timeout
+/// (`tools.ts:426-446`).
+pub fn gate_timeout_ms(gate: &str, timeout_s: Option<u64>) -> Option<u64> {
+    if gate != "quality" {
+        return None;
+    }
+    Some(match timeout_s {
+        None => QA_GATE_TIMEOUT_MS,
+        Some(n) => n.saturating_add(QA_GATE_MARGIN_S).saturating_mul(1000),
+    })
 }
 
 /// The `swarm_tool` argv for `swarm_catalog` (`tools.ts:462-464`). `kind` and `query` are sent
@@ -837,11 +852,11 @@ mod tests {
     #[test]
     fn gate_orders_findings_before_dry_run() {
         assert_eq!(
-            gate_args(ROOT, "T-1", "corr", None, false),
+            gate_args(ROOT, "T-1", "corr", None, false, None),
             s(&["--root=/repo", "--task-id=T-1", "--correlation-id=corr"])
         );
         assert_eq!(
-            gate_args(ROOT, "T-1", "corr", Some("/f.json"), true),
+            gate_args(ROOT, "T-1", "corr", Some("/f.json"), true, None),
             s(&[
                 "--root=/repo",
                 "--task-id=T-1",
@@ -861,11 +876,38 @@ mod tests {
 
     #[test]
     fn gate_timeout_is_the_qa_timeout_for_quality_only() {
-        assert_eq!(gate_timeout_ms("quality"), Some(1_860_000));
-        assert_eq!(gate_timeout_ms("review"), None);
-        assert_eq!(gate_timeout_ms("security"), None);
-        assert_eq!(gate_timeout_ms("release"), None);
+        assert_eq!(gate_timeout_ms("quality", None), Some(1_860_000));
+        assert_eq!(gate_timeout_ms("review", None), None);
+        assert_eq!(gate_timeout_ms("security", None), None);
+        assert_eq!(gate_timeout_ms("release", None), None);
         records_exist(&["A-GATE-07"]);
+    }
+
+    /// SDK-02: `timeout_s` (the quality gate's runner budget, `tools.ts:440`) becomes `--timeout=<n>` after `--correlation-id`, and the
+    /// bridge deadline grows to `(timeout_s + 60)` seconds (`tools.ts:445-446`). `gate_args` takes `timeout_s` as its last parameter.
+    #[test]
+    fn gate_args_quality_timeout_s_emits_flag_and_extends_deadline() {
+        assert_eq!(
+            gate_args(ROOT, "T-1", "corr", None, false, Some(3600)),
+            s(&[
+                "--root=/repo",
+                "--task-id=T-1",
+                "--correlation-id=corr",
+                "--timeout=3600",
+            ])
+        );
+        assert_eq!(
+            gate_args(ROOT, "T-1", "corr", Some("/f.json"), true, Some(3600)),
+            s(&[
+                "--root=/repo",
+                "--task-id=T-1",
+                "--correlation-id=corr",
+                "--timeout=3600",
+                "--per-target-findings=/f.json",
+                "--dry-run",
+            ])
+        );
+        assert_eq!(gate_timeout_ms("quality", Some(3600)), Some(3_660_000));
     }
 
     #[test]
