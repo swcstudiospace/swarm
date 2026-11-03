@@ -10,8 +10,8 @@
 
 import { invoke as guestInvoke } from "./generated/gsd-core.js";
 
-/** The deepest value the wire's snapshot parser accepts (crates/gsd-route/src/lib.rs MAX_JSON_DEPTH). The root is depth 0 and scalars count, as they do in the parser. */
-export const MAX_DEPTH = 128;
+/** The deepest value the browser loader accepts: the approved read-route depth limit (32). It is tighter than the server's snapshot parser (crates/gsd-route/src/lib.rs MAX_JSON_DEPTH, 128). The root is depth 0 and scalars count, as they do in the parser. */
+export const MAX_DEPTH = 32;
 
 /** The request keys the wire accepts. `history` is present only in history mode. */
 export const REQUEST_KEYS = Object.freeze([

@@ -20,8 +20,8 @@ export interface Snapshot {
   history?: { task_id: string; task: unknown; transitions: unknown[] };
 }
 
-/** The deepest value the loader accepts: the wire's snapshot parser limit, with the root at depth 0 and scalars counted. */
-export const MAX_DEPTH: 128;
+/** The deepest value the loader accepts: the approved read-route depth limit, tighter than the wire's snapshot parser limit (128). The root is at depth 0 and scalars count. */
+export const MAX_DEPTH: 32;
 
 /** The request keys the wire accepts, in the order the loader writes them. */
 export const REQUEST_KEYS: readonly string[];

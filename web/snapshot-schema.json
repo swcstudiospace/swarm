@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "agent-swarm/web/snapshot-schema.json",
   "title": "orch_status read-route snapshot",
-  "description": "The request fields the orch_status wire accepts (crates/gsd-route orch_status_wire.rs). The loader rejects any other key, a missing required key, or a value nested deeper than 128 (the root is depth 0).",
+  "description": "The request fields the orch_status wire accepts (crates/gsd-route orch_status_wire.rs). The loader rejects any other key, a missing required key, or a value nested deeper than 32 (the root is depth 0).",
   "type": "object",
   "additionalProperties": false,
   "required": ["mode", "agent", "script", "correlation", "db_path", "swarm_dir", "events", "tasks", "verdicts"],
@@ -26,5 +26,5 @@
       }
     }
   },
-  "x-max-depth": 128
+  "x-max-depth": 32
 }
