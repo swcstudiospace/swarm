@@ -1479,11 +1479,11 @@ fn a_budget_inside_the_reserve_is_timeout_and_one_before_it_calls_the_guest() {
 #[test]
 fn a_guest_that_spends_the_deadline_ends_the_call_as_timeout_with_no_failover() {
     let secs = Duration::from_secs;
-    // Each case backdates its call by `age`, which leaves the guest `18 s - age` of its own budget when it is called: three seconds, so
+    // Each case backdates its call by `age`, which leaves the guest `18 s - age` of its own budget when it is called: eight seconds, so
     // a host that needs seconds to open the store (load 40 to 150 here) still reaches the call with budget left. The guest then waits
     // until the offset the case aims at, counted from the start of the call, whatever the host's delay was. The guest's budget is 18 s
     // and the call deadline 20 s: 19 s is inside the reserve, 20.5 s is after the deadline.
-    let age = secs(15);
+    let age = secs(10);
     let cases = [
         ("stopped inside the reserve", 19.0, ErrorCode::Timeout),
         ("stopped after the call deadline", 20.5, ErrorCode::Timeout),
@@ -1810,7 +1810,8 @@ impl Probe {
             scope
                 .spawn(|| {
                     block(async {
-                        let contender = writer(&self.path, Duration::from_millis(300)).await;
+                        // A held lock waits out the whole busy timeout: long enough that a loaded host's open never gives up first.
+                        let contender = writer(&self.path, Duration::from_secs(5)).await;
                         let free = contender.store().begin().await.map(drop).is_ok();
                         contender.close().await;
                         free
