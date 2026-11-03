@@ -591,10 +591,11 @@ describe("HOOK-02", () => {
     // reference; the WR-09 backtracking class costs ~1000x or more, so a 40x
     // cap catches a genuine regression decisively with wide headroom. No
     // absolute wall-clock bound is asserted. The { timeout } above is a
-    // runaway budget, not a correctness assertion: a genuine superlinear hang
-    // still fails fast (via the ratio or the timeout) instead of hanging CI,
-    // and normal runs never approach it. Best-of-3 keeps the full-suite cost
-    // at ~2-4s even under contention from the ~1400 preceding tests.
+    // runaway budget, not a correctness assertion, and it is not headroom
+    // over a fast test: the 1 MB reference inputs dominate, and the
+    // differential leg plus the fresh-process scaling probe take one to
+    // three minutes under host load. A genuine superlinear hang still fails
+    // (via the ratio or the budget) instead of hanging CI.
     const LINEAR_CAP = 40;
     const REPS = 3;
     const BENIGN_UNIT = "git status ; ";
