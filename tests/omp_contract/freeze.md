@@ -514,3 +514,8 @@ Each id below is a `vectors.json` record of kind `constant` (ids `S-*`). The Rus
 Not pinned here: the multi-line `DEPTH_REASON` and the `/swarm` dispatch prompt bodies, which are large template literals with computed parts.
 
 **Addendum (2026-11-02, lanes merge `135d12b`).** The QA-gate lane changed `omp/src/tools.ts`: the QA timeout is now `QA_GATE_TIMEOUT_S = 1800` and `QA_GATE_CLEANUP_S = 60` (lines 43 to 44), and the per-call timeout is computed at lines 445 to 447 for the `quality` gate only. Records `C-QA-GATE-TIMEOUT-MS-01` and `A-GATE-07` were re-spelled to match; `QA_GATE_CLEANUP_S` is not a separate record, which keeps the 211-record count the replay test pins. The rest of this snapshot's line numbers are as read before the merge; `test_vectors_replay.py` is the authority for current citations.
+
+**Addendum (2026-11-02, correction pass).**
+- OSA-02 is reverted. `omp/src/bridge.ts` is back to its frozen form: a child stopped by timeout is E-TIMEOUT even when it exited 0 with JSON, and the row "stopped by timeout → E-TIMEOUT (`bridge.ts:172`)" and the §7 rule "a cancelled or timed-out child never returns success" hold again. Changing that contract needs an explicit decision; it is recorded in the audit status decision list, not applied.
+- The OSA-01 fix adds the RULES row `unjudged-substitution` after `nested-shell-depth` in `omp/src/guard.ts`, which moved the guard lines six records cite. They now cite `guard.ts:2965` (S-RULE-ID-01), `2978` (-02), `2994` (-03), `3016` (-04), `3047` (-05) and `3097` (-06). The record count stays 211.
+- `tests/omp_contract/test_vectors_replay.py` passes on this tree.

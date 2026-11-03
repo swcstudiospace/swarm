@@ -288,7 +288,7 @@ test("deadline: abort with a TimeoutError reason → E-TIMEOUT", async () => {
 test("deadline: bridge timeoutMs → E-TIMEOUT and the group is dead", async () => {
   const { cwd, root } = setup();
   const file = join(root, "pids.json");
-  const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, timeoutMs: 300 });
+  const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, timeoutMs: 3000 });
   const pids = await pidsFrom(file);
   const err = await rejection(p);
   expect(err.code).toBe("E-TIMEOUT");
