@@ -323,7 +323,10 @@ mod tests {
     #[test]
     fn qa_gate_timeout_is_one_million_eight_hundred_sixty_thousand_ms() {
         assert_eq!(QA_GATE_TIMEOUT_MS, 1_860_000);
-        assert_eq!(spelled("C-QA-GATE-TIMEOUT-MS-01"), "1800 + 60");
+        assert_eq!(
+            spelled("C-QA-GATE-TIMEOUT-MS-01"),
+            "QA_GATE_TIMEOUT_S = 1800"
+        );
         assert_eq!(spelled("C-QA-GATE-TIMEOUT-MS-02"), "* 1000");
     }
 
