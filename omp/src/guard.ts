@@ -364,6 +364,8 @@ export interface Segment {
   cwd: string | undefined;
   /** Set past MAX_LITERAL_DEPTH on a segment whose shell body (`sh -c`, su/trap/alias/env -S) is not unwrapped: nothing judges it. */
   unjudged?: true;
+  /** Set when a substitution stayed uncut past the cut cap: nothing judges its text, so the unjudged-substitution rule refuses it. */
+  uncut?: true;
 }
 type Matcher = (seg: Segment, facts: GuardFacts, command: string) => boolean;
 
@@ -750,6 +752,8 @@ interface Normalized {
   substitution?: boolean;
   /** Set past MAX_LITERAL_DEPTH on an item whose shell body is not unwrapped (see Segment.unjudged). */
   unjudged?: true;
+  /** Set on every item of a level whose text keeps a substitution past the cut cap (see Segment.uncut). */
+  uncut?: true;
 }
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
@@ -796,11 +800,16 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
   let rest = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
   const first = cuts.length;
   const sub = /\$\(([^()]*)\)|`([^`]*)`/;
-  for (let m = sub.exec(rest), n = 0; m !== null && n < 256 && cuts.length < MAX_CUTS; m = sub.exec(rest), n++) {
+  let n = 0;
+  for (let m = sub.exec(rest); m !== null && n < 256 && cuts.length < MAX_CUTS; m = sub.exec(rest), n++) {
     const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
     cuts.push(m[1] ?? m[2] ?? "");
     rest = `${rest.slice(0, m.index)}${marker}${rest.slice(m.index + m[0].length)}`;
   }
+  // OSA-01: past the cut cap a substitution left in the text is unjudged: every item of this level is refused.
+  // The cut loop ends on no match (none left) or on a cap, so the cap state alone says whether one was left. Exactly
+  // 256 cuts also refuse, which is fail-closed (a 257th may follow unseen). Constant time per level.
+  const uncut = n >= 256 || cuts.length >= MAX_CUTS;
   const items: Normalized[] = [];
   const attached = new Set<number>();
   /** The bodies of the substitutions `text` holds, normalized, as payload of `item`. */
@@ -860,7 +869,7 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     const runtime = info?.runtime;
     if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
     const opaque = /(?:^|\s)(?:\u0001[\uE000-\uF8FF])+(?:\s|$)/.test(prefix);
-    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn, ...(unjudged ? { unjudged: true as const } : {}) };
+    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn, ...(unjudged ? { unjudged: true as const } : {}), ...(uncut ? { uncut: true as const } : {}) };
     attach(item, `${prefix} ${seg} ${piece.body ?? ""}`);
     items.push(item);
     pipeIn = piece.end === "|" || (pipeIn && seg === "" && (piece.end === "(" || piece.end === "{"));
@@ -981,7 +990,7 @@ const REDIRECT_WORD = new RegExp(`^${REDIRECT_OP}`);
  * scan reads their targets from `marked`), unquoted brace lists expanded (`{touch,.swarm/x}`, `cp a{,.bak}`) and
  * run-time operands marked CUT; `cwd` is set by the caller.
  */
-function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque" | "piped" | "unjudged">): Segment {
+function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque" | "piped" | "unjudged" | "uncut">): Segment {
   const all: string[] = [];
   const raw = shellWords(item.text);
   for (let i = 0; i < raw.length; i++) {
@@ -1004,7 +1013,7 @@ function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "op
   // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
   const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
   const text = item.text.replace(CUT_TOKEN, " ").trim();
-  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix, ...(item.unjudged ? { unjudged: true as const } : {}) };
+  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix, ...(item.unjudged ? { unjudged: true as const } : {}), ...(item.uncut ? { uncut: true as const } : {}) };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -3461,6 +3470,13 @@ export const RULES: readonly Rule[] = [
     capability: "eval",
     pattern: (seg) => seg.unjudged === true,
     samples: [String.raw`sh -c "sh -c \"sh -c \\\"sh -c 'echo nested'\\\"\""`],
+  },
+  // OSA-01: a substitution the cut cap left in the text is unjudged: the call is refused, not judged as if complete
+  {
+    id: "unjudged-substitution",
+    capability: "eval",
+    pattern: (seg) => seg.uncut === true,
+    samples: ["$(:) ".repeat(257) + "echo x"],
   },
 ];
 

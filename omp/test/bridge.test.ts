@@ -47,10 +47,10 @@ open(out + ".tmp", "w").write(json.dumps({"child": os.getpid(), "grandchild": gc
 os.replace(out + ".tmp", out)
 time.sleep(60)
 `,
-  // exits 0 at once while a short-lived grandchild keeps stdout open
+  // exits 0 at once with valid JSON while a same-group grandchild sleeps 30 s holding stdout (OSA-02)
   fx_linger: `import json, os, subprocess, sys
 out = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--pids="))
-gc = subprocess.Popen(["sleep", "5"])
+gc = subprocess.Popen(["sleep", "30"])
 open(out + ".tmp", "w").write(json.dumps({"child": os.getpid(), "grandchild": gc.pid}))
 os.replace(out + ".tmp", out)
 print('{"status": "ok"}')
@@ -288,7 +288,7 @@ test("deadline: abort with a TimeoutError reason → E-TIMEOUT", async () => {
 test("deadline: bridge timeoutMs → E-TIMEOUT and the group is dead", async () => {
   const { cwd, root } = setup();
   const file = join(root, "pids.json");
-  const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, timeoutMs: 300 });
+  const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, timeoutMs: 3000 });
   const pids = await pidsFrom(file);
   const err = await rejection(p);
   expect(err.code).toBe("E-TIMEOUT");
@@ -364,4 +364,13 @@ test("sweep: a session's shutdown group-kills only its own in-flight children (W
   b.handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
   expect((await rejection(b.call)).code).toBe("E-INTERNAL");
   await expectGroupDead(pidsB);
+});
+
+test("OSA-02: a valid exit-0 JSON result is returned, not E-TIMEOUT, when a same-group child holds stdout past the deadline", async () => {
+  const { cwd, root } = setup();
+  const file = join(root, "pids-linger.json");
+  const res = await runScript({ script: "fx_linger", args: [`--pids=${file}`], cwd, timeoutMs: 300 });
+  expect(res.exitCode).toBe(0);
+  expect(res.json).toEqual({ status: "ok" });
+  await expectGroupDead(await pidsFrom(file));
 });

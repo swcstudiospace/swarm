@@ -683,6 +683,13 @@ describe("HOOK-02", () => {
     expect((run(bash(`rm -rf ${tmpdir()}`), a05) as { reason?: string }).reason).toEndWith(": rm-rf-protected)");
   });
 
+  test("OSA-01: a substitution past the 256-per-level cut cap is still judged, never left in the command text", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const a05 = agentCtx(CWD, B05, [], false);
+    const res = run(bash("$(:) ".repeat(257) + "`rm -rf /etc -f`"), a05) as { block?: boolean };
+    expect(res?.block).toBe(true);
+  });
+
   /** WR-08: read-only kubectl/helm forms and markers that only occur in file or resource names pass for A11. */
   test.each([
     "kubectl rollout status deploy/api -n production",
