@@ -11,11 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gsd_envelope::KeyMaterial;
 use gsd_failure::ErrorCode;
-use gsd_route::{is_safe_id, jstr, to_python_json, Json, Reply, SeamError};
+use gsd_route::{is_safe_id, jstr, parse_json, to_python_json, Json, Reply, SeamError};
 use gsd_taskwriter::{
     open_for_write, GateIssueRequest, GatePlan, SystemIds, TaskStoreWriter, WriteState,
     WriterConfig, WriterError,
 };
+use rustix::io::Errno;
 use serde_json::Value;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Row};
@@ -229,12 +230,61 @@ fn finding(
     ])
 }
 
-fn read_freeze(path: &Path) -> Option<Value> {
-    if !path.exists() {
-        return None;
+/// Whether a freeze file is present. ENOENT, ENOTDIR and ELOOP mean the path names no file; any other stat error is
+/// returned, so the caller reads the freeze as active rather than absent.
+fn freeze_present(path: &Path) -> std::io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) => match Errno::from_io_error(&error) {
+            Some(errno)
+                if errno == Errno::NOENT || errno == Errno::NOTDIR || errno == Errno::LOOP =>
+            {
+                Ok(false)
+            }
+            _ => Err(error),
+        },
     }
-    fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok())
-        .or_else(|| Some(serde_json::json!({"reason": "unreadable freeze file", "frozen_at": null, "by": "unknown"})))
+}
+
+/// The freeze record at `path`, or `None` when no freeze file is present. A file that cannot be statted is an active
+/// freeze with an unreadable record.
+fn read_freeze(path: &Path) -> Option<Json> {
+    match freeze_present(path) {
+        Ok(false) => None,
+        Ok(true) => Some(
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|text| parse_json(&text).ok())
+                .unwrap_or_else(unreadable_freeze),
+        ),
+        Err(_) => Some(unreadable_freeze()),
+    }
+}
+
+fn unreadable_freeze() -> Json {
+    Json::Obj(vec![
+        ("reason".into(), jstr("unreadable freeze file")),
+        ("frozen_at".into(), Json::Null),
+        ("by".into(), jstr("unknown")),
+    ])
+}
+
+fn freeze_field<'a>(record: &'a Json, key: &str) -> Option<&'a Json> {
+    match record {
+        Json::Obj(fields) => fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value),
+        _ => None,
+    }
+}
+
+/// Records one task's entry, replacing an earlier entry for the same id as Python's dict does.
+fn put_task(tasks: &mut Vec<(String, Json)>, id: &str, entry: Json) {
+    match tasks.iter_mut().find(|(known, _)| known == id) {
+        Some(slot) => slot.1 = entry,
+        None => tasks.push((id.to_string(), entry)),
+    }
 }
 
 struct TaskRow {
@@ -365,7 +415,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
             ))
         })?;
     }
-    if args.unfreeze && freeze_path.exists() {
+    if args.unfreeze && matches!(freeze_present(&freeze_path), Ok(true)) {
         fs::remove_file(&freeze_path).ok();
     }
     let frozen = read_freeze(&freeze_path);
@@ -373,6 +423,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
     let mut risk = "low".to_string();
     let mut artifacts = Vec::new();
     let mut per_task = Vec::new();
+    let mut tasks: Vec<(String, Json)> = Vec::new();
     if ids.is_empty() {
         findings.push(finding(
             "RF-000",
@@ -394,6 +445,17 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                     "",
                     "A01",
                 ));
+                put_task(
+                    &mut tasks,
+                    tid,
+                    Json::Obj(vec![
+                        ("gates".into(), Json::Obj(vec![])),
+                        ("verdicts".into(), Json::Obj(vec![])),
+                        ("required".into(), Json::Arr(vec![])),
+                        ("overall".into(), jstr("fail")),
+                        ("problems".into(), Json::Arr(vec![jstr("task:unknown")])),
+                    ]),
+                );
             }
             Some(task) => {
                 if task.notes.get("gate").is_some() {
@@ -449,15 +511,50 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                 if artifacts.is_empty() && task.risk != "low" {
                     findings.push(finding(&format!("RF-{:03}", findings.len() + 1), "minor", "provenance", &format!("{tid}: no build.artifact registered — A11 provenance required before promote"), "", "A11"));
                 }
+                let problems: Vec<String> = required
+                    .iter()
+                    .map(|gate| format!("{gate}:absent"))
+                    .collect();
+                let absent = Json::Obj(
+                    required
+                        .iter()
+                        .map(|gate| (gate.clone(), jstr("absent")))
+                        .collect(),
+                );
+                put_task(
+                    &mut tasks,
+                    tid,
+                    Json::Obj(vec![
+                        ("state".into(), jstr(&task.state)),
+                        ("risk_class".into(), jstr(&task.risk)),
+                        (
+                            "required".into(),
+                            Json::Arr(required.iter().map(|gate| jstr(gate)).collect()),
+                        ),
+                        ("gates".into(), absent.clone()),
+                        ("verdicts".into(), absent),
+                        (
+                            "overall".into(),
+                            jstr(if problems.is_empty() { "pass" } else { "fail" }),
+                        ),
+                        (
+                            "problems".into(),
+                            Json::Arr(problems.iter().map(|problem| jstr(problem)).collect()),
+                        ),
+                        ("expired".into(), Json::Arr(Vec::new())),
+                    ]),
+                );
                 per_task.push((tid.clone(), task.state, task.risk, required));
             }
         }
     }
     if let Some(frozen) = &frozen {
-        let reason = frozen.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-        let since = frozen
-            .get("frozen_at")
-            .map(|v| v.to_string())
+        let reason = match freeze_field(frozen, "reason") {
+            Some(Json::Str(text)) => text.as_str(),
+            _ => "",
+        };
+        let since = freeze_field(frozen, "frozen_at")
+            .map(to_python_json)
             .unwrap_or_else(|| "null".into());
         findings.push(finding(
             &format!("RF-{:03}", findings.len() + 1),
@@ -607,9 +704,9 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
         ),
         ("verdict".into(), jstr(&verdict)),
         ("frozen".into(), Json::Bool(frozen.is_some())),
-        ("freeze".into(), Json::Null),
+        ("freeze".into(), frozen.clone().unwrap_or(Json::Null)),
         ("release_id".into(), jstr(&release_id)),
-        ("tasks".into(), Json::Obj(vec![])),
+        ("tasks".into(), Json::Obj(tasks)),
         ("findings".into(), Json::Arr(findings)),
         ("summary".into(), jstr(&summary)),
         ("agent".into(), jstr("A12")),
@@ -723,7 +820,8 @@ fn write_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{committed, issue_gate_refusal, parse, write_files};
+    use super::{answer, committed, issue_gate_refusal, parse, read_freeze, write_files};
+    use crate::strangler_seam::Invocation;
     use gsd_envelope::{KeyFilePresence, KeyMaterial};
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
@@ -916,5 +1014,203 @@ mod tests {
         write_files(dir.path(), &plan, true, "R-1", "{}").expect("both files land");
         assert!(dir.path().join("verdicts/T-G.release.json").is_file());
         assert!(dir.path().join("releases/R-1.plan.json").is_file());
+    }
+
+    fn field<'a>(value: &'a Json, key: &str) -> Option<&'a Json> {
+        let Json::Obj(fields) = value else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, item)| item)
+    }
+
+    const CHILD_OUT: &str = "GSD_REL_PLAN_CHILD_OUT";
+    const CHILD_ROOT: &str = "GSD_REL_PLAN_CHILD_ROOT";
+    const CHILD_SWARM: &str = "GSD_REL_PLAN_CHILD_SWARM";
+    const CHILD_ARGV: &str = "GSD_REL_PLAN_CHILD_ARGV";
+    const CHILD_TEST: &str = "gates::rel_plan::tests::child_answers_one_call";
+
+    /// `answer` resolves its signing keys from the process environment, and this test process must not be written. The call
+    /// therefore runs in a child test process whose own environment carries the insecure dev key and an empty config home.
+    /// Returns the exit code and the parsed reply.
+    fn answer_in_child(
+        root: &std::path::Path,
+        swarm: &std::path::Path,
+        argv: &[&str],
+    ) -> (i32, Json) {
+        let out = root.join("child-reply.txt");
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD_OUT, &out)
+            .env(CHILD_ROOT, root)
+            .env(CHILD_SWARM, swarm)
+            .env(CHILD_ARGV, argv.join("\n"))
+            .env("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env_remove("SWARM_ED25519_KEY")
+            .env_remove("SWARM_SIGNING_KEY")
+            .env_remove("SWARM_ED25519_KEY_FILE")
+            .env_remove("SWARM_REQUIRE_KEY")
+            .env_remove("SWARM_AGENT_SESSION")
+            .env_remove("SWARM_DRYRUN_FAIL")
+            .status()
+            .expect("the child test process starts");
+        assert!(
+            status.success(),
+            "the child test process failed: {status:?}"
+        );
+        let text = std::fs::read_to_string(&out).expect("the child wrote its reply");
+        if let Some(reason) = text.strip_prefix("refused: ") {
+            panic!("rel_plan refused the call: {reason}");
+        }
+        let (code, stdout) = text.split_once('\n').expect("an exit code line");
+        let code: i32 = code.parse().expect("an integer exit code");
+        let body = gsd_route::parse_json(stdout).expect("stdout is one JSON object");
+        (code, body)
+    }
+
+    /// The child half of [`answer_in_child`]. It runs only when the parent names an output file, so the ordinary run passes it
+    /// at once.
+    #[test]
+    fn child_answers_one_call() {
+        let Some(out) = std::env::var_os(CHILD_OUT) else {
+            return;
+        };
+        let var = |name: &str| std::env::var(name).expect("the parent sets the call");
+        let call = Invocation {
+            agent: "A12".into(),
+            script: "rel_plan".into(),
+            argv: var(CHILD_ARGV).split('\n').map(str::to_string).collect(),
+            root: var(CHILD_ROOT).into(),
+            env: vec![("SWARM_DIR".into(), var(CHILD_SWARM))],
+            deadline: std::time::Duration::from_secs(60),
+            effects_path: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let text = match runtime.block_on(answer(&call)) {
+            Ok(reply) => format!("{}\n{}", reply.exit_code, reply.stdout),
+            Err(error) => format!("refused: {}", error.message()),
+        };
+        std::fs::write(out, text).expect("write the reply");
+    }
+
+    fn running_as_root() -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self")
+            .map(|meta| meta.uid() == 0)
+            .unwrap_or(false)
+    }
+
+    /// Restores a directory's mode when the test ends, so the tempdir can be removed.
+    struct Reopen(std::path::PathBuf);
+
+    impl Drop for Reopen {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn absent_freeze_file_is_no_freeze() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_freeze(&dir.path().join("release.freeze")).is_none());
+    }
+
+    #[test]
+    fn freeze_path_under_a_regular_file_is_no_freeze() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), "not a directory").expect("write");
+        assert!(read_freeze(&dir.path().join("plain").join("release.freeze")).is_none());
+    }
+
+    #[test]
+    fn freeze_path_that_loops_is_no_freeze() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path().join("b"), dir.path().join("a")).expect("symlink");
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("b")).expect("symlink");
+        assert!(read_freeze(&dir.path().join("a")).is_none());
+    }
+
+    /// ADG-07: a freeze file whose stat fails with EACCES is an active freeze, not an absent one. The freeze file is a symlink
+    /// into a directory this process cannot search, so `.swarm` stays writable for the verdict files. A `.swarm` of mode 000
+    /// would fail the verdict write itself, and no reply could carry the blocker.
+    #[test]
+    fn unstatable_freeze_file_is_an_active_freeze() {
+        if running_as_root() {
+            eprintln!("skipped: root searches a mode 000 directory, so EACCES cannot occur");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let swarm = dir.path().join(".swarm");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&swarm).expect("swarm dir");
+        std::fs::create_dir_all(&locked).expect("locked dir");
+        std::fs::write(
+            locked.join("release.freeze.json"),
+            r#"{"reason": "launch freeze", "frozen_at": null, "by": "A13"}"#,
+        )
+        .expect("freeze record");
+        std::os::unix::fs::symlink(
+            locked.join("release.freeze.json"),
+            swarm.join("release.freeze"),
+        )
+        .expect("symlink");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let _reopen = Reopen(locked.clone());
+        let (code, body) = answer_in_child(dir.path(), &swarm, &["--json", "--root", "."]);
+        let Some(Json::Arr(findings)) = field(&body, "findings") else {
+            panic!("the reply carries a findings array: {body:?}");
+        };
+        let blocker = findings.iter().any(|item| {
+            matches!(
+                (field(item, "kind"), field(item, "severity")),
+                (Some(Json::Str(kind)), Some(Json::Str(severity)))
+                    if kind == "freeze" && severity == "blocker"
+            )
+        });
+        assert!(
+            blocker,
+            "an unstatable freeze file must add a blocker freeze finding; findings: {findings:?}"
+        );
+        assert_ne!(code, 0, "an active freeze fails the verdict");
+    }
+
+    /// ADG-06: the reply carries the freeze record and one entry per task, as Python's reply does.
+    #[tokio::test]
+    async fn rel_plan_reply_carries_the_freeze_record_and_task_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let swarm = dir.path().join(".swarm");
+        std::fs::create_dir_all(&swarm).expect("swarm dir");
+        let _db = seeded_store(&swarm, &[]).await;
+        let (_code, body) = answer_in_child(
+            dir.path(),
+            &swarm,
+            &[
+                "--json",
+                "--root",
+                ".",
+                "--task-ids",
+                "T-1",
+                "--freeze",
+                "launch freeze",
+            ],
+        );
+        let freeze = field(&body, "freeze");
+        assert!(
+            matches!(freeze, Some(Json::Obj(_))),
+            "an active freeze is reported as its record; freeze: {freeze:?}"
+        );
+        let tasks = field(&body, "tasks");
+        assert!(
+            matches!(tasks, Some(Json::Obj(entries)) if entries.iter().any(|(id, _)| id == "T-1")),
+            "tasks maps each identified task; tasks: {tasks:?}"
+        );
     }
 }

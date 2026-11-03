@@ -866,17 +866,13 @@ async fn answer_with_keys<E>(
                     tail: tail.clone(),
                     evidence_complete: node.as_ref().map(|e| e.complete),
                 });
-                if tiers.iter().any(|tier| tier == "unit") {
-                    if let Some(slot) = runs.iter_mut().find(|(name, _)| name == "unit") {
-                        slot.1 = jstr(if ok { "pass" } else { "fail" });
-                    }
-                }
-                if tiers.iter().any(|tier| tier == "integration") {
-                    if let Some(slot) = runs.iter_mut().find(|(name, value)| {
-                        name == "integration"
-                            && matches!(value, Json::Str(text) if text.starts_with("skipped"))
-                    }) {
-                        slot.1 = jstr(if ok { "pass" } else { "fail" });
+                // A later passing runner must never overwrite an earlier tier failure (scripts/qa_gate.py).
+                for tier in ["unit", "integration"] {
+                    if tiers.iter().any(|item| item == tier) {
+                        if let Some(slot) = runs.iter_mut().find(|(name, _)| name == tier) {
+                            let failed = !ok || slot.1 == jstr("fail");
+                            slot.1 = jstr(if failed { "fail" } else { "pass" });
+                        }
                     }
                 }
                 if !ok {
@@ -1658,5 +1654,77 @@ esac
             .iter()
             .find(|(name, _)| name == key)
             .map(|(_, item)| item)
+    }
+
+    /// ADG-08: a failing runner in the unit tier makes `runs.unit` fail, whichever runner runs last. The fixture runs a failing
+    /// pytest (a stand-in interpreter) and then a passing `npm test`. It is skipped when `npm` is not on PATH, because the npm
+    /// runner is then absent and the case cannot arise.
+    #[test]
+    fn unit_tier_reports_fail_when_any_runner_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let npm_on_path = std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("npm").is_file()));
+        if !npm_on_path {
+            eprintln!("skipped: npm is not on PATH, so the npm test runner is absent");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"fixture\"\n",
+        )
+        .expect("write pyproject");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "fixture", "scripts": {"test": "true"}}"#,
+        )
+        .expect("write package.json");
+        let python = dir.path().join("fake-python");
+        std::fs::write(
+            &python,
+            r#"#!/bin/sh
+case "$*" in
+  "-c import pytest") exit 0 ;;
+  *) echo "1 failed in 0.01s"; exit 1 ;;
+esac
+"#,
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Throwaway test value, not a real key: the gate refuses without a signing key. It reaches the gate through the key
+        // seam, and the interpreter through the call's env overlay; the process environment is never written.
+        const THROWAWAY_SIGNING_KEY: &str =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let call = crate::strangler_seam::Invocation {
+            agent: "A08".into(),
+            script: "qa_gate".into(),
+            argv: ["--json", "--root", ".", "--risk-class", "low"]
+                .iter()
+                .map(|item| item.to_string())
+                .collect(),
+            root: dir.path().to_path_buf(),
+            env: vec![("GSD_QA_PYTHON".into(), python.display().to_string())],
+            deadline: std::time::Duration::from_secs(60),
+            effects_path: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let reply = runtime.block_on(super::answer_with_keys(&call, || {
+            KeyMaterial::from_lookup(
+                |name| (name == "SWARM_SIGNING_KEY").then(|| OsString::from(THROWAWAY_SIGNING_KEY)),
+                |_| KeyFilePresence::Absent,
+            )
+        }));
+        let reply = reply.expect("the gate answers");
+        let body = gsd_route::parse_json(&reply.stdout).expect("stdout is one JSON object");
+        let Some(runs) = field(&body, "runs") else {
+            panic!("the reply carries a runs map: {body:?}");
+        };
+        assert!(
+            matches!(field(runs, "unit"), Some(Json::Str(state)) if state == "fail"),
+            "a failing runner must fail the unit tier; runs: {runs:?}"
+        );
     }
 }
