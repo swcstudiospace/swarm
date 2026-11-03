@@ -552,14 +552,16 @@ fn scan_line(patterns: &Patterns, scan: &mut Scan, ext: &str, rel: &str, no: usi
         let Some(captures) = regex.captures(line) else {
             continue;
         };
-        if patterns.placeholder.is_match(line) {
-            continue;
-        }
         let val = if *name == "generic-credential" || *name == "aws-secret-key" {
             captures.get(captures.len() - 1).map_or("", |m| m.as_str())
         } else {
             captures.get(0).map_or("", |m| m.as_str())
         };
+        // The placeholder test runs on the captured value. A placeholder word elsewhere on the line, such as a
+        // comment that says `example`, does not make a real token a placeholder.
+        if patterns.placeholder.is_match(val) {
+            continue;
+        }
         if *name == "generic-credential" && (entropy(val) < 3.2 || is_alpha(val)) {
             continue;
         }
@@ -708,20 +710,6 @@ fn scan(root: &Path) -> Result<Scan, SeamError> {
                 "a file named sec_gate.py may be the script itself; Python answers",
             ));
         }
-        if meta.len() > MAX_SCAN_BYTES {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        if !text.is_ascii() {
-            return Err(decline(
-                "a scanned file holds non-ASCII text; Python answers",
-            ));
-        }
         let relative = path
             .strip_prefix(root)
             .map_err(|_| decline("a scanned path is outside the root; Python answers"))?;
@@ -736,6 +724,33 @@ fn scan(root: &Path) -> Result<Scan, SeamError> {
             parts.push(name);
         }
         let rel = parts.join("/");
+        // An in-scope input over the cap is not read. It is one major `scan-incomplete` finding (AGENTS.md).
+        if meta.len() > MAX_SCAN_BYTES {
+            let mut finding = Finding::plain(
+                fid(&["secrets", "scan-incomplete", rel.as_str()]),
+                "major",
+                "secrets",
+                format!(
+                    "scan-incomplete: scan incomplete, status is fail until every in-scope input is analysed: {rel} is {} bytes, over the {MAX_SCAN_BYTES}-byte scan cap",
+                    meta.len()
+                ),
+                format!("{} bytes exceeds the {MAX_SCAN_BYTES}-byte scan cap; not analysed", meta.len()),
+            );
+            finding.location = Some(rel.clone());
+            scan.findings.push(finding);
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if !text.is_ascii() {
+            return Err(decline(
+                "a scanned file holds non-ASCII text; Python answers",
+            ));
+        }
         let ext = py_suffix(parts.last().copied().unwrap_or(""));
         let translated = text.replace("\r\n", "\n").replace('\r', "\n");
         for (index, line) in py_splitlines(&translated).into_iter().enumerate() {
@@ -1661,7 +1676,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
 mod tests {
     use super::{
         civil_from_days, entropy, fid, has_kev_word, parse_iso_date, patterns, py_splitlines,
-        py_strip, py_suffix, sha1_hex, yaml_unsafe,
+        py_strip, py_suffix, scan, sha1_hex, yaml_unsafe, MAX_SCAN_BYTES,
     };
     use super::{committed, write_plan_file};
     use gsd_failure::ErrorCode;
@@ -1838,5 +1853,55 @@ mod tests {
         let error = write_plan_file(dir.path(), &derived, commits).expect_err("the write fails");
         assert_eq!(write_state(&error), Some("not_started"));
         assert_eq!(error.code(), ErrorCode::Dep);
+    }
+
+    #[test]
+    fn github_token_with_example_comment_is_still_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A live-shaped token (`ghp_` + 36 alphanumerics) followed by a trailing comment. The placeholder test runs
+        // on the whole line, so the comment's word `example` suppresses the token today.
+        std::fs::write(
+            dir.path().join("settings.env"),
+            "TOKEN=\"ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\"  # example\n",
+        )
+        .expect("write");
+        let found = scan(dir.path()).expect("scan");
+        assert!(
+            found.findings.iter().any(|finding| {
+                finding.kind == "secrets"
+                    && finding.severity == "critical"
+                    && finding.summary.starts_with("github-token:")
+                    && finding.location.as_deref() == Some("settings.env:1")
+            }),
+            "no critical secrets finding for the token: {:?}",
+            found
+                .findings
+                .iter()
+                .map(|finding| format!("{}/{}/{}", finding.kind, finding.severity, finding.summary))
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn secret_in_file_over_scan_cap_is_not_silently_passed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The credential is on line 1. The rest pads the file past MAX_SCAN_BYTES, where the walk skips it silently.
+        let mut body = String::from("password = \"Zq3rT8vL2mN5pX7kB1wD\"\n");
+        body.push_str(&"a = 1\n".repeat(350_000));
+        assert!(body.len() as u64 > MAX_SCAN_BYTES);
+        std::fs::write(dir.path().join("big.env"), &body).expect("write");
+        let found = scan(dir.path()).expect("scan");
+        assert!(
+            found.findings.iter().any(|finding| finding
+                .location
+                .as_deref()
+                .is_some_and(|loc| loc.starts_with("big.env"))),
+            "neither a finding nor a skip record names big.env: {:?}",
+            found
+                .findings
+                .iter()
+                .map(|finding| format!("{}/{}/{}", finding.kind, finding.severity, finding.summary))
+                .collect::<Vec<String>>()
+        );
     }
 }
