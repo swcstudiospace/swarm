@@ -169,11 +169,10 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
     ]);
     // D-07: never return after a cancellation — omp would record a half-applied mutation as success.
     if (signal?.aborted) throw abortError(script, signal);
-    // OSA-02: a child that exited 0 with a JSON object finished; a deadline that only reaped a lingering grandchild keeps that result
-    const json = parseObject(stdout);
-    if (stopped === "timeout" && !(code === 0 && json)) throw new SwarmToolError("E-TIMEOUT", `${script} exceeded ${timeoutMs} ms and was killed`);
+    if (stopped === "timeout") throw new SwarmToolError("E-TIMEOUT", `${script} exceeded ${timeoutMs} ms and was killed`);
     if (stopped === "abort") throw new SwarmToolError("E-INTERNAL", `${script} cancelled (omp session shutdown); re-check with swarm_status`);
 
+    const json = parseObject(stdout);
     if (code === 2 && !stdout.trim()) throw new SwarmToolError("E-INPUT", `${script} usage error: ${stderr.trim().slice(-TAIL)}`);
     if (!json) throw new SwarmToolError("E-INTERNAL", `${script} exit ${code}, stdout is not a JSON object: ${(stdout.trim() || stderr.trim()).slice(-TAIL)}`);
     if (code === 0) return { exitCode: 0, json, swarmDir: dir };
