@@ -22,5 +22,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-tokio-test = "0.4"
 proptest = "1.2"

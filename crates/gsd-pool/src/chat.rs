@@ -253,17 +253,20 @@ impl ChatPool {
     /// Opens a live thread with the caller's `id` and the given subagent type. Its message queue
     /// opens with it.
     ///
-    /// Returns [`ChatError::ThreadExists`] while a live thread holds `id`. A live id is refused
-    /// that way even when the cap is also full. Returns [`ChatError::ShuttingDown`] after
-    /// [`ChatPool::shutdown`], checked before capacity, so a closed pool refuses even when every
-    /// live slot is taken. Returns [`ChatError::Capacity`] when `max_threads` live threads
-    /// already exist.
+    /// Returns [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`]. That check comes first, so
+    /// a closed pool refuses even a live id, and even when every live slot is taken. Returns
+    /// [`ChatError::ThreadExists`] while a live thread holds `id`, even when the cap is also full.
+    /// Returns [`ChatError::Capacity`] when `max_threads` live threads already exist.
     ///
     /// A parked id is not live, so it opens as a fresh thread with a new handle. Any warm entry
     /// for that id is discarded before the new thread is registered and created, so its
     /// termination is reported first. A refused call changes nothing.
     pub fn open_thread(&self, id: &str, subagent_type: SubagentType) -> Result<(), ChatError> {
         let _lifecycle = self.lifecycle.lock();
+        // Shutdown is checked before the live-id lookup, so a closed pool changes nothing.
+        if self.runtime.state().is_closed() {
+            return Err(ChatError::ShuttingDown);
+        }
         if self.registry.get(id).is_some() {
             return Err(ChatError::ThreadExists(id.to_string()));
         }
@@ -997,6 +1000,38 @@ mod tests {
             Err(ChatError::ShuttingDown)
         );
         assert_eq!(pool.registry.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn open_thread_after_shutdown_refuses_a_live_id() -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        pool.open_thread("live", kind("w"))?;
+        pool.shutdown(Duration::ZERO);
+        assert_eq!(
+            pool.open_thread("live", kind("w")),
+            Err(ChatError::ShuttingDown)
+        );
+        // The refused call changed nothing: the live thread is still the only one.
+        assert_eq!(pool.registry.len(), 1);
+        assert_eq!(pool.pool.threads.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn open_thread_after_shutdown_leaves_a_parked_entry_in_place() -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        pool.open_thread("p", kind("w"))?;
+        assert_eq!(pool.park("p", Instant::now())?, Placement::Parked);
+        pool.shutdown(Duration::ZERO);
+        assert_eq!(
+            pool.open_thread("p", kind("w")),
+            Err(ChatError::ShuttingDown)
+        );
+        // The refused open discards no warm entry and creates no thread.
+        assert_eq!(pool.pool.warm_len(), 1);
+        assert_eq!(pool.registry.len(), 0);
+        assert_eq!(pool.pool.metrics().created(), 1);
         Ok(())
     }
 
