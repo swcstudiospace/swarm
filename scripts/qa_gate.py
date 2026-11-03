@@ -272,10 +272,18 @@ def run(args, ctx) -> dict:
     # optional coverage (pytest-cov) threshold
     if args.min_coverage and any(e["runner"] == "pytest" for e in executed):
         proc = sh([sys.executable, "-m", "pytest", "-q", "--cov", "--cov-report=term", "-p", "no:cacheprovider"], cwd=ctx.root, timeout=args.timeout)
-        m = re.search(r"TOTAL.*?(\d+)%", proc.stdout)
-        if m and int(m.group(1)) < args.min_coverage:
-            findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "coverage",
-                                         f"coverage {m.group(1)}% < {args.min_coverage}%", owner_suggestion="A05"))
+        out = proc.stdout + proc.stderr
+        m = re.search(r"TOTAL.*?(\d+)%", out)
+        if m:
+            if int(m.group(1)) < args.min_coverage:
+                findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "coverage",
+                                             f"coverage {m.group(1)}% < {args.min_coverage}%", owner_suggestion="A05"))
+        else:
+            findings.append(make_finding(
+                f"QF-{len(findings)+1:03d}", "major", "coverage",
+                f"coverage not measured: no TOTAL percent line in the coverage run; required minimum {args.min_coverage}%; "
+                f"coverage run exit code {proc.returncode}",
+                evidence="\n".join(out.splitlines()[-10:]), owner_suggestion="A05"))
 
     # D-13: the agent's per-target findings join the script's own findings on their target only; a target the
     # agent omits gets the script's findings alone

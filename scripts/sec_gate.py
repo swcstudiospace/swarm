@@ -11,6 +11,7 @@ Finding ids are stable hashes so --allow-list can suppress them with a justifica
 Writes a signed `gate.verdict` (gate=security) to .swarm/verdicts/<task_id>.security.json.
 """
 from __future__ import annotations
+import codecs
 from collections import Counter
 import hashlib
 import json
@@ -50,6 +51,8 @@ IAC_RULES = [(n, re.compile(p), sev) for n, p, sev in (
     ("iac.host-network", r"host(Network|PID|IPC)\s*[:=]\s*true", "major"),
     ("iac.priv-escalation", r"allowPrivilegeEscalation\s*:\s*true|runAsUser\s*:\s*0\b", "minor"))]
 COMMENT_RE = re.compile(r"^\s*(#|//|/\*|\*|--)")
+MAX_SCAN_BYTES = 2_000_000  # an in-scope text file strictly larger than this is not read; it is scan-incomplete
+PREFIX_BYTES = 8192  # bytes read from a file's head to decide it binary before the size check
 AUDITS = [  # (name, manifest globs, binary, command)
     ("pip-audit", ("requirements*.txt", "pyproject.toml"), "pip-audit", ["pip-audit", "--format", "json", "--progress-spinner", "off"]),
     ("npm-audit", ("package-lock.json", "package.json"), "npm", ["npm", "audit", "--json"]),
@@ -65,6 +68,21 @@ def fid(*parts: str) -> str:
     return "SEC-" + hashlib.sha1("|".join(parts).encode()).hexdigest()[:8]
 
 
+def _binary_prefix(path: Path) -> bool:
+    """True when the first PREFIX_BYTES of a file are not UTF-8 with an error that is not an incomplete sequence at the
+    prefix end, which the prefix may have cut. A prefix that cannot be read proves nothing, so the file is not binary."""
+    try:
+        with path.open("rb") as fh:
+            prefix = fh.read(PREFIX_BYTES)
+    except OSError:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
 def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
     findings, seen = [], {"secrets": 0, "sast": 0, "iac": 0}
 
@@ -74,20 +92,34 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
                                      location=loc, ac_ref=cwe, owner_suggestion="A05"))
 
     for p in iter_files(root):
-        if p.resolve() == self_path or p.stat().st_size > 2_000_000:
+        if p.resolve() == self_path:
+            continue
+        if _binary_prefix(p):
+            continue
+        rel, ext = p.relative_to(root).as_posix(), p.suffix
+        size = p.stat().st_size
+        if size > MAX_SCAN_BYTES:
+            # An in-scope text file over the cap is not read: it is one major scan-incomplete finding (AGENTS.md doctrine).
+            findings.append(make_finding(fid("secrets", "scan-incomplete", rel), "major", "secrets",
+                                         f"scan-incomplete: scan incomplete, status is fail until every in-scope input is analysed: {rel} is {size} bytes, over the {MAX_SCAN_BYTES}-byte scan cap",
+                                         evidence=f"{size} bytes exceeds the {MAX_SCAN_BYTES}-byte scan cap; not analysed",
+                                         location=rel))
             continue
         try:
             text = p.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        rel, ext = p.relative_to(root).as_posix(), p.suffix
         for no, line in enumerate(text.splitlines(), 1):
             loc = f"{rel}:{no}"
             for name, rx in SECRET_RULES:
                 m = rx.search(line)
-                if not m or PLACEHOLDER_RE.search(line):
+                if not m:
                     continue
                 val = m.group(m.lastindex) if name in ("generic-credential", "aws-secret-key") else m.group(0)
+                # The placeholder test runs on the captured value. A placeholder word elsewhere on the line, such as a
+                # comment that says `example`, does not make a real token a placeholder.
+                if PLACEHOLDER_RE.search(val):
+                    continue
                 if name == "generic-credential" and (_entropy(val) < 3.2 or val.isalpha()):
                     continue
                 add(name, "critical", "secrets", "credential material committed (value redacted)", loc,

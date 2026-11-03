@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -86,7 +87,10 @@ def collect_changes(root: Path, base: str | None) -> dict[str, dict]:
         elif line.startswith("Binary files") and cur is not None:
             cur["binary"] = True
     skip = {".swarm", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
-    for rel in sh(["git", "ls-files", "--others", "--exclude-standard", "."], cwd=root).stdout.splitlines():
+    # `-z`: names come back as raw bytes, not quoted octal; decoded with the filesystem encoding so the real path is read.
+    listed = subprocess.run(["git", "ls-files", "-z", "--others", "--exclude-standard", "."], cwd=root, capture_output=True, timeout=600).stdout
+    for raw in listed.split(b"\0"):
+        rel = os.fsdecode(raw)
         if rel and not skip & set(Path(rel).parts):
             whole(root / rel, rel)
     return changes
@@ -126,9 +130,9 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
                 add("minor", "dead-code", "commented-out code block (>=3 lines)", loc)
             for rx in SECRET_RES if not self_file else ():
                 m = rx.search(text)
-                if m and not PLACEHOLDER_RE.search(text):
+                if m:
                     val = m.group(m.lastindex or 0)
-                    if m.lastindex and _entropy(val) < 3.2:
+                    if PLACEHOLDER_RE.search(val) or (m.lastindex and _entropy(val) < 3.2):
                         continue
                     add("major", "secret", "secret-looking string added (value redacted)", loc, f"value not recorded ({len(val)} chars)")
     if src_changed and not tests_changed:

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+from bisect import bisect_left
 from pathlib import Path
 from typing import NamedTuple
 
@@ -48,8 +49,9 @@ _META_LINES = re.compile(r"^[ \t]*\*\*(?:Knowledge Base|Sources?) Used:?\*\*:?[^
 _HTML = re.compile(r"</?(?:a|img|picture|source|br|hr|p|b|i|em|strong|code|pre|sub|sup|summary|div|span|ul|ol|li|h[1-6]|"
                    r"blockquote|table|thead|tbody|tr|td|th)\b[^>]*>", re.I)
 # Link text may hold escaped brackets and nested labels: [\[n6\] title](url), [the [build] report](url). The label
-# is at most 300 tokens (one character, or a backslash plus the next). An unbounded scan from every "[" is quadratic
-# on a body that is mostly brackets (10,000 of them took 2 s). The URL is not capped, and parentheses in it nest:
+# is at most 300 tokens (one character, or a backslash plus the next). A scan from every "[" cost up to 300 tokens,
+# 300 times the work on a body of brackets (30,000 of them took about 5.8 s); _label_closers finds all labels in one pass.
+# The URL is not capped, and parentheses in it nest:
 # a 2,000-character cap left the tail of a long artifact URL in the evidence and cut off the explanation after it.
 _LABEL_TOKENS = 300
 # A backtick fence whose opening line contains a backtick is inline code (```a ` <b>```), not a block. Treating it as
@@ -202,17 +204,58 @@ def _unescape_label(label: str) -> str:
     return "".join(parts)
 
 
+def _label_closers(text: str) -> dict[int, int]:
+    """Each `[` that opens a link label _strip_links accepts, mapped to the position of the `]` that closes it.
+
+    A label is accepted when the scan from its `[` reaches its closing `]`: the first unmatched `]` after it, at most
+    _LABEL_TOKENS tokens before it, no unescaped newline, a non-empty label, and `(` right after the `]`. A token is one
+    character, or a backslash plus the next character. The token after any `[` begins where a scan from that `[` begins,
+    so one tokenization serves every `[`. Matching `]` comes from one backward pass with a stack, so the cost is linear
+    in the length of the text however many brackets it holds."""
+    if "[" not in text:
+        return {}
+    n = len(text)
+    starts: list[int] = []
+    p = 0
+    while p < n:
+        starts.append(p)
+        p += 2 if text[p] == "\\" and p + 1 < n else 1
+    m = len(starts)
+    top = [-1] * (m + 1)  # token t: the nearest unmatched "]" at or after t, or -1
+    newline = [m] * (m + 1)  # token t: the first unescaped newline at or after t, or m
+    pending: list[int] = []
+    for t in range(m - 1, -1, -1):
+        ch = text[starts[t]]
+        if ch == "]":
+            pending.append(t)
+        elif ch == "[" and pending:
+            pending.pop()
+        top[t] = pending[-1] if pending else -1
+        newline[t] = t if ch == "\n" else newline[t + 1]
+    closers: dict[int, int] = {}
+    for b, ch in enumerate(text):
+        if ch != "[" or b + 1 >= n:
+            continue
+        t = bisect_left(starts, b + 1)  # b + 1 always starts a token: a non-backslash character ends one
+        c = top[t]
+        if c < 0 or c == t or c - t > _LABEL_TOKENS or newline[t] < c:
+            continue
+        pos = starts[c]
+        if pos + 1 < n and text[pos + 1] == "(":
+            closers[b] = pos
+    return closers
+
+
 def _strip_links(text: str) -> str:
-    """Markdown links become their label, in one forward scan. The URL is not read again.
+    """Markdown links become their label. The URL is not read again.
 
-    A label opens at `[`. A token is one character, or a backslash plus the next character, and the label holds at most
-    300 tokens. A newline ends the candidate: it is not a link. Nested `[` raises the depth and an unescaped `]` lowers
-    it. Depth 0 on `]` with `(` next opens the URL. A `]` at depth 0 without `(` is not a link, so that `[` is copied
-    and the scan continues after it. `\\[` and `\\]` in the label are written back without the backslash.
-
-    The URL starts after `](`. Parenthesis depth starts at 1; an unescaped `(` raises it and an unescaped `)` lowers
-    it, and there is no length cap. A newline means the link is not closed, so that line is copied once from the `[`.
-    When the depth hits 0, only the label is emitted and the scan continues after the closing `)`."""
+    A label opens at `[` and closes at its matching `]`; _label_closers holds the rules: nested brackets balance, `\\[`
+    and `\\]` are literal, at most 300 tokens, no newline. Parenthesis depth starts at 1 after `](`; an unescaped `(`
+    raises it and an unescaped `)` lowers it, and there is no length cap. A newline means the link is not closed, so
+    that line is copied once from the `[`. When the depth hits 0, only the label is emitted and the scan continues after
+    the closing `)`. A `[` that opens no link is copied and the scan continues after it. `\\[` and `\\]` in the label are
+    written back without the backslash."""
+    closers = _label_closers(text)
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -221,30 +264,8 @@ def _strip_links(text: str) -> str:
             out.append(text[i:])
             break
         out.append(text[i:bracket])
-        j = bracket + 1
-        depth, tokens = 1, 0
-        while j < n and depth > 0:
-            ch = text[j]
-            if ch == "\\" and j + 1 < n:  # one token; the next character is not structural, newline included
-                if tokens >= _LABEL_TOKENS:
-                    break
-                j += 2
-                tokens += 1
-                continue
-            if ch == "\n":
-                break
-            if ch == "]" and depth == 1:  # the delimiter sits past the token cap and is not itself a token
-                depth = 0
-                break
-            if tokens >= _LABEL_TOKENS:
-                break
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-            j += 1
-            tokens += 1
-        if depth != 0 or tokens == 0 or j + 1 >= n or text[j + 1] != "(":
+        j = closers.get(bracket)
+        if j is None:
             out.append("[")
             i = bracket + 1
             continue
