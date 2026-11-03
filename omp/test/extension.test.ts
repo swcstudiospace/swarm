@@ -71,6 +71,24 @@ function reachable(value: unknown, out = new Set<object>()): Set<object> {
   return out;
 }
 
+test("positive control: after mock.module, a real node:fs call and a real Bun.spawn/spawnSync each move their counter", async () => {
+  fsCalls = 0;
+  spawn.mockClear();
+  spawnSync.mockClear();
+  // Intentional dynamic import (tests the module-loading boundary): a static import is hoisted and resolves
+  // before mock.module runs, so only a later import observes the mocked node:fs.
+  const mockedFs = await import("node:fs");
+  expect(mockedFs.existsSync(import.meta.dir)).toBe(true);
+  expect(fsCalls).toBe(1);
+  expect(Bun.spawnSync(["true"], { stdout: "ignore", stderr: "ignore" }).exitCode).toBe(0);
+  expect(spawnSync).toHaveBeenCalledTimes(1);
+  expect(spawn).toHaveBeenCalledTimes(0);
+  const proc = Bun.spawn(["true"], { stdout: "ignore", stderr: "ignore" });
+  expect(await proc.exited).toBe(0);
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(spawnSync).toHaveBeenCalledTimes(1);
+});
+
 test("registers hidden essential swarm operations without fs, spawn or spawnSync", async () => {
   fsCalls = 0;
   spawn.mockClear();

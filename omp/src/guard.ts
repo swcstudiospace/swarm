@@ -803,14 +803,14 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
   let n = 0;
   for (let m = sub.exec(rest); m !== null && n < 256 && cuts.length < MAX_CUTS; m = sub.exec(rest), n++) {
     const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
-    cuts.push(m[1] ?? m[2] ?? "");
+    pushCut(cuts, m[1] ?? m[2] ?? "");
     rest = `${rest.slice(0, m.index)}${marker}${rest.slice(m.index + m[0].length)}`;
   }
   // OSA-01: past the cut cap a substitution left in the text is unjudged: every item of this level is refused.
   // The cut loop ends on no match (none left) or on a cap, so the cap state alone says whether one was left. Exactly
   // 256 cuts also refuse, which is fail-closed (a 257th may follow unseen). Constant time per level.
   const uncut = n >= 256 || cuts.length >= MAX_CUTS;
-  const items: Normalized[] = [];
+  const items: Normalized[] = [], extra: Normalized[] = [];
   const attached = new Set<number>();
   /** The bodies of the substitutions `text` holds, normalized, as payload of `item`. */
   const attach = (item: Normalized, text: string) => {
@@ -875,10 +875,10 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     pipeIn = piece.end === "|" || (pipeIn && seg === "" && (piece.end === "(" || piece.end === "{"));
   }
   for (let n = first; n < cuts.length; n++) {
-    if (attached.has(n) || cuts.slice(first).some((body) => body.includes(`${CUT}${String.fromCharCode(0xe000 + n)}`))) continue;
-    for (const item of normalizeSegments(cuts[n], depth, cuts)) items.unshift({ ...item, chdirs: [CUT, ...item.chdirs] });
+    if (attached.has(n) || (cutHolders.get(cuts)?.get(n) ?? -1) >= first) continue;
+    for (const item of normalizeSegments(cuts[n], depth, cuts)) extra.push({ ...item, chdirs: [CUT, ...item.chdirs] });
   }
-  return items;
+  return [...extra.reverse(), ...items];
 }
 
 /** A redirection that gives a command its stdin: `<`, `0<`, `<>`, a heredoc `<<`/`<<-` or a here-string `<<<`. */
@@ -3661,3 +3661,19 @@ export function matchRule(command: string, facts: GuardFacts, start: string | un
 }
 
 export const ruleReason = (rule: Rule): string => rule.reason ?? reason(rule.capability, rule.id);
+
+/**
+ * Per cut table: for each cut index, the highest body index whose text holds that cut's marker. Bodies are pushed in
+ * index order, so an overwrite keeps the highest; the cut-held check reads it in O(1) instead of rescanning every body.
+ */
+const cutHolders = new WeakMap<string[], Map<number, number>>();
+/** Push a substitution body onto the cut table, recording the cut markers the body holds (see cutHolders). */
+function pushCut(cuts: string[], body: string): void {
+  let holders = cutHolders.get(cuts);
+  if (holders === undefined) {
+    holders = new Map();
+    cutHolders.set(cuts, holders);
+  }
+  for (const held of body.matchAll(CUT_TOKEN)) holders.set(held[1].charCodeAt(0) - 0xe000, cuts.length);
+  cuts.push(body);
+}
