@@ -365,3 +365,28 @@ test("sweep: a session's shutdown group-kills only its own in-flight children (W
   expect((await rejection(b.call)).code).toBe("E-INTERNAL");
   await expectGroupDead(pidsB);
 });
+
+test("settle: exit 0 with JSON settles within 3 s when a setsid grandchild holds stdout (OSA-03)", async () => {
+  const { cwd, root } = setup();
+  const file = join(root, "pids.json");
+  // exits 0 with a JSON result; the grandchild leaves the process group and inherits the stdout and stderr pipes
+  writeFileSync(join(root, "scripts", "fx_escape.py"), `import json, os, subprocess, sys
+out = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--pids="))
+gc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+open(out + ".tmp", "w").write(json.dumps({"child": os.getpid(), "grandchild": gc.pid}))
+os.replace(out + ".tmp", out)
+print('{"status": "ok", "n": 7}')
+sys.stdout.flush()
+os._exit(0)
+`);
+  const t0 = Date.now();
+  const p = runScript({ script: "fx_escape", args: [`--pids=${file}`], cwd, timeoutMs: 30_000 });
+  const outcome = p.then((res) => ({ res }), (err: unknown) => ({ err }));
+  const pids = await pidsFrom(file);
+  expect(alive(pids.grandchild)).toBe(true); // still holding stdout after the script has exited
+  // real-clock bound on a live child's settlement: fake timers cannot drive other processes (see waitFor)
+  const budget = Math.max(0, 3_000 - (Date.now() - t0));
+  const settled = await Promise.race([outcome, Bun.sleep(budget).then(() => "pending" as const)]);
+  if (settled === "pending") throw new Error("runScript did not settle within 3 s of the call while a setsid grandchild held stdout");
+  expect(settled).toMatchObject({ res: { exitCode: 0, json: { status: "ok", n: 7 } } });
+});

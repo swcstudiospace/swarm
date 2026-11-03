@@ -54,6 +54,8 @@ export type ScriptRequest = Omit<BridgeRequest, "script"> & { script: string };
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const KILL_GRACE_MS = 3_000;
+/** OSA-03: how long a child that exited 0 on its own may wait for its pipes to close before its JSON result settles. */
+const EXIT_PIPE_GRACE_MS = 500;
 const TAIL = 400;
 const SCRIPT_NAME = /^[a-z][a-z0-9_]*$/;
 const STRIPPED_ENV = ["SWARM_TASK_ID", "SWARM_CORRELATION_ID"]; // argparse defaults (swarm/script_base.py)
@@ -99,6 +101,23 @@ function parseObject(stdout: string): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Accumulates a child pipe as it arrives, so a settled exit reads what has arrived instead of waiting for EOF. */
+function collect(stream: ReadableStream<Uint8Array>): { text: () => string; done: Promise<void> } {
+  const decoder = new TextDecoder();
+  let text = "";
+  const done = (async () => {
+    const reader = stream.getReader();
+    for (;;) {
+      const { done: ended, value } = await reader.read();
+      if (ended) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  })();
+  done.catch(() => {}); // a stream error still surfaces through `await done`; a settled exit need not await it
+  return { text: () => text, done };
 }
 
 /**
@@ -162,11 +181,23 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
   const timer = setTimeout(() => stop("timeout"), timeoutMs);
 
   try {
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited,
-    ]);
+    const out = collect(child.stdout);
+    const err = collect(child.stderr);
+    const eof = Promise.all([out.done, err.done]);
+    const code = await child.exited;
+    if (!stopped && code === 0 && !signal?.aborted) {
+      // OSA-03: a grandchild that left the process group can hold the pipes after the child exited 0 on its own.
+      // Give the pipes a bounded grace; if stdout already holds a JSON result, settle on the exit with what arrived.
+      const { promise: grace, resolve: graceElapsed } = Promise.withResolvers<void>();
+      const graceTimer = setTimeout(graceElapsed, EXIT_PIPE_GRACE_MS);
+      await Promise.race([eof, grace]);
+      clearTimeout(graceTimer);
+      if (!parseObject(out.text())) await eof; // not a JSON result yet: read the whole output, as before
+    } else {
+      await eof; // a stopped child keeps the full-EOF wait, so a same-group grandchild still yields E-TIMEOUT / cancel
+    }
+    const stdout = out.text();
+    const stderr = err.text();
     // D-07: never return after a cancellation — omp would record a half-applied mutation as success.
     if (signal?.aborted) throw abortError(script, signal);
     if (stopped === "timeout") throw new SwarmToolError("E-TIMEOUT", `${script} exceeded ${timeoutMs} ms and was killed`);
