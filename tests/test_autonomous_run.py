@@ -73,6 +73,31 @@ def test_autonomous_skips_question_without_starting_a_run(tmp_path):
     assert not (tmp_path / ".swarm" / "autonomous.log").exists()
 
 
+def test_rejected_prompt_appends_no_hook_main_phase(tmp_path):
+    """H-01: a prompt the gate rejects exits 0 and appends no phase.hook.main record to events.jsonl.
+    The accepted-prompt control shows the same hook records phase.hook.main when the gate passes."""
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "what is a monad",
+         "--swarm-root", str(ROOT), "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    events = tmp_path / ".swarm" / "events.jsonl"
+    assert "phase.hook.main" not in (events.read_text() if events.exists() else "")
+
+    root = _stub_root(tmp_path, "pass\n")
+    accepted = {**os.environ, "SWARM_DIR": str(tmp_path / "accepted-swarm")}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement a billing feature",
+         "--swarm-root", str(root), "--dry-run"],
+        capture_output=True, text=True, env=accepted, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "phase.hook.main" in (tmp_path / "accepted-swarm" / "events.jsonl").read_text()
+
+
+
 def test_autonomous_skips_slash(tmp_path):
     env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
     r = subprocess.run(

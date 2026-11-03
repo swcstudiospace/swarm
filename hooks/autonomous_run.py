@@ -12,7 +12,7 @@ The kick gate is swarm.signal_detector.classify: a brief starts a plan and a run
 The run step is capped (SWARM_AUTONOMOUS_RUN_CAP_S, default 3600). On expiry the runner is
 SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_RUN_GRACE_S
 (default 15). subprocess.run's timeout SIGKILLs immediately, which orphans those sessions.
-The hook always exits 0; the runner's returncode is recorded as run_rc in autonomous.log. A cap or grace above 2,000,000 s takes its default.
+The hook exits 0; the runner's returncode is recorded as run_rc in autonomous.log. SIGTERM to the hook stops the runner's process group within the grace and exits 143. A cap or grace above 2,000,000 s takes its default.
 """
 from __future__ import annotations
 import argparse
@@ -81,6 +81,19 @@ def _signal_group(pgid: int, sig: int) -> None:
         pass
 
 
+class _Terminated(BaseException):
+    """Raised by the SIGTERM handler; run_capped's BaseException path stops the runner group before this reaches main."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _on_sigterm(signum: int, frame: object) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)  # one SIGTERM is enough: a repeat must not interrupt the cleanup
+    raise _Terminated(signum)
+
+
 def _stop_group(proc: subprocess.Popen, grace: float) -> None:
     """Terminate the child's process group, wait `grace` seconds for the leader, SIGKILL the group, then reap the leader.
     run_capped starts the child as its own session and group leader, so its pid is the group id."""
@@ -96,18 +109,19 @@ def _stop_group(proc: subprocess.Popen, grace: float) -> None:
             pipe.close()
 
 
-def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: float) -> subprocess.CompletedProcess:
+def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: float,
+               pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
     """Run `cmd`, capturing stdout and stderr. `subprocess.run(timeout=)` SIGKILLs on expiry, which orphans the
     runner's sessions: they sit in their own OS session, so the kill never reaches them and their tasks stay
     IN_PROGRESS (T-06-26). Ask the runner to stop with SIGTERM first — its handler ends those sessions — and
     SIGKILL only what ignores that for `grace` seconds. `Popen.communicate` does not kill on timeout; `run` does,
     which is why this does not call `run`. timeout and grace are clamped to _MAX_WAIT_S, the OS poll range. The child
     leads its own process group, and any BaseException (KeyboardInterrupt included) stops that group before it re-raises,
-    so an error never leaves a running child."""
+    so an error never leaves a running child. pass_fds are inherited by the child only."""
     timeout = min(timeout, _MAX_WAIT_S)
     grace = min(grace, _MAX_WAIT_S)
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
+                            start_new_session=True, pass_fds=pass_fds)
     try:
         try:
             out, err = proc.communicate(timeout=timeout)
@@ -165,6 +179,7 @@ def acquire(lock: Path) -> int | None:
 
 def main() -> int:
     try:
+        signal.signal(signal.SIGTERM, _on_sigterm)  # SIGTERM stops the runner's group before the hook exits (H-03)
         ap = argparse.ArgumentParser(description=__doc__)
         ap.add_argument("--cwd", default=".", help="target application repo")
         ap.add_argument("--brief", required=True, help="the user's original prompt (classification + dedupe key)")
@@ -174,9 +189,9 @@ def main() -> int:
         ap.add_argument("--dry-run", action="store_true")
         ap.add_argument("--wait", action="store_true", help="run in-process (tests); default is already in-process for this script")
         args = ap.parse_args()
-        log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd) if hasattr(logging_paths, "__call__") else {}}, source="autonomous_run", tee=True)
         if not classify(args.brief):
             return 0
+        log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd) if hasattr(logging_paths, "__call__") else {}}, source="autonomous_run", tee=True)
         root = Path(args.swarm_root).resolve()
         repo = Path(args.cwd).resolve()
         sys.path.insert(0, str(root))
@@ -232,7 +247,7 @@ def main() -> int:
             p2 = run_capped(
                 run, cwd=str(root), env=env,
                 timeout=_env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600),
-                grace=grace,
+                grace=grace, pass_fds=(held,),  # the runner keeps the kickoff flock, so it outlives a SIGKILLed hook
             )
             log.write_text(
                 json.dumps({
@@ -255,6 +270,8 @@ def main() -> int:
             # Debounce from release. A crash that skips this finally keeps the acquisition mtime.
             _stamp_lock(held)
             os.close(held)
+    except _Terminated as term:
+        return 128 + term.signum
     except Exception:
         # Fail open: whatever broke (unwritable state dir, lock, import), the hook prints {} and exits 0.
         print("{}")
