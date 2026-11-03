@@ -142,8 +142,12 @@ fn parse(argv: &[String]) -> Option<Args> {
     json.then_some(out)
 }
 
-fn python_bin() -> String {
-    std::env::var("GSD_QA_PYTHON").unwrap_or_else(|_| "python3".to_string())
+/// The interpreter: the call's `GSD_QA_PYTHON` overlay, else the process value, else `python3`.
+fn python_bin(env: &[(String, String)]) -> String {
+    env_value(env, "GSD_QA_PYTHON")
+        .map(str::to_string)
+        .or_else(|| std::env::var("GSD_QA_PYTHON").ok())
+        .unwrap_or_else(|| "python3".to_string())
 }
 
 fn which(name: &str) -> bool {
@@ -160,8 +164,8 @@ fn which(name: &str) -> bool {
     })
 }
 
-fn pytest_importable() -> bool {
-    Command::new(python_bin())
+fn pytest_importable(env: &[(String, String)]) -> bool {
+    Command::new(python_bin(env))
         .arg("-c")
         .arg("import pytest")
         .output()
@@ -349,7 +353,7 @@ fn is_node_test_script(script: &str) -> bool {
     test
 }
 
-fn detect_runners(root: &Path) -> Vec<Runner> {
+fn detect_runners(root: &Path, env: &[(String, String)]) -> Vec<Runner> {
     let mut runners = Vec::new();
     let pytest_marker = root.join("pyproject.toml").exists()
         || root.join("pytest.ini").exists()
@@ -361,11 +365,11 @@ fn detect_runners(root: &Path) -> Vec<Runner> {
                 })
             })
         });
-    if pytest_marker && pytest_importable() {
+    if pytest_marker && pytest_importable(env) {
         runners.push(Runner {
             name: "pytest",
             cmd: vec![
-                python_bin(),
+                python_bin(env),
                 "-m".into(),
                 "pytest".into(),
                 "-q".into(),
@@ -774,6 +778,15 @@ fn reply_of(body: Json, exit_code: i32) -> Reply {
 
 /// Answers one served `qa_gate` call. A [`SeamError`] of `E-DEP` is not-started: the selector runs Python.
 pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
+    answer_with_keys(call, KeyMaterial::from_env).await
+}
+
+/// [`answer`] with the key material resolved by `key_material`, so a test supplies keys without touching the process
+/// environment. The lookup keeps its place in the call: after the runs and before the store.
+async fn answer_with_keys<E>(
+    call: &Invocation,
+    key_material: impl FnOnce() -> Result<KeyMaterial, E>,
+) -> Result<Reply, SeamError> {
     let Some(args) = parse(&call.argv) else {
         return Err(before_any_write(SeamError::new(
             ErrorCode::Dep,
@@ -809,7 +822,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
                 "a .NET project is under the gate root; the host route does not serve .NET, Python answers",
             )));
         }
-        let runners = detect_runners(&root);
+        let runners = detect_runners(&root, &call.env);
         if runners.is_empty() {
             let severity = if risk == "low" { "minor" } else { "major" };
             findings.push(finding(
@@ -908,7 +921,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
         if args.min_coverage > 0 && executed.iter().any(|item| item.runner == "pytest") {
             let (code, out) = run_cmd(
                 &[
-                    python_bin(),
+                    python_bin(&call.env),
                     "-m".into(),
                     "pytest".into(),
                     "-q".into(),
@@ -981,7 +994,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
         dryrun_fail: std::env::var("SWARM_DRYRUN_FAIL").unwrap_or_default(),
         now: now_secs(),
     };
-    let keys = KeyMaterial::from_env().map_err(|_| {
+    let keys = key_material().map_err(|_| {
         before_any_write(SeamError::new(
             ErrorCode::Dep,
             "the signing configuration is Python's",
@@ -1206,9 +1219,11 @@ mod tests {
         committed, count, has_dotnet_project, is_node_test_script, literal_commands, node_evidence,
         node_ok, run_cmd, write_plan_file, NodeEvidence,
     };
+    use gsd_envelope::{KeyFilePresence, KeyMaterial};
     use gsd_failure::ErrorCode;
     use gsd_route::{Json, SeamError};
     use gsd_taskwriter::{GateFile, GateIssueRequest, GatePlan, GateWrite};
+    use std::ffi::OsString;
 
     #[test]
     fn the_count_sums_the_first_digit_group_of_each_match() {
@@ -1583,12 +1598,10 @@ esac
         )
         .expect("write fake python");
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        std::env::set_var("GSD_QA_PYTHON", &python);
-        // Throwaway test value, not a real key: the gate refuses without a signing key, and tests
-        // pass a throwaway SWARM_SIGNING_KEY (AGENTS.md). Removed again after the call.
+        // Throwaway test value, not a real key: the gate refuses without a signing key. It reaches the gate through the key
+        // seam, and the interpreter through the call's env overlay; the process environment is never written.
         const THROWAWAY_SIGNING_KEY: &str =
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        std::env::set_var("SWARM_SIGNING_KEY", THROWAWAY_SIGNING_KEY);
         let call = crate::strangler_seam::Invocation {
             agent: "A08".into(),
             script: "qa_gate".into(),
@@ -1605,7 +1618,7 @@ esac
             .map(|item| item.to_string())
             .collect(),
             root: dir.path().to_path_buf(),
-            env: Vec::new(),
+            env: vec![("GSD_QA_PYTHON".into(), python.display().to_string())],
             deadline: std::time::Duration::from_secs(60),
             effects_path: None,
         };
@@ -1613,9 +1626,12 @@ esac
             .enable_all()
             .build()
             .expect("runtime");
-        let reply = runtime.block_on(super::answer(&call));
-        std::env::remove_var("GSD_QA_PYTHON");
-        std::env::remove_var("SWARM_SIGNING_KEY");
+        let reply = runtime.block_on(super::answer_with_keys(&call, || {
+            KeyMaterial::from_lookup(
+                |name| (name == "SWARM_SIGNING_KEY").then(|| OsString::from(THROWAWAY_SIGNING_KEY)),
+                |_| KeyFilePresence::Absent,
+            )
+        }));
         let reply = reply.expect("the gate answers");
         let body = gsd_route::parse_json(&reply.stdout).expect("stdout is one JSON object");
         let Some(Json::Arr(findings)) = field(&body, "findings") else {
