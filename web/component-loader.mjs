@@ -1,9 +1,10 @@
 // Browser loader for the orch_status read route (Phase 13, U-WEB-1).
 //
 // The guest is the jco transpile of the server-built gsd-core component (web/generated/). The loader
-// takes a snapshot, the orch_status request fields as UTF-8 JSON bytes, checks it against the wire
-// rules of crates/gsd-route (the key set and the depth limit), and calls the guest's invoke. The
-// reply bytes are the same bytes the server's orch_status_invoke returns for the same request.
+// takes a snapshot, the orch_status request fields as UTF-8 JSON bytes. Where those bytes read as a
+// JSON request, the loader checks the wire rules of crates/gsd-route (the key set and the depth limit);
+// it then hands the same bytes, unchanged, to the guest's invoke. The reply bytes are the same bytes
+// the server's orch_status_invoke returns for the same request.
 //
 // The loader imports nothing from npm and supplies no host functions: the read route's component
 // imports none. It implements no write route.
@@ -29,7 +30,6 @@ export const REQUEST_KEYS = Object.freeze([
 
 const REQUIRED_KEYS = REQUEST_KEYS.filter((key) => key !== "history");
 const CODES = new Set(["input", "timeout", "dep", "capacity", "contract", "policy", "internal"]);
-const ENCODER = new TextEncoder();
 
 /** A failed invoke: the guest's error code and its message, which never carries an input value. */
 export class InvokeFailure extends Error {
@@ -57,20 +57,23 @@ function deepestValue(root) {
   return deepest;
 }
 
-/** Checks the snapshot bytes and returns the request object in the wire's key order. */
-export function requestFromBytes(snapshotBytes) {
+/** Reads the snapshot bytes as JSON text, keeping any leading BOM. Returns undefined when they are not JSON text; the guest decides those bytes. */
+function readJson(snapshotBytes) {
   let text;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(snapshotBytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(snapshotBytes);
   } catch {
-    refuse("request is not valid UTF-8");
+    return undefined;
   }
-  let parsed;
   try {
-    parsed = JSON.parse(text);
+    return JSON.parse(text);
   } catch {
-    refuse("request is not valid JSON");
+    return undefined;
   }
+}
+
+/** The wire's own checks on a parsed request: the object shape, the depth limit and the key set. Throws InvokeFailure("input"). */
+function checkRequest(parsed) {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     refuse("request must be a JSON object");
   }
@@ -78,11 +81,23 @@ export function requestFromBytes(snapshotBytes) {
   const keys = Object.keys(parsed);
   if (keys.some((key) => !REQUEST_KEYS.includes(key))) refuse("request has a key the wire does not accept");
   if (!REQUIRED_KEYS.every((key) => Object.hasOwn(parsed, key))) refuse("request is missing a wire key");
+}
+
+/** Returns the request object in the wire's key order. */
+function orderRequest(parsed) {
   const ordered = {};
   for (const key of REQUEST_KEYS) {
     if (Object.hasOwn(parsed, key)) ordered[key] = parsed[key];
   }
   return ordered;
+}
+
+/** Checks the snapshot bytes and returns the request object in the wire's key order. Throws InvokeFailure("input") for bytes that are not a JSON request. */
+export function requestFromBytes(snapshotBytes) {
+  const parsed = readJson(snapshotBytes);
+  if (parsed === undefined) refuse("request is not valid JSON");
+  checkRequest(parsed);
+  return orderRequest(parsed);
 }
 
 /** Maps a thrown guest error to an InvokeFailure. A trap carries no guest code and no runtime text. */
@@ -95,12 +110,12 @@ function toFailure(error) {
   return new InvokeFailure("internal", "the guest did not complete the call");
 }
 
-/** The read route: snapshot bytes in, reply bytes out, as the server's orch_status_invoke answers. */
+/** The read route: snapshot bytes in, reply bytes out, as the server's orch_status_invoke answers. The loader refuses a request that reads as JSON and breaks the wire's object shape, depth limit or key set. Every other byte sequence reaches the guest unchanged, which decides it. */
 export function invoke(snapshotBytes) {
-  const request = requestFromBytes(snapshotBytes);
-  const requestBytes = ENCODER.encode(JSON.stringify(request));
+  const parsed = readJson(snapshotBytes);
+  if (parsed !== undefined) checkRequest(parsed);
   try {
-    return guestInvoke(requestBytes);
+    return guestInvoke(snapshotBytes);
   } catch (error) {
     throw toFailure(error);
   }

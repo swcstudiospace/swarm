@@ -34,5 +34,5 @@ export class InvokeFailure extends Error {
 /** Checks snapshot bytes and returns the request object in the wire's key order. Throws InvokeFailure("input"). */
 export function requestFromBytes(snapshotBytes: Uint8Array): Record<string, unknown>;
 
-/** Runs the read route: snapshot JSON bytes in, the server's reply bytes out. Throws InvokeFailure. */
+/** Runs the read route: snapshot bytes in, the server's reply bytes out. Bytes the loader cannot parse go to the guest, which refuses them as the engine does; a refusal throws InvokeFailure. */
 export function invoke(snapshotBytes: Uint8Array): Uint8Array;
