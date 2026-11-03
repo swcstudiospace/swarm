@@ -60,13 +60,7 @@ const MIN_LEN: usize = 6;
 /// [`TextTooLong`] when `text` has more than [`lexer::MAX_LEN`] code points, which the quote lexer's 32-bit arrays cannot index. The
 /// text is then not scanned at all: the caller must not treat the error as "nothing to redact".
 pub fn redact_spans(text: &str) -> Result<Vec<(usize, usize)>, TextTooLong> {
-    // The byte length bounds the code-point count from above, so the exact count is only needed when the bytes exceed the limit.
-    let len = if text.len() <= lexer::MAX_LEN {
-        text.len()
-    } else {
-        text.chars().count()
-    };
-    spans_of_bounded(len, || text.chars().collect())
+    spans_of_bounded(code_point_bound(text), || text.chars().collect())
 }
 
 /// `text` with every span of [`redact_spans`] replaced by [`REDACTED`]; the rest is returned unchanged.
@@ -75,7 +69,7 @@ pub fn redact_spans(text: &str) -> Result<Vec<(usize, usize)>, TextTooLong> {
 ///
 /// [`TextTooLong`], as for [`redact_spans`].
 pub fn redact_text(text: &str) -> Result<String, TextTooLong> {
-    let chars: Vec<char> = text.chars().collect();
+    let chars = collect_bounded(code_point_bound(text), || text.chars().collect())?;
     let spans = spans_of(&chars)?;
     if spans.is_empty() {
         return Ok(text.to_owned());
@@ -93,17 +87,35 @@ pub fn redact_text(text: &str) -> Result<String, TextTooLong> {
     Ok(out)
 }
 
-/// The seam for `redact_spans`. `len` is an upper bound on the code-point count of the text that `collect` yields, and is exact
+/// The seam for the bounded collect. `len` is an upper bound on the code-point count of the text that `collect` yields, and is exact
 /// whenever it exceeds [`lexer::MAX_LEN`]. A text over the limit is refused before `collect` runs, so its characters are never
 /// allocated.
+fn collect_bounded(
+    len: usize,
+    collect: impl FnOnce() -> Vec<char>,
+) -> Result<Vec<char>, TextTooLong> {
+    if len > lexer::MAX_LEN {
+        return Err(TextTooLong { len });
+    }
+    Ok(collect())
+}
+
+/// An upper bound on the code-point count of `text`, exact whenever that count exceeds [`lexer::MAX_LEN`]. The byte length bounds the
+/// code-point count from above, so the exact count is only computed when the bytes exceed the limit.
+fn code_point_bound(text: &str) -> usize {
+    if text.len() <= lexer::MAX_LEN {
+        text.len()
+    } else {
+        text.chars().count()
+    }
+}
+
+/// `redact_spans` for a text whose code points are gathered by `collect`, refused exactly as [`collect_bounded`] refuses it.
 fn spans_of_bounded(
     len: usize,
     collect: impl FnOnce() -> Vec<char>,
 ) -> Result<Vec<(usize, usize)>, TextTooLong> {
-    if len > lexer::MAX_LEN {
-        return Err(TextTooLong { len });
-    }
-    spans_of(&collect())
+    spans_of(&collect_bounded(len, collect)?)
 }
 
 /// `redact_spans` for a text that is already a slice of code points.
@@ -440,6 +452,28 @@ mod tests {
     fn redact_spans_does_not_collect_past_max_len() {
         let collects = std::cell::Cell::new(0_usize);
         let result = spans_of_bounded(lexer::MAX_LEN + 1, || {
+            collects.set(collects.get() + 1);
+            Vec::new()
+        });
+        assert_eq!(
+            collects.get(),
+            0,
+            "the text was collected before its length was checked"
+        );
+        assert_eq!(
+            result,
+            Err(TextTooLong {
+                len: lexer::MAX_LEN + 1
+            })
+        );
+    }
+
+    /// RED-01 for `redact_text`: it reaches the refusal through `collect_bounded` with the same length bound, so an over-limit text is
+    /// refused before its characters are collected.
+    #[test]
+    fn collect_bounded_refuses_past_max_len_before_collecting() {
+        let collects = std::cell::Cell::new(0_usize);
+        let result = collect_bounded(lexer::MAX_LEN + 1, || {
             collects.set(collects.get() + 1);
             Vec::new()
         });
