@@ -52,9 +52,12 @@ use gsd_pool::{
 use gsd_proto::gsd::v1::{
     BudgetGrant, BudgetRequest, BudgetSnapshot, ChatThreadId, SessionId, SubagentType,
 };
+use gsd_route::SeamError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+
+use crate::pure::wire_error_message;
 
 /// The message a governor call reports when it does not complete on its first poll. The governor's reserve and release
 /// futures contain no await point, so this never happens; the message exists so that a broken invariant is a visible fault.
@@ -228,19 +231,11 @@ impl BudgetPort for GovernorBudget {
     }
 }
 
-/// A `ValueError` whose text starts with the wire code: `"<code>: <operation> failed: <detail>"`.
-fn raise(code: ErrorCode, operation: &str, detail: impl std::fmt::Display) -> PyErr {
-    PyValueError::new_err(format!("{}: {operation} failed: {detail}", code.as_str()))
-}
-
-/// The Python error for a chat-facade failure in `operation`.
-fn chat_err(operation: &str, error: ChatError) -> PyErr {
-    raise(chat_code(&error), operation, error)
-}
-
-/// The Python error for a governor failure in `operation`.
-fn governor_err(operation: &str, error: GovernorError) -> PyErr {
-    raise(governor_code(&error), operation, error)
+/// A `ValueError` for a failed wire call in `operation`. Its text is built by [`wire_error_message`]: the wire code, the
+/// operation, then `detail`.
+fn wire_err(operation: &str, code: ErrorCode, detail: impl std::fmt::Display) -> PyErr {
+    let error = SeamError::new(code, detail.to_string());
+    PyValueError::new_err(wire_error_message(operation, &error))
 }
 
 /// A dict of the wire grant fields. The `valid_for` duration is not exposed.
@@ -336,7 +331,7 @@ impl PyGovernor {
         );
         match poll_once(self.inner.reserve_budget(request)) {
             Some(grant) => grant_dict(py, &grant),
-            None => Err(raise(ErrorCode::Internal, "reserve_budget", NOT_READY)),
+            None => Err(wire_err("reserve_budget", ErrorCode::Internal, NOT_READY)),
         }
     }
 
@@ -367,10 +362,14 @@ impl PyGovernor {
         );
         match poll_once(self.inner.reserve_budget_checked(request)) {
             Some(Ok(grant)) => grant_dict(py, &grant),
-            Some(Err(error)) => Err(governor_err("reserve_budget_checked", error)),
-            None => Err(raise(
-                ErrorCode::Internal,
+            Some(Err(error)) => Err(wire_err(
                 "reserve_budget_checked",
+                governor_code(&error),
+                error,
+            )),
+            None => Err(wire_err(
+                "reserve_budget_checked",
+                ErrorCode::Internal,
                 NOT_READY,
             )),
         }
@@ -398,8 +397,10 @@ impl PyGovernor {
             tool_calls,
             cost_usd,
         )) {
-            Some(result) => result.map_err(|error| governor_err("release_budget", error)),
-            None => Err(raise(ErrorCode::Internal, "release_budget", NOT_READY)),
+            Some(result) => {
+                result.map_err(|error| wire_err("release_budget", governor_code(&error), error))
+            }
+            None => Err(wire_err("release_budget", ErrorCode::Internal, NOT_READY)),
         }
     }
 
@@ -414,7 +415,7 @@ impl PyGovernor {
         let snapshot = self
             .inner
             .get_budget_snapshot(session_id)
-            .map_err(|error| governor_err("budget_snapshot", error))?;
+            .map_err(|error| wire_err("budget_snapshot", governor_code(&error), error))?;
         snapshot_dict(py, &snapshot)
     }
 }
@@ -474,8 +475,8 @@ impl PyChatPool {
         };
         let budget: Arc<dyn BudgetPort> =
             Arc::new(GovernorBudget::new(Arc::clone(&governor.inner)));
-        let inner =
-            gsd_pool::ChatPool::new(config, budget).map_err(|error| chat_err("ChatPool", error))?;
+        let inner = gsd_pool::ChatPool::new(config, budget)
+            .map_err(|error| wire_err("ChatPool", chat_code(&error), error))?;
         Ok(Self {
             inner,
             drop_grace_ms,
@@ -494,7 +495,7 @@ impl PyChatPool {
                     value: subagent_type.to_string(),
                 },
             )
-            .map_err(|error| chat_err("open_thread", error))
+            .map_err(|error| wire_err("open_thread", chat_code(&error), error))
     }
 
     /// Closes live thread `thread_id`.
@@ -503,7 +504,7 @@ impl PyChatPool {
     fn close_thread(&self, thread_id: &str) -> PyResult<()> {
         self.inner
             .close_thread(thread_id)
-            .map_err(|error| chat_err("close_thread", error))
+            .map_err(|error| wire_err("close_thread", chat_code(&error), error))
     }
 
     /// Queues one message and returns `(outcome, seq, ticket)`.
@@ -529,7 +530,7 @@ impl PyChatPool {
                 session_id,
                 payload.to_vec(),
             ))
-            .map_err(|error| chat_err("submit", error))?;
+            .map_err(|error| wire_err("submit", chat_code(&error), error))?;
         let (outcome, seq) = match submitted.outcome {
             SubmitOutcome::Enqueued { seq } => ("enqueued", seq),
             SubmitOutcome::AlreadyAccepted { seq } => ("already_accepted", seq),
@@ -553,7 +554,7 @@ impl PyChatPool {
         match self
             .inner
             .cancel_message(thread_id, msg_id)
-            .map_err(|error| chat_err("cancel_message", error))?
+            .map_err(|error| wire_err("cancel_message", chat_code(&error), error))?
         {
             CancelOutcome::RemovedQueued => Ok("removed_queued"),
             CancelOutcome::SignalledInFlight => Ok("signalled_in_flight"),
@@ -567,7 +568,7 @@ impl PyChatPool {
         let report = self
             .inner
             .cancel_thread(thread_id)
-            .map_err(|error| chat_err("cancel_thread", error))?;
+            .map_err(|error| wire_err("cancel_thread", chat_code(&error), error))?;
         let dict = PyDict::new(py);
         dict.set_item("removed", message_refs(report.removed))?;
         dict.set_item("signalled", message_refs(report.signalled))?;
