@@ -1,9 +1,8 @@
 name: wheel
 
-# GitHub-hosted exception (D-P22): this is the one workflow that does not run on the Omega CI runner pool (ci.yml: every other job
-# does). The manylinux wheel is built inside a Docker container (scripts/ci_build_wheel.sh) and the pool's runners are unprivileged
-# containers without Docker, so the jobs below stay on ubuntu-latest. Decision by the user, 2026-10-28. Not chosen: `maturin --zig`
-# on the pool, a Docker runner on the VPS (srv1778002), no wheel job. The workflow uses no secrets and a read-only token.
+# Runs on GitHub-hosted ubuntu-24.04, like every job in ci.yml. The manylinux wheel is built inside a Docker container
+# (scripts/ci_build_wheel.sh), so the jobs need a runner with Docker. Decision D-P22, by the user, 2026-10-28. Not chosen: `maturin --zig`,
+# a self-hosted Docker runner on the VPS (srv1778002), no wheel job. The workflow uses no secrets and a read-only token.
 
 on:
   push:
@@ -15,7 +14,7 @@ permissions:
 
 jobs:
   wheel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A cold Rust build of the extension inside the manylinux container; bound it so a stuck build cannot hold a runner for 6 hours.
     timeout-minutes: 120
     steps:
@@ -62,7 +61,7 @@ jobs:
 
   install-and-gate:
     needs: wheel
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: python:3.12-slim-bookworm
     steps:
