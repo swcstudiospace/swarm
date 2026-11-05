@@ -37,6 +37,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install pytest ruff pyyaml cryptography
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
+      # The tests call cargo (cargo metadata --offline). The pool had a populated registry; a hosted runner starts empty.
+      - name: cargo registry (locked)
+        run: cargo fetch --locked
       - name: ruff
         run: ruff check .
       - name: pytest
@@ -80,6 +85,12 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: Build (locked)
         run: cargo build --workspace --locked
       # The signing-key tests (phase 14.5, unit U3.4e) run the real debug binary, so they run here and not in the `test` job, which
@@ -175,6 +186,12 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy (all targets, warnings are errors)
@@ -192,6 +209,12 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: parity gate (Python and Rust legs, fault tests, budget record)
         run: scripts/ci_parity_rust.sh parity-out
       - name: upload the parity records
@@ -216,6 +239,12 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       # The packages go into a venv beside the interpreter (see the `test` job).
       - name: Python environment
         run: |
