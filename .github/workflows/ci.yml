@@ -102,6 +102,14 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install pytest pyyaml cryptography
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      # The key tests below run the selector as a child process without SWARM_PURE_PYTHON, and the children import swarm, which
+      # needs swarm._native. It is built here, the way scripts/ci_parity_rust.sh builds it, only when it does not import already.
+      - name: parity cells - swarm._native
+        run: |
+          if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
+            "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
+            VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
+          fi
       # The default build: the sandbox write legs check the named E-DEP refusal and report "not covered", never a pass.
       - name: key tests (default build)
         env:
@@ -111,15 +119,7 @@ jobs:
           cp -p target/debug/gsd_engine "$RUNNER_TEMP/gsd_engine-default"
           GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/test_keys_never_in_guest.py -p no:cacheprovider --junitxml="$RUNNER_TEMP/keys-default.xml"
       # The transition matrix and the signed APPROVED cells (phase 14.5, unit U3.4d) run the real binary through the selector and alone and
-      # compare every byte with the Python script. Under CI a job that names its binary or build makes them FAIL instead of skipping. The
-      # selector legs run the Python body without SWARM_PURE_PYTHON, so `swarm._native` must import: it is built here, the way
-      # scripts/ci_parity_rust.sh builds it, only when it does not.
-      - name: parity cells - swarm._native
-        run: |
-          if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
-            "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
-            VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
-          fi
+      # compare every byte with the Python script. Under CI a job that names its binary or build makes them FAIL instead of skipping.
       - name: transition and signed parity cells (default build, host backend)
         env:
           GSD_ENGINE_BUILD: default
