@@ -1,8 +1,9 @@
-"""Policy for the GitHub workflows (Phase 14.2): every workflow runs on the Omega CI runner pool with a read-only
-token, a bounded job time and no swallowed failures, except the one declared GitHub-hosted exception (D-P22).
+"""Policy for the GitHub workflows: every job runs on GitHub-hosted ubuntu-24.04, with a read-only token, a bounded job
+time and no swallowed failures. Jobs outside wheel.yml also carry the fork-PR guard and start with checkout and the
+host-facts step (see STEPS_EXEMPT).
 
-A small checker works on the parsed YAML (and the raw text for the exception marker). The real workflows must pass
-it, and every rule is proven to bite: a mutated deep copy of the real document must fail with that rule's violation.
+A small checker works on the parsed YAML. The real workflows must pass it, and every rule is proven to bite: a mutated
+deep copy of the real document must fail with that rule's violation.
 """
 
 import copy
@@ -18,12 +19,14 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
-POOL = ["self-hosted", "linux", "x64", "omega-ci"]
-HOSTED = "ubuntu-latest"
-EXCEPTION_MARKER = "GitHub-hosted exception (D-P22)"
+HOSTED = "ubuntu-24.04"
+SELF_HOSTED = ["self-hosted", "linux", "x64", "omega-ci"]
 GUARD = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 MAX_TIMEOUT_MINUTES = 120
 HOST_FACTS = "scripts/ci_host_facts.sh"
+# wheel.yml builds the manylinux wheel inside a Docker container and its install job starts from downloaded artifacts,
+# so it has neither the fork guard nor the checkout-then-host-facts shape. Its jobs still meet every other rule.
+STEPS_EXEMPT = {"wheel.yml"}
 REQUIRED_CI_JOBS = ["test", "rust", "clippy", "parity-rust", "browser", "supply-chain"]
 BROWSER_SKIP = "vars.BROWSER_GATE != 'skip'"
 SCRIPT_REF = re.compile(r"(?<![\w./-])scripts/[\w./-]*\w")
@@ -31,7 +34,7 @@ SCRIPT_REF = re.compile(r"(?<![\w./-])scripts/[\w./-]*\w")
 Document = dict[str, Any]
 
 
-def check_workflow(path: Path, text: str, document: Document) -> list[str]:
+def check_workflow(path: Path, document: Document) -> list[str]:
     """Return one short violation per broken rule, each naming the workflow, the job (if any) and the rule."""
     name = path.name
     violations: list[str] = []
@@ -39,8 +42,6 @@ def check_workflow(path: Path, text: str, document: Document) -> list[str]:
 
     if document.get("permissions") != {"contents": "read"}:
         violations.append(f"{name}: permissions: top-level permissions must equal {{contents: read}}")
-
-    hosted_exception = name == "wheel.yml" and EXCEPTION_MARKER in text and all(job.get("runs-on") == HOSTED for job in jobs.values())
 
     for job_name, job in jobs.items():
         where = f"{name}: job {job_name}"
@@ -51,14 +52,9 @@ def check_workflow(path: Path, text: str, document: Document) -> list[str]:
             violations.append(f"{where}: timeout: timeout-minutes must be an integer from 1 to {MAX_TIMEOUT_MINUTES}, got {timeout!r}")
         if "continue-on-error" in job or any("continue-on-error" in step for step in steps):
             violations.append(f"{where}: continue-on-error: failures must not be swallowed")
-
-        exempt = hosted_exception and job.get("runs-on") == HOSTED
-        if not exempt and job.get("runs-on") != POOL:
-            reason = f"runs-on must equal {POOL}, got {job.get('runs-on')!r}"
-            if job.get("runs-on") == HOSTED:
-                reason += f" ({HOSTED} needs wheel.yml, the marker {EXCEPTION_MARKER!r} and every job of the file on it)"
-            violations.append(f"{where}: runs-on: {reason}")
-        if exempt:
+        if job.get("runs-on") != HOSTED:
+            violations.append(f"{where}: runs-on: runs-on must equal {HOSTED!r}, got {job.get('runs-on')!r}")
+        if name in STEPS_EXEMPT:
             continue
 
         if GUARD not in str(job.get("if", "")):
@@ -66,7 +62,7 @@ def check_workflow(path: Path, text: str, document: Document) -> list[str]:
         first = str(steps[0].get("uses", "")) if steps else ""
         second = str(steps[1].get("run", "")) if len(steps) > 1 else ""
         if not first.startswith("actions/checkout") or HOST_FACTS not in second:
-            violations.append(f"{where}: pool-steps: step 0 must be actions/checkout and step 1 must run {HOST_FACTS}")
+            violations.append(f"{where}: host-steps: step 0 must be actions/checkout and step 1 must run {HOST_FACTS}")
 
     if name == "ci.yml":
         missing = [job for job in REQUIRED_CI_JOBS if job not in jobs]
@@ -84,24 +80,22 @@ def check_workflow(path: Path, text: str, document: Document) -> list[str]:
     return violations
 
 
-def _load(path: Path) -> tuple[str, Document]:
-    text = path.read_text(encoding="utf-8")
-    return text, yaml.safe_load(text)
+def _load(path: Path) -> Document:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 @pytest.fixture(scope="module")
-def real() -> dict[str, tuple[str, Document]]:
+def real() -> dict[str, Document]:
     return {path.name: _load(path) for path in sorted(WORKFLOWS.glob("*.yml"))}
 
 
-def test_the_expected_workflows_exist(real: dict[str, tuple[str, Document]]) -> None:
+def test_the_expected_workflows_exist(real: dict[str, Document]) -> None:
     assert {"ci.yml", "wheel.yml"} <= set(real)
 
 
 @pytest.mark.parametrize("filename", sorted(path.name for path in WORKFLOWS.glob("*.yml")))
-def test_real_workflow_passes_the_policy(filename: str, real: dict[str, tuple[str, Document]]) -> None:
-    text, document = real[filename]
-    assert check_workflow(WORKFLOWS / filename, text, document) == []
+def test_real_workflow_passes_the_policy(filename: str, real: dict[str, Document]) -> None:
+    assert check_workflow(WORKFLOWS / filename, real[filename]) == []
 
 
 @dataclass(frozen=True)
@@ -111,9 +105,7 @@ class Mutation:
     label: str
     source: str
     rule: str
-    mutate: Callable[[Document], None] | None = None
-    strip_marker: bool = False
-    rename_to: str | None = None
+    mutate: Callable[[Document], None]
 
 
 def _swap_first_two_steps(document: Document) -> None:
@@ -133,11 +125,14 @@ def _stale_script_reference(document: Document) -> None:
 MUTATIONS = [
     Mutation("guard dropped from one job", "ci.yml", "guard", lambda d: d["jobs"]["clippy"].pop("if")),
     Mutation("guard replaced by an unrelated condition", "ci.yml", "guard", lambda d: d["jobs"]["rust"].update({"if": "always()"})),
-    Mutation("pool job moved to ubuntu-latest", "ci.yml", "runs-on", lambda d: d["jobs"]["test"].update({"runs-on": HOSTED})),
-    Mutation("pool label list shortened", "ci.yml", "runs-on", lambda d: d["jobs"]["test"].update({"runs-on": POOL[:3]})),
-    Mutation("one job of wheel.yml leaves ubuntu-latest", "wheel.yml", "runs-on", lambda d: d["jobs"]["wheel"].update({"runs-on": POOL})),
-    Mutation("wheel.yml marker removed from the text", "wheel.yml", "runs-on", strip_marker=True),
-    Mutation("ubuntu-latest workflow not named wheel.yml", "wheel.yml", "runs-on", rename_to="other.yml"),
+    Mutation("job moved to the self-hosted pool", "ci.yml", "runs-on", lambda d: d["jobs"]["test"].update({"runs-on": SELF_HOSTED})),
+    Mutation("job pinned to ubuntu-22.04", "ci.yml", "runs-on", lambda d: d["jobs"]["rust"].update({"runs-on": "ubuntu-22.04"})),
+    Mutation(
+        "one job of wheel.yml moved to the self-hosted pool",
+        "wheel.yml",
+        "runs-on",
+        lambda d: d["jobs"]["install-and-gate"].update({"runs-on": SELF_HOSTED}),
+    ),
     Mutation(
         "continue-on-error on a step",
         "ci.yml",
@@ -148,8 +143,8 @@ MUTATIONS = [
     Mutation("timeout-minutes 121", "ci.yml", "timeout", lambda d: d["jobs"]["test"].update({"timeout-minutes": 121})),
     Mutation("timeout-minutes removed", "ci.yml", "timeout", lambda d: d["jobs"]["supply-chain"].pop("timeout-minutes")),
     Mutation("timeout-minutes not an integer", "wheel.yml", "timeout", lambda d: d["jobs"]["wheel"].update({"timeout-minutes": "30"})),
-    Mutation("host-facts step removed", "ci.yml", "pool-steps", _drop_host_facts),
-    Mutation("steps 0 and 1 swapped", "ci.yml", "pool-steps", _swap_first_two_steps),
+    Mutation("host-facts step removed", "ci.yml", "host-steps", _drop_host_facts),
+    Mutation("steps 0 and 1 swapped", "ci.yml", "host-steps", _swap_first_two_steps),
     Mutation("stale scripts/ reference", "ci.yml", "script-ref", _stale_script_reference),
     Mutation(
         "stale scripts/ reference in wheel.yml",
@@ -165,22 +160,20 @@ MUTATIONS = [
 
 
 @pytest.mark.parametrize("mutation", MUTATIONS, ids=[mutation.label for mutation in MUTATIONS])
-def test_each_rule_reports_a_broken_workflow(mutation: Mutation, real: dict[str, tuple[str, Document]]) -> None:
-    text, original = real[mutation.source]
-    assert check_workflow(WORKFLOWS / mutation.source, text, original) == []
+def test_each_rule_reports_a_broken_workflow(mutation: Mutation, real: dict[str, Document]) -> None:
+    original = real[mutation.source]
+    assert check_workflow(WORKFLOWS / mutation.source, original) == []
 
     document = copy.deepcopy(original)
-    if mutation.mutate is not None:
-        mutation.mutate(document)
-    mutated_text = text.replace(EXCEPTION_MARKER, "") if mutation.strip_marker else text
-    assert document != original or mutated_text != text or mutation.rename_to is not None
+    mutation.mutate(document)
+    assert document != original
 
-    violations = check_workflow(WORKFLOWS / (mutation.rename_to or mutation.source), mutated_text, document)
+    violations = check_workflow(WORKFLOWS / mutation.source, document)
     assert any(f": {mutation.rule}:" in violation for violation in violations), violations
 
 
 def test_the_violation_names_workflow_and_job() -> None:
-    text, document = _load(WORKFLOWS / "ci.yml")
+    document = _load(WORKFLOWS / "ci.yml")
     del document["jobs"]["rust"]["timeout-minutes"]
-    violations = check_workflow(WORKFLOWS / "ci.yml", text, document)
+    violations = check_workflow(WORKFLOWS / "ci.yml", document)
     assert violations == ["ci.yml: job rust: timeout: timeout-minutes must be an integer from 1 to 120, got None"]

@@ -10,13 +10,12 @@ permissions:
 
 jobs:
   test:
-    # Every job runs on the Omega CI runner pool, never on GitHub-hosted runners
-    # (docs: swcstudiospace/Omega-Prime docs/ci-runners.md). Fork pull requests are
-    # skipped instead of queuing: the pool only takes this organisation's own code.
+    # Every job runs on a GitHub-hosted runner (ubuntu-24.04). The repository is public, so hosted
+    # standard runners are free. The fork-PR condition on each job below is unchanged.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, omega-ci]
-    # The full suite takes about 65-70 minutes (64 min on GitHub-hosted, 69 min on the pool). Bound it well
-    # above that, so a stuck test fails the job instead of holding a pool slot for GitHub's 6-hour default.
+    runs-on: ubuntu-24.04
+    # The full suite takes about 65-70 minutes (64 min on GitHub-hosted, 69 min on the old pool). Bound it well
+    # above that, so a stuck test fails the job instead of holding a runner for GitHub's 6-hour default.
     timeout-minutes: 120
     # Tooling and the omp suite import swarm; wheel.yml builds and gates the native extension.
     env:
@@ -29,7 +28,7 @@ jobs:
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
-      # The pool's tool cache is read-only, so a plain `pip install` falls back to the user site
+      # A plain `pip install` can fall back to the user site
       # (~/.local). tests/conftest.py points HOME at a temp dir for every test, so the scripts the tests
       # spawn with sys.executable could not see pytest, PyYAML or cryptography there (149 failures on main).
       # A venv keeps the packages next to the interpreter, whatever HOME is.
@@ -38,6 +37,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install pytest ruff pyyaml cryptography
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: pinned Rust toolchain
+        run: scripts/ci_rust_toolchain.sh
+      # The tests call cargo (cargo metadata --offline). The pool had a populated registry; a hosted runner starts empty.
+      - name: cargo registry (locked)
+        run: cargo fetch --locked
       - name: ruff
         run: ruff check .
       - name: pytest
@@ -65,12 +69,12 @@ jobs:
       - name: omp package suite
         working-directory: omp
         run: bun run test
-  # The Rust jobs below build cold on the pool: a debug gsd_engine is about 450 MB, too large to hand between jobs, so each one has the
+  # The Rust jobs below build cold on the runner: a debug gsd_engine is about 450 MB, too large to hand between jobs, so each one has the
   # full 120 minutes. They need Python 3.12 with a shared libpython (pyo3 runs the interpreter in its build script and `cargo test`
   # links it). scripts/ci_rust_toolchain.sh installs the toolchain pinned in rust-toolchain.toml.
   rust:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, omega-ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -81,16 +85,33 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+      # cargo metadata --offline (the key tests) needs every crate in the lockfile, including those for other targets, so fetch them all first.
+      - name: cargo registry (locked)
+        run: cargo fetch --locked
       - name: Build (locked)
         run: cargo build --workspace --locked
       # The signing-key tests (phase 14.5, unit U3.4e) run the real debug binary, so they run here and not in the `test` job, which
       # has no cargo build. Under CI a missing binary or one older than the Rust sources FAILS the tests instead of skipping them.
-      # Python comes as in the `test` job: a venv beside the interpreter, because the pool's tool cache is read-only.
+      # Python comes as in the `test` job: a venv beside the interpreter, the same as there.
       - name: key tests - Python environment
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install pytest pyyaml cryptography
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      # The key tests below run the selector as a child process without SWARM_PURE_PYTHON, and the children import swarm, which
+      # needs swarm._native. It is built here, the way scripts/ci_parity_rust.sh builds it, only when it does not import already.
+      - name: parity cells - swarm._native
+        run: |
+          if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
+            "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
+            VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
+          fi
       # The default build: the sandbox write legs check the named E-DEP refusal and report "not covered", never a pass.
       - name: key tests (default build)
         env:
@@ -100,15 +121,7 @@ jobs:
           cp -p target/debug/gsd_engine "$RUNNER_TEMP/gsd_engine-default"
           GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/test_keys_never_in_guest.py -p no:cacheprovider --junitxml="$RUNNER_TEMP/keys-default.xml"
       # The transition matrix and the signed APPROVED cells (phase 14.5, unit U3.4d) run the real binary through the selector and alone and
-      # compare every byte with the Python script. Under CI a job that names its binary or build makes them FAIL instead of skipping. The
-      # selector legs run the Python body without SWARM_PURE_PYTHON, so `swarm._native` must import: it is built here, the way
-      # scripts/ci_parity_rust.sh builds it, only when it does not.
-      - name: parity cells - swarm._native
-        run: |
-          if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
-            "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
-            VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
-          fi
+      # compare every byte with the Python script. Under CI a job that names its binary or build makes them FAIL instead of skipping.
       - name: transition and signed parity cells (default build, host backend)
         env:
           GSD_ENGINE_BUILD: default
@@ -165,7 +178,7 @@ jobs:
         run: GSD_ENGINE_BIN="$RUNNER_TEMP/gsd_engine-default" python3 -m pytest tests/test_write_faults.py -p no:cacheprovider
   clippy:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, omega-ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -176,13 +189,19 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy (all targets, warnings are errors)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
   parity-rust:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, omega-ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -193,6 +212,12 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: parity gate (Python and Rust legs, fault tests, budget record)
         run: scripts/ci_parity_rust.sh parity-out
       - name: upload the parity records
@@ -206,7 +231,7 @@ jobs:
   # (the plan's release rule) and writes its reports to scheduler-out/. Every leg's children must be witnessed on that leg's engine.
   scheduler:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, omega-ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -217,7 +242,13 @@ jobs:
           python-version: "3.12"
       - name: pinned Rust toolchain
         run: scripts/ci_rust_toolchain.sh
-      # The pool's tool cache is read-only, so the packages go into a venv beside the interpreter (see the `test` job).
+      # gsd-proto's build script runs prost-build, which needs protoc. The Omega pool had it installed; a hosted image does not.
+      - name: protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+      # The packages go into a venv beside the interpreter (see the `test` job).
       - name: Python environment
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
@@ -246,7 +277,7 @@ jobs:
   # turns the job off without a code change.
   browser:
     if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.BROWSER_GATE != 'skip'
-    runs-on: [self-hosted, linux, x64, omega-ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -265,7 +296,7 @@ jobs:
         run: python3 scripts/_ci_browser_gate.py
   supply-chain:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, omega-ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
