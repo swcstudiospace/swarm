@@ -89,6 +89,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
           protoc --version
+      # cargo metadata --offline (the key tests) needs every crate in the lockfile, including those for other targets, so fetch them all first.
+      - name: cargo registry (locked)
+        run: cargo fetch --locked
       - name: Build (locked)
         run: cargo build --workspace --locked
       # The signing-key tests (phase 14.5, unit U3.4e) run the real debug binary, so they run here and not in the `test` job, which
