@@ -189,6 +189,8 @@ def main() -> int:
         ap.add_argument("--dry-run", action="store_true")
         ap.add_argument("--wait", action="store_true", help="run in-process (tests); default is already in-process for this script")
         args = ap.parse_args()
+        if os.environ.get("SWARM_DISABLED") == "1":
+            return 0  # operator kill switch: never plan or dispatch while the swarm is disabled
         if not classify(args.brief):
             return 0
         log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd) if hasattr(logging_paths, "__call__") else {}}, source="autonomous_run", tee=True)

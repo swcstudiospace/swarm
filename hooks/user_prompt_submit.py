@@ -84,7 +84,10 @@ def main() -> int:
             print("{}")
             return 0
         prompt = extract_prompt(payload)
-        if os.environ.get("SWARM_CHILD") == "1":
+        if os.environ.get("SWARM_DISABLED") == "1":
+            # Operator kill switch (SWARM_DISABLED=1): no swarm context, no kickoff, same as omp's extension.
+            print("{}")
+        elif os.environ.get("SWARM_CHILD") == "1":
             # Headless swarm agent session: never re-inject orchestration or re-kick the swarm.
             print("{}")
         elif classify(prompt):

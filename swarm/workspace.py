@@ -26,6 +26,7 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -359,6 +360,21 @@ def write_token(path: Path, token: str) -> None:
         transaction.commit()
 
 
+def primary_checkout(workspace: str | Path) -> Path | None:
+    """The primary checkout that a git worktree of `workspace` belongs to (the parent of the shared `.git` dir), else None.
+    A worktree has its own path, hence its own env dir; its tokens are the repo's, so it reads the primary's."""
+    try:
+        out = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = Path(out.stdout.strip()) if out.returncode == 0 else None
+    if common is None or common.name != ".git":
+        return None
+    primary = common.parent
+    return None if primary.resolve() == Path(workspace).resolve() else primary
+
+
 def credential(agent_id: str | None, workspace: str | Path | None,
                env: Mapping[str, str] | None = None) -> tuple[str | None, str, str]:
     """(token, source, problem): THE lookup of an agent's own token, shared by its session (`child_env`), the leases the
@@ -371,7 +387,9 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     3. Else `SUBSTRATE_TOKEN` in `env` only when running inside this agent's own child session (`SWARM_AGENT_SESSION == "1"`
        and `SWARM_AGENT == slug`), where `child_env` stripped the server-specific variables.
     4. Else nothing. Never `SUBSTRATE_TOKEN` in the runner: that is A01's, and a claim or a run-log row of another
-       agent sent with it would be misattributed, or refused for naming another surface."""
+       agent sent with it would be misattributed, or refused for naming another surface.
+    A git worktree with no env file of its own reads the env file of its primary checkout (`primary_checkout`), so a
+    session started in any worktree of the repo holds the same agent token as the repo itself."""
     from .substrate_tee import AGENT_SURFACES  # lazy: the tee imports this module
 
     e = os.environ if env is None else env
@@ -384,6 +402,10 @@ def credential(agent_id: str | None, workspace: str | Path | None,
         try:
             slug = agent_slug(agent_id or "")
             path = env_file(workspace, slug, e)
+            if not os.path.lexists(path):
+                primary = primary_checkout(workspace)
+                if primary is not None and os.path.lexists(env_file(primary, slug, e)):
+                    path = env_file(primary, slug, e)
         except KeyError:
             return None, "", f"no agent {agent_id!r} in the manifest"
         try:

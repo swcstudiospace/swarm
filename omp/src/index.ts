@@ -29,6 +29,9 @@ export interface SwarmExtensionOptions {
 
 export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtensionOptions): ExtensionFactory {
   return (pi) => {
+    // Kill switch: SWARM_DISABLED=1 registers nothing (no tools, /swarm, hooks, guard or bar), so a stuck or
+    // misconfigured swarm can never block the operator's own session. Read per call, so `SWARM_DISABLED=1 omp` works.
+    if (process.env.SWARM_DISABLED === "1") return;
     // WR-01: this session's children only — a sibling session's shutdown never reaches them
     const inflight: Inflight = new Set();
     // the third bar is per session, like inflight: a sibling session never paints this session's rows
