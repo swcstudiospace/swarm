@@ -221,8 +221,10 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     label: "Swarm assignment",
     description:
       "Obtain the canonical verified signed task.assign envelope and exact specialist prompt for an existing " +
-      "IN_PROGRESS leased task in this correlation. A01 only; refused in plan mode. Read-only Task Store access, " +
-      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input.",
+      "IN_PROGRESS leased task in this correlation. The text you read is that prompt. status ok and " +
+      "assignment_verified true are enforced before the text is returned and are not repeated in it. A returned " +
+      "prompt is dispatch authority; an error is a refusal. A01 only; refused in plan mode. Read-only Task Store " +
+      "access, but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input.",
     parameters: {
       type: "object",
       properties: {

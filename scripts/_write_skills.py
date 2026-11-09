@@ -185,7 +185,7 @@ Never use from a specialist session.
 
 1. `swarm_status` for the correlation → the ready tasks, each with its `agent` and gate notes (`gate`, `gate_for`).
 2. Lease every task of the ready wave with `swarm_transition`: PLANNED → CLAIMED, then CLAIMED → IN_PROGRESS. Lease gate tasks before their gate agent runs: `swarm_gate` refuses a gate task that is not IN_PROGRESS.
-   Obtain each leased task's canonical prompt with `swarm_assignment({task_id, correlation_id})`; require `assignment_verified: true`. Do not construct signatures or use generic code-execution devices.
+   Obtain each leased task's canonical prompt with `swarm_assignment({task_id, correlation_id})`. A returned prompt with no tool error is already verified: `assignment_verified: true` is enforced before the text is shown and is absent from the prompt text on purpose. Dispatch that exact prompt. Do not yield BLOCKED because the field names are absent. An errored or refused call blocks only that specialist spawn. Do not construct signatures or use generic code-execution devices.
 3. Make **one** `task` call for the wave:
    - `tasks[]` holds one item per task, each with `agent: <slug>` from the verified assignment and its exact canonical signed prompt unchanged.
    - Add `schemaMode: "strict"` to every item for a08-qa, a09-reviewer, a10-security and a12-release.
@@ -197,7 +197,7 @@ Never use from a specialist session.
 5. Missing yield (D-07): a child whose output ends with `SUBAGENT_WARNING_MISSING_YIELD`, or has no parseable task.result, is ingested as FAILED with `error: {code: "E-CONTRACT", message: "missing yield"}`, or as BLOCKED with `needs` when it stated a need. Never IN_REVIEW.
 6. Refusals and blocks:
    - Ingest refuses a gate result with E-CONTRACT `review verdict mismatch:` or `gate script not run`: the result is not applied and the gate task stays leased (IN_PROGRESS). Reconcile holds that gate's targets (never APPROVED) until the gate task that recorded the row has an accepted result; a FAILED gate task holds them until step 7 retries or escalates it. Re-dispatch that gate agent with the error text. Never transition around it.
-   - A BLOCKED task: escalate to the human. Never self-release it.
+   - A BLOCKED task: escalate to the human. Never self-release it. A yield whose need says swarm_assignment omitted status or assignment_verified, after the tool returned the signed prompt, is a misread of a successful call. Dispatch from that prompt. It is not a human escalation.
 7. FAILED tasks: nothing in-session retries them (only the headless runner does). For each task FAILED after ingest, read `attempt` from `swarm_status` (`max_attempts` defaults to 3):
    - `attempt` < `max_attempts`: `swarm_transition` FAILED → RETRY, re-lease it RETRY → CLAIMED → IN_PROGRESS, and re-dispatch it to its agent with the error in the payload;
    - otherwise: FAILED → ESCALATED, and report it as an escalation.
@@ -209,12 +209,15 @@ Never use from a specialist session.
    - `summary_md`: the swarm.status summary, i.e. the per-state task counts and every ESCALATED, FAILED and BLOCKED task with its escalation or need.
 
 ## Parent contract
-The session that loaded this skill (the human's top-level) **must never** do domain work. All implementation goes through A01 waves.
+The session that loaded this skill (the human's top-level) **must never** do domain work in place of a specialist. All AgentSwarm implementation goes through A01 waves.
+A missing signed task.assign does not cancel read-only discovery or GSD work the user already asked for.
+A returned swarm_assignment prompt is already verified. Do not copy an assignment-field misread onto every todo, and do not mark every todo blocked to clear a reminder. Open phase-security findings block only phase close and milestone complete. A user decision already recorded for a node resolves that node. Files an advisor names are not closure of the request.
 
 ## Depth cap & plan mode
 - If you have no `task` tool and are not in plan mode, you may only `yield {state: "BLOCKED", needs: "depth"}` when orchestrator tools (`bash`, `write`, `swarm_*`) are still present, or you are inside a workpool child. The advisor review surface (`read`, `grep`, `glob`, and `advise`) is not that cap: do not yield depth for it.
 - An `<advisory>` note of any severity, including blocker, is the Omp advisor model's balanced-budget review. Weigh it. It is not a swarm BLOCKED. Keep the advisor. Do not skip the work pool or the `task` dispatch because the advisor spoke.
 - If A01 cannot dispatch, only the specialist spawn waits. Read-only discovery is not blocked. Finish it with read, grep, and glob. Do not hand off with every node blocked, and do not answer an advisory blocker by repeating that the work remains blocked.
+- A missing signed task.assign, or a yield that cites a workpool-child restriction, blocks only the specialist spawn. Do not tell the operator to restore a signing setup. Do not ask for credentials. Signing and notarization before publication stay a separate release hold. When `task` is present, a prose brief is enough to call swarm_plan; do not yield before that call.
 - In plan mode: yield a plan; perform zero Task Store writes.
 
 ## Negatives you must honour

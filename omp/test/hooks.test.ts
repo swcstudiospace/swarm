@@ -56,6 +56,8 @@ describe("fixture positives inject once, after the prior parts", () => {
       expect(added).toContain("/swarm <brief>");
       expect(added).toContain("If A01 cannot dispatch");
       expect(added).toContain("Read-only discovery stays in this session");
+      expect(added).toContain("signed task.assign");
+      expect(added).toContain("Do not ask for credentials");
       expect(added).toContain("not a swarm BLOCKED");
       expect(added).not.toContain("yields BLOCKED");
       expect(added).toContain("task");
@@ -86,6 +88,11 @@ test("gsd-autonomous handoff text does not name the retired policy token", () =>
   expect(GSD_HANDOFF).toContain("If A01 cannot dispatch");
   expect(GSD_HANDOFF).toContain("Do not hand off with every node blocked");
   expect(GSD_HANDOFF).toContain("finish them inline");
+  expect(GSD_HANDOFF).toContain("signed task.assign");
+  expect(GSD_HANDOFF).toContain("Do not ask for credentials");
+  expect(GSD_HANDOFF).toContain("already verified");
+  expect(GSD_HANDOFF).toContain("do not mark every todo blocked");
+  expect(SWARM_CONTEXT).toContain("already verified");
 });
 
 test("gsd-autonomous handoff fires only for a leading /gsd-autonomous command", () => {

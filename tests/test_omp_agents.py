@@ -346,7 +346,9 @@ def test_a01_lease_assignment_dispatch_protocol():
                       'status: "ok"', "assignment_verified: true"):
             assert token in lines[assignment], token
         for token in ("unsigned", "advisory", "dry-run", "no dispatch authority",
-                      "Never construct or sign", "signing material", "eval", "xd://run_code", "raw swarm state"):
+                      "Never construct or sign", "signing material", "eval", "xd://run_code", "raw swarm state",
+                      "absent from the prompt text on purpose",
+                      "Do not yield BLOCKED because those names are missing"):
             assert token in lines[assignment], token
         for token in ("verified assignment", "`agent_slug`", "`prompt` unchanged"):
             assert token in lines[dispatch], token
@@ -392,6 +394,18 @@ def test_a01_depth_rule_blocked_not_in_review():
     assert "advisor review surface" in depth
     assert "work pool" in depth
     assert "Read-only discovery is not blocked" in depth
+
+
+def test_a01_prose_brief_is_not_a_signing_stop():
+    """A pasted signature is not a prerequisite for planning. The workpool-child yield stays needs depth."""
+    lines = _a01_runtime_lines()
+    brief = lines[_rule(lines, "prose brief")]
+    assert "swarm_plan" in brief and "swarm_status" in brief
+    assert "do not ask for credentials" in brief
+    assert "separate release hold" in brief
+    assert '"depth"' not in brief
+    depth = lines[_rule(lines, '"depth"')]
+    assert "signed task.assign requirement" in depth
 
 
 def test_a01_advisor_note_is_not_a_depth_block():
