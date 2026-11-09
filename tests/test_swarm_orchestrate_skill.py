@@ -20,6 +20,18 @@ def _section(text: str, heading: str) -> str:
     return m.group(1)
 
 
+def test_advisor_review_is_not_the_depth_cap():
+    """The advisor model stays. Its review surface and notes do not replace the workpool-child depth cap."""
+    text = _skill()
+    depth = _section(text, "Depth cap & plan mode")
+    assert "advisor review surface" in depth
+    assert "<advisory>" in depth
+    assert "not a swarm BLOCKED" in depth
+    assert "If A01 cannot dispatch" in depth
+    assert "Read-only discovery is not blocked" in depth
+    assert "workpool child" in _section(text, "Negatives you must honour")
+
+
 def test_skill_frontmatter_loadable():
     text = _skill()
     assert text == skills_mod.swarm_orchestrate_skill()

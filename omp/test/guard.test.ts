@@ -155,6 +155,50 @@ describe("HOOK-04", () => {
     const { run } = guardHandler({ activeTools: ["read"] });
     expect((run(call("bash", {}), fakeCtx(CWD)) as { reason?: string } | undefined)?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
   });
+
+  test("advisor review surface is not the depth cap", () => {
+    for (const activeTools of [
+      ["read", "grep", "glob"],
+      ["read", "grep", "glob", "advise"],
+      ["grep", "glob"],
+      ["READ", "Grep", "Glob"],
+    ]) {
+      const facts = { ...capped, activeTools };
+      expect(guardToolCall(call("read", { path: "x" }), facts)).toBeUndefined();
+      expect(guardToolCall(call("bash", { command: "ls" }), facts)).toBeUndefined();
+      expect(guardToolCall(yieldData({ state: "IN_REVIEW" }), facts)).toBeUndefined();
+      const viaEval = guardToolCall(call("eval", { code: "p = workpool('scout')" }), facts);
+      expect(viaEval?.block).toBe(true);
+      expect(viaEval?.reason).toContain("eval-in-swarm");
+    }
+  });
+
+  test.each([
+    ["lone read", ["read"]],
+    ["read plus advise", ["read", "advise"]],
+    ["advise only", ["advise"]],
+    ["empty", [] as string[]],
+    ["orchestrator tools without task", ["read", "bash", "yield"]],
+    ["advisor set plus bash", ["read", "grep", "glob", "bash"]],
+    ["advisor set plus yield", ["read", "grep", "glob", "yield"]],
+    ["advisor set plus swarm_plan", ["read", "grep", "glob", "swarm_plan"]],
+  ])("active tools %s stay at the depth cap", (_name, activeTools) => {
+    const res = guardToolCall(call("read", { path: "x" }), { ...capped, activeTools });
+    expect(res?.block).toBe(true);
+    expect(res?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
+  });
+
+  test("registered handler: advisor review tools do not block A01", () => {
+    const { run } = guardHandler({ activeTools: ["read", "grep", "glob", "advise"] });
+    expect(run(call("read", { path: "x" }), a01Ctx())).toBeUndefined();
+    expect(run(call("bash", { command: "ls" }), a01Ctx())).toBeUndefined();
+  });
+
+  test("registered handler: advisor set plus an orchestrator tool stays capped", () => {
+    const { run } = guardHandler({ activeTools: ["read", "grep", "glob", "bash", "yield"] });
+    const res = run(call("bash", { command: "ls" }), a01Ctx()) as { reason?: string } | undefined;
+    expect(res?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
+  });
 });
 
 describe("fail", () => {

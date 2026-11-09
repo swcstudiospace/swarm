@@ -389,6 +389,21 @@ def test_a01_depth_rule_blocked_not_in_review():
     for token in ("`task`", "`_task`", '"BLOCKED"', "never IN_REVIEW"):
         assert token in depth, token
     assert "without reading, running or writing anything first" in depth
+    assert "advisor review surface" in depth
+    assert "work pool" in depth
+    assert "Read-only discovery is not blocked" in depth
+
+
+def test_a01_advisor_note_is_not_a_depth_block():
+    """The Omp advisor model stays. An <advisory> note is balanced-budget review, not the depth cap."""
+    lines = _a01_runtime_lines()
+    advisor = lines[_rule(lines, "<advisory>")]
+    assert "not a swarm BLOCKED" in advisor
+    assert "work pool" in advisor
+    assert "Keep the advisor model" in advisor
+    assert "read-only nodes" in advisor
+    assert "A01 cannot dispatch" in advisor
+    assert '"depth"' not in advisor
 
 
 def test_specialist_preamble_unchanged():

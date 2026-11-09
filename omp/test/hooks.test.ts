@@ -54,6 +54,10 @@ describe("fixture positives inject once, after the prior parts", () => {
       const added = out.systemPrompt.at(-1) ?? "";
       expect(added.startsWith("## AgentSwarm")).toBe(true);
       expect(added).toContain("/swarm <brief>");
+      expect(added).toContain("If A01 cannot dispatch");
+      expect(added).toContain("Read-only discovery stays in this session");
+      expect(added).toContain("not a swarm BLOCKED");
+      expect(added).not.toContain("yields BLOCKED");
       expect(added).toContain("task");
       expect(added).toContain("a01-orchestrator");
       expect(out.systemPrompt.filter((p) => p.includes("## AgentSwarm"))).toHaveLength(1);
@@ -79,6 +83,9 @@ describe("fixture negatives are silent except the gsd-autonomous handoff", () =>
 test("gsd-autonomous handoff text does not name the retired policy token", () => {
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join("-"));
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join(""));
+  expect(GSD_HANDOFF).toContain("If A01 cannot dispatch");
+  expect(GSD_HANDOFF).toContain("Do not hand off with every node blocked");
+  expect(GSD_HANDOFF).toContain("finish them inline");
 });
 
 test("gsd-autonomous handoff fires only for a leading /gsd-autonomous command", () => {

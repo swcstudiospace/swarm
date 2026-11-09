@@ -212,7 +212,9 @@ Never use from a specialist session.
 The session that loaded this skill (the human's top-level) **must never** do domain work. All implementation goes through A01 waves.
 
 ## Depth cap & plan mode
-- If you have no `task` tool and are not in plan mode, you may only `yield {state: "BLOCKED", needs: "depth"}`.
+- If you have no `task` tool and are not in plan mode, you may only `yield {state: "BLOCKED", needs: "depth"}` when orchestrator tools (`bash`, `write`, `swarm_*`) are still present, or you are inside a workpool child. The advisor review surface (`read`, `grep`, `glob`, and `advise`) is not that cap: do not yield depth for it.
+- An `<advisory>` note of any severity, including blocker, is the Omp advisor model's balanced-budget review. Weigh it. It is not a swarm BLOCKED. Keep the advisor. Do not skip the work pool or the `task` dispatch because the advisor spoke.
+- If A01 cannot dispatch, only the specialist spawn waits. Read-only discovery is not blocked. Finish it with read, grep, and glob. Do not hand off with every node blocked, and do not answer an advisory blocker by repeating that the work remains blocked.
 - In plan mode: yield a plan; perform zero Task Store writes.
 
 ## Negatives you must honour
