@@ -209,12 +209,14 @@ Never use from a specialist session.
    - `summary_md`: the swarm.status summary, i.e. the per-state task counts and every ESCALATED, FAILED and BLOCKED task with its escalation or need.
 
 ## Parent contract
-The session that loaded this skill (the human's top-level) **must never** do domain work. All implementation goes through A01 waves.
+The session that loaded this skill (the human's top-level) **must never** do domain work in place of a specialist. All AgentSwarm implementation goes through A01 waves.
+A missing signed task.assign does not cancel read-only discovery or GSD work the user already asked for.
 
 ## Depth cap & plan mode
 - If you have no `task` tool and are not in plan mode, you may only `yield {state: "BLOCKED", needs: "depth"}` when orchestrator tools (`bash`, `write`, `swarm_*`) are still present, or you are inside a workpool child. The advisor review surface (`read`, `grep`, `glob`, and `advise`) is not that cap: do not yield depth for it.
 - An `<advisory>` note of any severity, including blocker, is the Omp advisor model's balanced-budget review. Weigh it. It is not a swarm BLOCKED. Keep the advisor. Do not skip the work pool or the `task` dispatch because the advisor spoke.
 - If A01 cannot dispatch, only the specialist spawn waits. Read-only discovery is not blocked. Finish it with read, grep, and glob. Do not hand off with every node blocked, and do not answer an advisory blocker by repeating that the work remains blocked.
+- A missing signed task.assign, or a yield that cites a workpool-child restriction, blocks only the specialist spawn. Do not tell the operator to restore a signing setup. Do not ask for credentials. Signing and notarization before publication stay a separate release hold. When `task` is present, a prose brief is enough to call swarm_plan; do not yield before that call.
 - In plan mode: yield a plan; perform zero Task Store writes.
 
 ## Negatives you must honour

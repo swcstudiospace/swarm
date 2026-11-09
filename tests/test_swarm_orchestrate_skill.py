@@ -29,6 +29,9 @@ def test_advisor_review_is_not_the_depth_cap():
     assert "not a swarm BLOCKED" in depth
     assert "If A01 cannot dispatch" in depth
     assert "Read-only discovery is not blocked" in depth
+    assert "signed task.assign" in depth
+    assert "Do not ask for credentials" in depth
+    assert "prose brief" in depth
     assert "workpool child" in _section(text, "Negatives you must honour")
 
 

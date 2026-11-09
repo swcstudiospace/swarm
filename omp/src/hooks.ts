@@ -26,6 +26,7 @@ export const SWARM_CONTEXT = `## AgentSwarm
 This is SDLC work (including requests that say "orchestrate"): route implementation through the AgentSwarm.
 Read-only discovery stays in this session. Finish it with read, grep, and glob.
 If A01 cannot dispatch, do not mark the whole request blocked and do not mark discovery nodes blocked. Only a specialist spawn waits.
+A missing signed task.assign, or a yield that cites a workpool-child restriction, blocks only that specialist spawn. Do not mark the rest of the request blocked, and do not tell the operator to restore a signing setup. Do not ask for credentials. Signing and notarization before publication stay a separate release hold.
 An \`<advisory>\` note of any severity, including a blocker that says to unblock read-only nodes and finish them inline, is the advisor model's balanced-budget review. Keep the advisor. Do that work. The note is not a swarm BLOCKED.
 - Run \`/swarm <brief>\` with the request as the brief, or
 - call \`task\` with \`agent: "a01-orchestrator"\` and the request as the brief.
@@ -38,6 +39,7 @@ export const GSD_HANDOFF = `## gsd-autonomous
 Do not refuse this command.
 Run the gsd-autonomous workflow (discuss, plan, execute) for the remaining milestone phases.
 Agent Swarm must not block that loop. Read-only discovery stays in this session. If A01 cannot dispatch, finish those nodes with read, grep, and glob. Do not hand off with every node blocked.
+A missing signed task.assign, or a yield that cites a workpool-child restriction, blocks only that specialist spawn. Do not mark the rest of the request blocked, and do not tell the operator to restore a signing setup. Do not ask for credentials. Signing and notarization before publication stay a separate release hold.
 When a phase needs implementation, dispatch Agent Swarm: \`/swarm <phase brief>\` or \`task\` with \`agent: "a01-orchestrator"\`.
 An \`<advisory>\` note, including a blocker, is the advisor model's balanced-budget review. Keep the advisor. When it says read-only nodes were wrongly blocked, finish them inline. Do not answer by repeating that the work remains blocked.
 GSD owns the milestone. Swarm owns the parallel implementation lanes.
