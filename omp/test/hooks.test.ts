@@ -90,6 +90,9 @@ test("gsd-autonomous handoff text does not name the retired policy token", () =>
   expect(GSD_HANDOFF).toContain("finish them inline");
   expect(GSD_HANDOFF).toContain("signed task.assign");
   expect(GSD_HANDOFF).toContain("Do not ask for credentials");
+  expect(GSD_HANDOFF).toContain("already verified");
+  expect(GSD_HANDOFF).toContain("do not mark every todo blocked");
+  expect(SWARM_CONTEXT).toContain("already verified");
 });
 
 test("gsd-autonomous handoff fires only for a leading /gsd-autonomous command", () => {

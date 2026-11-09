@@ -346,7 +346,9 @@ def test_a01_lease_assignment_dispatch_protocol():
                       'status: "ok"', "assignment_verified: true"):
             assert token in lines[assignment], token
         for token in ("unsigned", "advisory", "dry-run", "no dispatch authority",
-                      "Never construct or sign", "signing material", "eval", "xd://run_code", "raw swarm state"):
+                      "Never construct or sign", "signing material", "eval", "xd://run_code", "raw swarm state",
+                      "absent from the prompt text on purpose",
+                      "Do not yield BLOCKED because those names are missing"):
             assert token in lines[assignment], token
         for token in ("verified assignment", "`agent_slug`", "`prompt` unchanged"):
             assert token in lines[dispatch], token
