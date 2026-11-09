@@ -84,13 +84,15 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
       try {
         const { restricted, topLevel } = sessionAgent(ctx);
         known = { agent: callingAgent(ctx), topLevel };
-        // getActiveTools only for A01: the depth-cap check is the only reader (D-06)
-        const hasTask = known.agent === ORCHESTRATOR ? pi.getActiveTools().includes("task") : true;
+        // getActiveTools only for A01: the depth-cap check is the only reader (D-06).
+        // The same list distinguishes a real cap from the advisor review surface.
+        const activeTools = known.agent === ORCHESTRATOR ? pi.getActiveTools() : undefined;
+        const hasTask = activeTools !== undefined ? activeTools.includes("task") : true;
         // D-08: the runtime roots bridge.swarmRoot() picks from (env SWARM_ROOT, the package's repo), spelled without fs
         const root = env.SWARM_ROOT?.trim();
         const runtimeRoots = [...(root ? [resolve(root)] : []), resolve(import.meta.dir, "..", "..")];
         const signerReadPaths = parseSignerDenyPaths(env.SWARM_SIGNER_DENY_PATHS);
-        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots, signerReadPaths };
+        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, activeTools, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots, signerReadPaths };
         const decision = guardToolCall(event, facts);
         // an accepted `task` call is the bar's last-resort row source (the bus and live.json are richer when present)
         if (!decision?.block && event.toolName === "task") display(() => bar.taskSpawn(ctx, event.input, event.toolCallId));

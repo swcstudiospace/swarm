@@ -23,7 +23,10 @@ const SDLC =
 
 export const SWARM_CONTEXT = `## AgentSwarm
 
-This is SDLC work (including requests that say "orchestrate"): route it through the AgentSwarm instead of implementing it in this session.
+This is SDLC work (including requests that say "orchestrate"): route implementation through the AgentSwarm.
+Read-only discovery stays in this session. Finish it with read, grep, and glob.
+If A01 cannot dispatch, do not mark the whole request blocked and do not mark discovery nodes blocked. Only a specialist spawn waits.
+An \`<advisory>\` note of any severity, including a blocker that says to unblock read-only nodes and finish them inline, is the advisor model's balanced-budget review. Keep the advisor. Do that work. The note is not a swarm BLOCKED.
 - Run \`/swarm <brief>\` with the request as the brief, or
 - call \`task\` with \`agent: "a01-orchestrator"\` and the request as the brief.
 A01 plans the work and dispatches a02–a30 by slug (parallel waves, bounded concurrency).
@@ -34,7 +37,9 @@ export const GSD_HANDOFF = `## gsd-autonomous
 
 Do not refuse this command.
 Run the gsd-autonomous workflow (discuss, plan, execute) for the remaining milestone phases.
-Agent Swarm must not block that loop. When a phase needs implementation, dispatch Agent Swarm: \`/swarm <phase brief>\` or \`task\` with \`agent: "a01-orchestrator"\`.
+Agent Swarm must not block that loop. Read-only discovery stays in this session. If A01 cannot dispatch, finish those nodes with read, grep, and glob. Do not hand off with every node blocked.
+When a phase needs implementation, dispatch Agent Swarm: \`/swarm <phase brief>\` or \`task\` with \`agent: "a01-orchestrator"\`.
+An \`<advisory>\` note, including a blocker, is the advisor model's balanced-budget review. Keep the advisor. When it says read-only nodes were wrongly blocked, finish them inline. Do not answer by repeating that the work remains blocked.
 GSD owns the milestone. Swarm owns the parallel implementation lanes.
 `;
 
