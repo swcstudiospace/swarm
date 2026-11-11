@@ -11,6 +11,7 @@ import datetime as dt
 import re
 from typing import Any
 
+from swarm.errors import ErrorCode, SwarmError
 from swarm.tools.support import respond
 
 # Heuristic detectors. The sec_gate scan remains the authority; these only report rule hits.
@@ -377,7 +378,8 @@ def sbom_diff(payload: dict[str, Any]) -> dict[str, Any]:
         after, problem = _component_map(payload["after"], "after")
         if problem:
             return problem
-        assert before is not None and after is not None  # _component_map returns a mapping whenever it reports no problem
+        if before is None or after is None:  # _component_map returns a mapping whenever it reports no problem
+            raise SwarmError(ErrorCode.E_INTERNAL, "component maps missing without a reported problem")
         added = [{"name": n, "version": after[n]} for n in sorted(after.keys() - before.keys())]
         removed = [{"name": n, "version": before[n]} for n in sorted(before.keys() - after.keys())]
         changed = [

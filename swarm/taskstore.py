@@ -7,6 +7,7 @@ which is validated and applied by the orchestrator scripts.
 from __future__ import annotations
 import builtins
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -64,6 +65,8 @@ DEFAULT_MAX_ATTEMPTS = 3
 GATES_BY_RISK = {"low": ["review"], "medium": ["review", "quality"],
                  "high": ["review", "quality", "security", "release"]}
 
+_LOG = logging.getLogger(__name__)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL, parent_id TEXT,
@@ -119,6 +122,15 @@ class TaskStore:
         self.conn.executescript(_SCHEMA)
         self._migrate_verdicts()
 
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> TaskStore:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
     def _tune_journal(self) -> None:
         """Opt-in (SWARM_TASKSTORE_WAL=1, read at every open): WAL + synchronous=NORMAL, so a commit costs no fsync of
         the main file instead of about two (measured 17% of a dry run). Off by default: default-on changes the scheduler's
@@ -131,9 +143,9 @@ class TaskStore:
             if mode.lower() != "wal":
                 self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             # read-only filesystem, no shared memory, or a concurrent opener holds the lock: keep the current mode, only slower
-            pass
+            _LOG.debug("journal_mode WAL not applied (%s); keeping the current mode", exc)
 
     def _migrate_verdicts(self) -> None:
         """D-14: in-place, idempotent add of the signed-envelope columns to a v1 verdicts table.
@@ -174,7 +186,12 @@ class TaskStore:
             raise
         self._tx_depth -= 1
         if self._tx_depth == 0:
-            self.conn.commit()
+            try:
+                self.conn.commit()
+            except BaseException:
+                self._live_dirty = False  # not committed: nothing to publish
+                self.conn.rollback()
+                raise
             if self._live_dirty:  # after the write lock is released
                 self._live_dirty = False
                 self._notify_committed()

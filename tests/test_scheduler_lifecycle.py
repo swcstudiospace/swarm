@@ -4,6 +4,7 @@ The synthetic import deliberately differs from the canonical runner module. Asse
 observe real store histories, lifecycle manager slots and telemetry, not source text.
 """
 import importlib.util
+import io
 import json
 import logging
 import signal
@@ -493,3 +494,145 @@ def test_acquire_after_release_is_refused_and_takes_no_slot(lifecycle):
         rig.mgr.acquire(sid)
     assert refused.value.code is ErrorCode.E_CONTRACT
     assert rig.mgr._sem._value == free
+
+
+# --- PY-09: swarm_run logging, handoff flush and the shared knob helper -------------------------------------------------
+def _run_once(rig, monkeypatch):
+    """run() with the dispatch loop stubbed: its setup and its tail (reconcile, handoff flush) run for real."""
+    monkeypatch.setattr(rig.mod.Scheduler, "loop", lambda self: None)
+    return rig.mod.run(rig.args, rig.ctx)
+
+
+def test_state_store_failure_is_logged(lifecycle, monkeypatch, caplog):
+    from swarm.state_store import SwarmStateStore
+    rig = lifecycle
+
+    def refused(self, *args, **kwargs):
+        raise RuntimeError("state store refused")
+
+    monkeypatch.setattr(SwarmStateStore, "append_gsd_line", refused)
+    with caplog.at_level(logging.WARNING, logger="swarm.run"):
+        out = _run_once(rig, monkeypatch)
+    assert out["correlation_id"] == rig.ctx.correlation_id  # the run goes on without the state store
+    failures = [r for r in caplog.records if r.name == "swarm.run" and r.exc_info]
+    assert len(failures) == 1 and failures[0].exc_info[0] is RuntimeError
+
+
+def test_kill_group_logs_permission_error(lifecycle, monkeypatch, caplog):
+    rig = lifecycle
+
+    def denied(pgid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(rig.mod.os, "killpg", denied)
+    with caplog.at_level(logging.WARNING, logger="swarm.run"):
+        rig.mod.kill_group(4242, signal.SIGTERM)
+    refused = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.WARNING]
+    assert len(refused) == 1 and "4242" in refused[0].getMessage()
+
+    def gone(pgid, sig):
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(rig.mod.os, "killpg", gone)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="swarm.run"):
+        rig.mod.kill_group(4242, signal.SIGTERM)
+    assert [r for r in caplog.records if r.name == "swarm.run"] == []  # a group that already exited is normal
+
+
+def test_unreaped_leader_is_logged(lifecycle, monkeypatch, caplog, tmp_path):
+    rig = lifecycle
+
+    class Stuck:
+        pid = 4242
+        stdin = None
+        stdout = io.BytesIO(b"")
+        stderr = io.BytesIO(b"")
+        returncode = None
+
+        def poll(self):
+            return 0  # the leader has exited, yet its reap never finishes
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("claude", timeout)
+
+    class Group:
+        def __init__(self, cmd, *, cwd, env, text):
+            self.proc = Stuck()
+            self.pgid = Stuck.pid
+            self.stopped = []
+
+        def kill(self, grace=None):
+            pass
+
+        def stop(self, reason, *, grace=None):
+            self.stopped.append(reason)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(rig.mod, "ChildGroup", Group)
+    with caplog.at_level(logging.WARNING, logger="swarm.run"):
+        rig.mod.run_agent_headless(rig.agent, "prompt", tmp_path, rig.args)
+    left = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.WARNING]
+    assert len(left) == 1 and "4242" in left[0].getMessage()
+
+
+def test_handoffs_flushed_when_reconcile_raises(lifecycle, monkeypatch):
+    rig = lifecycle
+
+    class Handoffs:
+        flushed = 0
+
+        def flush(self, stop_requested=None):
+            self.flushed += 1
+
+    handoffs = Handoffs()
+    monkeypatch.setattr(rig.mod, "handoff_bridge", lambda *a, **k: handoffs)
+
+    def reconcile_down(*args, **kwargs):
+        raise RuntimeError("reconcile down")
+
+    monkeypatch.setattr(rig.mod, "reconcile", reconcile_down)
+    with pytest.raises(RuntimeError, match="reconcile down"):
+        _run_once(rig, monkeypatch)
+    assert handoffs.flushed == 1
+
+
+def test_signing_lifecycle_message_reaches_logging(lifecycle, monkeypatch, caplog):
+    rig = lifecycle
+    text = "Signing key absent: purpose is enterprise audit/integrity of parallel swarm. Proceeding reduced-privilege."
+    monkeypatch.setattr("swarm.envelope.perform_signing_key_lifecycle", lambda **kw: {"status": "reduced", "message": text})
+    with caplog.at_level(logging.INFO, logger="swarm.run"):
+        _run_once(rig, monkeypatch)
+    assert [r.levelno for r in caplog.records if r.name == "swarm.run" and r.getMessage() == text] == [logging.WARNING]
+
+
+def test_validate_signer_deny_policy_refuses_a_malformed_policy(lifecycle):
+    rig = lifecycle
+    with pytest.raises(SwarmError) as refused:
+        rig.mod.validate_signer_deny_policy({"SWARM_SIGNER_DENY_PATHS": "not-json"})
+    assert refused.value.code is ErrorCode.E_INPUT
+    assert rig.mod.validate_signer_deny_policy({}) is None
+
+
+def test_native_execution_reads_retry_knobs_through_shared_helper(lifecycle, monkeypatch):
+    from swarm.retry import DEFAULT_BASE_S, DEFAULT_CAP_S
+    rig = lifecycle
+    monkeypatch.setenv("SWARM_RETRY_BASE_S", "0")  # a backoff base must be positive: the default
+    monkeypatch.setenv("SWARM_RETRY_CAP_S", "nan")  # not finite: the default
+    monkeypatch.setenv("SWARM_RATE_COOLDOWN_S", "0")  # a cooldown may be zero
+    rust = rig.mod._native_execution(rig.sched, (lambda *a, **k: {}, lambda: None))
+    assert rust._settings.backoff_base_s == DEFAULT_BASE_S and rust._settings.backoff_cap_s == DEFAULT_CAP_S
+    assert rust._settings.cooldown_s == 0.0
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-1", "abc"])
+def test_scheduler_knobs_refuse_malformed_values_and_keep_zero(lifecycle, monkeypatch, raw):
+    rig = lifecycle
+    monkeypatch.setenv("SWARM_CANCEL_GRACE_S", raw)
+    with pytest.raises(SwarmError) as refused:
+        rig.mod._env_seconds("SWARM_CANCEL_GRACE_S", 10.0)
+    assert refused.value.code is ErrorCode.E_INPUT
+    monkeypatch.setenv("SWARM_CANCEL_GRACE_S", "0")
+    assert rig.mod._env_seconds("SWARM_CANCEL_GRACE_S", 10.0) == 0.0

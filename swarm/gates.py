@@ -1,8 +1,9 @@
 """Gate verdicts (quality / review / security / release) and conjunction rules."""
 from __future__ import annotations
-import time
 from pathlib import Path
 from typing import Any
+
+from .clock import SYSTEM_CLOCK, Clock
 from .errors import SwarmError, ErrorCode
 from .envelope import build_envelope, sign_envelope, signing_config_error
 
@@ -10,6 +11,9 @@ GATES = {"quality", "review", "security", "release"}
 VERDICTS = {"pass", "fail", "waive"}
 SEVERITIES = ["info", "minor", "major", "critical", "blocker"]
 BLOCKING_SEVERITY = "major"   # any finding at or above this ⇒ fail
+# Members the verdict signs itself. An `extra` entry with one of these names is ignored: the signed value wins.
+# `issued_at` is not in this set: a caller may supply it (the signed store passes its own clock reading).
+SIGNED_FIELDS = frozenset({"gate", "task_id", "verdict", "findings", "runs", "expires_s"})
 
 
 def make_finding(fid: str, severity: str, kind: str, summary: str, *, evidence: str = "",
@@ -22,16 +26,24 @@ def make_finding(fid: str, severity: str, kind: str, summary: str, *, evidence: 
             "location": location}
 
 
+def _severity_index(finding: dict[str, Any]) -> int:
+    severity = finding.get("severity")
+    if severity not in SEVERITIES:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"bad severity {severity}")
+    return SEVERITIES.index(severity)
+
+
 def derive_verdict(findings: list[dict[str, Any]]) -> str:
-    """fail on any finding ≥ BLOCKING_SEVERITY, otherwise pass."""
+    """fail on any finding ≥ BLOCKING_SEVERITY, otherwise pass. Every severity is checked: an unknown one is E-CONTRACT."""
     idx = SEVERITIES.index(BLOCKING_SEVERITY)
-    return "fail" if any(SEVERITIES.index(f["severity"]) >= idx for f in findings) else "pass"
+    ranks = [_severity_index(f) for f in findings]
+    return "fail" if any(rank >= idx for rank in ranks) else "pass"
 
 
 def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict[str, Any]] | None = None,
                  verdict: str | None = None, runs: dict[str, Any] | None = None, expires_s: int = 86400,
                  correlation_id: str | None = None, extra: dict[str, Any] | None = None,
-                 root: str | Path | None = None, audit: bool = True) -> dict[str, Any]:
+                 root: str | Path | None = None, audit: bool = True, clock: Clock = SYSTEM_CLOCK) -> dict[str, Any]:
     """Return a signed envelope carrying a gate verdict. Waive requires explicit verdict.
     `root` routes the dev-key audit event to the caller's state dir; audit=False skips it (agent-session preview)."""
     if gate not in GATES:
@@ -43,7 +55,8 @@ def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict[
     if verdict == "waive" and not (extra or {}).get("waived_by"):
         raise SwarmError(ErrorCode.E_POLICY, "waive requires extra.waived_by (human, L3)")
     payload = {"gate": gate, "task_id": task_id, "verdict": verdict, "findings": findings,
-               "runs": runs or {}, "expires_s": expires_s, "issued_at": time.time(), **(extra or {})}
+               "runs": runs or {}, "expires_s": expires_s, "issued_at": clock.wall()}
+    payload.update((k, v) for k, v in (extra or {}).items() if k not in SIGNED_FIELDS)
     config_error = signing_config_error()
     if config_error:
         raise SwarmError(ErrorCode.E_POLICY, config_error, task_id=task_id)

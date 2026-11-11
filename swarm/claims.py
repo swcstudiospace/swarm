@@ -365,7 +365,7 @@ class NativeClaimTable:
 
     def _fall_back(self, exc: Exception) -> ClaimTable:
         """Replaces the native table by a Python `ClaimTable` holding the journal's claims; the caller repeats the failed call on it."""
-        _engine_warn_once("native-error", f"swarm._native.ClaimTable failed ({type(exc).__name__}: {str(exc)[:200]})")
+        _engine_warn_once("native-error", f"swarm._native.ClaimTable failed ({type(exc).__name__})")
         table = ClaimTable()
         table._held = {owner: list(claims) for owner, claims in self._journal.items()}
         self._python, self._native, self._journal = table, None, {}
@@ -404,5 +404,5 @@ def make_claim_table() -> ClaimStore:
     try:
         return NativeClaimTable(native_class())
     except Exception as exc:  # noqa: BLE001 - any native failure must degrade to the oracle, never propagate
-        _engine_warn_once("native-error", f"swarm._native.ClaimTable failed ({type(exc).__name__}: {str(exc)[:200]})")
+        _engine_warn_once("native-error", f"swarm._native.ClaimTable failed ({type(exc).__name__})")
         return ClaimTable()

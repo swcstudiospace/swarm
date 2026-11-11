@@ -34,7 +34,7 @@ A route flips only with all of the following (`14.5-CONTEXT.md` criterion 11; `1
 | A10 security gate, default pin | **SECURED**, scoped to the default read-only guest. F1 (major: the key canary scan did not cover the P2 request bytes) is closed by `d0617a5` (test-only; see the verification table). F2 (STATE wording) corrected in STATE. F3 (`regex` edge) closed by D-P40. F4 to F8 minor or info | record `tests/parity/records/14.5/A10-guest-pin-91b0970e.md` |
 | A11 reproducibility, default pin | **REPRODUCIBLE**: HEAD and `dc46279` build `91b0970e...`; tracked `web/generated` is byte-identical to a fresh jco 1.39.0 transpile; `scripts/_check_pins.py` exits 0 | record `tests/parity/records/14.5/A11-guest-pin-reproduce.md` |
 | User's answer on the digest | "Accept 91b0970e... and re-sign" (D-P38 item 1) | STATE |
-| A10 and A11 for the write guest `50b06310...` | **None.** The A10 record says it "is not a clearance for flipping the write routes" | — |
+| A10 and A11 for the write guest `50b06310...` | **A10 SECURED, scoped to the write guest. A11 REPRODUCIBLE.** A10 says it is not a clearance for flipping the write routes; U3.8c is still pending | `tests/parity/records/14.5/A10-write-guest-50b06310.md`, `tests/parity/records/14.5/A11-write-guest-50b06310.md` |
 
 ### Routes (one row per route)
 

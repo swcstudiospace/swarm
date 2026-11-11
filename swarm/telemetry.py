@@ -275,9 +275,11 @@ def _valid_live(doc: object) -> bool:
 
 
 @contextlib.contextmanager
-def _live_lock(target: Path, timeout: float = 2.0) -> Iterator[bool]:
+def _live_lock(target: Path, timeout: float = 2.0, *, clock: Clock = SYSTEM_CLOCK,
+                sleep: Callable[[float], None] = time.sleep) -> Iterator[bool]:
     """Exclusive `flock` on `<live.json>.lock` for the read-derive-write cycle. Yields True when held, False when it
-    could not be taken within `timeout` seconds (or there is no flock): callers decide whether to proceed unlocked."""
+    could not be taken within `timeout` seconds of `clock` (or there is no flock): callers decide whether to proceed
+    unlocked. The poll pauses with `sleep` between attempts."""
     if fcntl is None:
         yield False
         return
@@ -289,16 +291,16 @@ def _live_lock(target: Path, timeout: float = 2.0) -> Iterator[bool]:
         return
     held = False
     try:
-        deadline = time.monotonic() + timeout
+        deadline = clock.monotonic() + timeout
         while True:
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 held = True
                 break
             except OSError:
-                if time.monotonic() >= deadline:
+                if clock.monotonic() >= deadline:
                     break
-                time.sleep(0.005)
+                sleep(0.005)
         yield held
     finally:
         if held:

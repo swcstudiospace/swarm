@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -44,6 +45,8 @@ from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm import substrate_client, substrate_tee  # noqa: E402
 from swarm.blast_radius import lane_notes, load_slices, parallel_rows  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope, verify_envelope, real_key_configured, signing_config_error  # noqa: E402
+
+_LOG = logging.getLogger("swarm.orch_plan")
 
 # (suffix, capability, agent, title, depends_on suffixes, gate spec), or the 8-field row
 # (..., gate spec, risk_class, acceptance) when a row pins its own risk class.
@@ -150,7 +153,7 @@ def _budget(risk: str) -> dict:
 
 
 def load_custom(path: Path) -> list[tuple]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     rows = []
     for t in data["tasks"]:
         if re.search(r"\.r\d+$", str(t["id"])):  # rework reruns take <task>.rN; a planned task must not claim that name
@@ -586,7 +589,7 @@ def _plan_events(body: object) -> list[tuple[str, dict[str, Any]]] | None:
 
 def _plan_effects_lost(call: list[str], why: str) -> None:
     """A missing or unreadable manifest is a lost event: say so on the ledger and on stderr. The plan is committed; it is not run again."""
-    print(f"orch_plan: effects lost: {why}", file=sys.stderr)
+    _LOG.warning("orch_plan: effects lost: %s", why)
     try:
         Ctx("A01", "orch_plan", None, None, False, _plan_root(call)).emit("orch_plan.effects_lost", {"reason": why})
     except Exception:  # noqa: BLE001 - the answer stands; the stderr line above says what was lost

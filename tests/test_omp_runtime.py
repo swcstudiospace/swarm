@@ -2,6 +2,7 @@
 preflight, the --dry-run invocation print, and parity with the in-session ingest path."""
 import importlib.util
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -458,15 +459,36 @@ def test_omp_preflight_without_claude(tmp_path):
     assert [Path(c["argv"][0]).name for c in omp_calls(stub)] == ["omp-alt"]
 
 
-def test_grok_refuses_unsupported_safe_stdin_transport(tmp_path):
-    swarm = tmp_path / ".swarm"
-    env = _env(swarm)
-    work = _plan(tmp_path, env)
-    r = run_script("swarm_run.py", "--runtime", "grok", "--repo", str(work), "--json", env=env)
-    assert r.returncode == 2, r.stdout + r.stderr
-    err = json.loads(r.stdout)["error"]
-    assert err["code"] == "E-DEP" and "stdin assignment transport" in err["message"]
-    assert _states(swarm) == {"T-one": "PLANNED"}
+@pytest.mark.parametrize("mode", ["default", "acceptEdits", "plan"])
+def test_grok_reads_the_assignment_from_a_prompt_file(sr, tmp_path, mode):
+    args = type("A", (), {"permission_mode": mode, "model": "", "max_turns": 5, "task_timeout": 90})()
+    prompt_file = tmp_path / ".swarm" / "prompts" / "a05-backend-x.md"
+    argv, env, cwd = sr.headless_command("grok", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args,
+                                         prompt_file=prompt_file)
+    assert argv[argv.index("--prompt-file") + 1] == str(prompt_file)
+    assert argv[argv.index("--agent") + 1] == "a05-backend" and argv[argv.index("--output-format") + 1] == "json"
+    assert argv[argv.index("--permission-mode") + 1] == mode
+    assert "-p" not in argv and "--mcp-config" not in argv
+    assert not {"--yolo", "--always-approve", "--dangerously-skip-permissions"} & set(argv)
+    assert env["SWARM_AGENT"] == "a05-backend" and env["SWARM_AGENT_SESSION"] == "1"
+
+
+def test_grok_prompt_file_is_private_and_never_reused(sr, tmp_path):
+    first = sr.write_grok_prompt(tmp_path, "a05-backend", "assignment one")
+    second = sr.write_grok_prompt(tmp_path, "a05-backend", "assignment two")
+    assert first != second and first.parent == tmp_path / "prompts"
+    assert first.read_text(encoding="utf-8") == "assignment one"
+    assert first.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("mode", ["bypassPermissions", "dontAsk", "yolo"])
+def test_grok_refuses_bypass_permission_modes(sr, tmp_path, mode):
+    from swarm.errors import SwarmError
+    args = type("A", (), {"approval_mode": mode, "permission_mode": mode})()
+    with pytest.raises(SwarmError) as e:
+        sr.headless_command("grok", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args,
+                            prompt_file=tmp_path / "p.md")
+    assert e.value.code.value == "E-INPUT"
 
 
 def test_missing_omp_is_e_dep(tmp_path):
@@ -845,3 +867,71 @@ def test_rework_stashes_failing_evidence(tmp_path):
     store.transition("T-two", "CHANGES_REQUESTED", reason="manual")
     bare = store.get("T-two")["notes_json"]
     assert "rework_evidence" not in bare and bare["verdicts_since"] > 0
+
+
+# --- PY-09: agent body encoding, output drain and auth-status logging (P3-06, P3-18, P3-19) ------------------------------
+AGENT_SLUG = "a99-utf8"
+AGENT_BODY = "Agent body — café ✓\n"
+
+
+def test_agent_body_utf8_no_tmp_left(sr, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    (root / "omp" / "agents").mkdir(parents=True)
+    (root / "omp" / "agents" / f"{AGENT_SLUG}.md").write_bytes(f"---\ntools: Read, Grep\n---\n{AGENT_BODY}".encode("utf-8"))
+    sdir = tmp_path / ".swarm"
+    # the body is read and written under the C locale (ASCII default encoding, UTF-8 mode off), not the test's locale
+    child = ("import importlib.util, pathlib, sys\n"
+             "spec = importlib.util.spec_from_file_location('swarm_run_c_locale', sys.argv[1])\n"
+             "mod = importlib.util.module_from_spec(spec)\n"
+             "spec.loader.exec_module(mod)\n"
+             "mod.ROOT = pathlib.Path(sys.argv[2])\n"
+             "_, body = mod.omp_agent(sys.argv[3], pathlib.Path(sys.argv[4]))\n"
+             "sys.stdout.buffer.write(body.read_bytes())\n")
+    env = _scrubbed_base_env()
+    env.update(LC_ALL="C", LANG="C", LC_CTYPE="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    done = subprocess.run([sys.executable, "-c", child, str(ROOT / "scripts" / "swarm_run.py"), str(root), AGENT_SLUG, str(sdir)],
+                          env=env, capture_output=True, timeout=60)
+    assert done.returncode == 0, done.stderr.decode(errors="replace")
+    assert done.stdout == AGENT_BODY.encode("utf-8")
+    # a failed rename leaves no temporary file behind
+    monkeypatch.setattr(sr, "ROOT", root)
+
+    def refuse(src, dst):
+        raise OSError("replace refused")
+
+    monkeypatch.setattr(sr.os, "replace", refuse)
+    with pytest.raises(OSError, match="replace refused"):
+        sr.omp_agent(AGENT_SLUG, sdir)
+    assert list((sdir / "agents").glob(".*.tmp")) == []
+
+
+def test_drain_reports_read_error(sr, caplog):
+    class Broken:
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, size):
+            self.reads += 1
+            if self.reads == 1:
+                return b"partial output"
+            raise OSError("pipe read failed")
+
+    parts: list[str] = []
+    with caplog.at_level(logging.WARNING, logger="swarm.run"):
+        sr._drain(Broken(), parts, None)
+    assert parts == ["partial output"]  # what arrived before the failure is kept
+    failed = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.WARNING]
+    assert len(failed) == 1 and "pipe read failed" in failed[0].getMessage()
+
+
+def test_preflight_auth_logs_unavailable_status(sr, monkeypatch, caplog):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    def missing_cli(*args, **kwargs):
+        raise OSError("No such file or directory: 'claude'")
+
+    monkeypatch.setattr(sr.subprocess, "run", missing_cli)
+    with caplog.at_level(logging.DEBUG, logger="swarm.run"):
+        sr.preflight_auth("claude")  # continues: the first task surfaces any problem
+    skipped = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.DEBUG]
+    assert len(skipped) == 1 and "No such file" in skipped[0].getMessage()

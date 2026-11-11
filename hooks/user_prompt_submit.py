@@ -96,7 +96,8 @@ def main() -> int:
             json.dump({"additionalContext": CONTEXT}, sys.stdout)
         else:
             print("{}")
-    except Exception:
+    except Exception as exc:
+        print(f"user_prompt_submit: {exc!r}; injecting nothing", file=sys.stderr)
         print("{}")
     return 0
 

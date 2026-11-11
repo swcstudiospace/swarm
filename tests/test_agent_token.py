@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -97,18 +98,21 @@ def test_an_unwired_workspace_gets_no_mcp_flags(sr, ws, tmp_path):
 
 
 @pytest.mark.parametrize("wired", [False, True])
-def test_grok_refuses_unsupported_transport_before_dispatch(sr, ws, tmp_path, monkeypatch, wired):
+def test_grok_assignment_file_is_removed_when_the_spawn_fails(sr, ws, tmp_path, monkeypatch, wired):
     if wired:
         _wire(ws)
+    spawned = {}
 
-    def refuse_spawn(*args, **kwargs):
-        raise AssertionError("unsupported Grok transport must not spawn a specialist")
+    def refuse_spawn(argv, *args, **kwargs):
+        spawned["argv"] = list(argv)
+        raise OSError("grok not installed")
 
     monkeypatch.setattr(sr.subprocess, "Popen", refuse_spawn)
     with pytest.raises(sr.SwarmError) as e:
         sr.run_agent_headless(A05, "test-owned assignment", ws, _args(runtime="grok"))
     assert e.value.code.value == "E-DEP"
-    assert "stdin assignment transport" in str(e.value)
+    prompt_file = Path(spawned["argv"][spawned["argv"].index("--prompt-file") + 1])
+    assert prompt_file.parent.name == "prompts" and not prompt_file.exists()
 
 
 @pytest.mark.parametrize("config", [

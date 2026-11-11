@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
 from swarm.verdicts import agent_finding, check_per_target_keys, issue_gate, load_per_target  # noqa: E402
+from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(_test|\.test|\.spec|_spec)\.[a-z]+$|(^|/)test_[^/]+\.py$")
@@ -143,7 +144,10 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
 def load_extra(path: str | None, offset: int) -> list[dict]:
     if not path:
         return []
-    raw = json.loads(Path(path).read_text())
+    try:
+        raw = json.loads(Path(path).read_text())
+    except json.JSONDecodeError as exc:
+        raise SwarmError(ErrorCode.E_INPUT, f"findings file {path} is not valid JSON (line {exc.lineno})") from exc
     raw = raw.get("findings", raw) if isinstance(raw, dict) else raw
     return [agent_finding(f, i, path) for i, f in enumerate(raw, offset + 1)]
 
@@ -226,22 +230,7 @@ if __name__ == "__main__":
     answer = None
     if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
         from swarm import engine_select
-        if ENGINE_ROUTES:
-            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
-        else:
-            route = engine_select.Route(
-                claims=_claims_rev, parse=lambda argv: argv if _claims_rev(argv) else None,
-                default=lambda: "python", env_route=lambda argv, call: "rev-gate",
-                write=engine_select.WriteFlow(
-                    before=lambda call: None, commit=_rev_commit,
-                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
-                                          "verdicts/ before running the gate again", {}),
-                    preexec=lambda route: engine_select.no_core_dumps,
-                ),
-            )
-            answer = engine_select.select_engine(
-                engine_select.Selector(script, (route,), binary_env=_binary_env,
-                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
-                sys.argv[1:],
-            )
+        answer = engine_select.run_gate_engine(
+            script, ENGINE_ROUTES, sys.argv[1:], claims=_claims_rev, route_name="rev-gate", binary_env=_binary_env,
+            env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION"), commit=_rev_commit)
     sys.exit(answer if answer is not None else script.main())

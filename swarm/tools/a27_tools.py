@@ -52,6 +52,7 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Any, TypeVar
 
+from swarm.errors import ErrorCode, SwarmError
 from swarm.redact import redact_text
 from swarm.tools.support import respond
 
@@ -610,7 +611,8 @@ def fuzz_adequacy(payload: dict[str, Any]) -> dict[str, Any]:
             severity = "medium" if runs * 10 >= minimum else "high"
             checks.append((runs >= minimum, severity, "FUZZ-RUNS", f"{runs} runs, policy minimum {minimum}"))
         else:
-            assert depth is not None  # the schema admits only stateless and invariant; invariant without depth returned above
+            if depth is None:  # the schema admits only stateless and invariant; invariant without depth returned above
+                raise SwarmError(ErrorCode.E_INTERNAL, "invariant campaign reached the call budget without depth")
             total_calls = runs * depth
             minimum = payload.get("min_total_calls", INVARIANT_CALLS_MIN)
             severity = "medium" if total_calls * 10 >= minimum else "high"

@@ -20,9 +20,10 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import traceback
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -197,10 +198,34 @@ class AgentScript:
             print("  error:", json.dumps(obj["error"], indent=2, default=str))
 
 
-def sh(cmd: list[str] | str, *, cwd: Path | None = None, timeout: int = 600, check: bool = False) -> subprocess.CompletedProcess[str]:
-    """Run a command, capturing output; never raises unless check=True."""
+def _kill_group(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL the process group `proc` leads (its grandchildren included), reap the leader and close its pipes."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def sh(cmd: list[str] | str, *, cwd: Path | None = None, timeout: int = 600, check: bool = False,
+       env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run a command, capturing output; never raises unless check=True or the timeout expires. The child leads its own process
+    group: a timeout or an interrupt kills that group before the exception goes on, so nothing the command started outlives it.
+    `env`, when given, is the child's whole environment; None (the default) inherits this process's environment."""
     shell = isinstance(cmd, str)
-    return subprocess.run(cmd, cwd=cwd, shell=shell, capture_output=True, text=True, timeout=timeout, check=check)
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException:
+        _kill_group(proc)
+        raise
+    if check and proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def which(binary: str) -> bool:

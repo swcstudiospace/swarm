@@ -6,8 +6,8 @@
 
 | Item | State |
 |---|---|
-| Default engine | `python`. The Python `Scheduler` runs every swarm run. The selector that reads `GSD_ENGINE` in `scripts/swarm_run.py` is not wired yet (unit S3.2); the planned default constant is `SCHEDULER_DEFAULT_ENGINE` |
-| Native runtime | `run_scheduler` in `swarm._native` (crates `gsd-sched-core` and `gsd-python`). Opt-in once the selector exists |
+| Default engine | `python`. The Python `Scheduler` runs every swarm run unless `GSD_ENGINE=rust` is set. The selector is `scheduler_engine()` in `scripts/swarm_run.py`; the default constant is `SCHEDULER_DEFAULT_ENGINE` (`python`) |
+| Native runtime | `run_scheduler` in `swarm._native` (crates `gsd-sched-core` and `gsd-python`). Opt-in through `GSD_ENGINE=rust`; the selector is wired |
 | Switch | `GSD_ENGINE`: `python` (default, oracle) or `rust` (native). The scheduler does not read `GSD_ENGINE_BIN` |
 | Rollback | One switch: `GSD_ENGINE=python`. `SWARM_PURE_PYTHON=1` also forces Python and wins over `GSD_ENGINE` |
 | Architecture | B. Rust owns the worker pool threads and the decision loop. Python keeps session execution, the Task Store, telemetry, leases, handoffs, signals and signing, reached through sixteen callbacks |
@@ -33,11 +33,11 @@ Numbering follows `.planning/phases/14.4-rust-scheduler-runtime-and-default-flip
 | 1 | Core crate: `gsd-sched-core` builds; `cargo fmt --check` and clippy with `-D warnings` clean for `gsd-sched-core`, `gsd-scheduler` and `gsd-python` | fmt and clippy output with exit codes | | pending |
 | 2 | Vector parity: every committed and seeded vector equals the Python oracle through the real extension, 0 skipped | `tests/parity/test_scheduler_parity.py` output | file present | pending |
 | 3 | Binding: `swarm._native` exports the names with `.pyi` stubs; strict mypy; stubtest passes or the gap is recorded; GIL released | `tests/parity/test_scheduler_binding.py`, mypy and stubtest output | test file present, untracked | pending |
-| 4 | Selector, off by default: unset or `python` runs Python; `rust` runs native; any other value is refused with `E-INPUT` before dispatch; `SWARM_PURE_PYTHON=1` wins; a stale extension warns once at selection; both engines log `scheduler_engine: <name>` | selector tests for `run()` (S3.2) | `scripts/swarm_run.py` does not read `GSD_ENGINE`; `tests/test_scheduler_engine_rig.py` only sets child environment variables | pending |
+| 4 | Selector, off by default: unset or `python` runs Python; `rust` runs native; any other value is refused with `E-INPUT` before dispatch; `SWARM_PURE_PYTHON=1` wins; an explicit `rust` whose extension lacks `run_scheduler` is refused with `E-DEP` before any claim, with no warning and no fallback; both engines log `scheduler_engine: <name>` | selector tests for `run()` (S3.2) | `scripts/swarm_run.py` `scheduler_engine()` (lines 1538-1550) and `_native_scheduler()` (lines 1553-1564) implement the selector; `tests/test_scheduler_engine_rig.py` lines 153-229 test `run()` selection. Not evidence | pending |
 | 5 | Black-box parity: `tests/test_scheduler_continuous.py` under `SWARM_TEST_ENGINE=python` and `=rust`, 0 failures and 0 skips; the Rust leg proves native entry, not fallback; the 15 of 49 cases that do not exercise the native scheduler by selector are mapped in `14.4-INPROCESS.md` | both-leg run output, native-entry marker assertion, the mapping | rig selector present; no native leg yet | pending |
-| 6 | Ports parity: telemetry, leases, handoffs, reconcile reruns, `--once`, `--max-rounds`, rounds mode, the internal-failure limit and `extension_down` give the same records on both engines, modulo timestamps and ids | `tests/test_scheduler_ports.py` output | file missing | pending |
-| 7 | Cancel and signals: timeout, SIGINT, SIGTERM and force; exit status 128+signum; no orphan process; no flag left; budget respected under the cooperative bound; a stuck worker does not keep the process alive | cancel tests on the Rust leg; S5.4 stuck-worker, delayed-loop/GIL and idle-final-drain handshakes | `tests/parity/test_scheduler_threads.py` missing | pending |
-| 8 | Robustness: a worker panic or Python exception fails only its task (`E-INTERNAL`); a loop-thread exception keeps its type and exit mapping; 8 to 32 workers under stress, no deadlock; no Rust lock held across a Python call | `tests/parity/test_scheduler_threads.py`; Rust fake-port tests | file missing | pending |
+| 6 | Ports parity: telemetry, leases, handoffs, reconcile reruns, `--once`, `--max-rounds`, rounds mode, the internal-failure limit and `extension_down` give the same records on both engines, modulo timestamps and ids | `tests/test_scheduler_ports.py` output | `tests/test_scheduler_ports.py` present; contents not reviewed; no output recorded | pending |
+| 7 | Cancel and signals: timeout, SIGINT, SIGTERM and force; exit status 128+signum; no orphan process; no flag left; budget respected under the cooperative bound; a stuck worker does not keep the process alive | cancel tests on the Rust leg; S5.4 stuck-worker, delayed-loop/GIL and idle-final-drain handshakes | `tests/parity/test_scheduler_threads.py` present; contents not reviewed; no cancel run recorded | pending |
+| 8 | Robustness: a worker panic or Python exception fails only its task (`E-INTERNAL`); a loop-thread exception keeps its type and exit mapping; 8 to 32 workers under stress, no deadlock; no Rust lock held across a Python call | `tests/parity/test_scheduler_threads.py`; Rust fake-port tests | `tests/parity/test_scheduler_threads.py` present; contents not reviewed; no run recorded | pending |
 | 9 | Measured performance, no speed claim: paired Python/Rust pass latency (fake ports, 50 and 500 ready tasks; 12-task fixture) and quiet-host A2, host load recorded; both paired p50 and p95 strictly below 1.00 | S5.2 output; A2 paired records in `tests/perf/baseline.md` (new 14.4 section) and `.planning/a2-quiet-run/` | existing A2 runs are moderate-load (mean load 11.04 in the recorded run) and Python-only; they do not count | pending |
 | 10 | Flip evidence (S7 only): quiet-host A2 with both legs; this record complete; user approval recorded in `.planning/STATE.md`; default changed in one place; after the flip `GSD_ENGINE=python` runs the black-box suite green and `SWARM_PURE_PYTHON=1` forces Python | S6 section, this file, STATE entry, post-flip run output | nothing recorded | pending |
 | 11 | Existing gates: ruff, strict mypy, registries, `_check_pins.py` unchanged, full pytest, `bun test tests/ts`, `cd omp && bun run test`, parity harness on both legs, `cargo test --workspace --locked` | gate outputs with exit codes | not run for this record | pending |
@@ -50,7 +50,7 @@ Numbering follows `.planning/phases/14.4-rust-scheduler-runtime-and-default-flip
 | S5.1 | Parity run: both legs of the black-box suite, harness and full gate list; triage and fix | `tests/parity/records/14.4/scheduler-s5.md` | pending |
 | S5.2 | Bench: pass latency with fake ports (50 and 500 ready tasks) and the 12-task fake-omp fixture; paired `GSD_ENGINE` leg; `/proc/loadavg` at start and end | `tests/perf/scheduler_engines.py` and `tests/perf/run.sh` outputs in `scheduler-s5.md`. The existing `tests/perf/records/14.4/scheduler-engines-results.txt` is the historical D-P26 benchmark, not S5.2 | pending |
 | S5.3 | Docs: runbook section, AGENTS.md, this record | files named in this record | pending |
-| S5.4 | Native thread, GIL, stuck-worker, idle-drain and panic tests | `tests/parity/test_scheduler_threads.py` (missing) | pending |
+| S5.4 | Native thread, GIL, stuck-worker, idle-drain and panic tests | `tests/parity/test_scheduler_threads.py` (present; contents not reviewed; no S5.4 result recorded) | pending |
 | Local S5 | The parent records local S5 green | `tests/parity/records/14.4/scheduler-s5.md` | pending |
 | CI base | `scripts/ci_scheduler_rust.sh`, `.github/workflows/ci.yml`, `tests/test_scheduler_ci.py`; no feature push trigger yet | files and CI run | pending |
 | CI feature push | Trigger for `feat/v2.4-rust-wasm-core` only after local S5 green; actual Omega exact-head result and artifacts | `scheduler-s5.md` | pending |
@@ -81,3 +81,17 @@ Numbering follows `.planning/phases/14.4-rust-scheduler-runtime-and-default-flip
 - Attach, for each row, the command, its exit code, the artifact path and its SHA-256.
 - Do not mark a row passed from a contended run, a fake-port result or a historical benchmark.
 - Keep a row pending until its evidence file exists. A row that fails its criterion is recorded as failed, with the reason.
+
+## Evidence fields (not recorded)
+
+| Field | State |
+|---|---|
+| Source digest (sha256 of the tree that was built) | not recorded |
+| `gsd_engine` binary digest (`GSD_ENGINE_BIN_SHA256`) | not recorded |
+| `swarm._native` extension digest | not recorded |
+| Suite digest (`tests/test_scheduler_continuous.py` against `SCHEDULER_CONTINUOUS_SHA256`) | not recorded |
+| Commands and exit codes | not recorded |
+| JUnit reports (the `junit-*.xml` files written by `scripts/ci_scheduler_rust.sh`) | not recorded |
+| Witness files (`SWARM_SCHEDULER_WITNESS`, for example `witness-python.txt`) | not recorded |
+| No-gain decision | not recorded |
+| Quiet-host qualification (1-minute load below 1.5 for ten minutes) | not reached |

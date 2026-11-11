@@ -2247,16 +2247,25 @@ def test_public_keeps_only_a_known_boolean_setting_and_masks_a_boolean_looking_s
     assert a24_tools._public("accessToken: null") == "accessToken: [REDACTED]"
 
 
-def test_public_masks_a_secret_after_a_long_name_in_bounded_time():  # thread: the key lookup must not rescan the whole prefix
-    import time
-
+def test_public_masks_a_secret_after_a_long_name_in_bounded_time(monkeypatch):  # thread: the key lookup must not rescan the whole prefix
     from swarm.tools import a24_tools
 
+    reads = []
+    real_text, real_spans = a24_tools.redact_text, a24_tools.redact_spans
+
+    def counted(real):
+        def wrapper(text, *args, **kwargs):
+            reads.append(len(text))
+            return real(text, *args, **kwargs)
+        return wrapper
+
+    monkeypatch.setattr(a24_tools, "redact_text", counted(real_text))
+    monkeypatch.setattr(a24_tools, "redact_spans", counted(real_spans))
     text = "A" * 32_000 + " password=false"
-    started = time.monotonic()
     masked = a24_tools._public(text)
-    assert time.monotonic() - started < 2.0
     assert masked == "A" * 32_000 + " password=[REDACTED]"
+    # counted work instead of a wall-clock bound: the text gets one detection pass and one span pass, never a pass per position
+    assert reads and len(reads) <= 2 and sum(reads) <= 2 * len(text), reads
 
 
 def test_a_credential_pasted_into_a_role_name_is_masked_in_the_finding_id_and_summary():  # thread: _finding copies manifest names

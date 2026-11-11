@@ -11,6 +11,7 @@ refusal (which prints no JSON) and the JSON reply, the exit code and the store o
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -219,7 +220,9 @@ def test_the_selector_output_equals_python_for_every_case(tmp_path: Path) -> Non
         _seed(py_root, case, case.env)
         _seed(sel_root, case, case.env)
         py = _python(py_root, _argv(case, py_root), case.env)
-        env = _base_env(sel_root, {**case.env, "GSD_ENGINE": "rust", "GSD_ENGINE_BIN": binary, "GSD_RUST_BACKEND": "host"})
+        digest = hashlib.sha256((ROOT / binary).read_bytes()).hexdigest()
+        env = _base_env(sel_root, {**case.env, "GSD_ENGINE": "rust", "GSD_ENGINE_BIN": binary, "GSD_RUST_BACKEND": "host",
+                                   "GSD_ENGINE_BIN_SHA256": digest})
         sel = subprocess.run([sys.executable, str(SCRIPT), "--root", str(sel_root), *_argv(case, sel_root), "--json"],
                              capture_output=True, text=True, env=env, cwd=ROOT, timeout=120)
         assert sel.returncode == py.returncode, case.name

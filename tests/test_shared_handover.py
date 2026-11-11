@@ -3,9 +3,12 @@ A->B round trip, bounded bundles, artifact and definition-of-done checks, Task S
 read/write tier boundary. The tools come from the merged registry (agents.json)."""
 import hashlib
 import importlib
+import importlib.util
 import json
+import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1288,3 +1291,58 @@ def test_bundle_says_when_it_dropped_artifacts(env):
         store.add_artifact("T-be", kind="file", uri=f"src/part{i:02d}.py", digest="sha256:" + f"{i:02x}" * 32, producer="A05")
     bundle = env.call("shared_handover_bundle", "A05", {"task_id": "T-be"})
     assert len(bundle["artifacts"]) == 25 and bundle["truncated"] is True
+
+
+# --- PY-09: the assignment's handover section must not hide faults (P3-03, P3-20) -----------------------------------------
+@pytest.fixture()
+def swarm_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    spec = importlib.util.spec_from_file_location("swarm_run_handover_under_test", ROOT / "scripts" / "swarm_run.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_handover_section_reraises_inner_import_error(swarm_run, monkeypatch, tmp_path):
+    real = importlib.import_module
+
+    def inner_dependency_missing(name, package=None):
+        if name == "swarm.handover":  # the module is there, but one of its own imports is not
+            raise ModuleNotFoundError("No module named 'swarm.missing_dep'", name="swarm.missing_dep")
+        return real(name, package)
+
+    monkeypatch.setattr(swarm_run.importlib, "import_module", inner_dependency_missing)
+    task = {"agent_id": "A08", "correlation_id": "c1", "depends_on": ["T-up"]}
+    with pytest.raises(ModuleNotFoundError) as raised:
+        swarm_run.handover_section(task, tmp_path)
+    assert raised.value.name == "swarm.missing_dep"
+
+
+def test_handover_section_is_empty_when_the_module_is_absent(swarm_run, monkeypatch, tmp_path):
+    real = importlib.import_module
+
+    def absent(name, package=None):
+        if name == "swarm.handover":
+            raise ModuleNotFoundError("No module named 'swarm.handover'", name="swarm.handover")
+        return real(name, package)
+
+    monkeypatch.setattr(swarm_run.importlib, "import_module", absent)
+    assert swarm_run.handover_section({"agent_id": "A08", "correlation_id": "c1", "depends_on": ["T-up"]}, tmp_path) == ""
+
+
+def test_handover_section_logs_the_dependency_it_skips(swarm_run, monkeypatch, caplog, tmp_path):
+    real = importlib.import_module
+
+    def inspect(dep, *, root=None, to_agent=None, correlation_id=None):
+        if dep == "T-bad":
+            raise ValueError("handover document is not valid JSON")
+        return {"status": "ok"}, {"goal": "ship the export", "from_agent": "A05", "to_agent": "A08"}
+
+    fake = SimpleNamespace(inspect_handover=inspect)
+    monkeypatch.setattr(swarm_run.importlib, "import_module", lambda name, package=None: fake if name == "swarm.handover" else real(name, package))
+    task = {"agent_id": "A08", "correlation_id": "c1", "depends_on": ["T-bad", "T-good"]}
+    with caplog.at_level(logging.DEBUG, logger="swarm.run"):
+        section = swarm_run.handover_section(task, tmp_path)
+    assert "ship the export" in section  # the good dependency still reaches the assignment
+    skipped = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.DEBUG]
+    assert len(skipped) == 1 and "T-bad" in skipped[0].getMessage()

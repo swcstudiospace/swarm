@@ -6,6 +6,7 @@ placed in `sys.modules`, the place `swarm._native_loader.load_native` imports fr
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 import types
@@ -311,3 +312,7 @@ def test_no_secret_text_reaches_the_warning_on_a_native_failure(
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         redact_spans(SECRET)
     assert all("hunter2" not in message for message in warnings_of(caplog))
+
+
+def test_engine_warn_once_holds_lock() -> None:
+    assert "with _engine_warn_lock" in inspect.getsource(R._engine_warn_once)

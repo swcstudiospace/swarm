@@ -86,8 +86,11 @@ def engine_binary(monkeypatch: pytest.MonkeyPatch) -> str:
     return binary
 
 
-def _masked(raw: bytes) -> str:
+def _masked(raw: bytes, leg: Optional[Path] = None) -> str:
+    """The reply as text: the leg's own base path named `<leg>` (each leg writes under its own base) and the envelope fields masked."""
     text = raw.decode("utf-8")
+    if leg is not None:
+        text = text.replace(str(leg), "<leg>")
     for pattern, replacement in MASKS:
         text = pattern.sub(replacement, text)
     return text
@@ -162,14 +165,14 @@ def test_case_matches_python(case: gen.Case, tmp_path: Path, engine_binary: str)
 
     if case.served:
         assert returncode == python.returncode, f"{case.name}: exit {returncode} != {python.returncode}"
-        assert _masked(raw) == _masked(python.stdout), f"{case.name}: probe bytes differ from Python"
+        assert _masked(raw, rs_paths["base"]) == _masked(python.stdout, py_paths["base"]), f"{case.name}: probe bytes differ from Python"
 
     selector_env = dict(rs_env)
     selector_env.update({"GSD_ENGINE": "rust", "GSD_ENGINE_BIN": binary, "GSD_RUST_BACKEND": "host"})
     selected = subprocess.run([sys.executable, str(SCRIPT), *rs_argv], capture_output=True, env=selector_env,
                               cwd=ROOT, timeout=120)
     assert selected.returncode == python.returncode, f"{case.name}: selector exit differs"
-    assert _masked(selected.stdout) == _masked(python.stdout), f"{case.name}: selector bytes differ from Python"
+    assert _masked(selected.stdout, rs_paths["base"]) == _masked(python.stdout, py_paths["base"]), f"{case.name}: selector bytes differ from Python"
 
     if case.name in AUDIT_EXPECTATIONS:
         audit, expected = AUDIT_EXPECTATIONS[case.name]

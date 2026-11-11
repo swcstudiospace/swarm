@@ -193,7 +193,7 @@ def main() -> int:
             return 0  # operator kill switch: never plan or dispatch while the swarm is disabled
         if not classify(args.brief):
             return 0
-        log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd) if hasattr(logging_paths, "__call__") else {}}, source="autonomous_run", tee=True)
+        log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd)}, source="autonomous_run", tee=True)
         root = Path(args.swarm_root).resolve()
         repo = Path(args.cwd).resolve()
         sys.path.insert(0, str(root))

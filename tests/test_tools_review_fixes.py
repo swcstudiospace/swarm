@@ -5,10 +5,22 @@ D6 A26 cyclic base graph is bounded; D7 A24 deep macro chain does not escape as 
 """
 from __future__ import annotations
 
+import ast
+import importlib.util
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
 from swarm.tools.a07_tools import data_explain_regression_check
 from swarm.tools.a23_tools import netpol_coverage, netpol_reachability
 from swarm.tools.a24_tools import runtime_rule_lint
 from swarm.tools.a26_tools import upgrade_safety
+from swarm.tools import support
 
 # --- D3: A07 exact percentage -------------------------------------------------------------------------------------
 
@@ -98,3 +110,85 @@ def test_cyclic_base_graph_of_forty_contracts_is_invalid_input() -> None:
     result = upgrade_safety({"source": source, "pattern": "uups"})
 
     assert result["state"] == "INVALID_INPUT" and result["field"] == "source"
+
+
+# --- P5-08: handler invariants are explicit checks, not asserts; the handlers behave the same under python -O -------
+
+_REPO = Path(__file__).resolve().parents[1]
+_HANDLER_MODULES = ("a07_tools.py", "a10_tools.py", "a27_tools.py")
+_O_PROBE = """
+import json
+from swarm.tools.a07_tools import data_explain_regression_check, data_lock_risk_scan
+from swarm.tools.a10_tools import sbom_diff
+from swarm.tools.a27_tools import fuzz_adequacy
+print(json.dumps([
+    data_lock_risk_scan({"sql": "CREATE INDEX ix ON t (c); SELECT 1"}),
+    data_explain_regression_check({"queries": [{"id": "q", "baseline": 1, "shadow": 2}]}),
+    sbom_diff({"before": [{"name": "a", "version": "1.0.0"}], "after": [{"name": "a", "version": "1.0.1"}]}),
+    fuzz_adequacy({"mode": "invariant", "runs": 256, "depth": 10, "functions_exercised": 5, "functions_total": 5,
+                   "distinct_seeds": 8, "line_coverage_pct": 90, "branch_coverage_pct": 85}),
+], sort_keys=True, default=str))
+"""
+
+
+def test_handlers_no_assert_guards() -> None:
+    for name in _HANDLER_MODULES:
+        tree = ast.parse((_REPO / "swarm" / "tools" / name).read_text(encoding="utf-8"))
+        lines = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+        assert lines == [], f"{name} guards handler invariants with assert at lines {lines}"
+    outputs = []
+    for flags in ([], ["-O"]):
+        run = subprocess.run(
+            [sys.executable, *flags, "-c", _O_PROBE], cwd=_REPO, capture_output=True, text=True, check=False, timeout=120
+        )
+        assert run.returncode == 0, run.stderr
+        outputs.append(run.stdout)
+    assert outputs[0] == outputs[1]
+
+
+# --- P5-14: concurrent first calls load a script module exactly once ----------------------------------------------
+
+
+def test_script_loads_once_under_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "race_probe.py").write_text("LOADED = True\n", encoding="utf-8")
+    monkeypatch.setattr(support, "ROOT", tmp_path)
+    monkeypatch.delitem(support._SCRIPTS, "race_probe", raising=False)
+    real_spec_from_file_location = importlib.util.spec_from_file_location
+    execs: list[str] = []
+
+    def counting_spec(name: str, location: str, *args: object, **kwargs: object) -> importlib.machinery.ModuleSpec | None:
+        spec = real_spec_from_file_location(name, location, *args, **kwargs)
+        assert spec is not None and spec.loader is not None
+        real_exec = spec.loader.exec_module
+
+        def exec_module(module: ModuleType) -> None:
+            execs.append(location)
+            time.sleep(0.05)  # widen the window in which a second thread would also run the module
+            real_exec(module)
+
+        spec.loader.exec_module = exec_module  # type: ignore[method-assign]
+        return spec
+
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", counting_spec)
+    barrier = threading.Barrier(8)
+    modules: list[ModuleType] = []
+    modules_lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        module = support.script("race_probe")
+        with modules_lock:
+            modules.append(module)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+    finally:
+        support._SCRIPTS.pop("race_probe", None)
+    assert len(execs) == 1, f"module executed {len(execs)} times"
+    assert len(modules) == 8 and all(module is modules[0] for module in modules)
+    assert modules[0].LOADED is True

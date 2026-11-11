@@ -5,9 +5,11 @@ Unset `GSD_ENGINE_BIN` skips.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -109,3 +111,27 @@ def test_a_leased_task_matches_python(tmp_path: Path) -> None:
     py_prompt = fence.sub("FENCE", py_body["prompt"]).replace(str(py_root), "REPO")
     rs_prompt = fence.sub("FENCE", rs_body["prompt"]).replace(str(rs_root), "REPO")
     assert rs_prompt == py_prompt
+
+
+def _load_orch_assign():
+    spec = importlib.util.spec_from_file_location("orch_assign_parity_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Conn:
+    """A stand-in connection: `closed` records whether the store released it; `fail` makes the first statement raise."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.closed = False
+        self.row_factory = None
+
+    def execute(self, sql: str, *args: object) -> None:
+        if self.fail:
+            raise sqlite3.OperationalError("PRAGMA refused")
+
+    def close(self) -> None:
+        self.closed = True

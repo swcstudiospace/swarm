@@ -276,7 +276,7 @@ SIGN_ENVS: list[tuple[str, Env, bool]] = [
     ("ed25519_320_chars", {"SWARM_ED25519_KEY": "@ed-a|long"}, False),
     ("ed25519_not_hex", {"SWARM_ED25519_KEY": "not-hex-at-all"}, False),
     ("ed25519_wins_over_hmac", {**ED_A, **HMAC_A}, False),
-    ("ed25519_bad_seed_with_hmac_uses_hmac", {"SWARM_ED25519_KEY": "@ed-a|trunc", **HMAC_A}, False),
+    ("ed25519_bad_seed_with_hmac_fails_closed", {"SWARM_ED25519_KEY": "@ed-a|trunc", **HMAC_A}, False),
     ("ed25519_bad_seed_require_with_hmac", {"SWARM_ED25519_KEY": "@ed-a|trunc", **HMAC_A, "SWARM_REQUIRE_KEY": "1"}, False),
     ("no_key", {}, False),
     ("empty_hmac_key", {"SWARM_SIGNING_KEY": ""}, False),

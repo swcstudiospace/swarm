@@ -954,6 +954,21 @@ def _alive(pid: int) -> bool:
         return False
 
 
+@pytest.fixture(autouse=True)
+def no_pidfile_pid_outlives_its_test(tmp_path):
+    """Teardown check: every pid a test wrote to a `*.pid` file under its tmp_path (a session, tool or gate child) must be gone
+    when the test ends. A survivor is SIGKILLed here and fails the test, so a process group that was not signalled cannot leak."""
+    yield
+    pids = [int(text) for text in (path.read_text().strip() for path in tmp_path.rglob("*.pid")) if text.isdigit()]
+    deadline = time.monotonic() + 2
+    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    survivors = [pid for pid in pids if _alive(pid)]
+    for pid in survivors:
+        os.kill(pid, 9)
+    assert not survivors, f"pids outlived their test: {survivors}"
+
+
 def _wait_for(path, timeout=20.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

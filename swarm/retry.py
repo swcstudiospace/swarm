@@ -1,12 +1,11 @@
 """Retry policy: capped exponential backoff with bounded jitter, and the transient-error classifier."""
 from __future__ import annotations
 
-import os
 import random
 import re
 from typing import Protocol
 
-from .limiter import detect_rate_limit
+from .limiter import detect_rate_limit, env_seconds
 
 # The gsd-failure default (crates/gsd-failure/src/isolation.rs): the Rust contract (Phase 11 U5).
 DEFAULT_BASE_S = 0.1
@@ -21,17 +20,6 @@ class _Uniform(Protocol):
     def uniform(self, a: float, b: float) -> float: ...
 
 
-def _env_seconds(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return value if value > 0 and value != float("inf") else default
-
-
 def backoff_s(attempt: int, *, base: float | None = None, cap: float | None = None, jitter: float = 0.25, rng: _Uniform = random) -> float:
     """Delay before retry number `attempt` (1-based): min(cap, base * 2**(attempt-1)) scaled by 1 +/- jitter, then clamped to cap.
 
@@ -40,8 +28,8 @@ def backoff_s(attempt: int, *, base: float | None = None, cap: float | None = No
     """
     if not 0 <= jitter <= 1:
         raise ValueError(f"jitter must be within [0, 1], got {jitter!r}")
-    base_s = _env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S) if base is None else float(base)
-    cap_s = _env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S) if cap is None else float(cap)
+    base_s = env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S) if base is None else float(base)
+    cap_s = env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S) if cap is None else float(cap)
     if base_s <= 0 or cap_s <= 0:
         raise ValueError("base and cap must be > 0")
     exponent = min(max(int(attempt), 1) - 1, 62)

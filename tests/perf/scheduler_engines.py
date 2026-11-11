@@ -729,6 +729,8 @@ def section_aimd(env: Env, gate: bool) -> list[str]:
 
 
 def section_backoff(env: Env, gate: bool) -> list[str]:
+    from swarm.limiter import env_seconds
+
     native, corpus, retry = env.native, env.corpus, env.retry
     failures: list[str] = []
     rng = random.Random(f"{SEED}/backoff")
@@ -799,7 +801,7 @@ def section_backoff(env: Env, gate: bool) -> list[str]:
 
         def prep() -> Callable[[], object]:
             uniform = random.Random(case["seed"]).uniform
-            fn, env_s = native.sched_backoff_s, retry._env_seconds
+            fn, env_s = native.sched_backoff_s, env_seconds
 
             def run() -> None:
                 for a in attempts:

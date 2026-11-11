@@ -47,6 +47,7 @@ import functools
 import logging
 import os
 import re
+import threading
 from array import array
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable
@@ -1115,12 +1116,14 @@ _engine_log = logging.getLogger("swarm.redact")
 # Reasons already reported this process. The two extension reasons double as a negative cache (no import retry per call); tests reset
 # it with `monkeypatch.setattr(redact, "_ENGINE_WARNED", set())`.
 _ENGINE_WARNED: set[str] = set()
+_engine_warn_lock = threading.Lock()
 
 
 def _engine_warn_once(reason: str, message: str) -> None:
-    if reason in _ENGINE_WARNED:
-        return
-    _ENGINE_WARNED.add(reason)
+    with _engine_warn_lock:
+        if reason in _ENGINE_WARNED:
+            return
+        _ENGINE_WARNED.add(reason)
     _engine_log.warning("%s: %s; using the pure-Python redactor", _ENGINE_ENV, message)
 
 

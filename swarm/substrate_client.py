@@ -16,6 +16,7 @@ import functools
 import http.client
 import io
 import json
+import logging
 import os
 import queue
 import socket
@@ -25,6 +26,8 @@ import time
 import urllib.error
 import urllib.request
 from typing import IO, Any, Mapping, NamedTuple, Protocol
+
+_LOG = logging.getLogger(__name__)
 
 TIMEOUT_S = 1.5  # per socket operation; the whole request is also bounded, see DEADLINE_SLACK_S
 DEADLINE_SLACK_S = 0.5  # the caller's total wait for one request (DNS + connect + read) is TIMEOUT_S + this
@@ -324,7 +327,8 @@ def rest_post(path: str, body: dict[str, Any], env: Mapping[str, str] | None = N
         if base is None:
             return None
         return _request(base + "/" + path.lstrip("/"), body, e, "application/json", surface)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _LOG.debug("substrate rest_post failed: %s", type(exc).__name__)
         return None
 
 

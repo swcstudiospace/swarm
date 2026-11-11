@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from swarm import runlog
 from swarm.clock import SYSTEM_CLOCK, Clock
+from swarm.limiter import env_seconds
 from swarm.paths import latest_correlation, swarm_dir
 from swarm.redact import redact, redact_text
 from swarm.tools.support import current_caller, respond
@@ -52,6 +53,8 @@ SCRATCH_VALUE_MAX_BYTES = 8 * 1024
 SCRATCH_MAX_KEYS = 64
 SCRATCH_LOCK_WAIT_S = 5.0
 STATUS_EMIT_INTERVAL_S = 1.0
+# Default for SWARM_CANCEL_GRACE_S: how long an agent session gets to leave after a cancel request. A separate concept from
+# gsd-state's fixed 3 s session-join window (CANCEL_GRACE), which the variable does not set.
 DEFAULT_CANCEL_GRACE_S = 10.0
 STATUS_KINDS = ("progress", "blocked", "done")
 LOG_LEVELS = ("debug", "info", "warn", "error")
@@ -277,22 +280,23 @@ def _scratch_dir(correlation_id: str) -> Path:
 
 
 @contextlib.contextmanager
-def _scratch_lock(directory: Path) -> Iterator[None]:
+def _scratch_lock(directory: Path, *, clock: Clock | None = None, sleep: Callable[[float], None] = time.sleep) -> Iterator[None]:
     """Exclusive per-correlation lock shared by threads and processes (flock on separate open files excludes both)."""
     if fcntl is None:  # pragma: no cover - non-POSIX
         raise OSError("scratchpad locking needs POSIX flock")
     directory.mkdir(parents=True, exist_ok=True)
     fd = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        deadline = time.monotonic() + SCRATCH_LOCK_WAIT_S
+        source = SYSTEM_CLOCK if clock is None else clock
+        deadline = source.monotonic() + SCRATCH_LOCK_WAIT_S
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
+                if source.monotonic() >= deadline:
                     raise OSError("scratchpad is busy: lock not acquired in time") from None
-                time.sleep(0.005)
+                sleep(0.005)
         try:
             yield
         finally:
@@ -460,11 +464,7 @@ def _number(value: object) -> float | None:
 
 
 def _grace_default() -> float:
-    try:
-        value = float(os.environ["SWARM_CANCEL_GRACE_S"])
-    except (KeyError, ValueError):
-        return DEFAULT_CANCEL_GRACE_S
-    return value if math.isfinite(value) and value >= 0 else DEFAULT_CANCEL_GRACE_S
+    return env_seconds("SWARM_CANCEL_GRACE_S", DEFAULT_CANCEL_GRACE_S, zero_ok=True)
 
 
 def cancel_flag_path(sdir: str | Path, correlation_id: str) -> Path:

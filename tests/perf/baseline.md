@@ -2,6 +2,8 @@
 
 Status: two moderate-load runs recorded 2026-10-25 under the user's threshold (1-minute load below 4.0 for ten minutes): the 15:46 UTC run on the pre-fix native build, and the 21:31 UTC Phase 14 run on the final build. Neither is a quiet-host baseline, and under the Notes rule below neither is a promotion candidate. The Phase 14 quiet-host criterion is open.
 
+**Phase 7 waiver (user, 2026-10-22; recorded in `.planning/STATE.md`):** the A2 perf baseline is waived with recorded debt, so Wave B and Wave C code proceed. The quiet-window baseline is still required before any default flip. The Phase 7 baseline was not measured; this waiver does not promote either moderate-load run below.
+
 ## Hardware fingerprint
 
 - uname -a: Linux vps 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:33:16 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux

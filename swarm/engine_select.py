@@ -48,7 +48,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from swarm.errors import ErrorCode
+from swarm import _native_loader
+from swarm.errors import ErrorCode, SwarmError
 from swarm.script_base import AgentScript
 
 RUST_CALL_TIMEOUT_S = 660  # the binary's own deadline is 600 s and does not cover its start-up or its stdin read
@@ -208,14 +209,30 @@ def rust_timeout_s() -> int:
     return RUST_CALL_TIMEOUT_S
 
 
+def _parent_answers_beside_key_file(env: dict[str, str]) -> bool:
+    """True when the child is isolated and the parent sees the user's conventional key file: Python then answers, because the
+    isolated binary cannot see that file. Raw keys, SWARM_ED25519_KEY_FILE and agent sessions are excluded as envelope excludes them."""
+    from swarm.envelope import _conventional_reference
+
+    if not isolates_home(env):
+        return False
+    if any(os.environ.get(name) for name in ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE")):
+        return False
+    if os.environ.get("SWARM_AGENT_SESSION") == "1":
+        return False
+    conventional = _conventional_reference()
+    return conventional is not None and os.path.lexists(conventional)
+
+
 def run_read(selector: Selector, route: Route, argv: list[str], binary: str, *, explicit: bool) -> int | None:
     """Answers the call on the Rust engine at `binary`. None hands the call to the Python body.
 
     None (fallback) is returned exactly for these triggers: a reply whose error.code is in RUST_FALLBACK_CODES;
     an argument the binary cannot take (the request is not UTF-8 encodable); an exit-2 reply without a typed
     error.code; a reply that is not a JSON object; an exit code other than 0, 1 or 2; a binary that cannot be
-    started when the call did not ask for `rust` explicitly (`explicit` False); and a run-log record that cannot be
-    written (AgentScript.record_external_reply raised, so the Python body answers and applies its own failure rules).
+    started when the call did not ask for `rust` explicitly (`explicit` False); a run-log record that cannot be
+    written (AgentScript.record_external_reply raised, so the Python body answers and applies its own failure rules); and
+    a conventional key file beside an isolated child, explicit or not (`_parent_answers_beside_key_file`).
     A Rust answer is recorded in the run log before it is printed, as the Python path's own `main` does (D1).
     Refused with exit 2 and never a fallback: an identity refusal (`identity_refused`, E-POLICY) and a binary that cannot be started,
     both when `explicit`; and a binary that did not answer within the call deadline (E-TIMEOUT), explicit or not.
@@ -231,13 +248,15 @@ def run_read(selector: Selector, route: Route, argv: list[str], binary: str, *, 
     if refusal is not None:
         # not started: Python answers, or E-POLICY when explicit
         return identity_refused(selector, refusal, explicit=explicit)
+    if _parent_answers_beside_key_file(env):
+        return None  # fallback: Python reads the conventional key file, which the isolated binary cannot see
     try:
         with child_home(env) as child_env:
             done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
                                   env=child_env, preexec_fn=child_guard(child_env, None))
     except subprocess.TimeoutExpired:
         return refuse(selector, ErrorCode.E_TIMEOUT, "the gsd_engine binary did not answer within the call deadline")
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         if not explicit:
             return None  # fallback: the default engine never turns an unusable binary into an error
         return refuse(selector, ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")
@@ -253,7 +272,8 @@ def run_read(selector: Selector, route: Route, argv: list[str], binary: str, *, 
             return None
     try:
         selector.script.record_external_reply(argv, reply, done.returncode)
-    except Exception:  # noqa: BLE001 - any failure to record hands the call to the Python body, which answers on its own rules
+    except Exception as exc:  # noqa: BLE001 - any failure to record hands the call to the Python body, which answers on its own rules
+        warn(selector, f"recording the Rust answer failed ({type(exc).__name__}); the Python body answers")
         return None
     sys.stdout.buffer.write(done.stdout)
     sys.stdout.flush()
@@ -264,10 +284,17 @@ def warn(selector: Selector, message: str) -> None:
     print(f"{selector.script.name}: {message}", file=sys.stderr)
 
 
+def _write_flow(route: Route) -> WriteFlow:
+    """The write flow of `route`. A route that does not write is a caller's bug, checked explicitly because `python -O` strips asserts."""
+    if route.write is None:
+        raise SwarmError(ErrorCode.E_INTERNAL, "a write flow was asked of a route that does not write")
+    return route.write
+
+
 def unknown_outcome(selector: Selector, route: Route, argv: list[str], call: Any, why: str) -> int:
     """Prints the typed E-INTERNAL for a write whose outcome is unknown, records it, and returns exit 2. The call is not repeated."""
-    assert route.write is not None
-    hint, extra = route.write.unknown(call)
+    write = _write_flow(route)
+    hint, extra = write.unknown(call)
     body = {"agent": selector.script.agent_id, "script": selector.script.name, "status": "error",
             "error": {"code": ErrorCode.E_INTERNAL.value, "message": f"outcome unknown: {why}; the call was NOT repeated. {hint}",
                       "details": {"write_state": "unknown", **extra}, "handling": ErrorCode.E_INTERNAL.standard_handling}}
@@ -290,6 +317,7 @@ def run_write(selector: Selector, route: Route, argv: list[str], binary: str, *,
       binary's own); a hook that finds the effects lost says so itself and nothing is run again. The answer is recorded (D1)
       and printed.
     * exit 2 with `error.details.write_state == "not_started"`: nothing was written; the Python body answers.
+    * no start, because a conventional key file is beside an isolated child (`_parent_answers_beside_key_file`): nothing was written, and the Python body answers.
     * exit 2 with write_state `final`, or absent on any code but E-INTERNAL (E-CONTRACT, E-POLICY, E-INPUT of an unknown task or
       of an invalid id, Python's `max_attempts exceeded` E-TIMEOUT that names its task, ...): the binary's own refusal, with
       Python's text; recorded and printed as it is.
@@ -300,9 +328,9 @@ def run_write(selector: Selector, route: Route, argv: list[str], binary: str, *,
       as for reads; an identity refusal is E-POLICY under `explicit` and Python's answer otherwise; so is an argument the binary
       cannot take (not UTF-8 encodable).
     """
-    assert route.write is not None
+    write = _write_flow(route)
     call = route.parse(argv)
-    before = route.write.before(call)
+    before = write.before(call)
     try:
         handle, effects_path = tempfile.mkstemp(prefix="gsd-effects-", suffix=".json")
     except OSError:
@@ -319,7 +347,7 @@ def run_write(selector: Selector, route: Route, argv: list[str], binary: str, *,
 
 def _answer_write(selector: Selector, route: Route, argv: list[str], binary: str, explicit: bool, call: Any, before: Any,
                   effects_path: str) -> int | None:
-    assert route.write is not None
+    write = _write_flow(route)
     request = {"agent": selector.script.agent_id, "script": selector.script.name, "argv": argv, "root": os.getcwd(),
                "env": {key: os.environ[key] for key in selector.env_keys if os.environ.get(key)}, "effects_path": effects_path}
     try:
@@ -332,11 +360,13 @@ def _answer_write(selector: Selector, route: Route, argv: list[str], binary: str
     if refusal is not None:
         # not started and nothing written: Python answers, or E-POLICY when explicit
         return identity_refused(selector, refusal, explicit=explicit)
+    if _parent_answers_beside_key_file(env):
+        return None  # fallback: nothing was started; Python reads the conventional key file, which the isolated binary cannot see
     try:
         # A child that holds keys is started with core dumps off (a preexec_fn that fails is a start that did not happen).
         with child_home(env) as child_env:
             done = subprocess.run([binary], input=payload, stdout=subprocess.PIPE, check=False, timeout=rust_timeout_s(),
-                                  env=child_env, preexec_fn=child_guard(child_env, route.write.preexec(env_route)))
+                                  env=child_env, preexec_fn=child_guard(child_env, write.preexec(env_route)))
     except subprocess.TimeoutExpired:
         return unknown_outcome(selector, route, argv, call, "the gsd_engine binary did not answer within the call deadline")
     except (OSError, subprocess.SubprocessError):
@@ -361,10 +391,10 @@ def _answer_write(selector: Selector, route: Route, argv: list[str], binary: str
             return None  # Python answers: the binary wrote nothing
         if failure is None or state not in (None, "final") or (state is None and failure == ErrorCode.E_INTERNAL.value):
             return unknown_outcome(selector, route, argv, call, "the gsd_engine binary refused without saying that nothing was written")
-        if route.write.on_final is not None:
-            route.write.on_final(call, effects_path)
+        if write.on_final is not None:
+            write.on_final(call, effects_path)
     else:
-        reply, stdout = route.write.commit(call, before, effects_path, reply, stdout)
+        reply, stdout = write.commit(call, before, effects_path, reply, stdout)
     try:
         selector.script.record_external_reply(argv, reply, code)
     except Exception as exc:  # noqa: BLE001 - a write is never handed to Python once the binary has answered
@@ -379,7 +409,7 @@ def select_engine(selector: Selector, argv: list[str], *, release_binary: Path |
 
     `release_binary` is the fallback binary when GSD_ENGINE_BIN is unset: `RELEASE_BINARY` (read now, not at import) unless the script
     passes its own, as orch_status passes the value of its module so that a patched name there is the one used."""
-    if os.environ.get("SWARM_PURE_PYTHON") == "1":
+    if _native_loader.pure_python_requested():
         return None
     requested = os.environ.get("GSD_ENGINE", "")
     if requested == "python":
@@ -406,3 +436,31 @@ def select_engine(selector: Selector, argv: list[str], *, release_binary: Path |
             return refuse(selector, ErrorCode.E_DEP, "the gsd_engine binary named by GSD_ENGINE_BIN could not be started")
         return None  # unregistered route: the binary would answer E-DEP "not_started", which hands the call to Python
     return (run_write if route.write is not None else run_read)(selector, route, argv, binary, explicit=explicit)
+
+
+GATE_UNKNOWN_HINT = ("the verdict may or may not have been recorded; check the gate's verdict rows and verdicts/ before running the gate "
+                     "again")
+
+
+def record_commit(call: Any, before: Any, effects_path: str, reply: dict[str, Any], stdout: bytes) -> tuple[dict[str, Any], bytes]:
+    """`commit` of a gate route: the binary has committed the verdict and its reply is final; no effects manifest is replayed."""
+    return reply, stdout
+
+
+def gate_route(claims: Callable[[list[str]], bool], route_name: str,
+               commit: Callable[..., tuple[dict[str, Any], bytes]] = record_commit) -> Route:
+    """The one write route of a gate script that registers no routes of its own: the binary records the gate's verdict."""
+    return Route(claims=claims, parse=lambda argv: argv if claims(argv) else None, default=lambda: "python",
+                 env_route=lambda argv, call: route_name,
+                 write=WriteFlow(before=lambda call: None, commit=commit, unknown=lambda call: (GATE_UNKNOWN_HINT, {}),
+                                 preexec=lambda route: no_core_dumps))
+
+
+def run_gate_engine(script: AgentScript, engine_routes: tuple[Route, ...], argv: list[str], *, claims: Callable[[list[str]], bool],
+                    route_name: str, binary_env: Callable[[str], dict[str, str]], env_keys: tuple[str, ...],
+                    commit: Callable[..., tuple[dict[str, Any], bytes]] = record_commit) -> int | None:
+    """The engine step of a gate script's `__main__`. `engine_routes` (the script's ENGINE_ROUTES) is the seam a route registers in;
+    when it is empty, the script's one gate route serves the argv that `claims` takes. None runs the Python body."""
+    if engine_routes:
+        return select_engine(Selector(script, engine_routes), argv)
+    return select_engine(Selector(script, (gate_route(claims, route_name, commit),), binary_env=binary_env, env_keys=env_keys), argv)

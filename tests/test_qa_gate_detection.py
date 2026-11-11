@@ -13,6 +13,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -465,3 +466,17 @@ def test_real_npm_lifecycle_nonzero_overrides_passing_node_aggregate(node_tools,
     assert body["runs"]["unit"] == "fail"
     assert (root / "node-marker.json").exists()
     assert (root / "posttest-marker").exists()
+
+
+def test_runner_timeout_is_an_internal_error_not_a_verdict(tmp_path):
+    # P4-19: a runner that outruns --timeout propagates as E-INTERNAL; the gate records no verdict.
+    root = tmp_path / "repo"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_sleep.py").write_text("import time\n\n\ndef test_slow():\n    time.sleep(60)\n")
+    started = time.monotonic()
+    proc = run_script("qa_gate.py", "--root", str(root), "--risk-class", "low", "--json", "--timeout", "1")
+    assert time.monotonic() - started < 50, "the runner was not stopped at its deadline"
+    body = json.loads(proc.stdout)
+    assert (proc.returncode, body["status"], body["error"]["code"]) == (2, "error", "E-INTERNAL")
+    assert "verdict" not in body
+

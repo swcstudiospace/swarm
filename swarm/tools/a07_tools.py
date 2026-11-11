@@ -30,6 +30,7 @@ import re
 from fractions import Fraction
 from typing import Any, NamedTuple, cast
 
+from swarm.errors import ErrorCode, SwarmError
 from swarm.tools.support import respond
 
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
@@ -542,7 +543,8 @@ def _split_sql(sql: str) -> list[_Stmt]:
     position, size = 0, len(sql)
     while position < size:
         token = _SQL_TOKEN.match(sql, position)
-        assert token is not None  # _SQL_TOKEN ends in '.', which matches any character under re.S
+        if token is None:  # _SQL_TOKEN ends in '.', which matches any character under re.S, so this cannot happen
+            raise SwarmError(ErrorCode.E_INTERNAL, "SQL tokenizer produced no token")
         text = token.group(0)
         position = token.end()
         head = text[0]
@@ -804,7 +806,8 @@ def data_explain_regression_check(payload: dict[str, Any]) -> dict[str, Any]:
             worst = pct if worst is None or pct > worst else worst
             if pct > threshold:
                 regressions.append({"id": qid, "pct": pct_value})
-        assert worst is not None  # queries is non-empty, so the loop above set worst
+        if worst is None:  # queries is non-empty (checked above), so the loop always sets worst
+            raise SwarmError(ErrorCode.E_INTERNAL, "explain regression loop set no worst case")
         return {
             "state": "SUCCESS",
             "checked": len(queries),

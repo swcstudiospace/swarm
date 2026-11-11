@@ -128,6 +128,7 @@ def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, ta
     task_id = task_id or _task_of(subagent_id)
     effective_state = state or status
     payload = {
+        **kw,
         "subagent_id": subagent_id,
         "status": status,
         "state": effective_state,
@@ -137,7 +138,6 @@ def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, ta
         "ts": time.time(),
         "consolidated": kw.get("consolidated"),
         "error_agg": error_agg,
-        **kw
     }
     if effective_state in ("FAILED", "ERROR") and subagent_id:
         payload.setdefault("per_id_partial", True)
@@ -158,6 +158,7 @@ def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None
     task_id = task_id or _task_of(subagent_id)
     effective_state = state or status
     payload = {
+        **kw,
         "subagent_id": subagent_id,
         "status": status,
         "state": effective_state,
@@ -168,7 +169,6 @@ def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None
         "ts": time.time(),
         "consolidated": consolidated,
         "error_agg": error_agg,
-        **kw,
     }
     if effective_state in ("FAILED", "ERROR") and subagent_id:
         payload.setdefault("per_id_partial", True)

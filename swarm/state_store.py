@@ -143,12 +143,12 @@ class SwarmStateStore:
                 state = gsd_state_map.get(state, state if state in self.STATES else "INITIALIZING")
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             data = {
+                **(extra or {}),
                 "version": "1.0",
                 "correlation_id": corr,
                 "swarm_state": state,
                 "updated_at": now,
                 "progress": progress or {},
-                **(extra or {}),
             }
             if state in ("FAILED", "ERROR") and extra and extra.get("per_id_partial"):
                 data["error_partial"] = {"subagent_id": (extra or {}).get("subagent_id"), "agg": extra.get("error_agg")}
@@ -203,16 +203,6 @@ class SwarmStateStore:
             append_text(log_path, entry)
         except Exception:
             pass  # isolate
-
-    def check_pending_timeout(self, max_age: float = 3600) -> None:
-        try:
-            data = self.get()
-            if data.get("swarm_state") == "PENDING":
-                ts = data.get("updated_at")
-                if ts:
-                    pass
-        except Exception:
-            pass
 
 
 # compat thin

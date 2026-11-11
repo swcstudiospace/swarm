@@ -44,10 +44,12 @@ from _install_cursor import (  # noqa: E402
     RestoreIncomplete,
     _backup_path,
     _drop_backup,
+    _open_nofollow_read,
     _publish,
     _rollback,
     _save_backup,
     logical_target,
+    require_real_dirs,
 )
 from _install_omp import UnsafeDestination, unsafe_destinations  # noqa: E402
 
@@ -155,14 +157,12 @@ def _managed(rel: str) -> bool:
     )
 
 
-def _read_stamp(path: Path) -> tuple[str | None, dict | None]:
-    if path.is_symlink():
-        raise UnsafeDestination(f"{path} is a symlink")
-    if not path.exists():
+def _read_stamp(path: Path, root: Path) -> tuple[str | None, dict | None]:
+    blob = _open_nofollow_read(path, root)
+    if blob is None:
         return None, None
-    raw_bytes = path.read_bytes()
     try:
-        raw = raw_bytes.decode("utf-8")
+        raw = blob.decode("utf-8")
     except UnicodeDecodeError:
         return "\0", None
     try:
@@ -172,13 +172,12 @@ def _read_stamp(path: Path) -> tuple[str | None, dict | None]:
     return raw, data if isinstance(data, dict) else None
 
 
-def _same_text(dest: Path, content: str) -> bool:
-    if dest.is_symlink() or not dest.is_file():
-        return False
+def _same_text(dest: Path, content: str, root: Path) -> bool:
     try:
-        return dest.read_bytes() == content.encode("utf-8")
-    except OSError:
+        blob = _open_nofollow_read(dest, root)
+    except (UnsafeDestination, OSError):
         return False
+    return blob is not None and blob == content.encode("utf-8")
 
 
 def _stamp_is_ours(stamp: dict | None, target: Path, sources: dict[str, str]) -> bool:
@@ -189,6 +188,7 @@ def _stamp_is_ours(stamp: dict | None, target: Path, sources: dict[str, str]) ->
         return False
     for rel in sources:
         dest = _dest(target, rel)
+        require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
         if not dest.exists():
@@ -201,7 +201,7 @@ def _stamp_is_ours(stamp: dict | None, target: Path, sources: dict[str, str]) ->
 
 def _recorded_rels(target: Path) -> list[str]:
     try:
-        _raw, stamp = _read_stamp(target / STAMP_REL)
+        _raw, stamp = _read_stamp(target / STAMP_REL, target)
     except (OSError, UnsafeDestination):
         return []
     files = stamp.get("files") if isinstance(stamp, dict) else None
@@ -214,19 +214,20 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
     """(writes, refusals, removals, kept). See the module docstring."""
     expected = stamp_text(sources)
     stamp_path = _dest(target, STAMP_REL)
-    raw, stamp = _read_stamp(stamp_path)
+    raw, stamp = _read_stamp(stamp_path, target)
     ours = _stamp_is_ours(stamp, target, sources)
     recorded = stamp.get("files") if ours and isinstance(stamp, dict) else {}
     writes: dict[str, str] = {}
     refusals: list[str] = []
     for rel, content in sources.items():
         dest = _dest(target, rel)
+        require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
         if not dest.exists():
             writes[rel] = content
             continue
-        if _same_text(dest, content):
+        if _same_text(dest, content, target):
             continue
         prev = recorded.get(rel) if isinstance(recorded, dict) else None
         current = _bytes_sha(dest.read_bytes()) if dest.is_file() else None
@@ -251,6 +252,7 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
             if not isinstance(prev, str):
                 continue
             dest = _dest(target, rel)
+            require_real_dirs(target, dest.parent)
             if dest.is_symlink():
                 kept.append(rel)
                 continue
@@ -282,6 +284,7 @@ def _backup_conflicts(dest_root: Path, writes: dict[str, str], removals: list[st
     dests.extend(_dest(dest_root, rel) for rel in removals)
     found: list[Path] = []
     for dest in dests:
+        require_real_dirs(dest_root, dest.parent)
         if not (dest.is_file() and not dest.is_symlink()):
             continue
         bak = _backup_path(dest)
@@ -305,15 +308,16 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
     removed: list[tuple[Path, bytes]] = []
     try:
         for rel in sorted(r for r in writes if r != STAMP_REL):
-            _publish(_dest(dest_root, rel), writes[rel], replaced)
+            _publish(_dest(dest_root, rel), writes[rel], replaced, dest_root)
         for rel in removals:
             if not _managed(rel):
                 continue
             path = _dest(dest_root, rel)
+            require_real_dirs(dest_root, path.parent)
             if path.is_symlink() or not path.is_file():
                 continue
             data = path.read_bytes()
-            _save_backup(path, data)
+            _save_backup(path, data, dest_root)
             try:
                 path.unlink()
             except OSError:
@@ -324,9 +328,9 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
                 raise
             removed.append((path, data))
         if STAMP_REL in writes:
-            _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced)
+            _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced, dest_root)
     except (OSError, UnsafeDestination, ExistingBackup) as exc:
-        unrestored = _rollback(replaced, removed)
+        unrestored = _rollback(replaced, removed, dest_root)
         if unrestored:
             raise RestoreIncomplete(unrestored) from exc
         raise
@@ -336,11 +340,13 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
             if prev is None:
                 continue
             try:
+                require_real_dirs(dest_root, path.parent)
                 _drop_backup(path)
             except (OSError, UnsafeDestination):
                 left.append(_backup_path(path))
         for path, _data in removed:
             try:
+                require_real_dirs(dest_root, path.parent)
                 _drop_backup(path)
             except (OSError, UnsafeDestination):
                 left.append(_backup_path(path))

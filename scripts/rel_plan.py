@@ -205,24 +205,9 @@ ENGINE_ROUTES: tuple = ()
 if __name__ == "__main__":
     script = AgentScript("A12", "rel_plan", run, description=__doc__, add_args=add_args)
     answer = None
-    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
         from swarm import engine_select
-        if ENGINE_ROUTES:
-            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
-        else:
-            route = engine_select.Route(
-                claims=_claims_rel, parse=lambda argv: argv if _claims_rel(argv) else None,
-                default=lambda: "python", env_route=lambda argv, call: "rel-plan",
-                write=engine_select.WriteFlow(
-                    before=lambda call: None, commit=_rel_commit,
-                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
-                                          "verdicts/ before running the gate again", {}),
-                    preexec=lambda route: engine_select.no_core_dumps,
-                ),
-            )
-            answer = engine_select.select_engine(
-                engine_select.Selector(script, (route,), binary_env=_binary_env,
-                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
-                sys.argv[1:],
-            )
+        answer = engine_select.run_gate_engine(
+            script, ENGINE_ROUTES, sys.argv[1:], claims=_claims_rel, route_name="rel-plan", binary_env=_binary_env,
+            env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION"), commit=_rel_commit)
     sys.exit(answer if answer is not None else script.main())

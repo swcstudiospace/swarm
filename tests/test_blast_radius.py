@@ -215,6 +215,25 @@ def test_prepare_slice_worktree_reuses_a_worktree_on_its_own_branch(tmp_path):
     assert prepare_slice_worktree(repo, dest, "swarm/X/api") == first == dest.resolve()
 
 
+def test_prepare_slice_worktree_backs_off_linearly_on_a_lock_failure(tmp_path, monkeypatch):
+    """P5-16: each lock retry sleeps through the injected `sleep`, growing by 0.05 s per attempt (no real sleeping)."""
+    import swarm.blast_radius as blast
+
+    repo = _repo(tmp_path)
+    delays = []
+
+    def locked(repo_path, *args):
+        if args[0] == "rev-parse":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=128, stdout="", stderr="fatal: Unable to create index.lock: File exists.")
+
+    monkeypatch.setattr(blast, "_git", locked)
+    with pytest.raises(SwarmError) as failed:
+        prepare_slice_worktree(repo, tmp_path / "wt-lock", "swarm/X/lock", sleep=delays.append)
+    assert failed.value.code == ErrorCode.E_DEP
+    assert delays == pytest.approx([0.05, 0.10, 0.15, 0.20])
+
+
 def test_runner_join_merges_without_a_model(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     _commit(repo, "keep.txt", "keep\n")

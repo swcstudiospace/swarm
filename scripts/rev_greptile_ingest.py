@@ -37,6 +37,7 @@ SUMMARY_MAX = 200
 EVIDENCE_MAX = 1000
 MAX_BODY = 20_000
 GH_TIMEOUT_S = 60
+MAX_INPUT_BYTES = 16 * 1024 * 1024  # a threads export or a per-target map above this is refused before it is read
 UNBADGED = "no severity badge; treated as major"
 _BY_PRIORITY = ("blocker", "major", "minor")  # P0, P1, P2; P3 and lower are info
 
@@ -146,6 +147,9 @@ def _thread_nodes(data: object) -> list:
 
 def _load_file(path: str) -> object:
     try:
+        size = Path(path).stat().st_size
+        if size > MAX_INPUT_BYTES:
+            raise _fail(f"{path} is {size} bytes; the input cap is {MAX_INPUT_BYTES}")
         text = Path(path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise _fail(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from exc

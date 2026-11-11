@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from .clock import SYSTEM_CLOCK, Clock
 from .errors import SwarmError, ErrorCode
 from .envelope import insecure_dev_key, real_key_configured, signing_config_error
 from .gates import SEVERITIES, derive_verdict, make_finding, make_verdict
@@ -41,13 +42,13 @@ def keyless_advisory() -> bool:
 
 
 def advisory_envelope(*, gate: str, task_id: str, agent_id: str, findings: list[dict[str, Any]], runs: dict[str, Any],
-                      expires_s: int, correlation_id: str | None, extra: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+                      expires_s: int, correlation_id: str | None, extra: dict[str, Any] | None, reason: str,
+                      clock: Clock = SYSTEM_CLOCK) -> dict[str, Any]:
     """Unsigned gate envelope marked advisory. It does not verify and is not a verdict row."""
-    import time
     from .envelope import build_envelope
     payload: dict[str, Any] = {"gate": gate, "task_id": task_id, "verdict": derive_verdict(findings or []),
                "findings": findings or [], "runs": runs or {}, "expires_s": expires_s,
-               "issued_at": time.time(), "advisory": True, "advisory_reason": reason, **(extra or {})}
+               "issued_at": clock.wall(), "advisory": True, "advisory_reason": reason, **(extra or {})}
     return build_envelope(source=agent_id, target="A01", msg_type="gate.verdict", payload=payload,
                            correlation_id=correlation_id, priority="P1")
 

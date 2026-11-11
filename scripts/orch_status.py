@@ -497,12 +497,15 @@ def _replay(call: WriteCall, manifest: Manifest, before: str | None) -> dict[str
     ctx = _call_ctx(call)
     store = TaskStore(root=ctx.root)
     try:
-        from swarm import telemetry  # lazy, as TaskStore._notify_committed does
-        telemetry.refresh_live(db_path=store.path)
-    except Exception:  # noqa: BLE001 - the observer never fails a committed transition
-        logging.getLogger("swarm.telemetry").warning("live.json refresh failed", exc_info=True)
-    return finish_transition(store, ctx, call.target, before=manifest.inline_from if before is None else before,
-                             reason=manifest.inline_reason, events=lambda _row: list(manifest.effects))
+        try:
+            from swarm import telemetry  # lazy, as TaskStore._notify_committed does
+            telemetry.refresh_live(db_path=store.path)
+        except Exception:  # noqa: BLE001 - the observer never fails a committed transition
+            logging.getLogger("swarm.telemetry").warning("live.json refresh failed", exc_info=True)
+        return finish_transition(store, ctx, call.target, before=manifest.inline_from if before is None else before,
+                                 reason=manifest.inline_reason, events=lambda _row: list(manifest.effects))
+    finally:
+        store.conn.close()
 
 
 def _run_effects(call: WriteCall | None, before: str | None, effects_path: str) -> tuple[str | None, dict[str, Any] | None]:

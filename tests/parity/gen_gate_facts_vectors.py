@@ -93,6 +93,9 @@ class _Clock:
     def time(self) -> float:
         return self.now
 
+    def wall(self) -> float:
+        return self.now
+
     def __getattr__(self, name: str) -> Any:
         return getattr(time, name)
 
@@ -123,7 +126,7 @@ def seeded(clock: _Clock) -> Iterator[None]:
             os.environ.pop(name, None)
         with (
             mock.patch.object(taskstore, "time", clock),
-            mock.patch.object(gates, "time", clock),
+            mock.patch.dict(gates.make_verdict.__kwdefaults__, {"clock": clock}),
             mock.patch.object(envelope, "time", clock),
             mock.patch.object(envelope, "_now_iso", lambda: "2026-01-01T00:00:00.000Z"),
             mock.patch.object(uuid, "uuid4", ids.uuid4),

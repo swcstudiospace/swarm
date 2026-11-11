@@ -20,6 +20,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import stat
 import sys
@@ -40,6 +41,24 @@ SIGNATURE_REQUIRED = {
 REQUIRED_FIELDS = ("msg_id", "correlation_id", "trace_id", "source", "target", "type",
                    "schema", "ts", "ttl_s", "priority", "risk_class", "payload")
 
+
+
+class _BareStderrHandler(logging.Handler):
+    """Writes each record's bare message to the current sys.stderr, so operator text stays unchanged."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            sys.stderr.write(record.getMessage() + "\n")
+        except Exception:
+            self.handleError(record)
+
+
+_LOG = logging.getLogger("swarm.envelope")
+_LOG.setLevel(logging.INFO)
+if not any(h.get_name() == "swarm.envelope.bare" for h in _LOG.handlers):
+    _bare = _BareStderrHandler()
+    _bare.set_name("swarm.envelope.bare")
+    _LOG.addHandler(_bare)
 
 
 class _Ed25519Verifier(Protocol):
@@ -294,8 +313,7 @@ def signing_config_error() -> str | None:
     if not _signing_key_supplied() and not require:
         return None
     _key, error = _ed25519_material()
-    if error and (not os.environ.get("SWARM_SIGNING_KEY")
-                  or not os.environ.get("SWARM_ED25519_KEY")):
+    if error:
         return error
     if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
         return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
@@ -333,7 +351,7 @@ def perform_signing_key_lifecycle(*, root: str | Path | None = None) -> dict[str
     if require and (err or not configured):
         detail = err or "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
         msg = f"Signing key required for enterprise audit/integrity of parallel swarm. {detail} Actionable: provide via env; swarm start blocked."
-        print(msg, file=sys.stderr)
+        _LOG.error(msg)
         raise SwarmError(ErrorCode.E_POLICY, detail)
 
     if err:
@@ -342,18 +360,18 @@ def perform_signing_key_lifecycle(*, root: str | Path | None = None) -> dict[str
             "Signing key required for enterprise audit/integrity of parallel swarm. "
             f"{err} Actionable: provide a valid key via env. Proceeding reduced-privilege."
         )
-        print(msg, file=sys.stderr)
+        _LOG.warning(msg)
         return {"status": "reduced", "message": msg}
 
     if supplied and configured:
         # present/valid (purpose)
         msg = "Signing key required for enterprise audit/integrity of parallel swarm; validated successfully."
-        print(msg, file=sys.stderr)
+        _LOG.info(msg)
         return {"status": "full", "message": msg}
 
     # absent non-mand
     msg = "Signing key absent: purpose is enterprise audit/integrity of parallel swarm. Proceeding reduced-privilege."
-    print(msg, file=sys.stderr)
+    _LOG.info(msg)
     return {"status": "reduced", "message": msg}
 
 
@@ -371,8 +389,8 @@ def _warn_dev_key(env: dict[str, object], root: str | Path | None) -> None:
         # build_envelope always sets correlation_id to a str; hand-built envelopes may omit it, and emit takes str | None.
         emit("security.dev_key", {"msg_type": env["type"], "source": env["source"]},
 source="swarm.envelope", correlation_id=cast(str | None, env.get("correlation_id")), root=root)
-    except Exception:  # signing never fails on logging
-        pass
+    except Exception as exc:  # signing never fails on logging
+        _LOG.warning("security.dev_key audit event not recorded (%s); signing continues", type(exc).__name__)
 
 
 def sign_envelope(env: dict[str, object], *, root: str | Path | None = None, audit: bool = True) -> dict[str, object]:

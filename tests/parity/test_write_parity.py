@@ -241,7 +241,11 @@ def run_signed_cell(base: Path, cell: matrix.SignedCell, binary: str, request_ke
                     leg.effects, *written]
             problems += [f"{who}: the {slot} secret of the cell is in its output or store" for slot, value in secret_values.items()
                          if any(value in text for text in seen)]
-        if not chosen.started:
+        if cell.key_file:
+            # a conventional key file beside an isolated child: the selector answers in Python and never starts the binary
+            if chosen.started:
+                problems.append("the selector started the binary beside a conventional key file: Python answers that call")
+        elif not chosen.started:
             problems.append("the selector did not start the binary")
         if refused is not None:
             untouched = matrix.dump_store(initial / "state" / ".swarm" / "tasks.db", *cell.masks)

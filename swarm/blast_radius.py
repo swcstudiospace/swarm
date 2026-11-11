@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -279,10 +280,11 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
 
-def prepare_slice_worktree(repo: Path, dest: Path, branch: str) -> Path:
+def prepare_slice_worktree(repo: Path, dest: Path, branch: str, *,
+                           sleep: Callable[[float], None] = time.sleep) -> Path:
     """A worktree at `dest` on `branch`, created from HEAD when the branch is new.
 
-    Parallel lanes call this together. Git locks the main checkout, so a lock failure is retried.
+    Parallel lanes call this together. Git locks the main checkout, so a lock failure is retried; `sleep` is injectable (as `acp.Bus`).
     """
     if not branch or branch.startswith("-") or ".." in branch.split("/"):
         raise SwarmError(ErrorCode.E_CONTRACT, f"refusing blast-radius branch {branch!r}")
@@ -311,7 +313,7 @@ def prepare_slice_worktree(repo: Path, dest: Path, branch: str) -> Path:
         last = (proc.stderr or proc.stdout or "worktree add failed").strip()
         if "lock" not in last.lower() or attempt == 4:
             break
-        time.sleep(0.05 * (attempt + 1))
+        sleep(0.05 * (attempt + 1))
     raise SwarmError(ErrorCode.E_DEP, f"worktree for {branch} failed: {last[-400:]}")
 
 

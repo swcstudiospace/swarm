@@ -11,8 +11,11 @@ Each ready task is dispatched to its agent as a headless session, run with the t
 picks omp (use --runtime omp or SWARM_RUNTIME=omp). Preflight checks only the selected runtime's binary (and
 `claude auth status` for claude). The omp result is the `yield` payload of the terminal agent_end, falling back
 to the last fenced json block in the final assistant text.
-Grok dispatch is refused: its documented single-prompt interface does not support this runner's stdin assignment
-transport. No runtime is launched with permission bypasses; OMP keeps extension discovery and its explicit guard.
+    grok --prompt-file $SWARM_DIR/prompts/<slug>-<id>.md --agent <slug> --output-format json
+        --permission-mode <mode> --max-turns <n> --add-dir <agent-swarm> --add-dir <repo>   (--runtime grok)
+Grok reads the assignment from a bridge-owned 0600 file (its single-prompt interface takes no stdin); the file is
+removed when the session ends. No runtime is launched with permission bypasses; OMP keeps extension discovery and
+its explicit guard.
 
 Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>); OMP receives
 only bounded deny-path guard metadata, never loading references. A gate script they run records nothing.
@@ -61,6 +64,7 @@ import queue
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -94,7 +98,7 @@ from swarm.results import (parse_result, validate_result, apply_result, reconcil
 from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee, workspace  # noqa: E402
 from swarm.claims import ClaimStore, make_claim_table, parse_claims  # noqa: E402
 from swarm.lifecycle import RunEvent  # noqa: E402
-from swarm.limiter import AimdLimiter, detect_rate_limit  # noqa: E402
+from swarm.limiter import AimdLimiter, detect_rate_limit, env_seconds  # noqa: E402
 from swarm.retry import backoff_s, is_transient  # noqa: E402
 from swarm.subagent_lifecycle import get_manager, resolve_max_parallel  # noqa: E402
 from swarm.telemetry import Telemetry, heartbeat_default  # noqa: E402
@@ -205,7 +209,9 @@ def handover_section(task: dict, repo: Path) -> str:
     Bounded: HANDOVER_DEP_CHARS per dependency, HANDOVER_TOTAL_CHARS overall."""
     try:
         handover = importlib.import_module("swarm.handover")  # written by the handover unit: absent means nothing to add
-    except ImportError:
+    except ImportError as exc:
+        if exc.name != "swarm.handover":  # the module is there, but one of its own imports is missing: a fault, not absence
+            raise
         return ""
     inspect_fn = getattr(handover, "inspect_handover", None)
     if inspect_fn is None:
@@ -218,7 +224,8 @@ def handover_section(task: dict, repo: Path) -> str:
             # receiver's own handover first (a task can hand over to several receivers, A15 and A14 of one release), the
             # newest one as context when none is addressed to it: exactly what the shared handover tools would return
             status, doc = inspect_fn(dep, root=repo, to_agent=receiver or None, correlation_id=task.get("correlation_id"))
-        except (SwarmError, OSError, ValueError):
+        except (SwarmError, OSError, ValueError) as exc:
+            _LOG.debug("handover of %s skipped (%s: %s)", dep, type(exc).__name__, exc)
             continue
         if (status or {}).get("status") in ("ok", "partial") and isinstance(doc, dict):
             blocks.append(_handover_block(dep, doc))
@@ -337,8 +344,10 @@ def preflight_auth(claude_bin: str) -> None:
     try:
         proc = subprocess.run([claude_bin, "auth", "status"], capture_output=True, text=True, timeout=30)
         status = json.loads(proc.stdout or "{}")
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        return  # older CLI without `auth status`; let the first task surface any problem
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
+        # older CLI without `auth status`; let the first task surface any problem
+        _LOG.debug("claude auth status unavailable (%s: %s); continuing", type(exc).__name__, exc)
+        return
     if status.get("loggedIn") is False:
         raise SwarmError(ErrorCode.E_DEP, "claude CLI is not logged in — run `claude login` (or `claude setup-token` for headless use) "
                                           "or export ANTHROPIC_API_KEY; use --dry-run to simulate without credentials")
@@ -346,6 +355,7 @@ def preflight_auth(claude_bin: str) -> None:
 
 RUNTIMES = ("claude", "grok", "omp")
 CLAUDE_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+GROK_PERMISSION_MODES = CLAUDE_PERMISSION_MODES  # grok's --permission-mode accepts these; bypassPermissions stays refused
 OMP_APPROVAL_MODES = ("write", "always-ask")
 # the child-env deltas every runtime gets; --dry-run prints exactly these (never key material)
 CHILD_ENV_KEYS = ("SWARM_DIR", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_AGENT", "AIO_UPLIFT", "AIO_SWARM")
@@ -371,10 +381,8 @@ def runtime_bin(runtime: str, args) -> str:
 
 def unsupported_approval(runtime: str, args) -> tuple[ErrorCode, str] | None:
     """The named refusal for an unsupported transport or bypass mode, as (code, message); None when it may be dispatched."""
-    if runtime == "grok":
-        return (ErrorCode.E_DEP, "grok headless dispatch is unsupported: its documented single-prompt "
-                "interface does not accept this runner's stdin assignment transport; use --runtime claude "
-                "or --runtime omp with normal approval controls")
+    if runtime == "grok" and args.permission_mode not in GROK_PERMISSION_MODES:
+        return (ErrorCode.E_INPUT, "grok requires normal permission mode: default, acceptEdits or plan")
     if runtime == "omp" and getattr(args, "approval_mode", "write") not in OMP_APPROVAL_MODES:
         return (ErrorCode.E_INPUT, "omp requires normal approval mode: write or always-ask")
     if runtime == "claude" and args.permission_mode not in CLAUDE_PERMISSION_MODES:
@@ -395,7 +403,7 @@ def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
     frontmatter stripped, written to $SWARM_DIR/agents/<slug>.md (a missing file would be appended as literal text)."""
     src = ROOT / "omp" / "agents" / f"{slug}.md"
     try:
-        raw = src.read_text()
+        raw = src.read_text(encoding="utf-8")
     except OSError as e:
         raise SwarmError(ErrorCode.E_DEP, f"omp agent body {src} unreadable ({e.strerror}); run scripts/build_agents.py") from e
     fm = FRONTMATTER.match(raw)
@@ -409,20 +417,26 @@ def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
     body.parent.mkdir(parents=True, exist_ok=True)
     # atomic: parallel tasks of one agent rewrite the same file while an earlier child may be reading it
     tmp = body.with_name(f".{slug}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(raw[fm.end():])
-    os.replace(tmp, body)
+    try:
+        tmp.write_text(raw[fm.end():], encoding="utf-8")
+        os.replace(tmp, body)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return ",".join(tools), body
 
 
-def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) -> tuple[list[str], dict, Path]:
-    """(argv, env, cwd) of one agent session; the prompt goes on stdin. Shared by the live path and --dry-run.
+def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args,
+                     prompt_file: Path | None = None) -> tuple[list[str], dict, Path]:
+    """(argv, env, cwd) of one agent session; the prompt goes on stdin, or for grok in `prompt_file`. Shared by the
+    live path and --dry-run.
 
     `repo` is the installed workspace (ADR 0001 S4). The child's environment holds no token but its own: every
     SUBSTRATE_TOKEN* the runner has is dropped, and SUBSTRATE_TOKEN is set from the agent's env file, the one the lease
     calls use too (swarm/workspace.py). Each runtime reads the `substrate` MCP entry the install wrote:
     - claude runs in this checkout, where a workspace `.mcp.json` is never read, so it is passed as --mcp-config
       (strict: the agent's tools list admits no other server anyway) and its tools are added to --allowedTools;
-    - grok is refused until a supported stdin assignment transport is available;
+    - grok reads the assignment from `prompt_file` (--prompt-file), its MCP entry from the workspace's .grok config;
     - omp reads `.mcp.json` from its --cwd, and its --tools list does not hide MCP tools (they are xd:// devices)."""
     validate_runtime_approval(runtime, args)
     slug = agent["slug"]
@@ -447,6 +461,12 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         env.pop(workspace.TOKEN, None)
         env.pop("SUBSTRATE_URL", None)
         env.pop("SWARM_SUBSTRATE_AGENT", None)
+    if runtime == "grok":
+        # the assignment is read from a file: grok's single-prompt interface does not read this runner's stdin
+        # grok works only in its cwd (it refuses --add-dir), so the session runs in the workspace that holds .grok/agents
+        prompt_argv = ["--prompt-file", str(prompt_file)] if prompt_file is not None else []
+        return [binary, *prompt_argv, "--agent", slug, "--output-format", "json",
+                "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns), *model], env, repo
     if runtime == "omp":
         if wired and env.get(workspace.TOKEN):
             env["SWARM_SUBSTRATE_AGENT"] = slug
@@ -587,8 +607,10 @@ _stop_reason = SHUTDOWN_REASON  # what a session that registers after kill_sessi
 def kill_group(pgid: int, sig: int) -> None:
     try:
         os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
+    except ProcessLookupError:
+        pass  # the group has already gone
+    except PermissionError as exc:
+        _LOG.warning("signal %s to process group %s refused: %s", sig, pgid, exc)
 
 
 def _group_alive(pgid: int) -> bool:
@@ -759,6 +781,17 @@ class StderrScan:
             return self._message
 
 
+def write_grok_prompt(sdir: Path, slug: str, prompt: str) -> Path:
+    """The assignment for one grok session: a new 0600 file under SWARM_DIR/prompts (O_EXCL, never reused)."""
+    folder = sdir / "prompts"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{slug}-{os.urandom(8).hex()}.md"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    return path
+
+
 def _write_stdin(proc: subprocess.Popen, prompt: str) -> None:
     """stdin is the unbuffered binary pipe of an agent session."""
     try:
@@ -800,8 +833,8 @@ def _drain(stream, parts: list[str], scan: StderrScan | None, tap: OmpActivity |
         tail = decoder.decode(b"", final=True)
         if tail:
             seen(tail)
-    except (ValueError, OSError):
-        pass
+    except (ValueError, OSError) as exc:
+        _LOG.warning("session output read failed after %d characters, so it is truncated: %s", sum(map(len, parts)), exc)
 
 
 def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
@@ -816,10 +849,18 @@ def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[
     text = stdout or ""
     try:
         data = json.loads(text)
-        meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
-        text = data.get("result", "") if isinstance(data, dict) else text
     except json.JSONDecodeError:
-        pass
+        return text, meta
+    if runtime == "grok" and isinstance(data, dict):
+        # grok's --output-format json: the reply is `text`, the session is `sessionId`, and success is stopReason
+        # end_turn (there is no is_error). A session that never started is {"type": "error", "message": ...}.
+        failed = data.get("type") == "error" or data.get("stopReason") != "end_turn"
+        meta.update(total_cost_usd=data.get("total_cost_usd"), num_turns=data.get("num_turns"), is_error=failed,
+                    session_id=data.get("sessionId"))
+        return str(data.get("message" if data.get("type") == "error" else "text") or ""), meta
+    if isinstance(data, dict):
+        meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
+        text = data.get("result", "")
     return text, meta
 
 
@@ -831,12 +872,21 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
     drains are waited out until they finish or the task deadline. A deadline that arrives with a drain still blocked
     is a timeout, and close reaps the group because that kill set a deadline."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
-    cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
+    prompt_file = write_grok_prompt(swarm_dir(repo), agent["slug"], prompt) if runtime == "grok" else None
     try:
-        # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
-        group = ChildGroup(cmd, cwd=cwd, env=env, text=False)
-    except OSError as e:
-        raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
+        extra = {} if prompt_file is None else {"prompt_file": prompt_file}  # other runtimes keep their call shape
+        cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args, **extra)
+        try:
+            # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
+            group = ChildGroup(cmd, cwd=cwd, env=env, text=False)
+        except OSError as e:
+            raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
+    except BaseException:
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)
+        raise
+    # grok's prompt is in its file, so its stdin carries nothing but the end-of-input the pump sends
+    stdin_prompt = "" if prompt_file is not None else prompt
     proc = group.proc
     out_parts: list[str] = []
     err_parts: list[str] = []
@@ -852,7 +902,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         handle.started(runtime)
         tap = OmpActivity(handle.activity) if runtime == "omp" else None
     pumps = [
-        threading.Thread(target=_write_stdin, args=(proc, prompt), daemon=True),
+        threading.Thread(target=_write_stdin, args=(proc, stdin_prompt), daemon=True),
         threading.Thread(target=_drain, args=(proc.stdout, out_parts, None, tap), daemon=True),
         threading.Thread(target=_drain, args=(proc.stderr, err_parts, scan), daemon=True),
     ]
@@ -891,7 +941,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                _LOG.warning("child pid %s did not exit after SIGKILL; abandoned", proc.pid)
     finally:
         for pump in pumps:
             if pump.ident is not None:  # join() raises on a thread that was never started
@@ -899,6 +949,8 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         if on_session is not None:
             on_session(None)
         group.close()
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)  # the assignment never outlives its session
     out, err = "".join(out_parts), "".join(err_parts)
     # T-06-10: the live path records the producing runtime and argv like --dry-run does, so a stored
     # result names what produced it. Last so a session payload can never clobber the runner's own keys.
@@ -921,8 +973,11 @@ def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) ->
     replayable `env -u … K=V … argv < file` line, then where the session's SUBSTRATE_TOKEN comes from; spawn nothing.
     The token's value is never printed: a replay sources the agent's env file for it."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
-    cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
     slug = agent["slug"]
+    # grok's live assignment file is created per run; the dry run names where it will go
+    placeholder = sdir / "prompts" / f"{slug}-<id>.md" if runtime == "grok" else None
+    extra = {} if placeholder is None else {"prompt_file": placeholder}
+    cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args, **extra)
     token, source, problem = workspace.credential(agent["id"], repo, os.environ)
     # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06, INST-03).
     # SUBSTRATE_TOKEN is not unset only when the agent has an own credential: the operator sources the agent's env file
@@ -1497,15 +1552,13 @@ SKIPPED_REPORT_MAX = 64  # entries of `skipped` in one scheduler tick
 
 
 def _env_seconds(name: str, default: float) -> float:
-    """A non-negative number of seconds from the environment; a malformed value is refused, naming the variable."""
+    """A non-negative number of seconds from the environment (0 included); a malformed value is refused, naming the variable.
+    The parse is swarm.limiter.env_seconds: NaN marks a value it does not take."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
-    try:
-        value = float(raw)
-    except ValueError:
-        value = -1.0
-    if not value >= 0 or value == float("inf"):
+    value = env_seconds(name, math.nan, zero_ok=True)
+    if math.isnan(value):
         raise SwarmError(ErrorCode.E_INPUT, f"{name} must be a number of seconds >= 0, got {raw!r}")
     return value
 
@@ -1567,14 +1620,14 @@ def _native_scheduler() -> tuple[Callable[..., dict], Callable[[], object]]:
 def _native_execution(sched: Scheduler, native: tuple[Callable[..., dict], Callable[[], object]]):
     """The native loop composed around the active controller, bound to this runner's helpers and the settings read now."""
     from swarm.limiter import _env_cooldown, _retry_cap_s
-    from swarm.retry import DEFAULT_BASE_S, DEFAULT_CAP_S, _env_seconds
+    from swarm.retry import DEFAULT_BASE_S, DEFAULT_CAP_S
     from swarm.rust_scheduler import RunnerHelpers, RunSettings, RustScheduler
     run_native, fence = native
     helpers = RunnerHelpers(dispatchable=dispatchable, resolve_agent=resolve_agent, extension_failed=_extension_failed,
                             kill_sessions=kill_sessions, write_cancel_flag=write_cancel_flag, safe=_safe)
     settings = RunSettings(cooldown_s=_env_cooldown(), retry_cap_s=_retry_cap_s(),
-                           backoff_base_s=_env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S),
-                           backoff_cap_s=_env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S),
+                           backoff_base_s=env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S),
+                           backoff_cap_s=env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S),
                            wait_tick_s=WAIT_TICK_S, internal_failure_limit=INTERNAL_FAILURE_LIMIT,
                            kill_grace_s=KILL_GRACE_S, kill_settle_s=KILL_SETTLE_S)
     return RustScheduler(sched, helpers=helpers, settings=settings, run_native=run_native, fence_factory=fence,
@@ -2505,18 +2558,24 @@ def non_negative_seconds(value, name: str) -> float:
     return seconds
 
 
+def validate_signer_deny_policy(controller_env: dict[str, str]) -> None:
+    """Refuse a malformed SWARM_SIGNER_DENY_PATHS before any claim. headless_command parses the policy again for each
+    session; this is the controller's own up-front check, and it returns nothing."""
+    signer_deny_metadata(controller_env)
+
+
 def run(args, ctx) -> dict:
     from swarm.envelope import perform_signing_key_lifecycle
     repo = Path(args.repo).resolve()
     # A malformed deny-path policy is a controller configuration error. Refuse it here, before the lifecycle, leases or
     # any claim; per-task rejection would burn each task's attempts (headless_command re-checks it defensively).
-    signer_deny_metadata(dict(os.environ))
+    validate_signer_deny_policy(dict(os.environ))
     # the run's workspace: its keys, state and status writes are scoped to it, not to the cwd it started in
     ctx.root = repo
     key_state = perform_signing_key_lifecycle(root=ctx.root)
     message = key_state.get("message") or ""
     if message:
-        print(message, file=sys.stderr, flush=True)
+        _LOG.log(logging.INFO if key_state.get("status") == "full" else logging.WARNING, message)
         ctx.emit("signing.key.lifecycle", key_state)
     if key_state.get("status") == "blocked":
         raise SwarmError(ErrorCode.E_POLICY, message or "signing key lifecycle blocked")
@@ -2531,9 +2590,10 @@ def run(args, ctx) -> dict:
         ss.append_gsd_line("RUNNING", root=ctx.root)
         ss.update("RUNNING", corr=ctx.correlation_id, extra={"wave": "wave1"})
     except Exception:
-        pass
+        _LOG.warning("swarm state store could not record the run start; the run goes on without it", exc_info=True)
     sdir = swarm_dir(repo, create=True)
-    # one absolute state dir for this process and every child it spawns (D-10)
+    # one absolute state dir for this process and every child it spawns (D-10): a deliberate process-wide write that the
+    # child sessions and gate scripts inherit
     os.environ["SWARM_DIR"] = str(sdir)
     store_path = sdir / "tasks.db"
     store = TaskStore(store_path)
@@ -2646,9 +2706,11 @@ def run(args, ctx) -> dict:
             leases.close()
     log += sched.log
     # note: the outer finally was collapsed; original had reconcile after
-    log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
-    if handoffs is not None:
-        handoffs.flush()
+    try:
+        log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
+    finally:
+        if handoffs is not None:  # the packets written so far reach the ledger even when the reconcile fails
+            handoffs.flush()
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}
     for t in tasks:
@@ -2698,7 +2760,7 @@ def add_args(p):
     p.add_argument("--omp-bin", default="omp")
     p.add_argument("--runtime", choices=["auto", *RUNTIMES], default="auto",
                    help="headless runner: claude -p --agent, omp -p --mode json, or auto "
-                        "(claude/grok; Grok dispatch is currently refused; omp only when explicit or SWARM_RUNTIME=omp)")
+                        "(claude/grok; omp only when explicit or SWARM_RUNTIME=omp)")
     p.add_argument("--allowed-tools", default="Bash(python3:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Read,Grep,Glob",
                    help="comma list passed to claude --allowedTools so headless agents can run their scripts unattended")
 

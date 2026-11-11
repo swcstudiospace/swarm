@@ -324,8 +324,16 @@ def test_an_absolute_key_file_reference_still_resolves_in_an_isolated_child(
     assert (folder / "home.txt").read_text(encoding="utf-8") != str(home), "the child is isolated all the same"
 
 
+def assert_isolated_run(folder: Path, home: Path) -> None:
+    """The one probe run was started in an empty home that is not the user's, and that directory is removed when the call ends."""
+    child_home = (folder / "home.txt").read_text(encoding="utf-8")
+    assert child_home != str(home) and (folder / "xdg.txt").read_text(encoding="utf-8") == child_home
+    assert not Path(child_home).exists()
+
+
+# require and dev are below: with no key file beside them the child is isolated, and with one the parent answers in Python
 @pytest.mark.parametrize("argv", [SERVED, WRITE_ARGV], ids=["read", "write"])
-@pytest.mark.parametrize("grant", ["xdg", "require", "dev", "session"])
+@pytest.mark.parametrize("grant", ["xdg", "session"])
 def test_a_child_whose_grant_names_another_key_policy_variable_is_isolated_too(
         fake: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], grant: str) -> None:
     home = users_home(tmp_path, monkeypatch)
@@ -334,6 +342,44 @@ def test_a_child_whose_grant_names_another_key_policy_variable_is_isolated_too(
     folder = probe_binary(fake, monkeypatch)
     answer, _, _ = select(argv, grant=grant)
     assert answer == AgentScript.EXIT_OK and starts(folder) == 1
-    child_home = (folder / "home.txt").read_text(encoding="utf-8")
-    assert child_home != str(home) and (folder / "xdg.txt").read_text(encoding="utf-8") == child_home
-    assert not Path(child_home).exists()
+    assert_isolated_run(folder, home)
+
+
+@pytest.mark.parametrize("argv", [SERVED, WRITE_ARGV], ids=["read", "write"])
+@pytest.mark.parametrize("grant", ["require", "dev"])
+def test_a_child_whose_grant_names_require_or_dev_is_isolated_too_when_no_key_file_exists(
+        fake: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], grant: str) -> None:
+    home = users_home(tmp_path, monkeypatch)
+    (home / ".config" / "agent-swarm" / "signing-key.hex").unlink()  # nothing beside the child, so the parent does not answer
+    (name,) = GRANTS[grant]
+    monkeypatch.setenv(name, "1")
+    folder = probe_binary(fake, monkeypatch)
+    answer, _, _ = select(argv, grant=grant)
+    assert answer == AgentScript.EXIT_OK and starts(folder) == 1
+    assert_isolated_run(folder, home)
+
+
+@pytest.mark.parametrize("argv", [SERVED, WRITE_ARGV], ids=["read", "write"])
+@pytest.mark.parametrize("grant", ["require", "dev"])
+def test_a_conventional_key_file_beside_an_isolated_child_is_answered_by_python_and_the_binary_is_not_started(
+        fake: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], grant: str) -> None:
+    """The isolated binary cannot see the user's key file, so the parent does not start it: Python reads the file and answers."""
+    users_home(tmp_path, monkeypatch)
+    (name,) = GRANTS[grant]
+    monkeypatch.setenv(name, "1")
+    folder = probe_binary(fake, monkeypatch)
+    answer, out, _ = select(argv, grant=grant)
+    assert answer is None and out == b"", "the call is handed to the Python body, which prints nothing here"
+    assert starts(folder) == 0
+
+
+@pytest.mark.parametrize("argv", [SERVED, WRITE_ARGV], ids=["read", "write"])
+def test_a_raw_ed25519_key_in_the_callers_environment_keeps_the_binary_call_beside_a_key_file(
+        fake: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> None:
+    """Raw signing variables take precedence over the conventional file, so the parent starts the binary and does not answer."""
+    users_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("SWARM_ED25519_KEY", "11" * 32)
+    monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    folder = probe_binary(fake, monkeypatch)
+    answer, _, _ = select(argv, grant="require")
+    assert answer == AgentScript.EXIT_OK and starts(folder) == 1

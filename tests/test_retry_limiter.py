@@ -1,4 +1,5 @@
 """Backoff, transient-error classification and the AIMD limiter (swarm/retry.py, swarm/limiter.py)."""
+import os
 import random
 
 import pytest
@@ -221,3 +222,58 @@ def test_transient_classification_follows_the_rust_contract():
     assert is_transient("E-TIMEOUT") and is_transient("E-DEP") and is_transient("E-CAPACITY")
     assert not is_transient("E-INPUT")
     assert not is_transient("E-POLICY")
+
+
+# --- PY-08: lock waits follow the injected clock (P5-15) ---------------------------------------------------------------
+def test_live_lock_wait_follows_the_injected_clock(tmp_path):
+    import fcntl
+
+    from swarm import telemetry
+
+    clock = FakeClock()
+    target = tmp_path / "live.json"
+    holder = open(f"{target}.lock", "a")  # noqa: SIM115 - held for the whole wait, closed below
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    start = clock.monotonic()
+    try:
+        with telemetry._live_lock(target, timeout=2.0, clock=clock, sleep=clock.advance) as held:
+            assert held is False
+    finally:
+        holder.close()
+    assert clock.monotonic() - start == pytest.approx(2.0, abs=0.01)
+
+
+def test_scratch_lock_wait_follows_the_injected_clock(tmp_path):
+    import fcntl
+
+    from swarm.tools import shared_runtime as sr
+
+    clock = FakeClock()
+    directory = tmp_path / "scratch"
+    directory.mkdir()
+    holder = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    start = clock.monotonic()
+    try:
+        with pytest.raises(OSError, match="busy"), sr._scratch_lock(directory, clock=clock, sleep=clock.advance):
+            pass
+    finally:
+        os.close(holder)
+    assert clock.monotonic() - start == pytest.approx(sr.SCRATCH_LOCK_WAIT_S, abs=0.01)
+
+
+# --- PY-08: one env_seconds helper for the retry and limiter knobs (P5-18) --------------------------------------------
+@pytest.mark.parametrize("raw", ["0", "nan", "inf", "-1"])
+def test_env_seconds_knobs_agree(monkeypatch, raw):
+    from swarm.limiter import DEFAULT_COOLDOWN_S, DEFAULT_RETRY_CAP_S, _env_cooldown, _retry_cap_s, env_seconds
+    from swarm.retry import DEFAULT_BASE_S, DEFAULT_CAP_S, backoff_s
+
+    for name in ("SWARM_RATE_COOLDOWN_S", "SWARM_RETRY_BASE_S", "SWARM_RETRY_CAP_S"):
+        monkeypatch.setenv(name, raw)
+    # Retry base, backoff cap and the Retry-After cap need a positive number: every value here is the default.
+    assert env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S) == DEFAULT_BASE_S
+    assert env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S) == DEFAULT_CAP_S
+    assert _retry_cap_s() == DEFAULT_RETRY_CAP_S
+    assert backoff_s(1, jitter=0) == DEFAULT_BASE_S
+    # The cooldown is a hold, so an explicit 0 means no hold (the Rust contract); the other bad values are the default.
+    assert _env_cooldown() == (0.0 if raw == "0" else DEFAULT_COOLDOWN_S)

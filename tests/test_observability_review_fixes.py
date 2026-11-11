@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -89,3 +90,18 @@ def test_emit_error_agg_successful_write_reports_written(tmp_path: Path) -> None
     assert result["type"] == "error.agg"
     records = read_events(root=tmp_path, event_type="error.agg")
     assert [r["msg_id"] for r in records] == [result["msg_id"]]
+
+
+def test_emit_gsd_omp_reserved_keys_win(tmp_path: Path) -> None:
+    # A caller extra named like a reserved payload key must not overwrite the builder's own value.
+    result = observability.emit_gsd_omp("updated", subagent_id=SID, corr=CORR, root=tmp_path, dry_run=True, ts=1)
+
+    assert result["payload"]["ts"] != 1
+    assert abs(result["payload"]["ts"] - time.time()) < 60
+
+
+def test_stream_subagent_status_reserved_keys_win(tmp_path: Path) -> None:
+    result = observability.stream_subagent_status(SID, "RUNNING", corr=CORR, root=tmp_path, dry_run=True, ts=1)
+
+    assert result["payload"]["ts"] != 1
+    assert abs(result["payload"]["ts"] - time.time()) < 60

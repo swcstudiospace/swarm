@@ -251,3 +251,14 @@ def test_a_missing_example_fails_where_a_job_promised_a_binary_and_skips_otherwi
     with pytest.raises(BaseException) as caught:  # a skip is a BaseException too: it must not pass for a failure
         _binary()
     assert caught.type is outcome
+
+
+
+# ---- P5-10: issued_at comes from the injected clock ----------------------------------------------------------------------
+def test_gate_issued_at_uses_injected_clock(monkeypatch: Any) -> None:
+    from swarm.clock import FakeClock
+    from swarm.gates import make_verdict
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k")
+    env = make_verdict(gate="review", task_id="T-1", agent_id="A09", correlation_id="C-1", audit=False,
+                       clock=FakeClock(start_wall=1000.0))
+    assert env["payload"]["issued_at"] == 1000.0

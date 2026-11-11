@@ -35,9 +35,11 @@ not regenerate agents and does not run the substrate step.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -136,12 +138,68 @@ def _dest(target: Path, rel: str) -> Path:
     return dest
 
 
-def _read_stamp(path: Path) -> tuple[str | None, dict | None]:
-    if path.is_symlink():
-        raise UnsafeDestination(f"{path} is a symlink")
-    if not path.exists():
+def dir_refusal(root: Path, directory: Path) -> str | None:
+    """Why ``directory``, or a directory between ``root`` (exclusive) and it, must not be used: a symlink, a
+    non-directory, or a path outside ``root``. A missing component is fine: nothing below it exists yet. Every
+    component is ``lstat``-ed, so a symlink anywhere on the chain is seen, not only the parent of a leaf. Reads only."""
+    cur = directory
+    while cur != root:
+        if cur == cur.parent or not cur.is_relative_to(root):
+            return f"{directory} is outside {root}"
+        try:
+            st = os.lstat(cur)
+        except (FileNotFoundError, NotADirectoryError):
+            cur = cur.parent
+            continue
+        except OSError as exc:
+            return f"{cur} is unreadable ({exc.strerror})"
+        if stat.S_ISLNK(st.st_mode):
+            return f"{cur} is a symlink"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{cur} is not a directory"
+        cur = cur.parent
+    return None
+
+
+def require_real_dirs(root: Path, directory: Path) -> None:
+    """Raise ``UnsafeDestination`` unless ``directory`` and every directory down from ``root`` is real (``dir_refusal``)."""
+    reason = dir_refusal(root, directory)
+    if reason is not None:
+        raise UnsafeDestination(reason)
+
+
+def _open_nofollow_read(path: Path, root: Path) -> bytes | None:
+    """Bytes of ``path``, or None when absent. Every directory from ``root`` down to ``path`` must be real
+    (``require_real_dirs``); ``O_NOFOLLOW`` refuses a symlink at the leaf, even one swapped in after an ``is_symlink()``
+    check, the same guard as ``build_agents._read_target``. A FIFO, device or directory is refused before it is read:
+    a read would block or fail, and it is never an install file. A read error is refused, not raised raw."""
+    require_real_dirs(root, path.parent)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnsafeDestination(f"{path} is a symlink") from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise UnsafeDestination(f"{path} is not a regular file")
+        parts: list[bytes] = []
+        while chunk := os.read(fd, 1 << 16):
+            parts.append(chunk)
+        return b"".join(parts)
+    except OSError as exc:
+        raise UnsafeDestination(f"{path} cannot be read ({exc.strerror})") from None
+    finally:
+        os.close(fd)
+
+
+def _read_stamp(path: Path, root: Path) -> tuple[str | None, dict | None]:
+    blob = _open_nofollow_read(path, root)
+    if blob is None:
         return None, None
-    raw = path.read_text(encoding="utf-8")
+    raw = blob.decode("utf-8")
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -157,6 +215,7 @@ def _stamp_is_ours(stamp: dict | None, target: Path, sources: dict[str, str]) ->
         return False
     for rel in sources:
         dest = _dest(target, rel)
+        require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
         if not dest.exists():
@@ -185,13 +244,14 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
     """
     expected = stamp_text(sources)
     stamp_path = _dest(target, STAMP_REL)
-    raw, stamp = _read_stamp(stamp_path)
+    raw, stamp = _read_stamp(stamp_path, target)
     ours = _stamp_is_ours(stamp, target, sources)
     recorded = stamp.get("files") if ours and isinstance(stamp, dict) else {}
     writes: dict[str, str] = {}
     refusals: list[str] = []
     for rel, content in sources.items():
         dest = _dest(target, rel)
+        require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
         if not dest.exists():
@@ -222,6 +282,7 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
             if not isinstance(prev, str):
                 continue
             dest = _dest(target, rel)
+            require_real_dirs(target, dest.parent)
             if dest.is_symlink():
                 kept.append(rel)
                 continue
@@ -237,20 +298,26 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
     return writes, [], removals, kept
 
 
-def _stage_text(dest: Path, text: str) -> Path:
-    """Temp file in ``dest``'s directory. Never created through a symlink."""
+def _staged_mode() -> int:
+    """Mode of a file ``open()`` creates: 0o666 with the process umask applied. ``mkstemp`` creates 0600."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def _stage_text(dest: Path, text: str, root: Path) -> Path:
+    """Temp file in ``dest``'s directory. Never created through a symlink, or under one below ``root``."""
     if dest.is_symlink():
         raise UnsafeDestination(f"{dest} is a symlink")
     parent = dest.parent
-    if parent.is_symlink():
-        raise UnsafeDestination(f"{parent} is a symlink")
+    require_real_dirs(root, parent)
     parent.mkdir(parents=True, exist_ok=True)
-    if parent.is_symlink():
-        raise UnsafeDestination(f"{parent} is a symlink")
+    require_real_dirs(root, parent)
     fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".part", dir=os.fspath(parent))
     os.close(fd)
     path = Path(name)
     try:
+        os.chmod(path, _staged_mode())
         path.write_text(text, encoding="utf-8")
     except Exception:
         if path.exists() and not path.is_symlink():
@@ -263,17 +330,16 @@ def _backup_path(dest: Path) -> Path:
     return dest.parent / f".{dest.name}{_BACKUP_SUFFIX}"
 
 
-def _stage_bytes(parent: Path, prefix: str, data: bytes) -> Path:
-    """Temp file of ``data`` in ``parent``. Never created through a symlink, and not via write_text."""
-    if parent.is_symlink():
-        raise UnsafeDestination(f"{parent} is a symlink")
+def _stage_bytes(parent: Path, prefix: str, data: bytes, root: Path) -> Path:
+    """Temp file of ``data`` in ``parent``. Never created through a symlink, or under one below ``root``; not via write_text."""
+    require_real_dirs(root, parent)
     parent.mkdir(parents=True, exist_ok=True)
-    if parent.is_symlink():
-        raise UnsafeDestination(f"{parent} is a symlink")
+    require_real_dirs(root, parent)
     fd, name = tempfile.mkstemp(prefix=prefix, suffix=".part", dir=os.fspath(parent))
     os.close(fd)
     path = Path(name)
     try:
+        os.chmod(path, _staged_mode())
         path.write_bytes(data)
     except Exception:
         if path.exists() and not path.is_symlink():
@@ -282,11 +348,11 @@ def _stage_bytes(parent: Path, prefix: str, data: bytes) -> Path:
     return path
 
 
-def _replace_bytes(dest: Path, data: bytes) -> None:
+def _replace_bytes(dest: Path, data: bytes, root: Path) -> None:
     """Replace ``dest`` from a staged temp. Does not truncate ``dest`` first."""
     if dest.is_symlink():
         raise UnsafeDestination(f"{dest} is a symlink")
-    tmp = _stage_bytes(dest.parent, f".{dest.name}.", data)
+    tmp = _stage_bytes(dest.parent, f".{dest.name}.", data, root)
     try:
         os.replace(tmp, dest)
     except Exception:
@@ -295,13 +361,14 @@ def _replace_bytes(dest: Path, data: bytes) -> None:
         raise
 
 
-def _save_backup(dest: Path, data: bytes) -> None:
+def _save_backup(dest: Path, data: bytes, root: Path) -> None:
     bak = _backup_path(dest)
+    require_real_dirs(root, bak.parent)
     if bak.is_symlink():
         raise UnsafeDestination(f"{bak} is a symlink")
     if bak.exists():
         raise ExistingBackup([bak])
-    _replace_bytes(bak, data)
+    _replace_bytes(bak, data, root)
 
 
 def _drop_backup(dest: Path) -> None:
@@ -336,19 +403,20 @@ class BackupCleanupIncomplete(Exception):
         super().__init__(left)
 
 
-def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]]) -> None:
+def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]], root: Path) -> None:
     """Stage ``text`` and replace ``dest``. ``replaced`` records the previous bytes (None if new).
 
     Previous bytes are copied to a sibling backup before the replace. The backup stays until
     the install succeeds.
     """
+    require_real_dirs(root, dest.parent)
     prev = dest.read_bytes() if dest.is_file() and not dest.is_symlink() else None
     if dest.exists() and (dest.is_symlink() or not dest.is_file()):
         raise UnsafeDestination(f"{dest} is a symlink") if dest.is_symlink() else OSError(f"{dest} is not a regular file")
     if prev is not None:
-        _save_backup(dest, prev)
+        _save_backup(dest, prev, root)
     try:
-        tmp = _stage_text(dest, text)
+        tmp = _stage_text(dest, text, root)
         try:
             os.replace(tmp, dest)
         except Exception:
@@ -363,7 +431,7 @@ def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]]) -
     replaced.append((dest, prev))
 
 
-def _restore_one(path: Path, data: bytes | None) -> Path | None:
+def _restore_one(path: Path, data: bytes | None, root: Path) -> Path | None:
     """Put ``path`` back. Returns the backup path when this file could not be restored."""
     bak = _backup_path(path)
     try:
@@ -374,22 +442,22 @@ def _restore_one(path: Path, data: bytes | None) -> Path | None:
                 path.unlink()
         else:
             blob = bak.read_bytes() if bak.is_file() and not bak.is_symlink() else data
-            _replace_bytes(path, blob)
-    except OSError:
+            _replace_bytes(path, blob, root)
+    except (OSError, UnsafeDestination):
         return bak
     _drop_backup(path)
     return None
 
 
-def _rollback(replaced: list[tuple[Path, bytes | None]], removed: list[tuple[Path, bytes]]) -> list[tuple[Path, Path]]:
+def _rollback(replaced: list[tuple[Path, bytes | None]], removed: list[tuple[Path, bytes]], root: Path) -> list[tuple[Path, Path]]:
     """Restore every file. A failure is recorded and the remaining files are still restored."""
     unrestored: list[tuple[Path, Path]] = []
     for path, data in reversed(removed):
-        failed = _restore_one(path, data)
+        failed = _restore_one(path, data, root)
         if failed is not None:
             unrestored.append((path, failed))
     for path, prev in reversed(replaced):
-        failed = _restore_one(path, prev)
+        failed = _restore_one(path, prev, root)
         if failed is not None:
             unrestored.append((path, failed))
     return unrestored
@@ -403,6 +471,7 @@ def _backup_conflicts(dest_root: Path, writes: dict[str, str], removals: list[st
         dests.append(_dest(dest_root, STAMP_REL))
     found: list[Path] = []
     for dest in dests:
+        require_real_dirs(dest_root, dest.parent)
         if not (dest.is_file() and not dest.is_symlink()):
             continue
         bak = _backup_path(dest)
@@ -428,15 +497,16 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
     removed: list[tuple[Path, bytes]] = []
     try:
         for rel in sorted(r for r in writes if r != STAMP_REL):
-            _publish(_dest(dest_root, rel), writes[rel], replaced)
+            _publish(_dest(dest_root, rel), writes[rel], replaced, dest_root)
         for rel in removals:
             if not _agents_rel(rel):
                 continue
             path = _dest(dest_root, rel)
+            require_real_dirs(dest_root, path.parent)
             if path.is_symlink() or not path.is_file():
                 continue
             data = path.read_bytes()
-            _save_backup(path, data)
+            _save_backup(path, data, dest_root)
             try:
                 path.unlink()
             except OSError:
@@ -449,9 +519,9 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
                 raise
             removed.append((path, data))
         if STAMP_REL in writes:
-            _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced)
+            _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced, dest_root)
     except (OSError, UnsafeDestination, ExistingBackup) as exc:
-        unrestored = _rollback(replaced, removed)
+        unrestored = _rollback(replaced, removed, dest_root)
         if unrestored:
             raise RestoreIncomplete(unrestored) from exc
         raise
@@ -461,11 +531,13 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
             if prev is None:
                 continue
             try:
+                require_real_dirs(dest_root, path.parent)
                 _drop_backup(path)
             except (OSError, UnsafeDestination):
                 left.append(_backup_path(path))
         for path, _data in removed:
             try:
+                require_real_dirs(dest_root, path.parent)
                 _drop_backup(path)
             except (OSError, UnsafeDestination):
                 left.append(_backup_path(path))
@@ -476,7 +548,7 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
 def _recorded_agent_rels(target: Path) -> list[str]:
     """Agent paths the previous stamp records. Empty when there is no stamp of ours."""
     try:
-        _raw, stamp = _read_stamp(target / STAMP_REL)
+        _raw, stamp = _read_stamp(target / STAMP_REL, target)
     except (OSError, UnicodeDecodeError, UnsafeDestination):
         return []
     files = stamp.get("files") if isinstance(stamp, dict) else None

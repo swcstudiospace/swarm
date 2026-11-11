@@ -409,3 +409,43 @@ def test_a_call_the_binary_hands_back_is_answered_by_python_with_the_settled_row
     assert masked(other.out.decode("utf-8")) == masked(truth.out.decode("utf-8"))
     assert json.loads(other.out)["task"]["notes_json"]["lease"]["state"] == "released"
     assert [_dump(record) for record in other.records] == [_dump(record) for record in truth.records]
+
+
+# --- the replay of a committed transition releases its store ------------------------------------------------------------------------
+
+class _Conn:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_replay_closes_store(mod: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from swarm import telemetry
+
+    stores: list[Any] = []
+
+    class PatchedStore:
+        def __init__(self, *, root: Any) -> None:
+            self.path = tmp_path / "tasks.db"
+            self.conn = _Conn()
+            stores.append(self)
+
+    monkeypatch.setattr(mod, "TaskStore", PatchedStore)
+    monkeypatch.setattr(telemetry, "refresh_live", lambda **kwargs: None)
+    call = mod.WriteCall(target=TID, state="CANCELLED", reason="why", root=str(tmp_path), dry_run=False,
+                         task_id=TID, correlation_id="C-1")
+    manifest = mod.Manifest(effects=(), inline_from="IN_PROGRESS", inline_reason="why")
+
+    monkeypatch.setattr(mod, "finish_transition", lambda store, ctx, tid, **kwargs: {"state": "CANCELLED"})
+    assert mod._replay(call, manifest, "IN_PROGRESS") == {"state": "CANCELLED"}
+    assert [store.conn.closed for store in stores] == [True]
+
+    def settlement_fails(store: Any, ctx: Any, tid: str, **kwargs: Any) -> None:
+        raise RuntimeError("settlement failed")
+
+    monkeypatch.setattr(mod, "finish_transition", settlement_fails)
+    with pytest.raises(RuntimeError):
+        mod._replay(call, manifest, "IN_PROGRESS")
+    assert [store.conn.closed for store in stores] == [True, True]

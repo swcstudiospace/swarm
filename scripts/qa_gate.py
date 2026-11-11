@@ -350,22 +350,7 @@ if __name__ == "__main__":
     answer = None
     if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
         from swarm import engine_select
-        if ENGINE_ROUTES:
-            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
-        else:
-            route = engine_select.Route(
-                claims=_claims_qa, parse=lambda argv: argv if _claims_qa(argv) else None,
-                default=lambda: "python", env_route=lambda argv, call: "qa-gate",
-                write=engine_select.WriteFlow(
-                    before=lambda call: None, commit=_qa_commit,
-                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
-                                          "verdicts/ before running the gate again", {}),
-                    preexec=lambda route: engine_select.no_core_dumps,
-                ),
-            )
-            answer = engine_select.select_engine(
-                engine_select.Selector(script, (route,), binary_env=_binary_env,
-                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
-                sys.argv[1:],
-            )
+        answer = engine_select.run_gate_engine(
+            script, ENGINE_ROUTES, sys.argv[1:], claims=_claims_qa, route_name="qa-gate", binary_env=_binary_env,
+            env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION"), commit=_qa_commit)
     sys.exit(answer if answer is not None else script.main())

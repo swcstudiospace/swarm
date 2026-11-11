@@ -243,7 +243,8 @@ if @LOAD_ERROR_ON@ is not None and @LOAD_ERROR_ON@ in prompt:
           f"for dependency rewriting: {ext}/src/index.ts: Unexpected token (3:0)", file=sys.stderr, flush=True)
 if @HANG@:
     # a tool process of the session, then a session that outlives any --task-timeout
-    gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL,
+    # the grandchild reads a pipe this stub holds: it exits on EOF when the stub dies, so it cannot outlive its session
+    gc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with open(@GRANDCHILD@, "w") as fh:
         fh.write(str(gc.pid))

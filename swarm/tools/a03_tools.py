@@ -384,7 +384,9 @@ def nfr_allocation(payload: dict[str, Any]) -> dict[str, Any]:
             bindings = bound.get(nfr_id)
             if not bindings:
                 unallocated.append(nfr_id)
-            elif kind_of[nfr_id] == "quantitative" and not any("limit" in b for b in bindings):
+            elif kind_of[nfr_id] == "quantitative" and not any(
+                isinstance(b.get("limit"), (int, float)) and not isinstance(b.get("limit"), bool) for b in bindings
+            ):
                 unmeasurable.append(nfr_id)
             else:
                 allocated.append(nfr_id)

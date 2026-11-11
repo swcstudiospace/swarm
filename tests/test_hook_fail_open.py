@@ -1,5 +1,6 @@
 """Fail-open hooks: a broken swarm dependency or an unwritable state dir must end in exit 0, never a traceback."""
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "hooks" / "autonomous_run.py"
 ON_A01 = ROOT / "hooks" / "on_a01_complete.py"
 PROMPT_HOOK = ROOT / "hooks" / "user_prompt_submit.py"
+GREPTILE_INGEST = ROOT / "scripts" / "rev_greptile_ingest.py"
 
 
 def _env() -> dict:
@@ -78,3 +80,42 @@ def test_run_capped_accepts_cap_beyond_poll_range():
     r = runner.run_capped([sys.executable, "-c", "print('ok')"], cwd=".", env=os.environ.copy(), timeout=1e7, grace=1)
     assert r.returncode == 0
     assert r.stdout == "ok\n"
+
+
+def _load_prompt_hook():
+    spec = importlib.util.spec_from_file_location("user_prompt_submit_fail_open_under_test", PROMPT_HOOK)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_outer_failure_traced(monkeypatch, capsys):
+    """An exception outside the classifier still ends in `{}` with exit 0, and stderr names it so the failure is visible."""
+    hook = _load_prompt_hook()
+
+    def broken(payload):
+        raise RuntimeError("extract-marker")
+
+    monkeypatch.setattr(hook, "extract_prompt", broken)
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"prompt": "implement x"}'))
+    assert hook.main() == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "{}"
+    assert "RuntimeError" in captured.err and "extract-marker" in captured.err
+
+
+def test_greptile_over_cap_input_is_e_input(monkeypatch, tmp_path):
+    """An input file above MAX_INPUT_BYTES is refused with E_INPUT before it is parsed."""
+    spec = importlib.util.spec_from_file_location("rev_greptile_ingest_fail_open_under_test", GREPTILE_INGEST)
+    assert spec is not None and spec.loader is not None
+    ingest = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ingest)
+    from swarm.errors import ErrorCode, SwarmError
+
+    monkeypatch.setattr(ingest, "MAX_INPUT_BYTES", 16)
+    big = tmp_path / "threads.json"
+    big.write_text('{"data": {"padding": "' + "x" * 64 + '"}}')
+    with pytest.raises(SwarmError) as info:
+        ingest._load_file(str(big))
+    assert info.value.code is ErrorCode.E_INPUT

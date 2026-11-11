@@ -64,6 +64,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1562,7 +1563,8 @@ def check_approved_run(
     else:
         error = binary.get("error") or {}
         assert error.get("code") == "E-POLICY" and expected in error.get("message", ""), f"expected the E-POLICY {expected!r} {where}"
-        assert "write_state" not in (error.get("details") or {}) or error["details"]["write_state"] == "final", f"unexpected write_state {where}"
+        details = error.get("details") or {}
+        assert details.get("write_state") in ("final", None), f"the refusal must say write_state final, or none on a typed E-POLICY refusal {where}"
     # What the caller was told: through the selector Python answers whatever the binary refused before a write.
     if driver == "selector" and refused_before_write:
         final_expected = NO_KEY_TEXT if case == "key-file-reference" else expected
@@ -1663,6 +1665,59 @@ def test_the_approved_check_detects_a_key_in_each_channel_and_a_wrong_answer(tmp
         check_approved_run(world, canaries, outcome, case, driver, "host", build, where)
 
 
+def test_a_refusal_states_write_state_final_or_none_and_never_not_started(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fail-closed refusal of a no-key call as the transition route answers it. The documented contract (engine_select.py:301-304)
+    accepts `write_state` `final` or none on a typed non-E-INTERNAL code, and refuses `not_started` (nothing written, Python answers).
+    Built from the reply itself, so it needs no binary."""
+    case = "no-key"
+    world = make_world(tmp_path)
+    canaries = make_canaries(tmp_path)
+    record_review_verdict(world, {"SWARM_SIGNING_KEY": canaries.env["SWARM_SIGNING_KEY"]}, monkeypatch)
+
+    def refusal(details: dict[str, str]) -> Outcome:
+        reply = {"status": "error", "error": {"code": "E-POLICY", "message": NO_KEY_TEXT, "details": details}}
+        return Outcome(1, json.dumps(reply).encode(), b"")
+
+    check_approved_run(world, canaries, refusal({"write_state": "final"}), case, "direct", "host", "default", "[scratch]")
+    check_approved_run(world, canaries, refusal({}), case, "direct", "host", "default", "[scratch]")
+    with pytest.raises(AssertionError, match="write_state"):
+        check_approved_run(world, canaries, refusal({"write_state": "not_started"}), case, "direct", "host", "default", "[scratch]")
+
+
+def _proc_state(pid: int) -> str:
+    with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+        return fh.read().rsplit(")", 1)[1].split()[0]
+
+
+def _blocked_on_lock(process: subprocess.Popen[bytes], *, timeout: float = 20.0, samples: int = 5) -> None:
+    """Returns once the binary is seen asleep (`S`) in `samples` polls in a row. A process waiting for the write lock sleeps between
+    sqlite's busy retries; one still running but not sleeping proves nothing about the lock, so it fails, as does one that finishes
+    first."""
+    deadline = time.monotonic() + timeout
+    asleep = 0
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError("the binary finished before it was seen blocked on the write lock")
+        asleep = asleep + 1 if _proc_state(process.pid) == "S" else 0
+        if asleep >= samples:
+            return
+        time.sleep(0.05)
+    raise AssertionError("the binary never blocked on the write lock: it neither waited nor finished")
+
+
+def test_the_write_lock_probe_rejects_a_binary_that_is_not_blocked() -> None:
+    spinner = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        with pytest.raises(AssertionError, match="never blocked"):
+            _blocked_on_lock(spinner, timeout=2)
+        _blocked_on_lock(sleeper, timeout=10)
+    finally:
+        for child in (spinner, sleeper):
+            child.kill()
+            child.wait()
+
+
 def test_an_approved_transition_reads_the_verdict_rows_after_it_has_the_write_lock(tmp_path: Path, build: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """A second connection holds the write lock and the verdict the task is missing is committed while the binary waits: the binary must
     see it, which only a read inside its own transaction does. Nothing here is sensitive to how long the binary takes to reach the lock."""
@@ -1682,11 +1737,7 @@ def test_an_approved_transition_reads_the_verdict_rows_after_it_has_the_write_lo
         assert process.stdin is not None
         process.stdin.write(json.dumps(request).encode())
         process.stdin.close()
-        try:
-            process.wait(timeout=3)
-            raise AssertionError("the binary finished while another connection held the write lock: it did not wait for it")
-        except subprocess.TimeoutExpired:
-            pass
+        _blocked_on_lock(process)
         now = envelope["payload"]["issued_at"]
         holder.execute(
             "INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",

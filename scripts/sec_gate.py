@@ -139,6 +139,14 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
     return findings, seen
 
 
+def _audit_env() -> dict[str, str]:
+    # The audit child gets what the audit tools need: the names `_binary_env` grants a child, XDG_CONFIG_HOME and the locale
+    # variables. Every SWARM_* variable, signing material included, is left out.
+    from swarm.engine_select import BINARY_ENV_NAMES
+    return {key: value for key, value in os.environ.items()
+            if key in BINARY_ENV_NAMES or key == "XDG_CONFIG_HOME" or key.startswith("LC_")}
+
+
 def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
     findings, runs = [], {}
     for name, globs, binary, cmd in AUDITS:
@@ -148,7 +156,7 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
             runs[name] = "skipped:tool-missing"
             continue
         try:
-            proc = sh(cmd, cwd=root, timeout=timeout)
+            proc = sh(cmd, cwd=root, timeout=timeout, env=_audit_env())
         except Exception as e:  # noqa: BLE001 - timeout etc. ⇒ fail-closed advisory
             runs[name] = "fail"
             findings.append(make_finding(fid("deps", name, "run"), "major", "deps", f"{name} did not complete: {e}"))
@@ -188,19 +196,27 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
 def apply_allow_list(findings: list[dict], path: str | None) -> tuple[list[dict], list[dict]]:
     if not path:
         return findings, []
-    raw = json.loads(Path(path).read_text())
-    entries = raw.get("allow", raw) if isinstance(raw, dict) else raw
-    allow = {}
-    for e in entries:
-        e = {"id": e} if isinstance(e, str) else e
-        if not e.get("justification"):
-            raise SwarmError(ErrorCode.E_POLICY, f"allow-list entry {e.get('id')} lacks a justification")
-        if e.get("expires") and time.strptime(e["expires"], "%Y-%m-%d") < time.gmtime():
-            continue
-        allow[e["id"]] = e["justification"]
+    allow, expired = {}, []
+    try:
+        raw = json.loads(Path(path).read_text())
+        entries = raw.get("allow", raw) if isinstance(raw, dict) else raw
+        for e in entries:
+            e = {"id": e} if isinstance(e, str) else e
+            if not e.get("justification"):
+                raise SwarmError(ErrorCode.E_POLICY, f"allow-list entry {e.get('id')} lacks a justification")
+            if e.get("expires") and time.strptime(e["expires"], "%Y-%m-%d") < time.gmtime():
+                expired.append((e["id"], e["expires"]))
+                continue
+            allow[e["id"]] = e["justification"]
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise SwarmError(ErrorCode.E_INPUT, f"allow-list {path} is malformed ({type(exc).__name__})") from exc
     kept, suppressed = [], []
     for f in findings:
         (suppressed if f["id"] in allow else kept).append({**f, "justification": allow[f["id"]]} if f["id"] in allow else f)
+    # P4-26: an expired suppression no longer applies; the info finding names the entry that lapsed
+    kept += [make_finding(fid("allow-list", "expired", str(entry_id)), "info", "allow-list",
+                          f"allow-list entry {entry_id} expired on {expires}; its suppression no longer applies")
+             for entry_id, expires in expired]
     return kept, suppressed
 
 
@@ -279,22 +295,7 @@ if __name__ == "__main__":
     answer = None
     if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
         from swarm import engine_select
-        if ENGINE_ROUTES:
-            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
-        else:
-            route = engine_select.Route(
-                claims=_claims_sec, parse=lambda argv: argv if _claims_sec(argv) else None,
-                default=lambda: "python", env_route=lambda argv, call: "sec-gate",
-                write=engine_select.WriteFlow(
-                    before=lambda call: None, commit=_sec_commit,
-                    unknown=lambda call: ("the verdict may or may not have been recorded; check the gate's verdict rows and "
-                                          "verdicts/ before running the gate again", {}),
-                    preexec=lambda route: engine_select.no_core_dumps,
-                ),
-            )
-            answer = engine_select.select_engine(
-                engine_select.Selector(script, (route,), binary_env=_binary_env,
-                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION")),
-                sys.argv[1:],
-            )
+        answer = engine_select.run_gate_engine(
+            script, ENGINE_ROUTES, sys.argv[1:], claims=_claims_sec, route_name="sec-gate", binary_env=_binary_env,
+            env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION"), commit=_sec_commit)
     sys.exit(answer if answer is not None else script.main())

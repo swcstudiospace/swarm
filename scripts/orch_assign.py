@@ -31,8 +31,12 @@ class ReadOnlyTaskStore(TaskStore):
     def __init__(self, *, root: Path):
         self.path = swarm_dir(root) / "tasks.db"
         self.conn = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA query_only=ON")
+        try:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA query_only=ON")
+        except BaseException:
+            self.conn.close()
+            raise
         self._tx_depth = 0
 
 

@@ -16,6 +16,7 @@ _Result = TypeVar("_Result")
 
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS: dict[str, ModuleType] = {}
+_SCRIPTS_LOCK = threading.RLock()
 _running: set[int] = set()
 _lane = threading.Condition()
 _cancel: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar("swarm_call_cancel", default=None)
@@ -131,14 +132,18 @@ def script(stem: str) -> ModuleType:
     cached = _SCRIPTS.get(stem)
     if cached is not None:
         return cached
-    path = ROOT / "scripts" / f"{stem}.py"
-    spec = importlib.util.spec_from_file_location(f"_swarm_lane_{stem}", path)
-    if spec is None or spec.loader is None:
-        raise OSError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _SCRIPTS[stem] = module
-    return module
+    with _SCRIPTS_LOCK:
+        cached = _SCRIPTS.get(stem)
+        if cached is not None:
+            return cached
+        path = ROOT / "scripts" / f"{stem}.py"
+        spec = importlib.util.spec_from_file_location(f"_swarm_lane_{stem}", path)
+        if spec is None or spec.loader is None:
+            raise OSError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCRIPTS[stem] = module
+        return module
 
 
 def respond(payload: dict[str, Any], work: Callable[[], _Result]) -> dict[str, Any] | _Result:

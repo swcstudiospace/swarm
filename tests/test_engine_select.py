@@ -25,12 +25,13 @@ from typing import Any
 import pytest
 from conftest import ROOT
 
-from swarm import engine_select, substrate_tee
+from swarm import _native_loader, engine_select, substrate_tee
 from swarm.script_base import AgentScript
 
 ENGINE_SELECT = ROOT / "swarm" / "engine_select.py"
 ENGINE_ENV = ("GSD_ENGINE", "GSD_ENGINE_BIN", "GSD_RUST_BACKEND", "GSD_RUST_TIMEOUT_S", "SWARM_PURE_PYTHON", "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
 SIX = (("orch_plan", "A01"), ("orch_assign", "A01"), ("qa_gate", "A08"), ("rev_gate", "A09"), ("sec_gate", "A10"), ("rel_plan", "A12"))
+GATE_SCRIPTS = frozenset({"qa_gate", "rev_gate", "sec_gate", "rel_plan"})  # the scripts whose block calls engine_select.run_gate_engine
 SERVED = ["--json"]
 WRITE_ARGV = ["--json", "--write"]
 OK_REPLY = {"agent": "A99", "script": "demo", "status": "ok", "summary": "answered by the fake engine"}
@@ -806,23 +807,123 @@ def test_an_explicit_rust_for_a_script_without_a_route_is_answered_as_an_unserve
     assert (code, body["error"]["code"], fake.starts) == (2, "E-INPUT", 0)
 
 
+def _registered_gate(script: AgentScript, engine_routes: tuple[Any, ...], argv: list[str], **_options: Any) -> int | None:
+    """The shared gate helper's call with a registered route: the selector that serves that route, with its environment policy."""
+    return engine_select.select_engine(engine_select.Selector(script, engine_routes, binary_env=lambda route: {"PATH": os.environ["PATH"]}), argv)
+
+
 @pytest.mark.parametrize(("name", "agent"), SIX)
 def test_the_block_hands_the_call_to_the_selector_once_a_route_is_registered(
         name: str, agent: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """The inert block is a seam: a route in ENGINE_ROUTES reaches the selector even with GSD_ENGINE unset (its default row decides)."""
     source = (ROOT / "scripts" / f"{name}.py").read_text(encoding="utf-8")
-    routes, selector = "ENGINE_ROUTES: tuple = ()", "engine_select.Selector(script, ENGINE_ROUTES)"
-    assert source.count(routes) == 1 and source.count(selector) == 1
+    routes = "ENGINE_ROUTES: tuple = ()"
+    if name in GATE_SCRIPTS:  # a gate block calls the shared helper; the registered route reaches the selector through _registered_gate
+        selector, seam = "engine_select.run_gate_engine(", "_registered_gate("
+        assert source.count(routes) == 1 and source.count(selector) == 1 and source.count("script, ENGINE_ROUTES, sys.argv[1:]") == 1
+    else:
+        selector = "engine_select.Selector(script, ENGINE_ROUTES)"
+        seam = "engine_select.Selector(script, ENGINE_ROUTES, binary_env=lambda route: {'PATH': os.environ['PATH']})"
+        assert source.count(routes) == 1 and source.count(selector) == 1
     fake = build_fake(tmp_path / "fake", stdout=_rendered({"agent": agent, "script": name, "status": "ok", "summary": "from the fake engine"}))
     monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
     route = engine_select.Route(claims=lambda argv: True, parse=lambda argv: argv, default=lambda: "rust", env_route=lambda argv, call: "plain")
     monkeypatch.setattr(engine_select, "ROUTE_UNDER_TEST", route, raising=False)
     # what a unit that registers a route writes in the block: the route, and the environment policy of its routes
-    patched = source.replace(routes, "ENGINE_ROUTES: tuple = (__import__('swarm.engine_select').engine_select.ROUTE_UNDER_TEST,)").replace(
-        selector, "engine_select.Selector(script, ENGINE_ROUTES, binary_env=lambda route: {'PATH': os.environ['PATH']})")
+    patched = source.replace(routes, "ENGINE_ROUTES: tuple = (__import__('swarm.engine_select').engine_select.ROUTE_UNDER_TEST,)").replace(selector, seam)
     real = ROOT / "scripts" / f"{name}.py"
     monkeypatch.setattr(sys, "argv", [name, *DRY])
     with pytest.raises(SystemExit) as exit_info:
-        exec(compile(patched, str(real), "exec"), {"__name__": "__main__", "__file__": str(real)})  # noqa: S102
+        exec(compile(patched, str(real), "exec"), {"__name__": "__main__", "__file__": str(real), "_registered_gate": _registered_gate})  # noqa: S102
     out = capsys.readouterr().out
     assert exit_info.value.code == 0 and json.loads(out)["summary"] == "from the fake engine" and fake.starts == 1
+
+
+# --- PY-04 rows: read-side subprocess errors, the pure-Python switch, the write route's check, the record warning, the gate helper ----
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
+def test_run_read_subprocess_error_falls_back(explicit: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = build_fake(tmp_path / "fake", stdout=_rendered(OK_REPLY))
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    if explicit:
+        monkeypatch.setenv("GSD_ENGINE", "rust")
+
+    def cannot_spawn(*args: object, **kwargs: object) -> None:
+        raise subprocess.SubprocessError("the spawn failed without an OSError")
+
+    monkeypatch.setattr(engine_select.subprocess, "run", cannot_spawn)
+    code, out = Demo(engine_select).select(SERVED)
+    if explicit:
+        assert (code, _body(out)["error"]["code"]) == (2, "E-DEP")
+    else:
+        assert (code, out) == (None, b"")
+    assert fake.starts == 0
+
+
+def test_select_engine_asks_the_native_loader_whether_pure_python_is_requested(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = build_fake(tmp_path / "fake", stdout=_rendered(OK_REPLY))
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+    monkeypatch.setattr(_native_loader, "pure_python_requested", lambda: True)
+    assert Demo(engine_select).select(SERVED) == (None, b"")
+    assert fake.starts == 0
+
+
+def test_write_route_none_under_O(tmp_path: Path) -> None:
+    """`python -O` strips asserts: a write flow asked of a route that does not write is an explicit E-INTERNAL, not an AttributeError."""
+    program = (
+        "from swarm import engine_select\n"
+        "from swarm.errors import SwarmError\n"
+        "from swarm.script_base import AgentScript\n"
+        "route = engine_select.Route(claims=lambda argv: True, parse=lambda argv: argv, default=lambda: 'rust', env_route=lambda argv, call: 'demo')\n"
+        "selector = engine_select.Selector(AgentScript('A99', 'demo', lambda args, ctx: {'status': 'ok'}), (route,))\n"
+        "try:\n"
+        "    engine_select.run_write(selector, route, ['--json'], '/bin/true', explicit=True)\n"
+        "except SwarmError as exc:\n"
+        "    print(exc.code.value)\n"
+        "else:\n"
+        "    print('no error')\n"
+    )
+    result = subprocess.run([sys.executable, "-O", "-c", program], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+    assert result.stdout.strip() == "E-INTERNAL", result.stderr
+
+
+def test_record_reply_failure_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = build_fake(tmp_path / "fake", stdout=_rendered(OK_REPLY))
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+    demo = Demo(engine_select)
+
+    def record_fails(argv: list[str], reply: dict[str, Any], exit_code: int) -> None:
+        raise RuntimeError("the run log is full")
+
+    monkeypatch.setattr(demo.selector.script, "record_external_reply", record_fails)
+    assert demo.select(SERVED) == (None, b"")
+    assert fake.starts == 1
+    assert "demo: recording the Rust answer failed (RuntimeError); the Python body answers" in capsys.readouterr().err
+
+
+def test_the_gate_helper_serves_the_claimed_argv_through_the_gate_route_and_leaves_the_rest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = build_fake(tmp_path / "fake", stdout=_rendered(OK_REPLY))
+    monkeypatch.setenv("GSD_ENGINE_BIN", str(fake.path))
+    monkeypatch.setenv("GSD_ENGINE", "rust")
+
+    def binary_env(route: str) -> dict[str, str]:
+        if route != "demo-gate":
+            raise KeyError(route)
+        return {key: value for key, value in os.environ.items() if key in engine_select.BINARY_ENV_NAMES}
+
+    def claims(argv: list[str]) -> bool:
+        return "--json" in argv and "--dry-run" not in argv
+
+    def call(argv: list[str]) -> tuple[int | None, bytes]:
+        sink = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        with contextlib.redirect_stdout(sink):
+            code = engine_select.run_gate_engine(_script(), (), argv, claims=claims, route_name="demo-gate", binary_env=binary_env,
+                                                 env_keys=("SWARM_DIR",))
+        sink.flush()
+        return code, sink.buffer.getvalue()  # type: ignore[attr-defined]
+
+    served_code, served_out = call(SERVED)
+    assert served_code == 0 and _body(served_out)["summary"] == "answered by the fake engine" and fake.starts == 1
+    assert call(["--json", "--dry-run"]) == (None, b"") and fake.starts == 1

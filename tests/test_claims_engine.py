@@ -281,7 +281,7 @@ def test_a_native_constructor_failure_falls_back_with_one_warning(
         tables = [make_claim_table(), make_claim_table()]
     assert [type(t) for t in tables] == [ClaimTable, ClaimTable]
     messages = warnings_of(caplog)
-    assert len(messages) == 1 and "RuntimeError" in messages[0] and "constructor exploded" in messages[0]
+    assert len(messages) == 1 and "RuntimeError" in messages[0] and "constructor exploded" not in messages[0]
 
 
 def test_each_reason_warns_once_and_reasons_are_independent(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -352,7 +352,7 @@ def test_a_native_failure_at_any_call_keeps_the_oracles_answers_and_the_claims_h
         assert type(table) is NativeClaimTable
         assert play(table, SCRIPT) == reference
     messages = warnings_of(caplog)
-    assert len(messages) == 1 and "injected" in messages[0]
+    assert len(messages) == 1 and "RuntimeError" in messages[0] and "injected" not in messages[0]
     assert table._python is not None and table._native is None and table._journal == {}  # one-way: the Python table serves the rest
 
 
@@ -393,6 +393,36 @@ def test_a_native_failure_message_is_bounded(monkeypatch: pytest.MonkeyPatch, ca
         make_claim_table().acquire("A", [claim("a")])
     (message,) = warnings_of(caplog)
     assert len(message) < 600
+
+
+def test_native_error_log_names_only_the_exception_class(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, rust: None
+) -> None:
+    def boom() -> Any:
+        raise RuntimeError("pattern-7f3c must not reach the log")
+
+    monkeypatch.setitem(sys.modules, NATIVE, FakeNative(boom))
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert type(make_claim_table()) is ClaimTable
+    (message,) = warnings_of(caplog)
+    assert "swarm._native.ClaimTable failed (RuntimeError);" in message
+    assert "pattern-7f3c" not in message
+
+
+def test_native_error_log_omits_the_message_on_a_mid_run_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, rust: None
+) -> None:
+    class Leaky(FakeNativeTable):
+        def acquire(self, owner: str, claims: list[tuple[str, str]]) -> tuple[bool, list[tuple[str, str, str]]]:
+            raise RuntimeError("pattern-7f3c must not reach the log")
+
+    monkeypatch.setitem(sys.modules, NATIVE, FakeNative(Leaky))
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        table = make_claim_table()
+        assert table.acquire("A", [claim("a")]) == ClaimResult(True, ())
+    (message,) = warnings_of(caplog)
+    assert "swarm._native.ClaimTable failed (RuntimeError);" in message
+    assert "pattern-7f3c" not in message
 
 
 # ---- the adapter against the Python table over the real extension ---------------------------------------------------------------------

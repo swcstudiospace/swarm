@@ -6,6 +6,7 @@ from an injected `Clock`, so tests drive the cooldown with `FakeClock` instead o
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -55,25 +56,33 @@ def detect_rate_limit(text: str | None) -> float | None:
     return None
 
 
-def _env_cooldown() -> float:
-    raw = os.environ.get("SWARM_RATE_COOLDOWN_S")
+def env_seconds(name: str, default: float, *, zero_ok: bool = False) -> float:
+    """The number of seconds in environment variable `name`, or `default`.
+
+    A finite number above zero is taken; zero is taken only with `zero_ok` (a hold or grace where none is a real
+    setting). Unset, blank, non-numeric, NaN, infinite and negative values all fall back to `default`.
+    """
+    raw = os.environ.get(name)
     if raw is None:
-        return DEFAULT_COOLDOWN_S
+        return default
     try:
         value = float(raw)
     except ValueError:
-        return DEFAULT_COOLDOWN_S
-    return value if value >= 0 and value == value and value != float("inf") else DEFAULT_COOLDOWN_S
+        return default
+    if not math.isfinite(value):
+        return default
+    if value > 0 or (zero_ok and value == 0):
+        return value
+    return default
+
+
+def _env_cooldown() -> float:
+    return env_seconds("SWARM_RATE_COOLDOWN_S", DEFAULT_COOLDOWN_S, zero_ok=True)
 
 
 def _retry_cap_s() -> float:
     """`SWARM_RETRY_CAP_S` (default 120): the longest a server-supplied Retry-After may hold growth back."""
-    raw = os.environ.get("SWARM_RETRY_CAP_S")
-    try:
-        value = float(raw) if raw is not None else DEFAULT_RETRY_CAP_S
-    except ValueError:
-        return DEFAULT_RETRY_CAP_S
-    return value if value > 0 and value != float("inf") else DEFAULT_RETRY_CAP_S
+    return env_seconds("SWARM_RETRY_CAP_S", DEFAULT_RETRY_CAP_S)
 
 
 class AimdLimiter:
