@@ -238,12 +238,23 @@ impl TempFileManager {
         Ok((path, file))
     }
 
+    /// Removes every tracked file. Paths that cannot be removed stay tracked, and the first such
+    /// error is returned once the rest have been attempted. A file already gone is not an error.
     pub async fn cleanup(&mut self) -> io::Result<()> {
-        for file in &self.files {
-            let _ = fs::remove_file(file).await;
+        let mut first_error = None;
+        let mut failed = Vec::new();
+        for file in self.files.drain(..) {
+            match fs::remove_file(&file).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                    failed.push(file);
+                }
+            }
         }
-        self.files.clear();
-        Ok(())
+        self.files = failed;
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -595,6 +606,24 @@ mod tests {
         assert!(path.exists());
         manager.cleanup().await.unwrap();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_removal_error() {
+        let mut manager = TempFileManager::new().unwrap();
+        let (removable, _file) = manager.create_file("removable").await.unwrap();
+        // remove_file fails on a directory even as root, so this entry cannot be removed.
+        let blocker = manager.path().join("blocker");
+        fs::create_dir(&blocker).await.unwrap();
+        manager.files.push(blocker.clone());
+
+        assert!(manager.cleanup().await.is_err());
+        assert!(!removable.exists(), "other tracked files are still removed");
+        assert_eq!(
+            manager.files,
+            vec![blocker],
+            "the failed path stays tracked"
+        );
     }
 
     #[tokio::test]

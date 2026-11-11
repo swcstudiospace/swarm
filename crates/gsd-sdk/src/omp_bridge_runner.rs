@@ -418,11 +418,8 @@ impl OmpBridge {
                 (PipeRead::default(), PipeRead::default())
             }
         };
-        if stdout_read.overflowed || stderr_read.overflowed {
-            return Err(BridgeError::new(
-                ErrorCode::Internal,
-                format!("{script} wrote more than {PIPE_CAP_BYTES} bytes of output"),
-            ));
+        if let Some(err) = pipe_failure(script, &stdout_read, &stderr_read) {
+            return Err(err);
         }
         Ok(RawRun {
             exit_code: status.code(),
@@ -483,16 +480,18 @@ fn signal_group(pid: i32, signal: Signal) {
     let _ = killpg(Pid::from_raw(pid), signal);
 }
 
-/// What one child pipe held: the bytes kept under the cap, and whether any byte was dropped.
+/// What one child pipe held: the bytes kept under the cap, whether any byte was dropped, and
+/// whether the read failed before the pipe ended.
 #[derive(Default)]
 struct PipeRead {
     bytes: Vec<u8>,
     overflowed: bool,
+    errored: bool,
 }
 
 /// Reads a pipe to its end, keeping at most `cap` bytes. Bytes past the cap are read and dropped,
-/// so the child never blocks on a full pipe. A read error ends the stream like EOF; the bytes read
-/// so far are kept, and the exit status decides the verdict.
+/// so the child never blocks on a full pipe. A read error ends the read; the bytes read so far
+/// are kept and `errored` is set, which the caller reports as `E-INTERNAL`.
 async fn read_pipe<R>(mut pipe: R, cap: usize) -> PipeRead
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -506,7 +505,10 @@ where
                 captured.overflowed |= append_capped(&mut captured.bytes, &chunk[..count], cap);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(_) => {
+                captured.errored = true;
+                break;
+            }
         }
     }
     captured
@@ -519,6 +521,24 @@ fn append_capped(kept: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
     let taken = room.min(chunk.len());
     kept.extend_from_slice(&chunk[..taken]);
     taken < chunk.len()
+}
+
+/// The failure a child's pipes force, if any: a read error or an overflow past the cap is
+/// `E-INTERNAL`. Both pipes are checked, stdout first.
+fn pipe_failure(script: &str, stdout: &PipeRead, stderr: &PipeRead) -> Option<BridgeError> {
+    if stdout.errored || stderr.errored {
+        return Some(BridgeError::new(
+            ErrorCode::Internal,
+            format!("{script} output could not be read"),
+        ));
+    }
+    if stdout.overflowed || stderr.overflowed {
+        return Some(BridgeError::new(
+            ErrorCode::Internal,
+            format!("{script} wrote more than {PIPE_CAP_BYTES} bytes of output"),
+        ));
+    }
+    None
 }
 
 fn read_failure(script: &str, error: JoinError) -> BridgeError {
@@ -1404,5 +1424,102 @@ open(sys.argv[1], "w").close()
         let within = read_pipe(&b"0123"[..], 4).await;
         assert_eq!(within.bytes, b"0123");
         assert!(!within.overflowed);
+    }
+
+    /// Yields `good` on the first read, then fails every later read with a non-EINTR error.
+    struct FailAfter {
+        good: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for FailAfter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            match self.good.take() {
+                Some(bytes) => {
+                    buf.put_slice(&bytes);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                None => std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "read failed",
+                ))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_read_error_is_internal() {
+        let failed = read_pipe(
+            FailAfter {
+                good: Some(b"partial".to_vec()),
+            },
+            1024,
+        )
+        .await;
+        assert!(failed.errored, "a read error must be recorded");
+        assert_eq!(
+            failed.bytes, b"partial",
+            "bytes read before the error are kept"
+        );
+        let clean = read_pipe(&b"done"[..], 1024).await;
+        assert!(!clean.errored);
+        let err = pipe_failure("probe", &failed, &clean).expect("a failed pipe is an error");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("could not be read"), "{}", err.message);
+        assert!(pipe_failure("probe", &clean, &clean).is_none());
+    }
+
+    /// Records its own pid in `argv[1]` (written whole, then renamed into place), then sleeps.
+    const RECORD_PID: &str = r#"import os, sys, time
+tmp = sys.argv[1] + ".tmp"
+with open(tmp, "w") as handle:
+    handle.write(str(os.getpid()))
+os.replace(tmp, sys.argv[1])
+time.sleep(60)
+"#;
+
+    /// Whether `/proc/<pid>` is gone. A zombie still has an entry, so this means reaped.
+    async fn wait_for_reap(pid: i32, limit: Duration) -> bool {
+        let started = std::time::Instant::now();
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            if started.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn dropping_invoke_reaps_leader() {
+        let root = TempRoot::new("drop-reap");
+        root.script("recorder", RECORD_PID);
+        let bridge = init(&root.path, None).expect("init");
+        let pid_file = root.path.join("leader.pid");
+        let env = base_env();
+        let args = [text(&pid_file)];
+        let mut invoke = Box::pin(run(
+            &bridge,
+            &root,
+            "recorder",
+            &args,
+            &env,
+            60_000,
+            pending::<AbortKind>(),
+        ));
+        let written = tokio::select! {
+            _ = &mut invoke => panic!("the leader exited before the invoke was dropped"),
+            written = wait_for_file(&pid_file, Duration::from_secs(10)) => written,
+        };
+        assert!(written, "leader never wrote its pid file");
+        let leader = read_pid(&pid_file);
+        drop(invoke);
+        assert!(
+            wait_for_reap(leader, Duration::from_secs(5)).await,
+            "leader {leader} is still in the process table after its invoke was dropped"
+        );
     }
 }

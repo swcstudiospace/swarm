@@ -138,7 +138,7 @@ class Ids:
 def patched(clock: Clock) -> contextlib.ExitStack:
     stack = contextlib.ExitStack()
     ids = Ids()
-    for module in (taskstore, gates, envelope):
+    for module in (taskstore, envelope):
         stack.enter_context(mock.patch.object(module, "time", clock))
     stack.enter_context(mock.patch.object(envelope, "_now_iso", lambda: "2026-01-01T00:00:00.000Z"))
     stack.enter_context(mock.patch.object(uuid, "uuid4", ids.uuid4))

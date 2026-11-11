@@ -268,11 +268,11 @@ mod tests {
         Ok(state)
     }
 
-    fn phase_of_task(state: &SessionState, task_id: &str) -> String {
+    /// The phase of the thread serving `task_id`, or `None` when no thread is bound to it.
+    fn phase_of_task(state: &SessionState, task_id: &str) -> Option<String> {
         thread_for_task(state, task_id)
             .and_then(|key| state.threads.get(&key))
             .and_then(|thread| thread.metadata.get(PHASE_KEY).cloned())
-            .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -283,7 +283,15 @@ mod tests {
             refused,
             Err(DispatchError::Phase(PoolError::InvalidState(_)))
         ));
-        assert_eq!(phase_of_task(&state, "a"), "IDLE");
+        assert_eq!(phase_of_task(&state, "a").as_deref(), Some("IDLE"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase_of_task_is_some_for_a_bound_thread_and_none_otherwise() -> TestResult {
+        let state = bound_session(vec![task("a", "w", &[])], &[("t1", "a")]).await?;
+        assert_eq!(phase_of_task(&state, "a").as_deref(), Some("IDLE"));
+        assert_eq!(phase_of_task(&state, "missing"), None);
         Ok(())
     }
 
@@ -291,9 +299,9 @@ mod tests {
     async fn queued_thread_hands_off_to_running_once() -> TestResult {
         let mut state = bound_session(vec![task("a", "w", &[])], &[("t1", "a")]).await?;
         admit_thread(&mut state, "t1")?;
-        assert_eq!(phase_of_task(&state, "a"), "QUEUED");
+        assert_eq!(phase_of_task(&state, "a").as_deref(), Some("QUEUED"));
         handoff_thread(&mut state, "t1")?;
-        assert_eq!(phase_of_task(&state, "a"), "RUNNING");
+        assert_eq!(phase_of_task(&state, "a").as_deref(), Some("RUNNING"));
         assert_eq!(
             state.threads.get("t1").map(|t| t.state),
             Some(ThreadStateKind::Running as i32)
@@ -303,7 +311,7 @@ mod tests {
             again,
             Err(DispatchError::Phase(PoolError::InvalidState(_)))
         ));
-        assert_eq!(phase_of_task(&state, "a"), "RUNNING");
+        assert_eq!(phase_of_task(&state, "a").as_deref(), Some("RUNNING"));
         Ok(())
     }
 
@@ -320,7 +328,7 @@ mod tests {
             &refused,
             Err(DispatchError::Phase(PoolError::InvalidState(msg))) if msg.contains("FAILED -> RUNNING")
         ));
-        assert_eq!(phase_of_task(&state, "a"), "FAILED");
+        assert_eq!(phase_of_task(&state, "a").as_deref(), Some("FAILED"));
         Ok(())
     }
 
@@ -332,7 +340,7 @@ mod tests {
         )
         .await?;
         let session = Arc::new(Mutex::new(state));
-        let observed: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
         let seen_session = Arc::clone(&session);
         let seen = Arc::clone(&observed);
 
@@ -359,12 +367,18 @@ mod tests {
         assert_eq!(
             *observed.lock(),
             vec![
-                ("a".to_string(), "RUNNING".to_string()),
-                ("b".to_string(), "RUNNING".to_string()),
+                ("a".to_string(), Some("RUNNING".to_string())),
+                ("b".to_string(), Some("RUNNING".to_string())),
             ]
         );
-        assert_eq!(phase_of_task(&session.lock(), "a"), "RUNNING");
-        assert_eq!(phase_of_task(&session.lock(), "b"), "RUNNING");
+        assert_eq!(
+            phase_of_task(&session.lock(), "a").as_deref(),
+            Some("RUNNING")
+        );
+        assert_eq!(
+            phase_of_task(&session.lock(), "b").as_deref(),
+            Some("RUNNING")
+        );
         Ok(())
     }
 

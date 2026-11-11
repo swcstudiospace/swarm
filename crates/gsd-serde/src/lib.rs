@@ -32,9 +32,16 @@ pub enum SerdeError {
     Utf8(#[from] std::str::Utf8Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("batch record of {0} bytes does not fit its u32 length prefix")]
+    RecordTooLarge(usize),
 }
 
 pub type SerdeResult<T> = std::result::Result<T, SerdeError>;
+
+/// Length prefix for one batch record. A record a u32 cannot describe is refused.
+fn frame_len(len: usize) -> SerdeResult<u32> {
+    u32::try_from(len).map_err(|_| SerdeError::RecordTooLarge(len))
+}
 
 /// Configuration for serialization
 #[derive(Debug, Clone)]
@@ -93,12 +100,14 @@ impl Serializer {
     /// Serialize a Protobuf message to bincode bytes
     pub fn serialize<M: prost::Message>(&self, message: &M) -> SerdeResult<Vec<u8>> {
         if self.config.use_bincode {
-            // First encode to protobuf, then to bincode
-            let mut buf = Vec::new();
+            // Same bytes as `bincode::serialize(&protobuf)`: a u64 little-endian
+            // length (bincode 1.x fixint) followed by the protobuf body. Both go
+            // into one buffer sized up front, so the body is encoded once.
+            let body_len = message.encoded_len();
+            let mut buf = Vec::with_capacity(8 + body_len);
+            buf.extend_from_slice(&(body_len as u64).to_le_bytes());
             message.encode(&mut buf)?;
-            // For Protobuf messages, we can also use bincode directly on the protobuf bytes
-            // or use prost-reflect for more complex scenarios
-            Ok(bincode::serialize(&buf)?)
+            Ok(buf)
         } else {
             // Just protobuf
             let mut buf = Vec::new();
@@ -236,7 +245,7 @@ pub fn serialize_batch<M: prost::Message>(messages: &[M]) -> SerdeResult<Vec<u8>
     for msg in messages {
         let encoded = serializer.serialize(msg)?;
         // Prefix with length for framing
-        let len = (encoded.len() as u32).to_le_bytes();
+        let len = frame_len(encoded.len())?.to_le_bytes();
         results.extend_from_slice(&len);
         results.extend_from_slice(&encoded);
     }
@@ -248,7 +257,6 @@ pub fn serialize_batch<M: prost::Message>(messages: &[M]) -> SerdeResult<Vec<u8>
 pub fn deserialize_batch<M: prost::Message + Default>(bytes: &[u8]) -> SerdeResult<Vec<M>> {
     let mut offset = 0;
     let mut results = Vec::new();
-    let _deserializer = Deserializer::new();
 
     while offset < bytes.len() {
         // Each record is a 4-byte little-endian length followed by that many bytes.
@@ -502,5 +510,75 @@ mod tests {
             result.is_err(),
             "storage decoder accepted two concatenated records and ignored the trailing bytes"
         );
+    }
+
+    #[test]
+    fn frame_len_refuses_records_beyond_u32() {
+        assert_eq!(frame_len(7).unwrap(), 7);
+        assert!(frame_len(u32::MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn deserialize_batch_has_no_unused_deserializer() {
+        // Concatenated so this test's own source does not contain the forbidden line.
+        let forbidden = concat!("let _deser", "ializer = Deserializer::new();");
+        assert!(!include_str!("lib.rs").contains(forbidden));
+    }
+
+    mod alloc_count {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct CountingAlloc;
+
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                System.alloc(layout)
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                System.realloc(ptr, layout, new_size)
+            }
+        }
+
+        /// Runs `f` and returns its result with the number of heap allocations
+        /// made on this thread while it ran.
+        pub fn allocations_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+            let before = ALLOCATIONS.with(Cell::get);
+            let out = f();
+            (out, ALLOCATIONS.with(Cell::get) - before)
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: alloc_count::CountingAlloc = alloc_count::CountingAlloc;
+
+    #[test]
+    fn serialize_storage_record_allocates_once_and_matches_bincode() {
+        let task = Task {
+            id: Some(TaskId {
+                value: "allocation-count".repeat(4),
+            }),
+            ..Default::default()
+        };
+        let serializer = Serializer::new();
+
+        let (encoded, allocations) =
+            alloc_count::allocations_during(|| serializer.serialize(&task).unwrap());
+
+        assert_eq!(allocations, 1);
+        let mut protobuf = Vec::new();
+        prost::Message::encode(&task, &mut protobuf).unwrap();
+        assert_eq!(encoded, bincode::serialize(&protobuf).unwrap());
     }
 }

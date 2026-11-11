@@ -1258,9 +1258,13 @@ fn read_json(path: &str, what: &str) -> Result<Value, SeamError> {
     })
 }
 
+/// Suppressions and the expired entries (id, expiry text) read from an allow list.
+type LoadedAllowList = (HashMap<String, String>, Vec<(String, String)>);
+
 /// `apply_allow_list`: the entries are an array, or an object whose `allow` is one. Expired entries (date not after
-/// today, UTC) are skipped; an entry without a justification is Python's E-POLICY and declines.
-fn load_allow_list(path: &str) -> Result<HashMap<String, String>, SeamError> {
+/// today, UTC) do not suppress; they are returned with their id and expiry text. An entry without a justification is
+/// Python's E-POLICY and declines.
+fn load_allow_list(path: &str) -> Result<LoadedAllowList, SeamError> {
     let raw = read_json(path, "the allow list")?;
     let entries: Vec<&Value> = match &raw {
         Value::Array(items) => items.iter().collect(),
@@ -1273,6 +1277,7 @@ fn load_allow_list(path: &str) -> Result<HashMap<String, String>, SeamError> {
     };
     let today = today_utc();
     let mut allow = HashMap::new();
+    let mut expired = Vec::new();
     for entry in entries {
         let Value::Object(entry) = entry else {
             return Err(decline(
@@ -1287,6 +1292,10 @@ fn load_allow_list(path: &str) -> Result<HashMap<String, String>, SeamError> {
                 ))
             }
         };
+        let id = match entry.get("id") {
+            Some(Value::String(text)) => text.clone(),
+            _ => return Err(decline("an allow-list id is not a string; Python answers")),
+        };
         if let Some(expires) = entry.get("expires").filter(|value| truthy(value)) {
             let Value::String(text) = expires else {
                 return Err(decline(
@@ -1297,16 +1306,13 @@ fn load_allow_list(path: &str) -> Result<HashMap<String, String>, SeamError> {
                 decline("an allow-list expiry is not a valid date; Python answers")
             })?;
             if date <= today {
+                expired.push((id, text.clone()));
                 continue;
             }
         }
-        let id = match entry.get("id") {
-            Some(Value::String(text)) => text.clone(),
-            _ => return Err(decline("an allow-list id is not a string; Python answers")),
-        };
         allow.insert(id, justification);
     }
-    Ok(allow)
+    Ok((allow, expired))
 }
 
 fn apply_allow_list(
@@ -1316,7 +1322,7 @@ fn apply_allow_list(
     let Some(path) = path.filter(|value| !value.is_empty()) else {
         return Ok((findings, Vec::new()));
     };
-    let allow = load_allow_list(path)?;
+    let (allow, expired) = load_allow_list(path)?;
     let mut kept = Vec::new();
     let mut suppressed = Vec::new();
     for finding in findings {
@@ -1328,6 +1334,18 @@ fn apply_allow_list(
             None => kept.push(finding),
         }
     }
+    // P4-26: an expired suppression no longer applies; the info finding names the entry that lapsed
+    kept.extend(expired.iter().map(|(id, expires)| {
+        Finding::plain(
+            fid(&["allow-list", "expired", id.as_str()]),
+            "info",
+            "allow-list",
+            format!(
+                "allow-list entry {id} expired on {expires}; its suppression no longer applies"
+            ),
+            String::new(),
+        )
+    }));
     Ok((kept, suppressed))
 }
 
@@ -1738,6 +1756,7 @@ pub async fn answer(call: &Invocation) -> Result<Reply, SeamError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{apply_allow_list, Finding};
     use super::{
         civil_from_days, entropy, fid, has_kev_word, parse_iso_date, patterns, py_splitlines,
         py_strip, py_suffix, scan, sha1_hex, yaml_unsafe, MAX_SCAN_BYTES,
@@ -2078,5 +2097,44 @@ mod tests {
             daemon_gone,
             "the daemon holding the pipe must be killed with the audit tool's process group"
         );
+    }
+
+    #[test]
+    fn an_expired_suppression_reports_an_info_finding() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("allow.json");
+        std::fs::write(
+            &path,
+            r#"[{"id": "SEC-1", "justification": "old waiver", "expires": "2000-01-01"}]"#,
+        )
+        .expect("write the allow list");
+        let finding = Finding::plain(
+            "SEC-1".into(),
+            "major",
+            "secrets",
+            "aws access key".into(),
+            String::new(),
+        );
+        let (kept, suppressed) = apply_allow_list(vec![finding], path.to_str())
+            .expect("an expired entry is not a decline");
+        assert!(suppressed.is_empty(), "an expired entry suppresses nothing");
+        let reported: Vec<&str> = kept
+            .iter()
+            .filter(|finding| finding.severity != "info")
+            .map(|finding| finding.id.as_str())
+            .collect();
+        assert_eq!(
+            reported,
+            ["SEC-1"],
+            "the finding the entry named stays reported"
+        );
+        let info: Vec<&Finding> = kept
+            .iter()
+            .filter(|finding| finding.severity == "info")
+            .collect();
+        assert_eq!(info.len(), 1, "one info finding names the expired entry");
+        assert_eq!(info[0].id, fid(&["allow-list", "expired", "SEC-1"]));
+        assert_eq!(info[0].kind, "allow-list");
+        assert!(info[0].summary.contains("SEC-1") && info[0].summary.contains("2000-01-01"));
     }
 }

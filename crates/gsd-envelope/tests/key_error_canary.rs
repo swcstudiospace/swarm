@@ -333,7 +333,7 @@ fn shapes(canary: &str) -> Vec<Shape> {
                 ("SWARM_ED25519_KEY", text(&canary[..63])),
             ],
             presence: KeyFilePresence::Absent,
-            expect: loaded(false, true),
+            expect: loaded(true, true),
         },
         Shape {
             name: "require-key-with-a-malformed-seed",

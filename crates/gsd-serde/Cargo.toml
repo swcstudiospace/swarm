@@ -13,18 +13,9 @@ prost = { workspace = true, features = ["derive", "std"] }
 prost-types = { workspace = true }
 prost-reflect = { workspace = true }
 bincode = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_with = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 bytes = { workspace = true }
-uuid = { workspace = true }
-ulid = { workspace = true }
-time = { workspace = true }
-chrono = { workspace = true }
 dashmap = { workspace = true }
 
 [dev-dependencies]
-proptest = "1.2"
 gsd-proto = { path = "../gsd-proto" }

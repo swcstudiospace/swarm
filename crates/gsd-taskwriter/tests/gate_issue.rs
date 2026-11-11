@@ -21,8 +21,8 @@ use std::sync::LazyLock;
 use gsd_envelope::{KeyFilePresence, KeyMaterial};
 use gsd_route::{jstr, obj_get, parse_json, Fields, Json};
 use gsd_taskwriter::{
-    open_for_write, EnvelopeIds, GateIssueRequest, GatePlan, GateWrite, SystemIds, TaskStoreWriter,
-    WriteState, WriterConfig, WriterError,
+    derive_gate_issue, open_for_write, EnvelopeIds, GateIssueRequest, GatePlan, GateWrite,
+    StoreFacts, SystemIds, TaskStoreWriter, WriteState, WriterConfig, WriterError,
 };
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Column, ConnectOptions, Connection, Row, SqliteConnection, TypeInfo, ValueRef};
@@ -681,4 +681,52 @@ async fn rows_signed_with_ed25519_by_rust_verify_in_python() {
     )
     .expect("keys");
     rust_signed_rows_verify_in_python("SWARM_ED25519_KEY", &seed, &keys, "ed25519:").await;
+}
+
+/// P1-06 at the public boundary: a request whose `extra` names a signed verdict field is declined, so Python answers it and
+/// Rust never signs a payload in which `extra` overrides the verdict.
+#[test]
+fn extra_naming_a_signed_field_is_declined_for_python() {
+    struct NoIds;
+    impl EnvelopeIds for NoIds {
+        fn msg_id(&mut self, _now_ms: u64) -> Option<String> {
+            None
+        }
+        fn correlation_id(&mut self) -> Option<String> {
+            None
+        }
+        fn trace_id(&mut self) -> Option<String> {
+            None
+        }
+    }
+    let keys =
+        KeyMaterial::from_lookup(|_| None::<OsString>, |_| KeyFilePresence::Absent).expect("keys");
+    for key in [
+        "gate",
+        "task_id",
+        "verdict",
+        "findings",
+        "runs",
+        "expires_s",
+    ] {
+        let request = GateIssueRequest {
+            gate: "review".to_string(),
+            agent_id: "A09".to_string(),
+            findings: Vec::new(),
+            runs: Vec::new(),
+            expires_s: 86_400,
+            extra: vec![(key.to_string(), Json::Null)],
+            simulate: false,
+            per_target: Vec::new(),
+            task_id: Some("T-1".to_string()),
+            correlation_id: None,
+            session: false,
+            dryrun_fail: String::new(),
+            now: 1_700_000_000.5,
+        };
+        assert!(
+            derive_gate_issue(&request, &StoreFacts::default(), &keys, &mut NoIds).is_err(),
+            "extra naming {key} must be declined"
+        );
+    }
 }

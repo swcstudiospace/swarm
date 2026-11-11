@@ -362,10 +362,14 @@ pub(crate) fn write_manifest(call: &Invocation, manifest: &Json) -> Result<(), S
     }
 }
 
-/// A name for the temporary file beside `path` that no other process of this host uses at the same time.
+/// A name for the temporary file beside `path`, unique to this write: the process id and a time nonce, so a leftover under the same
+/// process id does not block it. The nonce scheme is that of `write_plan_file`.
 fn temporary_beside(path: &Path) -> std::path::PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}.{nonce:x}.tmp", std::process::id()));
     path.with_file_name(name)
 }
 
@@ -513,6 +517,36 @@ mod tests {
         assert_eq!(
             fs::read_dir(dir.path()).map_err(|e| e.to_string())?.count(),
             1
+        );
+        Ok(())
+    }
+
+    /// A temporary file another write left under this process id does not block the manifest write.
+    #[test]
+    fn manifest_write_survives_stale_temp_name() -> Result<(), String> {
+        let dir = tempfile::TempDir::new().map_err(|e| e.to_string())?;
+        let path = dir.path().join("effects.json");
+        let stale = dir
+            .path()
+            .join(format!("effects.json.{}.tmp", std::process::id()));
+        fs::write(&stale, "left behind").map_err(|e| e.to_string())?;
+        let call = Invocation {
+            agent: "A01".to_string(),
+            script: "orch_status".to_string(),
+            argv: Vec::new(),
+            root: dir.path().to_path_buf(),
+            env: Vec::new(),
+            deadline: std::time::Duration::from_secs(5),
+            effects_path: Some(path.clone()),
+        };
+        write_manifest(&call, &no_effects()).map_err(|e| e.message().to_string())?;
+        assert_eq!(
+            fs::read_to_string(&path).map_err(|e| e.to_string())?,
+            "{\"effects\": [], \"post\": []}"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale).map_err(|e| e.to_string())?,
+            "left behind"
         );
         Ok(())
     }

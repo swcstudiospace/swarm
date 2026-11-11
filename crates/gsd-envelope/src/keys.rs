@@ -21,7 +21,7 @@ use crate::Declined;
 /// `SWARM_ALLOW_INSECURE_DEV_KEY=1`, no Ed25519 signer is configured and `SWARM_REQUIRE_KEY` is not `1`.
 const DEV_KEY: &str = "dev-insecure-key";
 
-const ED25519_UNLOADABLE: &str =
+pub(crate) const ED25519_UNLOADABLE: &str =
     "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)";
 const AGENT_SESSION_REFERENCE: &str =
     "fail-closed: private signing references are unavailable in agent sessions";
@@ -283,10 +283,9 @@ impl KeyMaterial {
                 });
         let real_key =
             ed25519.is_some() || env.signing_key.as_deref().is_some_and(|key| key != DEV_KEY);
-        let both_raw_set = env.signing_key.is_some() && env.ed25519_key.is_some();
         let config_error = match ed25519_error {
             _ if !supplied => None,
-            Some(error) if !both_raw_set => Some(error),
+            Some(error) => Some(error),
             _ if env.require_key && !real_key => Some(REQUIRE_WITHOUT_KEY),
             _ => None,
         };
@@ -476,7 +475,7 @@ mod tests {
                 false,
                 true,
                 false,
-                None,
+                Some(ED25519_UNLOADABLE),
             ),
             (
                 &[("SWARM_REQUIRE_KEY", "1")],
@@ -1115,77 +1114,60 @@ mod env_tests {
 
     use super::*;
 
-    const NAMES: [&str; 8] = [
-        "SWARM_ED25519_KEY",
-        "SWARM_SIGNING_KEY",
-        "SWARM_ED25519_KEY_FILE",
-        "SWARM_AGENT_SESSION",
-        "SWARM_ALLOW_INSECURE_DEV_KEY",
-        "SWARM_REQUIRE_KEY",
-        "XDG_CONFIG_HOME",
-        "HOME",
-    ];
-
-    /// The only test that reads the real process environment (through `from_env`), so it owns every variable it touches and
-    /// restores them; the file system part uses a private directory under the temp dir.
+    /// Resolves through `from_lookup` with a fixed snapshot of the variables passed in, so the test never writes the process
+    /// environment (a `set_var` would race with every other test that reads it). The file system part uses a private directory
+    /// under the temp dir.
     #[test]
-    fn from_env_sees_the_conventional_file_only_through_the_real_file_system() -> Result<(), String>
-    {
-        let saved: Vec<(&str, Option<OsString>)> = NAMES
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect();
+    fn from_lookup_reads_conventional_file_from_disk() -> Result<(), String> {
         let created =
-            std::env::temp_dir().join(format!("gsd-envelope-from-env-{}", std::process::id()));
+            std::env::temp_dir().join(format!("gsd-envelope-from-lookup-{}", std::process::id()));
         fs::create_dir_all(created.join("agent-swarm")).map_err(|e| e.to_string())?;
         // A temp dir that itself sits behind a symlink would make every ancestor walk unclear; walk from the real path.
         let root = fs::canonicalize(&created).map_err(|e| e.to_string())?;
-        let key_dir = root.join("agent-swarm");
-        let key_path = key_dir.join("signing-key.hex");
+        let key_path = root.join("agent-swarm").join("signing-key.hex");
+
+        let resolve = |vars: &[(&str, OsString)]| {
+            KeyMaterial::from_lookup(
+                |name| {
+                    vars.iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| value.clone())
+                },
+                conventional_key_file_presence,
+            )
+        };
+        let base = |dir: &Path| ("XDG_CONFIG_HOME", dir.as_os_str().to_os_string());
 
         let mut observed: Vec<String> = Vec::new();
-        for name in NAMES {
-            std::env::remove_var(name);
-        }
-        std::env::set_var("XDG_CONFIG_HOME", &root);
         observed.push(format!(
             "absent: {:?}",
-            KeyMaterial::from_env().map(|keys| keys.config_error())
+            resolve(&[base(&root)]).map(|keys| keys.config_error())
         ));
         fs::write(&key_path, b"placeholder, never read").map_err(|e| e.to_string())?;
-        observed.push(format!("regular file: {:?}", KeyMaterial::from_env().err()));
-        std::env::set_var("SWARM_SIGNING_KEY", "k");
+        observed.push(format!("regular file: {:?}", resolve(&[base(&root)]).err()));
         observed.push(format!(
             "hidden by a raw key: {:?}",
-            KeyMaterial::from_env().map(|keys| keys.hmac.is_some())
+            resolve(&[base(&root), ("SWARM_SIGNING_KEY", OsString::from("k"))])
+                .map(|keys| keys.hmac.is_some())
         ));
-        std::env::remove_var("SWARM_SIGNING_KEY");
         fs::remove_file(&key_path).map_err(|e| e.to_string())?;
         symlink(root.join("missing-target"), &key_path).map_err(|e| e.to_string())?;
         observed.push(format!(
             "dangling link: {:?}",
-            KeyMaterial::from_env().err()
+            resolve(&[base(&root)]).err()
         ));
         fs::remove_file(&key_path).map_err(|e| e.to_string())?;
         let linked_base = root.join("linked-base");
         symlink(&root, &linked_base).map_err(|e| e.to_string())?;
-        std::env::set_var("XDG_CONFIG_HOME", &linked_base);
         observed.push(format!(
             "symlinked base: {:?}",
-            KeyMaterial::from_env().err()
+            resolve(&[base(&linked_base)]).err()
         ));
-        std::env::set_var("XDG_CONFIG_HOME", "relative/base");
         observed.push(format!(
             "relative base: {:?}",
-            KeyMaterial::from_env().err()
+            resolve(&[("XDG_CONFIG_HOME", OsString::from("relative/base"))]).err()
         ));
 
-        for (name, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
         let _ = fs::remove_dir_all(&root);
         assert_eq!(
             observed,

@@ -5,8 +5,10 @@
 //! core module is then wrapped as a component. That target links no WASI imports, so the
 //! component imports nothing and instantiates with an empty linker. The component path is
 //! published as `GSD_GUEST_WASM` for `include_bytes!(env!("GSD_GUEST_WASM"))`. The SHA-256 of the
-//! component is written to `OUT_DIR/guest-module.sha256` and published as
-//! `GSD_GUEST_DIGEST_FILE`, so a test can compare the build with the committed pin.
+//! component is written to `OUT_DIR/guest-module.built.sha256` and published as
+//! `GSD_GUEST_DIGEST_FILE`, so a test can compare the build with the committed pin. The nested build remaps the local rust-src
+//! path to the toolchain's `/rustc/<commit>` name, so the digest does not depend on whether `rust-src` is installed. That remap
+//! is the nested build's only rustflag, set through `CARGO_ENCODED_RUSTFLAGS`, which replaces the host's rustflags sources.
 //!
 //! With this crate's `write-routes` feature the nested build gets the guest's `write-routes-2` feature (the transition decision and
 //! the second batch, which implies `write-routes`), and the committed pin is `guest-module-write.sha256` instead of
@@ -25,7 +27,7 @@ const GUEST_PACKAGE: &str = "gsd-guest";
 const GUEST_TARGET: &str = "wasm32-unknown-unknown";
 const CORE_FILE: &str = "gsd_guest.wasm";
 const COMPONENT_FILE: &str = "gsd_guest.component.wasm";
-const DIGEST_FILE: &str = "guest-module.sha256";
+const DIGEST_FILE: &str = "guest-module.built.sha256";
 const PIN_FILE: &str = "guest-module.sha256";
 const WRITE_PIN_FILE: &str = "guest-module-write.sha256";
 
@@ -60,6 +62,35 @@ fn ambient_env_names() -> Vec<String> {
     names
 }
 
+/// The sysroot of the toolchain that builds the guest, and the commit hash that names its std sources.
+///
+/// With the `rust-src` component installed, rustc names std source files by their local path under the sysroot; without it, by
+/// `/rustc/<commit>`. The guest digest must not depend on that, so the nested build maps the local path to the commit name.
+fn std_source_remap_inputs() -> (String, String) {
+    let rustc = required_env("RUSTC");
+    let run = |args: &[&str]| -> String {
+        let output = Command::new(&rustc)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("cannot run `{rustc} {}`: {err}", args.join(" ")));
+        if !output.status.success() {
+            panic!(
+                "`{rustc} {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        String::from_utf8(output.stdout).expect("rustc prints UTF-8")
+    };
+    let sysroot = run(&["--print", "sysroot"]).trim().to_owned();
+    let commit = run(&["-vV"])
+        .lines()
+        .find_map(|line| line.strip_prefix("commit-hash: "))
+        .map(|hash| hash.trim().to_owned())
+        .expect("rustc -vV names its commit-hash");
+    (sysroot, commit)
+}
+
 fn main() {
     let cargo = required_env("CARGO");
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
@@ -70,8 +101,8 @@ fn main() {
     let write_routes = env::var_os("CARGO_FEATURE_WRITE_ROUTES").is_some();
     let ambient_env = ambient_env_names();
 
-    // The outer build's encoded rustflags describe the host build; the guest must read its own
-    // flags from the environment and the cargo config files.
+    // The outer build's encoded rustflags describe the host build, so the nested build starts without them. Its one rustflag
+    // is set below.
     let mut build = Command::new(&cargo);
     build
         .current_dir(&workspace_root)
@@ -92,6 +123,11 @@ fn main() {
     if write_routes {
         build.args(["--features", "write-routes-2"]);
     }
+    let (sysroot, commit) = std_source_remap_inputs();
+    build.env(
+        "CARGO_ENCODED_RUSTFLAGS",
+        format!("--remap-path-prefix={sysroot}/lib/rustlib/src/rust=/rustc/{commit}"),
+    );
     let status = build
         .status()
         .unwrap_or_else(|err| panic!("failed to run `{cargo}` for the GSD-Core guest: {err}"));

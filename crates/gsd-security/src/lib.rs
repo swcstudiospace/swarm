@@ -182,6 +182,7 @@ fn decode_claims(config: &SecurityConfig, token: &str) -> SecurityResult<Capabil
 /// Capability token manager
 pub struct CapabilityTokenManager {
     config: SecurityConfig,
+    /// Revoked token → its `exp`; `revoke` prunes entries whose `exp` has passed.
     revoked_tokens: DashMap<String, u64>,
 }
 
@@ -242,9 +243,15 @@ impl CapabilityTokenManager {
         Ok(claims)
     }
 
+    /// Revokes `token` until its `exp`. A token that does not verify is not stored, so junk cannot grow the map; entries whose
+    /// `exp` has passed are pruned on each call.
     pub fn revoke(&self, token: &str) {
-        self.revoked_tokens
-            .insert(token.to_string(), now_secs().unwrap_or_default());
+        let Ok(claims) = decode_claims(&self.config, token) else {
+            return;
+        };
+        let now = now_secs().unwrap_or_default();
+        self.revoked_tokens.retain(|_, exp| *exp >= now);
+        self.revoked_tokens.insert(token.to_string(), claims.exp);
     }
 }
 
@@ -264,7 +271,6 @@ pub struct AuditEntry {
 /// Audit logger
 pub struct AuditLogger {
     file: Mutex<std::fs::File>,
-    merkle_tree: Mutex<MerkleTree>,
 }
 
 impl AuditLogger {
@@ -286,7 +292,6 @@ impl AuditLogger {
 
         Ok(Self {
             file: Mutex::new(file),
-            merkle_tree: Mutex::new(MerkleTree::new()),
         })
     }
 
@@ -296,38 +301,7 @@ impl AuditLogger {
         writeln!(file, "{}", json)?;
         file.flush()?;
 
-        // Add to merkle tree
-        self.merkle_tree.lock().add_entry(&json);
-
         Ok(())
-    }
-}
-
-struct MerkleTree {
-    leaves: Vec<String>,
-    root: Option<String>,
-}
-
-impl MerkleTree {
-    fn new() -> Self {
-        Self {
-            leaves: Vec::new(),
-            root: None,
-        }
-    }
-
-    fn add_entry(&mut self, json: &str) {
-        let hash = blake3::hash(json.as_bytes());
-        self.leaves.push(hash.to_hex().to_string());
-        self.recompute_root();
-    }
-
-    fn recompute_root(&mut self) {
-        // Simplified - in production use proper Merkle tree
-        if !self.leaves.is_empty() {
-            let combined = self.leaves.join("");
-            self.root = Some(blake3::hash(combined.as_bytes()).to_hex().to_string());
-        }
     }
 }
 
@@ -763,6 +737,28 @@ mod tests {
         let end = second.end as usize;
         assert_eq!(start, 3, "offset must index the original input");
         assert_eq!(&input[start..end], "b2");
+        Ok(())
+    }
+
+    #[test]
+    fn revoke_prunes_expired_entries() -> SecurityResult<()> {
+        let manager = new_manager()?;
+        let now = now_secs()?;
+
+        // A token already past `exp` is refused by `decode_claims`, so revoking it must not grow the map.
+        let expired = sign(&claims_with(ISSUER, AUDIENCE, now.saturating_sub(60))?)?;
+        manager.revoke(&expired);
+        assert_eq!(manager.revoked_tokens.len(), 0);
+
+        // An entry whose `exp` has passed is pruned by the next revocation; a live one is kept.
+        manager
+            .revoked_tokens
+            .insert("stale".to_string(), now.saturating_sub(60));
+        let live = manager.issue(THREAD, vec![SCOPE.to_string()], vec![RESOURCE.to_string()])?;
+        manager.revoke(&live);
+        assert!(!manager.revoked_tokens.contains_key("stale"));
+        assert!(manager.revoked_tokens.contains_key(&live));
+        assert_eq!(manager.revoked_tokens.len(), 1);
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 //! Chat-thread facade: the public entry point to the chat-thread pool.
 //!
-//! The pool machinery (`ThreadPool`, the warm pool, the handle registry and the lifecycle
-//! dispatcher) is crate-private (D-1). `ChatPool` is the only way in, and the types here are
+//! The pool machinery (`ThreadPool`, the warm pool and the handle registry) is crate-private.
+//! `ChatPool` is the only way in, and the types here are
 //! the only ones a consumer sees. Budget enforcement is supplied by the consumer through
 //! [`BudgetPort`]; `gsd-pool` never implements it and never depends on `gsd-governor` (DEC-1).
 //!
@@ -25,6 +25,36 @@ use crate::{PoolConfig, PoolError, ThreadPool};
 /// and the default is 4, so the bound stops a mistyped count from exhausting the process's
 /// thread limit.
 pub const MAX_WORKERS: usize = 256;
+
+/// Largest accepted thread, message or session id, in bytes. `gsd-governor` caps its ids at the same size: keep them equal.
+pub const MAX_ID_BYTES: usize = 256;
+/// Largest accepted message payload, in bytes: 1 MiB.
+pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Refuses an id over [`MAX_ID_BYTES`] with [`ChatError::TooLarge`] (E-INPUT).
+fn check_id(what: &str, id: &str) -> Result<(), ChatError> {
+    if id.len() > MAX_ID_BYTES {
+        return Err(ChatError::TooLarge(format!(
+            "{what} is {} bytes; the limit is {MAX_ID_BYTES}",
+            id.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a message whose ids or payload are over their byte caps, before anything is queued.
+fn check_message(msg: &ChatMessage) -> Result<(), ChatError> {
+    check_id("message id", &msg.msg_id)?;
+    check_id("thread id", &msg.thread_id)?;
+    check_id("session id", &msg.session_id)?;
+    if msg.payload.len() > MAX_PAYLOAD_BYTES {
+        return Err(ChatError::TooLarge(format!(
+            "payload is {} bytes; the limit is {MAX_PAYLOAD_BYTES}",
+            msg.payload.len()
+        )));
+    }
+    Ok(())
+}
 
 /// Configuration for [`ChatPool::new`]. Every field must be greater than zero, and `workers`
 /// must not exceed [`MAX_WORKERS`].
@@ -127,6 +157,15 @@ pub enum ChatError {
     /// The budget port refused the reservation as rate limited. `E-CAPACITY`.
     #[error("rate limited: {0}")]
     RateLimited(String),
+    /// An id or payload is over its byte cap. `E-INPUT`.
+    #[error("input too large: {0}")]
+    TooLarge(String),
+    /// The budget port refused the reservation because a quota is spent. `E-CAPACITY`.
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+    /// The budget port refused the reservation as unauthorized. `E-POLICY`.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     /// The budget port reported the reservation amounts as invalid. `E-INPUT`.
     #[error("invalid budget: {0}")]
     InvalidBudget(String),
@@ -185,6 +224,10 @@ pub enum BudgetRefusal {
     Invalid(String),
     /// The request rate limit refused the reservation.
     RateLimited(String),
+    /// A quota is spent; the refusal is a capacity limit, not a budget overrun.
+    Quota(String),
+    /// The reservation is not authorized.
+    Unauthorized(String),
     /// Any other refusal or fault.
     Other(String),
 }
@@ -262,6 +305,7 @@ impl ChatPool {
     /// for that id is discarded before the new thread is registered and created, so its
     /// termination is reported first. A refused call changes nothing.
     pub fn open_thread(&self, id: &str, subagent_type: SubagentType) -> Result<(), ChatError> {
+        check_id("thread id", id)?;
         let _lifecycle = self.lifecycle.lock();
         // Shutdown is checked before the live-id lookup, so a closed pool changes nothing.
         if self.runtime.state().is_closed() {
@@ -335,14 +379,12 @@ impl ChatPool {
                 .registry
                 .register_reserved(handle.id().clone(), handle.subagent_type().clone())
             {
-                // The registry returned the reserved slot. The popped thread is discarded and its termination reported.
-                self.pool.discard_parked(&id);
+                // The registry returned the reserved slot. The popped thread is discarded.
                 return Err(self.admission_error(err, &id));
             }
             if let Err(err) = self.open_queue(&id) {
                 // Refused during shutdown. Free the slot and discard the popped parked thread.
                 let _released = self.registry.release(&id);
-                self.pool.discard_parked(&id);
                 return Err(err);
             }
             self.pool.reopen_parked(&handle);
@@ -350,7 +392,7 @@ impl ChatPool {
         }
         let id = self.pool.create_thread(subagent_type.clone());
         if let Err(err) = self.registry.register_reserved(id.clone(), subagent_type) {
-            // The created thread was never admitted, so report its termination and drop it.
+            // The created thread was never admitted, so drop it.
             self.pool.forget(&id.value);
             return Err(self.admission_error(err, &id.value));
         }
@@ -377,8 +419,7 @@ impl ChatPool {
     /// The thread id names the thread, not a handle, because the handle type is crate-private.
     /// The thread leaves the live set in both outcomes, so its id is free afterwards, and its
     /// queue is closed. [`Placement::Parked`] keeps it warm for reuse. [`Placement::Closed`]
-    /// means the warm pool was full: the thread was closed and its termination was reported to
-    /// the lifecycle observers.
+    /// means the warm pool was full: the thread was closed.
     ///
     /// Returns [`ChatError::ShuttingDown`] after [`ChatPool::shutdown`],
     /// [`ChatError::UnknownThread`] for an id that is not live, and
@@ -445,6 +486,7 @@ impl ChatPool {
     /// or inside its dedupe window, returns [`crate::SubmitOutcome::AlreadyAccepted`] with no
     /// ticket (DEC-6). A refused call enqueues nothing.
     pub fn submit(&self, msg: ChatMessage) -> Result<Submitted, ChatError> {
+        check_message(&msg)?;
         self.runtime.submit(msg)
     }
 
@@ -547,7 +589,6 @@ mod tests {
 
     use super::*;
     use crate::chat_runtime::tests::{settle, Probe};
-    use crate::hook_dispatch::{LifecycleEvent, LifecycleObserver};
     use crate::Completed;
     use std::sync::atomic::Ordering;
 
@@ -762,7 +803,6 @@ mod tests {
             pool.release("unknown").await,
             Err(ChatError::UnknownThread("unknown".to_string()))
         );
-        assert_eq!(pool.pool.metrics().released(), 0);
         Ok(())
     }
 
@@ -775,7 +815,6 @@ mod tests {
         assert_eq!(pool.park("a", now)?, Placement::Parked);
         assert_eq!(pool.park("b", now)?, Placement::Closed);
         assert!(!pool.pool.threads.contains_key("b"));
-        assert_eq!(pool.pool.metrics().released(), 2);
         // The closed thread is not live, so its id opens again.
         pool.open_thread("b", kind("w"))?;
         Ok(())
@@ -807,8 +846,6 @@ mod tests {
         assert_eq!(pool.release(&first).await?, Placement::Parked);
         let second = pool.acquire(kind("w")).await?;
         assert_eq!(second, first);
-        assert_eq!(pool.pool.metrics().created(), 1);
-        assert_eq!(pool.pool.metrics().acquired_from_warm(), 1);
         Ok(())
     }
 
@@ -834,7 +871,37 @@ mod tests {
             pool.park("never-opened", Instant::now()),
             Err(ChatError::UnknownThread("never-opened".to_string()))
         );
-        assert_eq!(pool.pool.metrics().released(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_id_over_the_byte_cap_is_refused_and_changes_nothing() -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        let long = "a".repeat(MAX_ID_BYTES + 1);
+        assert!(matches!(
+            pool.open_thread(&long, kind("w")),
+            Err(ChatError::TooLarge(_))
+        ));
+        assert_eq!(pool.registry.len(), 0);
+        // Exactly at the cap is accepted.
+        pool.open_thread(&"a".repeat(MAX_ID_BYTES), kind("w"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_message_over_a_byte_cap_is_refused_before_it_is_queued() -> Result<(), ChatError> {
+        let pool = make_pool(30, 5)?;
+        pool.open_thread("t", kind("w"))?;
+        let long_id = "m".repeat(MAX_ID_BYTES + 1);
+        let refused = [
+            ChatMessage::new(long_id.clone(), "t", "s", Vec::new()),
+            ChatMessage::new("m", long_id.clone(), "s", Vec::new()),
+            ChatMessage::new("m", "t", long_id, Vec::new()),
+            ChatMessage::new("m", "t", "s", vec![0; MAX_PAYLOAD_BYTES + 1]),
+        ];
+        for msg in refused {
+            assert!(matches!(pool.submit(msg), Err(ChatError::TooLarge(_))));
+        }
         Ok(())
     }
 
@@ -953,13 +1020,10 @@ mod tests {
         let pool = make_pool(30, 5)?;
         pool.open_thread("a", kind("w"))?;
         assert_eq!(pool.release("a").await?, Placement::Parked);
-        let created = pool.pool.metrics().created();
         pool.shutdown(Duration::ZERO);
         assert_eq!(pool.acquire(kind("w")).await, Err(ChatError::ShuttingDown));
         // The refused call pops no warm entry and creates no thread.
         assert_eq!(pool.pool.warm_len(), 1);
-        assert_eq!(pool.pool.metrics().created(), created);
-        assert_eq!(pool.pool.metrics().acquired_from_warm(), 0);
         Ok(())
     }
 
@@ -984,7 +1048,6 @@ mod tests {
             Err(ChatError::ShuttingDown)
         );
         assert_eq!(pool.pool.warm_len(), 0);
-        assert_eq!(pool.pool.metrics().created(), 0);
         assert_eq!(pool.registry.len(), 0);
         Ok(())
     }
@@ -1031,7 +1094,6 @@ mod tests {
         // The refused open discards no warm entry and creates no thread.
         assert_eq!(pool.pool.warm_len(), 1);
         assert_eq!(pool.registry.len(), 0);
-        assert_eq!(pool.pool.metrics().created(), 1);
         Ok(())
     }
 
@@ -1044,37 +1106,13 @@ mod tests {
         assert!(matches!(cfg.validate(), Err(ChatError::InvalidConfig(_))));
     }
 
-    /// Records `create:<id>` and `terminate:<id>` for the lifecycle events it sees.
-    #[derive(Default)]
-    struct TerminationLog {
-        events: Mutex<Vec<String>>,
-    }
-
-    impl LifecycleObserver for TerminationLog {
-        fn on_event(&self, event: &LifecycleEvent) {
-            let label = match event {
-                LifecycleEvent::OnCreate(_) => "create",
-                LifecycleEvent::OnTerminate(_) => "terminate",
-                _ => return,
-            };
-            self.events
-                .lock()
-                .push(format!("{label}:{}", event.thread_id().value));
-        }
-    }
-
     #[test]
-    fn open_thread_terminates_a_parked_warm_thread_before_creating_the_new_one(
-    ) -> Result<(), ChatError> {
+    fn reopening_a_parked_thread_id_displaces_its_warm_entry() -> Result<(), ChatError> {
         let pool = make_pool(30, 5)?;
-        let log = Arc::new(TerminationLog::default());
-        pool.pool.lifecycle.register(log.clone());
         pool.open_thread("a", kind("w"))?;
         assert_eq!(pool.park("a", Instant::now())?, Placement::Parked);
-        // Reopening "a" displaces its parked entry: that thread must end before the new one starts.
+        // Reopening "a" displaces its parked entry, so the warm pool no longer holds it.
         pool.open_thread("a", kind("w"))?;
-        let events: Vec<String> = log.events.lock().clone();
-        assert_eq!(events, ["create:a", "terminate:a", "create:a"]);
         assert_eq!(pool.pool.warm_len(), 0);
         Ok(())
     }

@@ -425,7 +425,7 @@ impl PythonEngine {
             Some(StopReason::Timeout) => {
                 return Err(SeamError::new(
                     ErrorCode::Timeout,
-                    format!("{} exceeded {} s", call.script, call.deadline.as_secs()),
+                    format!("{} exceeded {} s", call.script, call.deadline.as_secs_f64()),
                 ));
             }
             Some(StopReason::Abort) => {
@@ -626,7 +626,7 @@ pub(crate) async fn within_deadline<T>(
         Ok(result) => result,
         Err(_) => Err(SeamError::new(
             ErrorCode::Timeout,
-            format!("{script} exceeded {} s", deadline.as_secs()),
+            format!("{script} exceeded {} s", deadline.as_secs_f64()),
         )),
     }
 }
@@ -1802,6 +1802,35 @@ sys.exit(2)
         let err = engine.lane_verb(&call).err().ok_or("usage must fail")?;
         if err.code() != ErrorCode::Input {
             return Err(err.message().to_string());
+        }
+        Ok(())
+    }
+
+    /// A sub-second deadline is reported with its fraction of a second, not as `0 s`.
+    #[test]
+    fn python_engine_timeout_message_keeps_sub_second_deadlines() -> TestResult {
+        const SLEEPY: &str = r#"import time
+time.sleep(30)
+"#;
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        write_script(dir.path(), "sleepy", SLEEPY)?;
+        let engine = PythonEngine::new("python3");
+        let call = python_call(
+            dir.path(),
+            "sleepy",
+            &[],
+            Vec::new(),
+            Duration::from_millis(300),
+        );
+        let err = engine
+            .lane_verb(&call)
+            .err()
+            .ok_or("the deadline must stop the call")?;
+        if err.code() != ErrorCode::Timeout {
+            return Err(err.message().to_string());
+        }
+        if err.message() != "E-TIMEOUT: sleepy exceeded 0.3 s" {
+            return Err(format!("unexpected deadline message: {}", err.message()));
         }
         Ok(())
     }

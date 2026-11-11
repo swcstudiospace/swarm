@@ -34,7 +34,7 @@ crossbeam = { workspace = true }
 itertools = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = "0.4"
 proptest = "1.2"
 tempfile = { workspace = true }

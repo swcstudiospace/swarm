@@ -104,6 +104,16 @@ const RESERVED_EXTRA: [&str; 9] = [
     "advisory_reason",
 ];
 
+/// Payload members the verdict signs itself (`swarm/gates.py::SIGNED_FIELDS`): an `extra` entry naming one is ignored.
+const SIGNED_FIELDS: [&str; 6] = [
+    "gate",
+    "task_id",
+    "verdict",
+    "findings",
+    "runs",
+    "expires_s",
+];
+
 /// `swarm/verdicts.py::MISSING_KEY_REASON`.
 pub const MISSING_KEY_REASON: &str = "fail-closed: no signing key configured (SWARM_ED25519_KEY and SWARM_SIGNING_KEY are unset; SWARM_ALLOW_INSECURE_DEV_KEY=1 opts into the dev key)";
 
@@ -781,7 +791,13 @@ impl Deriver<'_> {
             payload.push(("advisory".to_string(), Json::Bool(true)));
             payload.push(("advisory_reason".to_string(), jstr(reason)));
         }
-        payload.extend(extra.iter().cloned());
+        // Python's `{signed fields, **extra}`: an `extra` entry naming a signed field is ignored; any other entry is set the
+        // way a dict assignment would (in place when it exists, at the end otherwise).
+        for (key, value) in extra {
+            if !SIGNED_FIELDS.contains(&key.as_str()) {
+                upsert(&mut payload, key, value.clone());
+            }
+        }
         payload
     }
 
@@ -1391,5 +1407,125 @@ impl TaskStoreWriter {
         }
         tx.commit().await?;
         Ok(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use gsd_envelope::{KeyFilePresence, KeyMaterial};
+    use gsd_route::{jstr, obj_get, Fields, Json};
+
+    use super::{Deriver, EnvelopeIds, GateIssueRequest, GatePlan, StoreFacts};
+
+    /// Ids that are never drawn: `payload` takes none.
+    struct NoIds;
+
+    impl EnvelopeIds for NoIds {
+        fn msg_id(&mut self, _now_ms: u64) -> Option<String> {
+            None
+        }
+        fn correlation_id(&mut self) -> Option<String> {
+            None
+        }
+        fn trace_id(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    fn request(extra: Fields) -> GateIssueRequest {
+        GateIssueRequest {
+            gate: "review".to_string(),
+            agent_id: "A09".to_string(),
+            findings: Vec::new(),
+            runs: Vec::new(),
+            expires_s: 86_400,
+            extra,
+            simulate: false,
+            per_target: Vec::new(),
+            task_id: Some("T-1".to_string()),
+            correlation_id: None,
+            session: false,
+            dryrun_fail: String::new(),
+            now: 1_700_000_000.5,
+        }
+    }
+
+    /// `payload(task, verdict, findings, extra, advisory)` of a deriver over `request`, with no store and no keys.
+    fn payload_of(request: &GateIssueRequest) -> Fields {
+        let facts = StoreFacts::default();
+        let keys = KeyMaterial::from_lookup(|_| None::<OsString>, |_| KeyFilePresence::Absent)
+            .expect("keyless key material");
+        let mut ids = NoIds;
+        let deriver = Deriver {
+            request,
+            facts: &facts,
+            keys: &keys,
+            ids: &mut ids,
+            plan: GatePlan::default(),
+            extra: request.extra.clone(),
+        };
+        deriver.payload("T-1", "fail", &[], &request.extra, None)
+    }
+
+    /// P1-06: `swarm/gates.py::make_verdict` ignores an `extra` entry that names a signed field; this is the Rust mirror.
+    #[test]
+    fn extra_cannot_override_the_signed_payload_fields() {
+        let extra: Fields = vec![
+            ("gate".to_string(), jstr("release")),
+            ("task_id".to_string(), jstr("T-OTHER")),
+            ("verdict".to_string(), jstr("pass")),
+            ("findings".to_string(), Json::Arr(Vec::new())),
+            (
+                "runs".to_string(),
+                Json::Obj(vec![("x".to_string(), Json::Int(1))]),
+            ),
+            ("expires_s".to_string(), Json::Int(999_999)),
+            ("waived_by".to_string(), jstr("alice")),
+        ];
+        let payload = payload_of(&request(extra));
+
+        let names: Vec<&str> = payload.iter().map(|(key, _)| key.as_str()).collect();
+        for key in [
+            "gate",
+            "task_id",
+            "verdict",
+            "findings",
+            "runs",
+            "expires_s",
+        ] {
+            assert_eq!(
+                names.iter().filter(|name| **name == key).count(),
+                1,
+                "signed field {key} must appear exactly once"
+            );
+        }
+        assert!(matches!(obj_get(&payload, "gate"), Some(Json::Str(v)) if v == "review"));
+        assert!(matches!(obj_get(&payload, "task_id"), Some(Json::Str(v)) if v == "T-1"));
+        assert!(matches!(obj_get(&payload, "verdict"), Some(Json::Str(v)) if v == "fail"));
+        assert!(matches!(
+            obj_get(&payload, "expires_s"),
+            Some(Json::Int(86_400))
+        ));
+        assert!(
+            matches!(obj_get(&payload, "runs"), Some(Json::Obj(members)) if members.is_empty())
+        );
+        assert!(
+            matches!(obj_get(&payload, "findings"), Some(Json::Arr(items)) if items.is_empty())
+        );
+        assert!(matches!(obj_get(&payload, "waived_by"), Some(Json::Str(v)) if v == "alice"));
+    }
+
+    /// `issued_at` stays injectable: the signed store passes its own clock reading through `extra`.
+    #[test]
+    fn issued_at_in_extra_still_replaces_the_clock_reading() {
+        let extra: Fields = vec![("issued_at".to_string(), Json::Float(5.0))];
+        let payload = payload_of(&request(extra));
+        assert!(matches!(obj_get(&payload, "issued_at"), Some(Json::Float(v)) if *v == 5.0));
+        assert_eq!(
+            payload.iter().filter(|(key, _)| key == "issued_at").count(),
+            1
+        );
     }
 }

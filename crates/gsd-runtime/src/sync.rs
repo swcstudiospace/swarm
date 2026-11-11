@@ -6,6 +6,7 @@
 //! - Wait-for graph for deadlock detection
 //! - Async barriers with timeout support
 
+use crate::clock::Clock;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use crossbeam::queue::SegQueue;
 use parking_lot::RwLock;
@@ -13,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{oneshot, Barrier, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Lock-free MPSC queue for high-throughput message passing
@@ -455,26 +456,30 @@ where
     tokio::time::timeout(duration, fut()).await
 }
 
-/// Rate limiter using token bucket algorithm
+/// Rate limiter using token bucket algorithm. Refill is measured on the injected clock, so a
+/// simulation clock drives it deterministically; a real clock refills by wall time.
 pub struct TokenBucket {
     capacity: usize,
     refill_rate: f64, // tokens per second
+    clock: Arc<dyn Clock>,
     state: std::sync::Mutex<BucketState>,
 }
 
 struct BucketState {
     tokens: f64,
-    last_refill: Instant,
+    last_refill_ns: u64,
 }
 
 impl TokenBucket {
-    pub fn new(capacity: usize, refill_rate: f64) -> Self {
+    pub fn new(capacity: usize, refill_rate: f64, clock: Arc<dyn Clock>) -> Self {
+        let last_refill_ns = clock.now_nanos();
         Self {
             capacity,
             refill_rate,
+            clock,
             state: std::sync::Mutex::new(BucketState {
                 tokens: capacity as f64,
-                last_refill: Instant::now(),
+                last_refill_ns,
             }),
         }
     }
@@ -486,10 +491,10 @@ impl TokenBucket {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        let now = self.clock.now_nanos();
+        let elapsed = Duration::from_nanos(now.saturating_sub(state.last_refill_ns)).as_secs_f64();
         state.tokens = (state.tokens + elapsed * self.refill_rate).min(self.capacity as f64);
-        state.last_refill = now;
+        state.last_refill_ns = now;
 
         if state.tokens >= tokens as f64 {
             state.tokens -= tokens as f64;
@@ -551,6 +556,7 @@ pub struct FairPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{RealClock, SimClock};
     use std::time::Duration;
 
     #[tokio::test]
@@ -654,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_bucket() {
-        let bucket = TokenBucket::new(10, 10.0); // 10 tokens, refill 10/s
+        let bucket = TokenBucket::new(10, 10.0, Arc::new(RealClock::new())); // 10 tokens, refill 10/s
         assert!(bucket.take(5).await);
         assert!(bucket.take(5).await);
         assert!(!bucket.take(1).await);
@@ -662,10 +668,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_take_refills_after_drain() {
-        let bucket = TokenBucket::new(1, 1000.0);
+        let bucket = TokenBucket::new(1, 1000.0, Arc::new(RealClock::new()));
         assert!(bucket.try_take(1));
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(bucket.try_take(1), "try_take must refill like take does");
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_refills_on_injected_clock() {
+        let clock = Arc::new(SimClock::new());
+        let bucket = TokenBucket::new(10, 10.0, clock.clone());
+        assert!(bucket.take(5).await);
+        assert!(bucket.take(5).await);
+        assert!(!bucket.take(1).await);
+        clock.advance(Duration::from_millis(100));
+        assert!(
+            bucket.take(1).await,
+            "100 ms at 10 tokens/s refills one token"
+        );
     }
 
     async fn wait_for_queued(sem: &PrioritySemaphore, count: usize) {

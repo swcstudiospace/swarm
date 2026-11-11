@@ -833,13 +833,12 @@ fn a_dry_run_writes_nothing_but_an_empty_manifest_and_matches_python_even_for_an
 
 // ---- refusals before the first write ----------------------------------------------------------------------------------------
 
-/// A legal IN_REVIEW → APPROVED and the argv shapes the route does not serve, none of which may touch the store.
+/// The argv shapes the route does not serve, none of which may touch the store.
 #[test]
 fn what_rust_cannot_prove_is_refused_before_the_first_write() {
-    let world = World::new(&[row_in("IN_REVIEW", "T-rev"), row_in("CREATED", "T-new")]);
+    let world = World::new(&[row_in("CREATED", "T-new")]);
     let before = world.db_bytes();
-    let cases: [(&[&str], &str); 11] = [
-        (&["--json", "--transition", "T-rev", "APPROVED"], "APPROVED"),
+    let cases: [(&[&str], &str); 10] = [
         (
             &["--json", "--transition", "T-new", "NOT_A_STATE"],
             "state name",

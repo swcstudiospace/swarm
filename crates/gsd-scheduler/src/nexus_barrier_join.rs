@@ -733,7 +733,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn straggler_past_deadline_is_named_partial_timeout() {
         let join = "join";
         let stage0 = stage_reply_topic(join, 0);
@@ -751,7 +751,7 @@ mod tests {
             vec![task("c", "x")],
         ]);
 
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let report = run(&fake, &plan, config(150)).await.expect("join runs");
 
         assert!(
@@ -776,7 +776,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn stage_deadline_fires_without_real_waiting() {
+        let join = "join";
+        let stage0 = stage_reply_topic(join, 0);
+        let fake = FakeNexus::with(vec![("b", stage0, Behaviour::Silent)], false);
+        let plan = plan(vec![vec![task("b", "x")]]);
+
+        // A ten-second stage deadline. Under the paused clock it is observed on the virtual clock and fires at once in real time.
+        let real = std::time::Instant::now();
+        let virtual_started = Instant::now();
+        let report = run(&fake, &plan, config(10_000)).await.expect("join runs");
+
+        assert!(
+            virtual_started.elapsed() >= Duration::from_secs(10),
+            "the stage deadline was observed on the clock"
+        );
+        assert!(
+            real.elapsed() < Duration::from_secs(5),
+            "the stage deadline must fire without real waiting"
+        );
+        assert_eq!(report.partial_timeouts, vec!["b".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn failed_participant_yields_a_value_and_no_hang() {
         let join = "join";
         let stage0 = stage_reply_topic(join, 0);
@@ -795,7 +818,7 @@ mod tests {
         ]);
 
         // A five-second deadline proves the failure is not waited out.
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let report = run(&fake, &plan, config(5_000)).await.expect("join runs");
 
         assert!(
@@ -919,11 +942,11 @@ mod tests {
         assert_eq!(fake.published(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unavailable_reply_topic_fails_every_participant_without_hang() {
         let fake = FakeNexus::with(vec![("a", stage_reply_topic("join", 0), ok(1, "a"))], true);
         let plan = plan(vec![vec![task("a", "x")]]);
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let report = run(&fake, &plan, config(5_000)).await.expect("join runs");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(report.failed, vec!["a".to_string()]);

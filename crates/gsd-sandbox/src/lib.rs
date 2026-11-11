@@ -36,6 +36,7 @@ pub const GUEST_MODULE: (&[u8], &str) = (
 mod guest_digest {
     use sha2::{Digest, Sha256};
     use std::fs;
+    use std::path::Path;
 
     const GUEST: &[u8] = include_bytes!(env!("GSD_GUEST_WASM"));
 
@@ -58,6 +59,20 @@ mod guest_digest {
             pinned.trim(),
             actual,
             "the guest must match its committed pin (guest-module.sha256, or guest-module-write.sha256 with write-routes)"
+        );
+    }
+
+    #[test]
+    fn digest_and_pin_file_names_differ() {
+        let digest = Path::new(env!("GSD_GUEST_DIGEST_FILE"))
+            .file_name()
+            .expect("the digest path names a file");
+        let pin = Path::new(env!("GSD_GUEST_PIN_FILE"))
+            .file_name()
+            .expect("the pin path names a file");
+        assert_ne!(
+            digest, pin,
+            "the build digest must not overwrite the committed pin's file name"
         );
     }
 }

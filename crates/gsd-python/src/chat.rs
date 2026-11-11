@@ -18,9 +18,10 @@
 //!
 //! | `ChatError` | Code |
 //! |---|---|
-//! | `InvalidConfig`, `UnknownThread`, `ThreadExists`, `UnknownMessage`, `InvalidBudget` | `E-INPUT` |
-//! | `ThreadBusy`, `QueueFull`, `Capacity`, `ShuttingDown`, `RateLimited` | `E-CAPACITY` |
+//! | `InvalidConfig`, `UnknownThread`, `ThreadExists`, `UnknownMessage`, `InvalidBudget`, `TooLarge` | `E-INPUT` |
+//! | `ThreadBusy`, `QueueFull`, `Capacity`, `ShuttingDown`, `RateLimited`, `QuotaExceeded` | `E-CAPACITY` |
 //! | `BudgetDenied` | `E-TIMEOUT` |
+//! | `Unauthorized` | `E-POLICY` |
 //! | `Governor`, `Panicked`, `WorkerSpawn` | `E-INTERNAL` |
 //!
 //! [`governor_code`] maps each `GovernorError`:
@@ -70,13 +71,16 @@ pub fn chat_code(error: &ChatError) -> ErrorCode {
         | ChatError::UnknownThread(_)
         | ChatError::ThreadExists(_)
         | ChatError::UnknownMessage { .. }
-        | ChatError::InvalidBudget(_) => ErrorCode::Input,
+        | ChatError::InvalidBudget(_)
+        | ChatError::TooLarge(_) => ErrorCode::Input,
         ChatError::ThreadBusy(_)
         | ChatError::QueueFull { .. }
         | ChatError::Capacity { .. }
         | ChatError::ShuttingDown
-        | ChatError::RateLimited(_) => ErrorCode::Capacity,
+        | ChatError::RateLimited(_)
+        | ChatError::QuotaExceeded(_) => ErrorCode::Capacity,
         ChatError::BudgetDenied(_) => ErrorCode::Timeout,
+        ChatError::Unauthorized(_) => ErrorCode::Policy,
         ChatError::Governor(_) | ChatError::Panicked(_) | ChatError::WorkerSpawn(_) => {
             ErrorCode::Internal
         }
@@ -98,17 +102,17 @@ pub fn governor_code(error: &GovernorError) -> ErrorCode {
     }
 }
 
-/// The budget-port refusal for a governor error: `Exceeded`, `RateLimited`, `Invalid` or `Other`.
+/// The budget-port refusal for a governor error: `Exceeded`, `RateLimited`, `Quota`, `Invalid`, `Unauthorized` or `Other`.
 pub fn refusal_of(error: GovernorError) -> BudgetRefusal {
     match error {
-        GovernorError::BudgetExceeded(m)
-        | GovernorError::QuotaExceeded(m)
-        | GovernorError::CostLimitExceeded(m) => BudgetRefusal::Exceeded(m),
+        GovernorError::BudgetExceeded(m) | GovernorError::CostLimitExceeded(m) => {
+            BudgetRefusal::Exceeded(m)
+        }
         GovernorError::RateLimitExceeded(m) => BudgetRefusal::RateLimited(m),
+        GovernorError::QuotaExceeded(m) => BudgetRefusal::Quota(m),
         GovernorError::InvalidBudget(m) => BudgetRefusal::Invalid(m),
-        GovernorError::Unauthorized(m)
-        | GovernorError::Other(m)
-        | GovernorError::UnknownReservation(m) => BudgetRefusal::Other(m),
+        GovernorError::Unauthorized(m) => BudgetRefusal::Unauthorized(m),
+        GovernorError::Other(m) | GovernorError::UnknownReservation(m) => BudgetRefusal::Other(m),
     }
 }
 
@@ -650,6 +654,7 @@ mod tests {
                 ErrorCode::Input,
             ),
             (ChatError::InvalidBudget("x".into()), ErrorCode::Input),
+            (ChatError::TooLarge("x".into()), ErrorCode::Input),
             (ChatError::ThreadBusy("t".into()), ErrorCode::Capacity),
             (
                 ChatError::QueueFull {
@@ -661,6 +666,8 @@ mod tests {
             (ChatError::Capacity { max_threads: 1 }, ErrorCode::Capacity),
             (ChatError::ShuttingDown, ErrorCode::Capacity),
             (ChatError::RateLimited("x".into()), ErrorCode::Capacity),
+            (ChatError::QuotaExceeded("x".into()), ErrorCode::Capacity),
+            (ChatError::Unauthorized("x".into()), ErrorCode::Policy),
             (ChatError::BudgetDenied("x".into()), ErrorCode::Timeout),
             (ChatError::Governor("x".into()), ErrorCode::Internal),
             (ChatError::Panicked("x".into()), ErrorCode::Internal),
@@ -703,6 +710,61 @@ mod tests {
         }
     }
 
+    /// A budget port that refuses every reservation with the same refusal.
+    struct Refusing(BudgetRefusal);
+
+    impl BudgetPort for Refusing {
+        fn reserve(&self, _reservation: &BudgetReservation) -> Result<(), BudgetRefusal> {
+            Err(self.0.clone())
+        }
+
+        fn release(&self, _reservation: &BudgetReservation) -> Result<(), BudgetRefusal> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_governor_refusal_completes_with_its_governor_code(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Each refusal takes the real path: refusal_of, the pool's budget port, and chat_code. Its wire code must equal
+        // governor_code, so the two mappings cannot drift apart again.
+        let makers: [fn(String) -> GovernorError; 8] = [
+            GovernorError::BudgetExceeded,
+            GovernorError::CostLimitExceeded,
+            GovernorError::InvalidBudget,
+            GovernorError::RateLimitExceeded,
+            GovernorError::QuotaExceeded,
+            GovernorError::Unauthorized,
+            GovernorError::Other,
+            GovernorError::UnknownReservation,
+        ];
+        for make in makers {
+            let expected = governor_code(&make("x".into()));
+            let pool = gsd_pool::ChatPool::new(
+                ChatRuntimeConfig::default(),
+                Arc::new(Refusing(refusal_of(make("x".into())))),
+            )?;
+            pool.open_thread(
+                "t",
+                SubagentType {
+                    value: "w".to_string(),
+                },
+            )?;
+            let submitted = pool.submit(ChatMessage::new("m", "t", "s", Vec::new()))?;
+            let ticket: Ticket = submitted.ticket.ok_or("the message was enqueued")?;
+            let completed = ticket
+                .wait(Duration::from_secs(5))
+                .ok_or("the refused message completes")?;
+            match completed {
+                Completed::Failed(refused) => {
+                    assert_eq!(chat_code(&refused), expected, "{refused}")
+                }
+                other => return Err(format!("expected a failed completion, got {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn governor_refusals_map_to_the_budget_port_kinds() {
         assert!(matches!(
@@ -711,7 +773,7 @@ mod tests {
         ));
         assert!(matches!(
             refusal_of(GovernorError::QuotaExceeded("x".into())),
-            BudgetRefusal::Exceeded(_)
+            BudgetRefusal::Quota(_)
         ));
         assert!(matches!(
             refusal_of(GovernorError::CostLimitExceeded("x".into())),
@@ -727,7 +789,7 @@ mod tests {
         ));
         assert!(matches!(
             refusal_of(GovernorError::Unauthorized("x".into())),
-            BudgetRefusal::Other(_)
+            BudgetRefusal::Unauthorized(_)
         ));
         assert!(matches!(
             refusal_of(GovernorError::Other("x".into())),

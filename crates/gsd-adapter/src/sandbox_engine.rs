@@ -242,7 +242,7 @@ fn budget_after(total: Duration, elapsed: Duration) -> Result<Duration, SeamErro
         Some(remaining) if !remaining.is_zero() => Ok(remaining),
         _ => Err(SeamError::new(
             ErrorCode::Timeout,
-            format!("guest call exceeded {} s", total.as_secs()),
+            format!("guest call exceeded {} s", total.as_secs_f64()),
         )),
     }
 }
@@ -565,7 +565,7 @@ impl Decider for SandboxDecider<'_> {
                 message: format!(
                     "{}: guest call exceeded {} s",
                     ErrorCode::Timeout.as_str(),
-                    self.deadline.as_secs()
+                    self.deadline.as_secs_f64()
                 ),
                 details: Vec::new(),
                 write_state: WriteState::Final,
@@ -1186,6 +1186,16 @@ mod tests {
                 .ok_or("a spent budget was granted")?;
             assert_eq!(error.code(), ErrorCode::Timeout);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_sub_second_deadline_is_not_reported_as_zero_seconds() -> TestResult {
+        let total = Duration::from_millis(300);
+        let error = budget_after(total, total)
+            .err()
+            .ok_or("a spent budget was granted")?;
+        assert_eq!(message(error), "E-TIMEOUT: guest call exceeded 0.3 s");
         Ok(())
     }
 

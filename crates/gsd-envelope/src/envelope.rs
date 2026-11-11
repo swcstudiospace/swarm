@@ -119,6 +119,7 @@ mod tests {
     use sha2::Digest;
 
     use super::*;
+    use crate::keys::ED25519_UNLOADABLE;
     use crate::{parse_envelope, KeyFilePresence};
 
     type TestResult = Result<(), String>;
@@ -494,11 +495,8 @@ mod tests {
     }
 
     /// F-5 of the U3.4 security review. With an Ed25519 signer AND an HMAC secret configured, an `hmac:` envelope still verifies,
-    /// so a holder of only the shared HMAC secret can forge a verdict that passes; and a malformed `SWARM_ED25519_KEY` beside a
-    /// set `SWARM_SIGNING_KEY` silently downgrades signing to HMAC with no configuration error. Both are PYTHON'S behaviour today
-    /// (`verify_envelope` dispatches on the prefix and `_signing_hmac()` ignores the Ed25519 signer; `signing_config_error`
-    /// stays quiet when both raw variables are set) and are kept here for parity. Tightening either changes what Python accepts
-    /// and needs a user decision: do not "fix" this test or the code behind it without one.
+    /// so a holder of only the shared HMAC secret can forge a verdict that passes. That verification parity is Python's behaviour
+    /// (`verify_envelope` dispatches on the prefix) and stays pinned: tightening it needs a user decision that has not been made.
     #[test]
     fn hmac_verifies_beside_an_ed25519_signer_because_python_does_parity_kept_pending_a_user_decision(
     ) -> TestResult {
@@ -511,19 +509,21 @@ mod tests {
             verify_envelope(&forged, &both),
             "an hmac: envelope made with the shared secret alone verifies while an Ed25519 signer is configured"
         );
+        Ok(())
+    }
 
+    /// P1-05 of the U3.4 security review. A malformed `SWARM_ED25519_KEY` beside `SWARM_SIGNING_KEY` used to be exempt and signed
+    /// with HMAC. The user decided on 2026-11-06 to fail closed: the configuration is an error and nothing is signed.
+    #[test]
+    fn a_malformed_ed25519_seed_beside_an_hmac_secret_fails_closed_p1_05() -> TestResult {
         let downgraded = keys(&[("SWARM_SIGNING_KEY", "@hmac"), ("SWARM_ED25519_KEY", "zz")])?;
-        assert_eq!(
-            downgraded.config_error(),
-            None,
-            "no configuration error is raised"
-        );
+        assert_eq!(downgraded.config_error(), Some(ED25519_UNLOADABLE));
         let mut env = body()?;
-        sign_envelope(&mut env, &downgraded).map_err(|e| e.to_string())?;
         assert!(
-            sig_of(&env).is_some_and(|sig| sig.starts_with("hmac:")),
-            "a malformed Ed25519 seed beside an HMAC secret signs with HMAC"
+            sign_envelope(&mut env, &downgraded).is_err(),
+            "a malformed Ed25519 seed beside an HMAC secret must refuse to sign"
         );
+        assert!(sig_of(&env).is_none(), "no hmac: signature is written");
         Ok(())
     }
 }

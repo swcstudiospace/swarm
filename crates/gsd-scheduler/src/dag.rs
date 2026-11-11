@@ -64,12 +64,25 @@ impl TaskDag {
 
     /// Removes the task `id`, every edge into or out of it, and its completion and failure marks.
     ///
-    /// The other tasks keep their insertion order and their edges. Returns `false` and changes
-    /// nothing when `id` is not in the DAG.
-    pub fn remove_task(&mut self, id: &str) -> bool {
-        let Some(removed) = self.index.remove(id) else {
-            return false;
+    /// The other tasks keep their insertion order and their edges. Returns `Ok(false)` and changes
+    /// nothing when `id` is not in the DAG. A task that still has dependents is refused with
+    /// `InvalidDag` and nothing changes: removing it would leave those dependents with a parent
+    /// that is gone.
+    pub fn remove_task(&mut self, id: &str) -> SchedulerResult<bool> {
+        let Some(&removed) = self.index.get(id) else {
+            return Ok(false);
         };
+        if self
+            .graph
+            .neighbors_directed(removed, Direction::Outgoing)
+            .next()
+            .is_some()
+        {
+            return Err(SchedulerError::InvalidDag(format!(
+                "task {id} still has dependents"
+            )));
+        }
+        self.index.remove(id);
         self.completed.remove(id);
         self.failed.remove(id);
 
@@ -96,7 +109,7 @@ impl TaskDag {
             }
         }
         self.graph = graph;
-        true
+        Ok(true)
     }
 
     /// Returns the ids of a task on a cycle, or `None` when the graph is acyclic.
@@ -231,7 +244,7 @@ mod tests {
         dag.add_task(task("A", &[]))?;
         dag.add_task(task("B", &[]))?;
         dag.add_task(task("C", &["B"]))?;
-        assert!(dag.remove_task("A"));
+        assert!(dag.remove_task("A")?);
         assert_eq!(ready_ids(&dag), vec!["B".to_string()]);
         dag.mark_complete(&TaskId {
             value: "B".to_string(),
@@ -239,12 +252,12 @@ mod tests {
         assert_eq!(ready_ids(&dag), vec!["C".to_string()]);
         assert_eq!(dag.critical_path_len("B"), 2);
         assert_eq!(dag.critical_path_len("C"), 1);
-        assert!(!dag.remove_task("A"), "a second removal changes nothing");
+        assert!(!dag.remove_task("A")?, "a second removal changes nothing");
         Ok(())
     }
 
     /// `remove_task` drops the removed task's edges and keeps every other edge across the index
-    /// remap. C loses its only parent B, and D keeps its parent A.
+    /// remap. C is removed first, which leaves B with no dependents, so B can go. D keeps its parent A.
     #[test]
     fn removing_a_task_drops_its_edges_and_keeps_the_others() -> SchedulerResult<()> {
         let mut dag = TaskDag::new();
@@ -252,16 +265,17 @@ mod tests {
         dag.add_task(task("B", &[]))?;
         dag.add_task(task("C", &["B"]))?;
         dag.add_task(task("D", &["A"]))?;
-        assert!(dag.remove_task("B"));
-        assert_eq!(ready_ids(&dag), vec!["A".to_string(), "C".to_string()]);
+        assert!(dag.remove_task("C")?);
+        assert!(dag.remove_task("B")?);
+        assert_eq!(ready_ids(&dag), vec!["A".to_string()]);
         dag.mark_complete(&TaskId {
             value: "A".to_string(),
         })?;
-        assert_eq!(ready_ids(&dag), vec!["C".to_string(), "D".to_string()]);
+        assert_eq!(ready_ids(&dag), vec!["D".to_string()]);
         assert_eq!(dag.critical_path_len("A"), 2);
-        // D's only parent A stays complete, so removing D leaves C as the only ready task.
-        assert!(dag.remove_task("D"));
-        assert_eq!(ready_ids(&dag), vec!["C".to_string()]);
+        // D's only parent A stays complete, so removing D leaves no task ready.
+        assert!(dag.remove_task("D")?);
+        assert!(ready_ids(&dag).is_empty());
         Ok(())
     }
 
@@ -323,11 +337,29 @@ mod tests {
         dag.mark_failed(&TaskId {
             value: "B".to_string(),
         })?;
-        assert!(dag.remove_task("A"));
-        assert!(dag.remove_task("B"));
+        assert!(dag.remove_task("A")?);
+        assert!(dag.remove_task("B")?);
         dag.add_task(task("A", &[]))?;
         dag.add_task(task("B", &[]))?;
         assert_eq!(ready_ids(&dag), vec!["A".to_string(), "B".to_string()]);
+        Ok(())
+    }
+
+    /// `remove_task` refuses a task that still has dependents: it stays, and its dependents keep their parent.
+    #[test]
+    fn a_task_with_dependents_is_not_removed() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &["A"]))?;
+        assert!(matches!(
+            dag.remove_task("A"),
+            Err(SchedulerError::InvalidDag(_))
+        ));
+        assert_eq!(ready_ids(&dag), vec!["A".to_string()]);
+        dag.mark_complete(&TaskId {
+            value: "A".to_string(),
+        })?;
+        assert_eq!(ready_ids(&dag), vec!["B".to_string()]);
         Ok(())
     }
 }

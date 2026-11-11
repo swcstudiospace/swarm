@@ -11,6 +11,27 @@ use std::sync::Arc;
 /// Result type for governor operations
 pub type GovernorResult<T> = std::result::Result<T, GovernorError>;
 
+/// Largest accepted session, thread or pair id, in bytes. `gsd-pool` caps its ids at the same size: keep them equal.
+pub const MAX_ID_BYTES: usize = 256;
+
+/// Refuses a session id, or a thread id, over [`MAX_ID_BYTES`] with `InvalidBudget` (E-INPUT).
+fn validate_ids(session_id: &str, thread_id: Option<&str>) -> GovernorResult<()> {
+    let over = |what: &str, len: usize| {
+        GovernorError::InvalidBudget(format!(
+            "{what} is {len} bytes; the limit is {MAX_ID_BYTES}"
+        ))
+    };
+    if session_id.len() > MAX_ID_BYTES {
+        return Err(over("session id", session_id.len()));
+    }
+    if let Some(thread_id) = thread_id {
+        if thread_id.len() > MAX_ID_BYTES {
+            return Err(over("thread id", thread_id.len()));
+        }
+    }
+    Ok(())
+}
+
 /// Governor errors
 #[derive(Debug, thiserror::Error)]
 pub enum GovernorError {
@@ -146,6 +167,7 @@ impl Governor {
                 "session_id and thread_id are required".to_string(),
             ));
         };
+        validate_ids(&session_id.value, Some(&thread_id.value))?;
         // Check rate limits
         if !self.rate_limiters.check_rate_limit() {
             return Err(GovernorError::RateLimitExceeded(
@@ -264,6 +286,7 @@ impl Governor {
         tool_calls: i32,
         cost_usd: f64,
     ) -> GovernorResult<ReleasedAmounts> {
+        validate_ids(session_id, Some(thread_id))?;
         validate_amounts(tokens, wall_time_ms, tool_calls, cost_usd)?;
 
         // Match both ids before touching either aggregate. A session or thread alone does not
@@ -332,6 +355,7 @@ impl Governor {
         tool_calls: i32,
         cost_usd: f64,
     ) -> GovernorResult<()> {
+        validate_ids(session_id, Some(thread_id))?;
         validate_amounts(tokens, wall_time_ms, tool_calls, cost_usd)?;
         if self.global_usage.holds(session_id, thread_id) {
             Ok(())
@@ -345,6 +369,7 @@ impl Governor {
         &self,
         session_id: &str,
     ) -> GovernorResult<gsd_proto::gsd::v1::BudgetSnapshot> {
+        validate_ids(session_id, None)?;
         if let Some(budget) = self.session_budgets.get(session_id) {
             let snapshot = *budget.read();
             Ok(snapshot)
@@ -820,6 +845,25 @@ mod tests {
         assert_eq!(thread.wall_time_ms_remaining, 300_000);
         assert_eq!(thread.tool_calls_remaining, 100);
         assert_eq!(thread.cost_usd_remaining, 1.0);
+    }
+
+    #[test]
+    fn an_id_over_the_byte_cap_is_refused_and_moves_no_budget() {
+        let gov = Governor::new(GovernorConfig::default());
+        // 257 bytes: one over the 256-byte id cap.
+        let long = "s".repeat(257);
+        let reserved = tokio_test::block_on(
+            gov.reserve_budget_checked(budget_request(&long, "t", 5_000, 0.0)),
+        );
+        assert!(
+            matches!(reserved, Err(GovernorError::InvalidBudget(_))),
+            "{reserved:?}"
+        );
+        let released = tokio_test::block_on(gov.release_budget(&long, "t", 1_000, 500, 2, 0.5));
+        assert!(
+            matches!(released, Err(GovernorError::InvalidBudget(_))),
+            "{released:?}"
+        );
     }
 
     fn budget_request(

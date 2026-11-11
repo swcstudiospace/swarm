@@ -18,8 +18,8 @@
 //! returned by then are discarded; no retention semantics are implemented.
 //!
 //! A nexus participant's `E-TIMEOUT` straggler ends `CANCELLED_TIMED_OUT` with reason `timed_out`, the same
-//! terminal a matrix task stopped at the window ends. A `RateLimited` matrix outcome leaves its thread
-//! `RUNNING`; retry belongs to the caller and its backoff rule is not implemented.
+//! terminal a matrix task stopped at the window ends. A `RateLimited` outcome ends its task `FAILED`: the verdict
+//! stays on the collected record, and retry belongs to the caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -41,7 +41,8 @@ use crate::session_create::{thread_for_task, PHASE_KEY};
 use crate::session_dispatch::{admit_thread, handoff_thread, DispatchError};
 
 /// Total cooperative wait a cancelled task has before it is force-dropped. The bound is 3 s, walked in
-/// [`CANCEL_SLICE`] slices. `SWARM_CANCEL_GRACE_S`.
+/// [`CANCEL_SLICE`] slices. It is fixed: `SWARM_CANCEL_GRACE_S` does not set it. That variable sets the agent cancel wait
+/// (10 s by default), a separate concept.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(3);
 /// Granularity of the cooperative wait: the window is walked in 500 ms slices.
 pub const CANCEL_SLICE: Duration = Duration::from_millis(500);
@@ -327,9 +328,6 @@ pub struct JoinCompletion {
     pub cancelled: Vec<String>,
     /// Tasks not started because the marker was already set. Their threads stay as they were.
     pub not_started: Vec<String>,
-    /// Tasks whose outcome was rate-limited. Their threads stay `RUNNING` and their keys are not
-    /// collected; retry belongs to the caller.
-    pub rate_limited: Vec<String>,
     /// Tasks the matrix join never dispatched, for example behind a failed dependency.
     pub undispatched: Vec<String>,
     /// Tasks whose thread could not be admitted to `RUNNING`, so they did not run. Their keys are
@@ -441,7 +439,6 @@ where
     let forced = take(&run.forced);
     let cooperative = take(&run.cooperative);
     let mut by_task: BTreeMap<String, Vec<CompletionRecord>> = BTreeMap::new();
-    let mut rate_limited = Vec::new();
     let mut start_failed = BTreeSet::new();
     {
         let mut guard = ctx.session.lock();
@@ -458,16 +455,12 @@ where
             }
             let is_forced = forced.contains(id);
             let is_cooperative = cooperative.contains(id);
-            match terminal_for(&record.outcome, is_forced, is_cooperative) {
-                Some(terminal) => {
-                    apply_terminal_to_task(&mut guard, id, terminal)?;
-                    by_task
-                        .entry(id.to_string())
-                        .or_default()
-                        .push(record.clone());
-                }
-                None => rate_limited.push(id.to_string()),
-            }
+            let terminal = terminal_for(&record.outcome, is_forced, is_cooperative);
+            apply_terminal_to_task(&mut guard, id, terminal)?;
+            by_task
+                .entry(id.to_string())
+                .or_default()
+                .push(record.clone());
         }
     }
 
@@ -488,7 +481,6 @@ where
         forced: sorted(forced),
         cancelled: sorted(cooperative),
         not_started: sorted(skipped),
-        rate_limited,
         start_failed: start_failed.into_iter().collect(),
         undispatched: report.undispatched,
         cancel_requested: ctx.cancel.is_cancelled(),
@@ -614,9 +606,8 @@ fn settle_nexus(
     let mut guard = session.lock();
     for (_, log) in &merges {
         for record in log.records() {
-            if let Some(terminal) = nexus_terminal_for(&record.outcome) {
-                apply_terminal_to_task(&mut guard, &record.key.task_id, terminal)?;
-            }
+            let terminal = nexus_terminal_for(&record.outcome);
+            apply_terminal_to_task(&mut guard, &record.key.task_id, terminal)?;
         }
     }
     Ok((merges, Vec::new()))
@@ -794,27 +785,27 @@ fn apply_terminal_to_task(
     apply_terminal(state, &thread_id, terminal)
 }
 
-/// Maps a completion outcome to its terminal phase. `None` leaves the thread `RUNNING`.
-fn terminal_for(outcome: &TaskOutcome, forced: bool, cooperative: bool) -> Option<Terminal> {
+/// Maps a completion outcome to its terminal phase. A rate-limited task ends `FAILED`, like a failed one; its verdict
+/// stays on the record.
+fn terminal_for(outcome: &TaskOutcome, forced: bool, cooperative: bool) -> Terminal {
     if forced {
-        return Some(Terminal::Cancelled(TerminalReason::TimedOut));
+        return Terminal::Cancelled(TerminalReason::TimedOut);
     }
     if cooperative {
-        return Some(Terminal::Cancelled(TerminalReason::Cancelled));
+        return Terminal::Cancelled(TerminalReason::Cancelled);
     }
     match outcome {
-        TaskOutcome::Completed => Some(Terminal::Succeeded),
-        TaskOutcome::Failed { .. } => Some(Terminal::Failed),
-        TaskOutcome::RateLimited { .. } => None,
+        TaskOutcome::Completed => Terminal::Succeeded,
+        TaskOutcome::Failed { .. } | TaskOutcome::RateLimited { .. } => Terminal::Failed,
     }
 }
 
 /// Maps a nexus record to its terminal. An `E-TIMEOUT` straggler ends `CANCELLED_TIMED_OUT` (`timed_out`),
 /// as a matrix task stopped at the window does. Every other outcome maps as in [`terminal_for`].
-fn nexus_terminal_for(outcome: &TaskOutcome) -> Option<Terminal> {
+fn nexus_terminal_for(outcome: &TaskOutcome) -> Terminal {
     match outcome {
         TaskOutcome::Failed { code, .. } if *code == PARTIAL_JOIN_TIMEOUT => {
-            Some(Terminal::Cancelled(TerminalReason::TimedOut))
+            Terminal::Cancelled(TerminalReason::TimedOut)
         }
         other => terminal_for(other, false, false),
     }
@@ -996,8 +987,16 @@ mod tests {
         guard
             .threads
             .get(thread)
-            .map(|state| state.metadata.clone())
-            .unwrap_or_default()
+            .expect("thread missing from session")
+            .metadata
+            .clone()
+    }
+
+    #[test]
+    #[should_panic(expected = "thread missing from session")]
+    fn metadata_of_a_missing_thread_panics() {
+        let session = shared(SessionState::default());
+        metadata_of(&session, "absent");
     }
 
     fn state_kind(session: &Arc<Mutex<SessionState>>, thread: &str) -> i32 {
@@ -1376,7 +1375,11 @@ mod tests {
                 emit: Emit::Deduplicated,
             }]
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry must not run the worker");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the retry must not run the worker"
+        );
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.log(&key).map(|log| log.records().len()), Some(1));
         assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
@@ -1458,7 +1461,11 @@ mod tests {
                 emit: Emit::Deduplicated,
             }]
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry must not run the worker");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the retry must not run the worker"
+        );
         assert_eq!(ledger.len(), 1);
         assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
         assert_eq!(
@@ -1645,7 +1652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limited_outcome_leaves_its_key_uncollected() -> TestResult {
+    async fn rate_limited_outcome_fails_the_thread_and_collects_its_key() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (_control, signal) = cancel_channel();
         let ctx = context(&session, 10, CancelTiming::default(), signal);
@@ -1666,11 +1673,12 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(completion.rate_limited, vec!["t1".to_string()]);
-        assert!(completion.stages.is_empty());
-        assert!(ledger.is_empty());
-        // The thread keeps RUNNING, as the module contract states; see `rate_limited`.
-        assert_eq!(phase(&session, "th1")?, ThreadPhase::Running);
+        // A rate-limited task ends FAILED. Its verdict stays on the record, so its key is collected.
+        assert_eq!(completion.stages.len(), 1);
+        assert_eq!(completion.stages[0].key.task_id, "t1");
+        assert_eq!(completion.stages[0].emit, Emit::Collected);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
         Ok(())
     }
 

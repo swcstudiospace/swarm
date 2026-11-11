@@ -103,7 +103,9 @@ impl TracingLayer {
             )
             .with(filter);
 
-        tracing::subscriber::set_global_default(subscriber).ok();
+        if let Err(err) = tracing::subscriber::set_global_default(subscriber) {
+            tracing::warn!(error = %err, "logging subscriber already set; keeping the existing one");
+        }
     }
 
     pub fn tracer(&self) -> global::BoxedTracer {
@@ -115,6 +117,16 @@ impl TracingLayer {
 
     pub fn metrics(&self) -> Arc<MetricsSink> {
         self.metrics_sink.clone()
+    }
+
+    /// Flushes buffered spans to the exporter and shuts the pipeline down.
+    /// A no-op when no tracer provider was installed.
+    pub fn shutdown(&self) {
+        if let Some(provider) = &self.tracer_provider {
+            if let Err(err) = provider.shutdown() {
+                tracing::warn!(error = %err, "span pipeline shutdown failed; buffered spans may be lost");
+            }
+        }
     }
 }
 
@@ -136,6 +148,10 @@ impl MetricsSink {
     }
 
     pub fn increment(&self, name: &str, value: u64) {
+        if let Some(counter) = self.counters.get(name) {
+            counter.fetch_add(value, Ordering::Relaxed);
+            return;
+        }
         self.counters
             .entry(name.to_string())
             .or_insert_with(|| AtomicU64::new(0))
@@ -143,6 +159,10 @@ impl MetricsSink {
     }
 
     pub fn set_gauge(&self, name: &str, value: f64) {
+        if let Some(gauge) = self.gauges.get(name) {
+            gauge.store(value.to_bits(), Ordering::Relaxed);
+            return;
+        }
         self.gauges
             .entry(name.to_string())
             .or_insert_with(|| AtomicU64::new(0))
@@ -222,5 +242,114 @@ mod tests {
 
         assert_eq!(warnings.0.load(Ordering::SeqCst), 1);
         assert!(layer.tracer_provider.is_none());
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingExporter(Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for RecordingExporter {
+        async fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shutdown_flushes_spans_recorded_before_it() {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+
+        let exported = RecordingExporter::default();
+        let layer = TracingLayer {
+            tracer_provider: Some(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_batch_exporter(exported.clone())
+                    .build(),
+            ),
+            metrics_sink: Arc::new(MetricsSink::new()),
+        };
+
+        let tracer = layer.tracer();
+        let mut span = tracer.start("before-shutdown");
+        span.end();
+
+        layer.shutdown();
+
+        let names: Vec<String> = exported
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["before-shutdown".to_string()]);
+    }
+
+    #[test]
+    fn rejected_logging_init_emits_warning() {
+        let warnings = WarnCounter::default();
+        let layer = TracingLayer::new(ObservabilityConfig::default());
+
+        tracing::subscriber::with_default(Registry::default().with(warnings.clone()), || {
+            // The first call installs the global subscriber; the second is rejected.
+            layer.init_logging();
+            layer.init_logging();
+        });
+
+        assert_eq!(warnings.0.load(Ordering::SeqCst), 1);
+    }
+
+    mod alloc_count {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct CountingAlloc;
+
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                System.alloc(layout)
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                System.realloc(ptr, layout, new_size)
+            }
+        }
+
+        /// Runs `f` and returns its result with the number of heap allocations
+        /// made on this thread while it ran.
+        pub fn allocations_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+            let before = ALLOCATIONS.with(Cell::get);
+            let out = f();
+            (out, ALLOCATIONS.with(Cell::get) - before)
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: alloc_count::CountingAlloc = alloc_count::CountingAlloc;
+
+    #[test]
+    fn metrics_hit_path_does_not_allocate() {
+        let sink = MetricsSink::new();
+        sink.increment("requests", 1);
+        sink.set_gauge("queue_depth", 1.0);
+
+        let ((), allocations) = alloc_count::allocations_during(|| {
+            sink.increment("requests", 1);
+            sink.set_gauge("queue_depth", 2.0);
+        });
+
+        assert_eq!(allocations, 0);
     }
 }

@@ -705,7 +705,9 @@ fn refusal_error(refusal: BudgetRefusal) -> ChatError {
     match refusal {
         BudgetRefusal::Exceeded(message) => ChatError::BudgetDenied(message),
         BudgetRefusal::RateLimited(message) => ChatError::RateLimited(message),
+        BudgetRefusal::Quota(message) => ChatError::QuotaExceeded(message),
         BudgetRefusal::Invalid(message) => ChatError::InvalidBudget(message),
+        BudgetRefusal::Unauthorized(message) => ChatError::Unauthorized(message),
         BudgetRefusal::Other(message) => ChatError::Governor(message),
     }
 }
@@ -715,7 +717,9 @@ fn refusal_text(refusal: BudgetRefusal) -> String {
     match refusal {
         BudgetRefusal::Exceeded(message)
         | BudgetRefusal::RateLimited(message)
+        | BudgetRefusal::Quota(message)
         | BudgetRefusal::Invalid(message)
+        | BudgetRefusal::Unauthorized(message)
         | BudgetRefusal::Other(message) => message,
     }
 }
@@ -1100,7 +1104,16 @@ pub(crate) mod tests {
                 BudgetRefusal::Other("x".to_string()),
                 ChatError::Governor("x".to_string()),
             ),
+            (
+                BudgetRefusal::Quota("quota".to_string()),
+                ChatError::QuotaExceeded("quota".to_string()),
+            ),
+            (
+                BudgetRefusal::Unauthorized("no".to_string()),
+                ChatError::Unauthorized("no".to_string()),
+            ),
         ];
+        let refused = cases.len();
         for (index, (refusal, expected)) in cases.into_iter().enumerate() {
             *budget.refusal.lock() = Some(refusal);
             let id = format!("r{index}");
@@ -1109,7 +1122,7 @@ pub(crate) mod tests {
         }
         *budget.refusal.lock() = None;
         assert!(!probe.started().iter().any(|id| id.starts_with('r')));
-        assert_eq!(budget.reserved.lock().len(), 4);
+        assert_eq!(budget.reserved.lock().len(), refused);
         assert!(budget.released.lock().is_empty());
         runtime.shutdown(WAIT);
         Ok(())

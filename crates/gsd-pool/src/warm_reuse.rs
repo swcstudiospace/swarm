@@ -24,8 +24,6 @@ struct PooledEntry {
 pub(crate) struct PushOutcome {
     /// `true` when the handle was parked. `false` when the pool stayed full.
     pub parked: bool,
-    /// Thread ids of the stale entries the push reclaimed. Empty when the pool was not full.
-    pub evicted: Vec<String>,
 }
 
 /// Bounded pool of idle handles, keyed by `SubagentType::value`.
@@ -62,8 +60,7 @@ impl WarmPool {
 
     /// Takes the most recently parked live handle for `subagent_type`.
     ///
-    /// Stale entries of that type are dropped first, without being reported. A successful pop
-    /// counts as a hit. Callers that report terminations sweep with `evict_expired` before popping.
+    /// Stale entries of that type are dropped first. A successful pop counts as a hit.
     pub(crate) fn pop(
         &mut self,
         subagent_type: &SubagentType,
@@ -85,25 +82,19 @@ impl WarmPool {
 
     /// Parks `handle` under `subagent_type`, running the checkpoint hook first.
     ///
-    /// When the pool is full, stale entries are reclaimed first and their thread ids are
-    /// reported in the outcome. If the pool is still full, `parked` is `false`, the handle is
-    /// not parked and the hook does not run.
+    /// When the pool is full, stale entries are reclaimed first. If the pool is still full,
+    /// `parked` is `false`, the handle is not parked and the hook does not run.
     pub(crate) fn push(
         &mut self,
         subagent_type: &SubagentType,
         handle: ChatThreadHandle,
         now: Instant,
     ) -> PushOutcome {
-        let evicted = if self.len() >= self.capacity {
-            self.evict_expired(now)
-        } else {
-            Vec::new()
-        };
         if self.len() >= self.capacity {
-            return PushOutcome {
-                parked: false,
-                evicted,
-            };
+            self.evict_expired(now);
+        }
+        if self.len() >= self.capacity {
+            return PushOutcome { parked: false };
         }
         if let Some(checkpoint) = &self.checkpoint {
             checkpoint(&handle);
@@ -115,28 +106,16 @@ impl WarmPool {
                 handle,
                 parked_at: now,
             });
-        PushOutcome {
-            parked: true,
-            evicted,
-        }
+        PushOutcome { parked: true }
     }
 
-    /// Drops every entry parked for longer than the grace period; returns the thread ids of
-    /// the dropped entries.
-    pub(crate) fn evict_expired(&mut self, now: Instant) -> Vec<String> {
+    /// Drops every entry parked for longer than the grace period.
+    pub(crate) fn evict_expired(&mut self, now: Instant) {
         let grace = self.eviction_grace;
-        let mut evicted = Vec::new();
         self.slots.retain(|_, entries| {
-            entries.retain(|entry| {
-                let stale = is_stale(entry, now, grace);
-                if stale {
-                    evicted.push(entry.handle.id().value.clone());
-                }
-                !stale
-            });
+            entries.retain(|entry| !is_stale(entry, now, grace));
             !entries.is_empty()
         });
-        evicted
     }
 
     /// Removes the warm entry whose handle has thread id `id`. Returns `true` when one was
@@ -248,12 +227,10 @@ mod tests {
         );
 
         // Exactly at the grace boundary the entry is still live.
-        assert!(pool.evict_expired(t0 + grace).is_empty());
-        // Past the boundary only the entry parked at t0 is stale, and its id is reported.
-        assert_eq!(
-            pool.evict_expired(t0 + Duration::from_secs(11)),
-            vec!["old".to_string()]
-        );
+        pool.evict_expired(t0 + grace);
+        assert_eq!(pool.len(), 2);
+        // Past the boundary only the entry parked at t0 is stale.
+        pool.evict_expired(t0 + Duration::from_secs(11));
         assert_eq!(pool.len(), 1);
         assert!(pool
             .pop(&kind("coder"), t0 + Duration::from_secs(11))
@@ -287,18 +264,17 @@ mod tests {
             t0 + Duration::from_secs(11),
         );
         assert!(outcome.parked);
-        assert_eq!(outcome.evicted, vec!["t1".to_string()]);
         assert_eq!(pool.len(), 1);
     }
 
     #[test]
-    fn rejected_push_reports_no_eviction_when_nothing_is_stale() {
+    fn rejected_push_leaves_the_pool_unchanged() {
         let t0 = Instant::now();
         let mut pool = WarmPool::new(1, Duration::from_secs(10));
         assert!(pool.push(&kind("coder"), handle("t1", "coder"), t0).parked);
         let outcome = pool.push(&kind("coder"), handle("t2", "coder"), t0);
         assert!(!outcome.parked);
-        assert!(outcome.evicted.is_empty());
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]

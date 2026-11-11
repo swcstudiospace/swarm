@@ -55,6 +55,11 @@ pub(crate) fn assert_scales(
     mut parts: impl FnMut(),
     mut whole: impl FnMut(),
 ) {
+    // Without thread CPU accounting `measure` falls back to wall time, which counts a busy host's neighbours. The scaling
+    // claim cannot be measured then, so the assertion is skipped.
+    if cpu_time().is_none() {
+        return;
+    }
     // Double the repetitions until even the less disturbed of two timings spans the floor.
     let mut reps = 1u32;
     while reps < 1 << 24 {
@@ -96,10 +101,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs Linux CPU accounting (/proc/thread-self/schedstat); no CPU-time seam off Linux"
+    )]
     fn measure_counts_cpu_time_not_waiting() {
-        if cpu_time().is_none() {
-            return; // wall-clock fallback: sleeping is time
-        }
         let slept = best_of(5, Duration::from_millis(30), || {
             std::thread::sleep(Duration::from_millis(60))
         });

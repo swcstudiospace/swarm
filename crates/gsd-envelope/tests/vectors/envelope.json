@@ -9920,7 +9920,7 @@
    },
    "name": "bad_seed/real_secret/no_opt_in/no_require",
    "python": {
-    "config_error": null,
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": true
    }
@@ -9933,7 +9933,7 @@
    },
    "name": "bad_seed/real_secret/no_opt_in/require",
    "python": {
-    "config_error": null,
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": true
    }
@@ -9946,7 +9946,7 @@
    },
    "name": "bad_seed/real_secret/opt_in/no_require",
    "python": {
-    "config_error": null,
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": true
    }
@@ -9960,7 +9960,7 @@
    },
    "name": "bad_seed/real_secret/opt_in/require",
    "python": {
-    "config_error": null,
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": true
    }
@@ -9972,7 +9972,7 @@
    },
    "name": "bad_seed/dev_value_secret/no_opt_in/no_require",
    "python": {
-    "config_error": null,
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": false
    }
@@ -9985,7 +9985,7 @@
    },
    "name": "bad_seed/dev_value_secret/no_opt_in/require",
    "python": {
-    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": false
    }
@@ -9998,7 +9998,7 @@
    },
    "name": "bad_seed/dev_value_secret/opt_in/no_require",
    "python": {
-    "config_error": null,
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": false
    }
@@ -10012,7 +10012,7 @@
    },
    "name": "bad_seed/dev_value_secret/opt_in/require",
    "python": {
-    "config_error": "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured",
+    "config_error": "fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
     "dev_key_active": false,
     "real_key_configured": false
    }
@@ -10875,11 +10875,10 @@
     "SWARM_ED25519_KEY": "@ed-a|trunc",
     "SWARM_SIGNING_KEY": "@hmac-a"
    },
-   "name": "ed25519_bad_seed_with_hmac_uses_hmac/plain",
+   "name": "ed25519_bad_seed_with_hmac_fails_closed/plain",
    "python": {
-    "dev_key_audit": false,
-    "ok": true,
-    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+    "error": "E-POLICY: fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "ok": false
    },
    "rust": "match"
   },
@@ -10889,11 +10888,10 @@
     "SWARM_ED25519_KEY": "@ed-a|trunc",
     "SWARM_SIGNING_KEY": "@hmac-a"
    },
-   "name": "ed25519_bad_seed_with_hmac_uses_hmac/unicode",
+   "name": "ed25519_bad_seed_with_hmac_fails_closed/unicode",
    "python": {
-    "dev_key_audit": false,
-    "ok": true,
-    "sig": "hmac:175J49JtNvyeN/iV+lTQ/wbsMjGSWoqumbAtEmt2coo="
+    "error": "E-POLICY: fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "ok": false
    },
    "rust": "match"
   },
@@ -10906,9 +10904,8 @@
    },
    "name": "ed25519_bad_seed_require_with_hmac/plain",
    "python": {
-    "dev_key_audit": false,
-    "ok": true,
-    "sig": "hmac:ZkAhYiyWjZfGRvjVBSLfaFaczIsEPVdPP9837ZW5ZC0="
+    "error": "E-POLICY: fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "ok": false
    },
    "rust": "match"
   },
@@ -10921,9 +10918,8 @@
    },
    "name": "ed25519_bad_seed_require_with_hmac/unicode",
    "python": {
-    "dev_key_audit": false,
-    "ok": true,
-    "sig": "hmac:175J49JtNvyeN/iV+lTQ/wbsMjGSWoqumbAtEmt2coo="
+    "error": "E-POLICY: fail-closed: SWARM_ED25519_KEY is set but cannot be loaded (cryptography missing or seed is not 32-byte hex)",
+    "ok": false
    },
    "rust": "match"
   },

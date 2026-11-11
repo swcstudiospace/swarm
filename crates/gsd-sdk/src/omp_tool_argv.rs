@@ -10,6 +10,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gsd_codes::ErrorCode;
 use serde::Deserialize;
@@ -281,25 +282,24 @@ pub fn tool_call_args(
     args
 }
 
-/// Compact JSON text of a tool input, after the size and depth checks (`tools.ts:496-498`).
+/// Compact JSON text of a tool input, after the depth and size checks (`tools.ts:496-498`).
 ///
-/// The size limit is the UTF-8 byte length of the text, inclusive. The depth limit is
-/// `MAX_JSON_DEPTH`.
+/// The depth is checked first, so the serialiser never recurses past `MAX_JSON_DEPTH`. The
+/// serialiser stops at the size cap, so an oversize input is refused without building its full
+/// text. The size limit is the UTF-8 byte length of the text, inclusive.
 pub fn check_tool_input(input: &Value) -> Result<String, BridgeError> {
-    let text = js_stringify(input, false);
-    if text.len() > MAX_TOOL_INPUT_BYTES {
-        return Err(BridgeError::new(
-            ErrorCode::Input,
-            format!("swarm_tool_call input exceeds {MAX_TOOL_INPUT_BYTES} bytes"),
-        ));
-    }
     if json_depth(input) > MAX_JSON_DEPTH {
         return Err(BridgeError::new(
             ErrorCode::Input,
             format!("swarm_tool_call input nests deeper than {MAX_JSON_DEPTH} levels"),
         ));
     }
-    Ok(text)
+    js_stringify_within(input, false, MAX_TOOL_INPUT_BYTES).ok_or_else(|| {
+        BridgeError::new(
+            ErrorCode::Input,
+            format!("swarm_tool_call input exceeds {MAX_TOOL_INPUT_BYTES} bytes"),
+        )
+    })
 }
 
 /// Parameters of `swarm_tool_call`. Unknown fields are rejected.
@@ -384,14 +384,47 @@ pub fn write_input_file(
         .collect();
     let path = results.join(format!("{}-{sanitised}.json", kind.as_str()));
     let text = js_stringify(value, true);
-    fs::write(&path, text)
-        .map_err(|e| io_error(&format!("cannot write {}", path.display()), &e))?;
+    write_new_file(&path, text.as_bytes())?;
     path.into_os_string().into_string().map_err(|_| {
         BridgeError::new(
             ErrorCode::Internal,
             "result path is not valid UTF-8".to_owned(),
         )
     })
+}
+
+/// Counts temporary result files, so each name this process picks is distinct.
+static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+
+/// Writes `bytes` to `path` without following a symlink: a symlink at `path` is refused. The bytes
+/// go to a temporary file created exclusively in the same directory, which is renamed over `path`.
+/// A link planted at the temporary name cannot be followed, because creation fails instead.
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), BridgeError> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(BridgeError::new(
+            ErrorCode::Internal,
+            format!("refusing to write through symlink {}", path.display()),
+        ));
+    }
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| io_error(&format!("cannot create {}", temp.display()), &e))?;
+    let result = file.write_all(bytes).and_then(|()| fs::rename(&temp, path));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(io_error(
+            &format!("cannot write {}", path.display()),
+            &error,
+        ));
+    }
+    Ok(())
 }
 
 /// Text returned to the agent: `FAIL: <summary>` for exit 1 only, then each extra line
@@ -509,12 +542,38 @@ fn io_error(context: &str, error: &std::io::Error) -> BridgeError {
 /// `JSON.stringify(value)`, or `JSON.stringify(value, null, 2)` when `pretty` is set. Numbers go
 /// through [`js_number`], because serde_json writes an integral `f64` as `N.0`.
 fn js_stringify(value: &Value, pretty: bool) -> String {
-    let mut out = String::new();
-    write_js(value, pretty, 0, &mut out);
-    out
+    js_stringify_within(value, pretty, usize::MAX).unwrap_or_default()
 }
 
-fn write_js(value: &Value, pretty: bool, depth: usize, out: &mut String) {
+/// [`js_stringify`], or `None` once the text would pass `cap` bytes. Writing stops at the first
+/// token that crosses the cap, so an oversize value is never serialised in full.
+fn js_stringify_within(value: &Value, pretty: bool, cap: usize) -> Option<String> {
+    let mut out = String::new();
+    write_js(value, pretty, 0, &mut out, cap).ok()?;
+    room(&out, cap).ok()?;
+    Some(out)
+}
+
+/// Marks that the output passed its byte cap, where writing stops.
+struct OverCap;
+
+/// Fails once `out` holds more than `cap` bytes.
+fn room(out: &str, cap: usize) -> Result<(), OverCap> {
+    if out.len() > cap {
+        Err(OverCap)
+    } else {
+        Ok(())
+    }
+}
+
+fn write_js(
+    value: &Value,
+    pretty: bool,
+    depth: usize,
+    out: &mut String,
+    cap: usize,
+) -> Result<(), OverCap> {
+    room(out, cap)?;
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
@@ -522,7 +581,7 @@ fn write_js(value: &Value, pretty: bool, depth: usize, out: &mut String) {
             Some(float) => out.push_str(&js_number(float)),
             None => out.push_str(&number.to_string()),
         },
-        Value::String(text) => write_js_string(text, out),
+        Value::String(text) => write_js_string(text, out, cap)?,
         Value::Array(items) => {
             out.push('[');
             for (index, item) in items.iter().enumerate() {
@@ -530,7 +589,7 @@ fn write_js(value: &Value, pretty: bool, depth: usize, out: &mut String) {
                     out.push(',');
                 }
                 break_line(pretty, depth + 1, out);
-                write_js(item, pretty, depth + 1, out);
+                write_js(item, pretty, depth + 1, out, cap)?;
             }
             if !items.is_empty() {
                 break_line(pretty, depth, out);
@@ -544,9 +603,9 @@ fn write_js(value: &Value, pretty: bool, depth: usize, out: &mut String) {
                     out.push(',');
                 }
                 break_line(pretty, depth + 1, out);
-                write_js_string(key, out);
+                write_js_string(key, out, cap)?;
                 out.push_str(if pretty { ": " } else { ":" });
-                write_js(item, pretty, depth + 1, out);
+                write_js(item, pretty, depth + 1, out, cap)?;
             }
             if !map.is_empty() {
                 break_line(pretty, depth, out);
@@ -554,6 +613,7 @@ fn write_js(value: &Value, pretty: bool, depth: usize, out: &mut String) {
             out.push('}');
         }
     }
+    Ok(())
 }
 
 /// A new line indented to `depth` in pretty output. Compact output has none.
@@ -564,10 +624,12 @@ fn break_line(pretty: bool, depth: usize, out: &mut String) {
     }
 }
 
-/// A JSON string literal, escaped as `JSON.stringify` escapes it.
-fn write_js_string(text: &str, out: &mut String) {
+/// A JSON string literal, escaped as `JSON.stringify` escapes it. Stops once the output passes
+/// `cap` bytes, so an oversize string is never escaped in full.
+fn write_js_string(text: &str, out: &mut String, cap: usize) -> Result<(), OverCap> {
     out.push('"');
     for ch in text.chars() {
+        room(out, cap)?;
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -583,6 +645,7 @@ fn write_js_string(text: &str, out: &mut String) {
         }
     }
     out.push('"');
+    Ok(())
 }
 
 /// `Number.prototype.toString` for a finite number, as `JSON.stringify` writes it. The digits are
@@ -1063,6 +1126,21 @@ mod tests {
         fs::write(&gitignore, "keep").unwrap();
         write_input_file(&dir, InputKind::Ingest, "c2", &json!({})).unwrap();
         assert_eq!(fs::read_to_string(&gitignore).unwrap(), "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn findings_write_refuses_planted_symlink() {
+        let dir = scratch("symlink");
+        let results = dir.join("results");
+        fs::create_dir_all(&results).unwrap();
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, results.join("findings-s1.json")).unwrap();
+        let err = write_input_file(&dir, InputKind::Findings, "s1", &json!({"a": 1})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("symlink"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
     }
 
     #[test]

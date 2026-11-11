@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use gsd_governor::{Governor, GovernorError};
-use gsd_pool::{ChatPool, Placement as PoolPlacement, ThreadPhase};
+use gsd_pool::{ChatError, ChatPool, Placement as PoolPlacement, ThreadPhase};
 use gsd_proto::gsd::v1::{BudgetRequest, BudgetSnapshot, SessionState, SubagentType, ThreadState};
 
 use crate::session_dispatch::DispatchError;
@@ -57,9 +57,6 @@ pub enum TeardownError {
     /// The governor refused the settlement.
     #[error("governor: {0}")]
     Governor(#[from] GovernorError),
-    /// The chat pool refused an open, close or park. Carries the pool error text.
-    #[error("pool: {0}")]
-    Pool(String),
 }
 
 /// Where a torn-down thread goes.
@@ -132,21 +129,22 @@ pub struct TeardownReport {
     pub overrun: bool,
 }
 
-/// Tears down thread `request.thread_id`: checks the release, parks its handle in `pool` (or destroys
-/// it), returns its unused reservation through `governor`, then removes the thread from the session.
+/// Tears down thread `request.thread_id`: checks the release, returns its unused reservation through
+/// `governor`, parks its handle in `pool` (or destroys it), then removes the thread from the session.
 ///
-/// A refusal before the pool step changes nothing. Those refusals are `InvalidAmounts`,
-/// `MissingSessionId`, `MissingBudget`, `UnknownThread`, `Dispatch`, `Live` and `NoHandle`, and the
-/// governor's `check_release` refusal, which runs only when something is unused and surfaces as
-/// `Governor(UnknownReservation)` when the pair has no reservation. The check runs before the pool
-/// step, so a thread is never parked for a release already known to be refused. A pool refusal
-/// (`Pool`) also changes nothing: nothing is parked and no release is made.
+/// A refusal before any change: `InvalidAmounts`, `MissingSessionId`, `MissingBudget`, `UnknownThread`,
+/// `Dispatch`, `Live` and `NoHandle`, and the governor's `check_release` refusal, which runs only when
+/// something is unused and surfaces as `Governor(UnknownReservation)` when the pair has no reservation.
+/// The check is read-only, so a refused teardown can be retried.
 ///
-/// `release_unused` runs after the park, so a refusal there does not undo the park. An
-/// `UnknownReservation` from the release means a concurrent release drained the pair after the check:
-/// the report shows zero, no snapshot refund is applied, and the teardown succeeds. Any other governor
-/// refusal is returned after the park: with `ReleaseToPool` the handle stays parked, the thread stays
-/// in the session, and no refund is applied. A second call for a removed thread is refused as
+/// The release runs before the park. A refusal from `release_unused` therefore parks nothing: the thread
+/// stays in the session, no refund is applied, and the teardown can be retried. An `UnknownReservation`
+/// from the release means a concurrent release drained the pair after the check: the report shows zero,
+/// no snapshot refund is applied, and the teardown succeeds.
+///
+/// Once the release has returned the budget, the session drops the thread whatever the pool does. When the
+/// pool refuses the park (for example a live id it already holds, or a shutdown), the placement is
+/// `Destroyed` and the refund stands. A second call for a removed thread is refused as
 /// [`TeardownError::UnknownThread`] and settles nothing again.
 pub async fn teardown_thread(
     state: &mut SessionState,
@@ -182,8 +180,7 @@ pub async fn teardown_thread(
         Disposition::Destroy => None,
     };
     let (unused, overrun) = settle_amounts(request.reserved, request.consumed);
-    // The check is read-only, so a refusal here changes nothing. It runs before the pool step, so no
-    // thread is parked for a release that is already known to be refused.
+    // The check is read-only, so a refusal here changes nothing.
     if unused != Amounts::default() {
         governor.check_release(
             &session_id,
@@ -194,34 +191,54 @@ pub async fn teardown_thread(
             unused.cost_usd,
         )?;
     }
-    // The pool step refuses without changing anything; it runs before the release.
-    let pool_placement = match &identity {
-        Some((pool_thread_id, subagent_type)) => Some(
-            pool.park_fresh(pool_thread_id, subagent_type.clone(), request.now)
-                .map_err(|err| TeardownError::Pool(err.to_string()))?,
-        ),
-        None => None,
-    };
+    // The release comes before the park: a refusal here parks nothing, so the teardown can be retried.
     let refunded = if unused == Amounts::default() {
         Amounts::default()
     } else {
         release_unused(governor, &session_id, thread_id, unused).await?
+    };
+    // The budget is back, so the session drops the thread whatever the pool does. A park the pool refuses
+    // (a live id it already holds, or a shutdown) destroys the thread, and the refund stands.
+    let placement = match &identity {
+        Some((pool_thread_id, subagent_type)) => {
+            match pool.park_fresh(pool_thread_id, subagent_type.clone(), request.now) {
+                Ok(PoolPlacement::Parked) => Placement::ReleasedToPool,
+                Ok(PoolPlacement::Closed) => Placement::Destroyed,
+                Err(error) => {
+                    log_refused_park(thread_id, &error);
+                    Placement::Destroyed
+                }
+            }
+        }
+        None => Placement::Destroyed,
     };
     if let Some(snapshot) = state.budget_snapshot.as_mut() {
         refund(snapshot, refunded);
     }
     state.threads.remove(thread_id);
 
-    let placement = match pool_placement {
-        Some(PoolPlacement::Parked) => Placement::ReleasedToPool,
-        Some(PoolPlacement::Closed) | None => Placement::Destroyed,
-    };
     Ok(TeardownReport {
         thread_id: thread_id.to_string(),
         placement,
         refunded,
         overrun,
     })
+}
+
+/// Logs a park the pool refused after the release. A shutdown is routine. Any other refusal, such as a live id the pool
+/// already holds, means the session's thread id is live under another owner, an invariant break.
+fn log_refused_park(thread_id: &str, error: &ChatError) {
+    match error {
+        ChatError::ShuttingDown => {
+            tracing::warn!(
+                thread = thread_id,
+                "park refused during shutdown; the thread is destroyed"
+            );
+        }
+        other => {
+            tracing::error!(thread = thread_id, error = %other, "park refused; the thread is destroyed");
+        }
+    }
 }
 
 /// Returns `true` when any amount is negative or the cost is not finite.
@@ -497,41 +514,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_pool_step_changes_nothing() -> TestResult {
+    async fn a_refused_park_after_the_release_destroys_the_thread() -> TestResult {
         let governor = Governor::new(GovernorConfig::default());
         let mut state = finished(&governor, 1000).await?;
         let pool = test_pool(1)?;
-        // A live thread already holds the id this teardown would park, so the pool step refuses first.
+        // A live thread already holds the id this teardown would park, so the park is refused after the release.
         pool.open_thread(
             "th1",
             SubagentType {
                 value: "w".to_string(),
             },
         )?;
-        let before = state.budget_snapshot;
 
-        let refused = teardown_thread(
+        let report = teardown_thread(
             &mut state,
             &governor,
             &pool,
             request(
                 Disposition::ReleaseToPool,
                 reserved(1000),
-                consumed(1000),
+                consumed(0),
                 Instant::now(),
             ),
         )
-        .await;
+        .await?;
 
-        assert!(
-            matches!(refused, Err(TeardownError::Pool(_))),
-            "{refused:?}"
-        );
-        assert!(
-            state.threads.contains_key("th1"),
-            "the session still holds its thread"
-        );
-        assert_eq!(state.budget_snapshot, before, "no refund was applied");
+        // The release came first and its refund stands. The park was refused, so the session drops the thread.
+        assert_eq!(report.placement, Placement::Destroyed);
+        assert_eq!(report.refunded.tokens, 1000);
+        assert!(!state.threads.contains_key("th1"));
         Ok(())
     }
 
@@ -664,7 +675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_governor_without_the_reservation_refuses_before_the_pool_step() -> TestResult {
+    async fn a_governor_without_the_reservation_refuses_before_any_change() -> TestResult {
         let governor_a = Governor::new(GovernorConfig::default());
         let mut state = finished(&governor_a, 1000).await?;
         // A governor that never reserved this pair cannot return its budget.
@@ -707,7 +718,7 @@ mod tests {
             },
         )?;
 
-        // The check still refuses before the pool step, so a retry settles nothing either.
+        // The check still refuses before any change, so a retry settles nothing either.
         let again = teardown_thread(
             &mut state,
             &governor_b,

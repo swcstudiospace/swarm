@@ -32,7 +32,7 @@ pub use policy_config::*;
 pub use ready_frontier::*;
 pub use semaphore::*;
 
-use gsd_proto::gsd::v1::{SchedulingPolicy, TaskId};
+use gsd_proto::gsd::v1::TaskId;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -110,13 +110,16 @@ struct Lease {
     thread_id: String,
     budget_thread: String,
 }
-
+/// Pending refund that failed after the lease was removed (M2). Retry of `complete` for the same
+/// id resumes only the outstanding refund (no second DAG mark or chat release).
+struct PendingRefund {
+    budget_thread: String,
+}
 /// Matrix Scheduler
 pub struct MatrixScheduler {
     dag: Arc<RwLock<TaskDag>>,
     chat_pool: Arc<gsd_pool::ChatPool>,
     governor: Arc<gsd_governor::Governor>,
-    policy: Arc<RwLock<Box<dyn SchedulingPolicyTrait>>>,
     semaphores: Arc<SemaphoreManager>,
     metrics: Arc<SchedulerMetrics>,
     /// Lease per task id. `submit` inserts it and `complete` removes it.
@@ -124,29 +127,44 @@ pub struct MatrixScheduler {
     /// Ids whose admission is in progress: in the DAG but not yet acquired. A pending task is
     /// refused as a dependency and is left off `get_frontier`.
     pending: parking_lot::Mutex<HashSet<String>>,
+    /// Pending refunds (M2) that failed after lease removal. `complete` for the same id resumes
+    /// only the outstanding refund (no second DAG mark or chat release).
+    pending_refunds: parking_lot::Mutex<HashMap<String, PendingRefund>>,
+    #[cfg(test)]
+    fail_next_refund: std::sync::atomic::AtomicBool,
 }
 
 impl MatrixScheduler {
     pub fn new(chat_pool: Arc<gsd_pool::ChatPool>, governor: Arc<gsd_governor::Governor>) -> Self {
-        let policy = match SchedulingPolicy::CriticalPathThroughputHybrid {
-            gsd_proto::gsd::v1::SchedulingPolicy::CriticalPathThroughputHybrid => {
-                Box::new(CriticalPathThroughputHybridPolicy::new())
-                    as Box<dyn SchedulingPolicyTrait>
-            }
-            _ => Box::new(CriticalPathThroughputHybridPolicy::new())
-                as Box<dyn SchedulingPolicyTrait>,
-        };
-
         Self {
             dag: Arc::new(RwLock::new(TaskDag::new())),
             chat_pool,
             governor,
-            policy: Arc::new(RwLock::new(policy)),
             semaphores: Arc::new(SemaphoreManager::new()),
             metrics: Arc::new(SchedulerMetrics::new()),
             leases: parking_lot::Mutex::new(HashMap::new()),
             pending: parking_lot::Mutex::new(HashSet::new()),
+            pending_refunds: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_next_refund: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_fail_next_refund(&self) {
+        self.fail_next_refund
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(not(test))]
+    fn should_fail_next_refund(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn should_fail_next_refund(&self) -> bool {
+        self.fail_next_refund
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reserves the task budget, admits the task and takes a chat-thread lease for it. On `Err`,
@@ -236,7 +254,16 @@ impl MatrixScheduler {
         let mut pending = self.pending.lock();
         pending.remove(id);
         if !admitted {
-            self.dag.write().remove_task(id);
+            let removed = self.dag.write().remove_task(id);
+            // A pending node has no dependents: dependents cannot attach to it, and this node stayed pending under the
+            // lock until now. A refusal would mean that invariant is broken.
+            debug_assert!(
+                removed.is_ok(),
+                "a refused admission found dependents: {removed:?}"
+            );
+            if let Err(err) = removed {
+                tracing::error!(task = id, error = %err, "a refused admission left its node in the DAG");
+            }
         }
     }
 
@@ -292,6 +319,43 @@ impl MatrixScheduler {
     /// settles the DAG and refunds the reservation, and then returns that refusal. While a
     /// `complete` for an id is in flight, a second call for that id returns `TaskNotFound`.
     pub async fn complete(&self, task_id: &TaskId, outcome: LeaseOutcome) -> SchedulerResult<()> {
+        // M2: if this id has a pending refund from a prior failed complete (after lease removal),
+        // resume *only* the outstanding refund. No second DAG mark or chat release.
+        let pending_refund = self.pending_refunds.lock().remove(&task_id.value);
+        if let Some(pending) = pending_refund {
+            let do_fail = self.should_fail_next_refund();
+            let refunded = if do_fail {
+                Err(gsd_governor::GovernorError::Other("test injected".into()))
+            } else {
+                self.governor
+                    .release_budget(
+                        SESSION_ID,
+                        &pending.budget_thread,
+                        TASK_TOKENS,
+                        TASK_WALL_TIME_MS,
+                        TASK_TOOL_CALLS,
+                        TASK_COST_USD,
+                    )
+                    .await
+            };
+            match refunded {
+                Ok(_) => return Ok(()),
+                Err(gsd_governor::GovernorError::UnknownReservation(detail)) => {
+                    tracing::warn!(
+                        task = %task_id.value,
+                        %detail,
+                        "pending refund found no reservation; nothing to refund"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    self.pending_refunds
+                        .lock()
+                        .insert(task_id.value.clone(), pending);
+                    return Err(SchedulerError::Other(err.to_string()));
+                }
+            }
+        }
         // The guard is a temporary of this statement, so it is released before the await.
         let lease = self
             .leases
@@ -313,17 +377,21 @@ impl MatrixScheduler {
             LeaseOutcome::Failed | LeaseOutcome::Cancelled => self.dag.write().mark_failed(task_id),
         };
         // The lease is gone, so its reservation returns whether or not the thread release succeeded.
-        let refunded = self
-            .governor
-            .release_budget(
-                SESSION_ID,
-                &lease.budget_thread,
-                TASK_TOKENS,
-                TASK_WALL_TIME_MS,
-                TASK_TOOL_CALLS,
-                TASK_COST_USD,
-            )
-            .await;
+        let do_fail = self.should_fail_next_refund();
+        let refunded = if do_fail {
+            Err(gsd_governor::GovernorError::Other("test injected".into()))
+        } else {
+            self.governor
+                .release_budget(
+                    SESSION_ID,
+                    &lease.budget_thread,
+                    TASK_TOKENS,
+                    TASK_WALL_TIME_MS,
+                    TASK_TOOL_CALLS,
+                    TASK_COST_USD,
+                )
+                .await
+        };
         let refund = match refunded {
             Ok(_) => Ok(()),
             Err(gsd_governor::GovernorError::UnknownReservation(detail)) => {
@@ -335,7 +403,17 @@ impl MatrixScheduler {
                 );
                 Ok(())
             }
-            Err(err) => Err(SchedulerError::Other(err.to_string())),
+            Err(err) => {
+                // M2: retain the pending refund (lease already removed above). A subsequent
+                // complete for the same task_id will resume only this outstanding settlement.
+                self.pending_refunds.lock().insert(
+                    task_id.value.clone(),
+                    PendingRefund {
+                        budget_thread: lease.budget_thread.clone(),
+                    },
+                );
+                Err(SchedulerError::Other(err.to_string()))
+            }
         };
         let placement = match released {
             Ok(placement) => placement,
@@ -385,18 +463,6 @@ impl MatrixScheduler {
             .into_iter()
             .filter(|task| !pending.contains(&task.value))
             .collect()
-    }
-
-    pub fn set_policy(&self, policy: SchedulingPolicy) {
-        let policy_impl = match policy {
-            gsd_proto::gsd::v1::SchedulingPolicy::CriticalPathThroughputHybrid => {
-                Box::new(CriticalPathThroughputHybridPolicy::new())
-                    as Box<dyn SchedulingPolicyTrait>
-            }
-            _ => Box::new(CriticalPathThroughputHybridPolicy::new())
-                as Box<dyn SchedulingPolicyTrait>,
-        };
-        *self.policy.write() = policy_impl;
     }
 
     pub fn metrics(&self) -> &SchedulerMetrics {
@@ -496,14 +562,14 @@ fn refusal_of(err: gsd_governor::GovernorError) -> gsd_pool::BudgetRefusal {
     use gsd_governor::GovernorError;
     use gsd_pool::BudgetRefusal;
     match err {
-        GovernorError::BudgetExceeded(m)
-        | GovernorError::QuotaExceeded(m)
-        | GovernorError::CostLimitExceeded(m) => BudgetRefusal::Exceeded(m),
+        GovernorError::BudgetExceeded(m) | GovernorError::CostLimitExceeded(m) => {
+            BudgetRefusal::Exceeded(m)
+        }
         GovernorError::RateLimitExceeded(m) => BudgetRefusal::RateLimited(m),
+        GovernorError::QuotaExceeded(m) => BudgetRefusal::Quota(m),
         GovernorError::InvalidBudget(m) => BudgetRefusal::Invalid(m),
-        GovernorError::Unauthorized(m)
-        | GovernorError::Other(m)
-        | GovernorError::UnknownReservation(m) => BudgetRefusal::Other(m),
+        GovernorError::Unauthorized(m) => BudgetRefusal::Unauthorized(m),
+        GovernorError::Other(m) | GovernorError::UnknownReservation(m) => BudgetRefusal::Other(m),
     }
 }
 
@@ -584,7 +650,7 @@ mod governor_budget_tests {
         ));
         assert!(matches!(
             refusal_of(GovernorError::QuotaExceeded(String::new())),
-            BudgetRefusal::Exceeded(_)
+            BudgetRefusal::Quota(_)
         ));
         assert!(matches!(
             refusal_of(GovernorError::CostLimitExceeded(String::new())),
@@ -600,7 +666,7 @@ mod governor_budget_tests {
         ));
         assert!(matches!(
             refusal_of(GovernorError::Unauthorized(String::new())),
-            BudgetRefusal::Other(_)
+            BudgetRefusal::Unauthorized(_)
         ));
         assert!(matches!(
             refusal_of(GovernorError::Other(String::new())),
@@ -873,6 +939,40 @@ mod lease_tests {
             }
             other => panic!("expected BudgetExhausted, got {other:?}"),
         }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn complete_refund_error_retains_for_retry_and_refund_happens_exactly_once(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = scheduler(1)?;
+        scheduler.set_fail_next_refund();
+        let snap0 = scheduler.governor.get_budget_snapshot(SESSION_ID)?;
+        scheduler.submit(task("t1")).await?;
+        let first = scheduler
+            .complete(&task_id("t1"), LeaseOutcome::Succeeded)
+            .await;
+        assert!(
+            first.is_err(),
+            "first complete must hit injected refund error and retain"
+        );
+        let snap1 = scheduler.governor.get_budget_snapshot(SESSION_ID)?;
+        assert_eq!(snap0, snap1, "reservation still held after failed refund");
+        let second = scheduler
+            .complete(&task_id("t1"), LeaseOutcome::Succeeded)
+            .await;
+        assert!(
+            second.is_ok(),
+            "second complete resumes the pending refund exactly once"
+        );
+        let snap2 = scheduler.governor.get_budget_snapshot(SESSION_ID)?;
+        assert_ne!(snap1, snap2, "reservation released exactly once on retry");
+        // third should be TaskNotFound (no lease, no pending)
+        assert!(matches!(
+            scheduler
+                .complete(&task_id("t1"), LeaseOutcome::Succeeded)
+                .await,
+            Err(SchedulerError::TaskNotFound(_))
+        ));
         Ok(())
     }
 }

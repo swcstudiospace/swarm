@@ -607,24 +607,28 @@ mod tests {
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (r, p) = (Arc::clone(&running), Arc::clone(&peak));
+        // The cap's thirty workers meet here, so thirty are in flight at once by construction, not by a 5 ms race with dispatch.
+        let meet = Arc::new(tokio::sync::Barrier::new(30));
         let mut config = DispatchConfig {
             requested_parallel: 64,
             ..Default::default()
         };
         // Python's select_batch limits an agent with no manifest max_parallel to one session; grant "w" the full cap.
         config.agent_max_parallel.insert("w".to_string(), 64);
-        let report = run_force_parallel(built(tasks), config, move |_t: Task| {
-            let (r, p) = (Arc::clone(&r), Arc::clone(&p));
+        let run = run_force_parallel(built(tasks), config, move |_t: Task| {
+            let (r, p, m) = (Arc::clone(&r), Arc::clone(&p), Arc::clone(&meet));
             async move {
                 let now = r.fetch_add(1, Ordering::SeqCst) + 1;
                 p.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                m.wait().await;
                 r.fetch_sub(1, Ordering::SeqCst);
                 Ok(())
             }
-        })
-        .await
-        .expect("dispatch");
+        });
+        let report = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the cap's thirty workers never all met at the barrier")
+            .expect("dispatch");
         assert_eq!(report.outcomes.len(), 60);
         assert!(report
             .outcomes
@@ -1113,8 +1117,14 @@ mod tests {
         let log = log.lock().expect("log").clone();
         let at = |event: &str| log.iter().position(|e| e == event).expect(event);
         assert_eq!(report.dispatch_order, vec!["a", "c", "b"]);
-        assert!(at("start:c") < at("end:a"), "c must start while a runs: {log:?}");
-        assert!(at("end:a") < at("start:b"), "b waits for its dependency a: {log:?}");
+        assert!(
+            at("start:c") < at("end:a"),
+            "c must start while a runs: {log:?}"
+        );
+        assert!(
+            at("end:a") < at("start:b"),
+            "b waits for its dependency a: {log:?}"
+        );
         assert!(at("start:b") < at("end:c"), "b must overlap c: {log:?}");
         assert!(report.undispatched.is_empty());
         assert_eq!(report.max_in_flight, 2);
@@ -1124,7 +1134,16 @@ mod tests {
     async fn peak_concurrency_is_min_of_tasks_and_cap_for_several_sizes() {
         // (tasks, requested parallelism). The cap is effective_global_cap(requested). Each run must reach
         // exactly min(tasks, cap) concurrent workers: the gate stalls any run that falls short.
-        let cases: [(usize, usize); 8] = [(1, 4), (3, 8), (5, 2), (7, 1), (10, 4), (30, 30), (40, 32), (60, 64)];
+        let cases: [(usize, usize); 8] = [
+            (1, 4),
+            (3, 8),
+            (5, 2),
+            (7, 1),
+            (10, 4),
+            (30, 30),
+            (40, 32),
+            (60, 64),
+        ];
         for (n, requested) in cases {
             let expected = n.min(effective_global_cap(requested));
             let overlap = Arc::new(Overlap::default());
@@ -1144,9 +1163,14 @@ mod tests {
             });
             let report = tokio::time::timeout(Duration::from_secs(5), run)
                 .await
-                .unwrap_or_else(|_| panic!("n={n} requested={requested}: stalled short of {expected}"))
+                .unwrap_or_else(|_| {
+                    panic!("n={n} requested={requested}: stalled short of {expected}")
+                })
                 .expect("dispatch");
-            assert_eq!(report.max_in_flight, expected, "n={n} requested={requested}");
+            assert_eq!(
+                report.max_in_flight, expected,
+                "n={n} requested={requested}"
+            );
             assert_eq!(
                 overlap.peak.load(Ordering::SeqCst),
                 expected,
