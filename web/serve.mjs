@@ -7,12 +7,13 @@
 // Usage: node serve.mjs [port]
 
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const config = JSON.parse(await readFile(join(here, "headers.config.json"), "utf8"));
+const realHere = await realpath(here);
 
 const TYPES = {
   ".mjs": "text/javascript; charset=utf-8",
@@ -38,6 +39,11 @@ export function startServer({ isolated = true, port = 0 } = {}) {
   const extra = isolated ? config.headers : {};
   const server = createServer(async (request, response) => {
     try {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        response.writeHead(405, { ...extra, allow: "GET, HEAD" });
+        response.end();
+        return;
+      }
       const url = new URL(request.url ?? "/", "http://localhost");
       if (url.pathname === "/") {
         response.writeHead(200, { ...extra, "content-type": TYPES[".html"] });
@@ -60,8 +66,14 @@ export function startServer({ isolated = true, port = 0 } = {}) {
         return;
       }
       try {
-        const body = await readFile(target);
-        response.writeHead(200, { ...extra, "content-type": TYPES[extname(target)] ?? "application/octet-stream" });
+        const real = await realpath(target);
+        if (!real.startsWith(realHere + sep)) {
+          response.writeHead(403, extra);
+          response.end();
+          return;
+        }
+        const body = await readFile(real);
+        response.writeHead(200, { ...extra, "content-type": TYPES[extname(real)] ?? "application/octet-stream" });
         response.end(body);
       } catch {
         response.writeHead(404, extra);
@@ -77,8 +89,14 @@ export function startServer({ isolated = true, port = 0 } = {}) {
       }
     }
   });
-  return new Promise((resolvePromise) => {
+  return new Promise((resolvePromise, rejectPromise) => {
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      rejectPromise(new RangeError(`port must be an integer from 0 to 65535, got ${port}`));
+      return;
+    }
+    server.once("error", rejectPromise);
     server.listen(port, "127.0.0.1", () => {
+      server.off("error", rejectPromise);
       resolvePromise({ server, url: `http://127.0.0.1:${server.address().port}` });
     });
   });

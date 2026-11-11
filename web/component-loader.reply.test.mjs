@@ -89,3 +89,28 @@ test("raw_request_with_leading_bom_gets_the_engine_reply", () => {
 test("control_plain_list_request_gets_the_engine_reply", () => {
   assertSameAnswerAsEngine(listRequest("3"), "control: plain events 3");
 });
+
+// The guest throws a plain TypeError for bytes that are not a Uint8Array (not a ComponentError payload).
+// The loader's failure keeps that error as its cause, so the original reason survives the mapping.
+test("guest_plain_error_is_kept_as_failure_cause", () => {
+  let guestError;
+  try {
+    guestInvoke(null);
+  } catch (error) {
+    guestError = error;
+  }
+  assert.ok(guestError instanceof Error, "the guest throws a plain Error for null input");
+
+  let failure;
+  try {
+    invoke(null);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof InvokeFailure, "the loader wraps the guest error in an InvokeFailure");
+  assert.equal(failure.code, "internal");
+  assert.equal(failure.message, "the guest did not complete the call");
+  assert.ok(failure.cause instanceof Error, "the failure carries the original guest error as cause");
+  assert.equal(failure.cause.name, guestError.name);
+  assert.equal(failure.cause.message, guestError.message);
+});

@@ -13,6 +13,13 @@ export const MODES = Object.freeze({
   fallback: "non-isolated-fallback",
 });
 
+/** Accepts the snapshot as a byte array or an ArrayBuffer; any other value is a caller error. */
+function binaryInput(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  throw new TypeError("snapshot bytes must be a Uint8Array or an ArrayBuffer");
+}
+
 /**
  * Returns the read route for this scope: its mode, its status, and its invoke.
  * @param {object} scope the global object of the page or worker (globalThis by default)
@@ -32,9 +39,10 @@ export function readRoute(scope = globalThis) {
       return { mode, accelerated: mode === MODES.accelerated, isolated, sharedArrayBuffer };
     },
     invoke(snapshotBytes) {
-      if (mode !== MODES.accelerated) return invoke(snapshotBytes);
+      const bytes = binaryInput(snapshotBytes);
+      if (mode !== MODES.accelerated) return invoke(bytes);
       // The loader decodes its input as a normal buffer, so the staged copy is read through one.
-      const request = Uint8Array.from(stage(snapshotBytes));
+      const request = Uint8Array.from(stage(bytes));
       const reply = invoke(request);
       return Uint8Array.from(stage(reply));
     },

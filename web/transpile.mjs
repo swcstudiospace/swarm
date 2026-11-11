@@ -9,11 +9,12 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
+const root = resolve(here, "..");
 const pin = JSON.parse(readFileSync(join(here, "jco.pin.json"), "utf8"));
 
 function fail(message) {
@@ -30,6 +31,10 @@ const digest = createHash("sha256").update(readFileSync(component)).digest("hex"
 if (digest !== pin.component_sha256) {
   fail(`component sha256 ${digest} is not the pin ${pin.component_sha256}`);
 }
+const pinnedDigest = readFileSync(join(root, pin.component_pin), "utf8").trim().split(/\s+/)[0];
+if (digest !== pinnedDigest) {
+  fail(`component sha256 ${digest} is not the pin ${pinnedDigest} in ${pin.component_pin}`);
+}
 
 const jcoPackage = join(here, "node_modules", "@bytecodealliance", "jco", "package.json");
 if (!existsSync(jcoPackage)) fail("jco is not installed: run npm install in web/");
@@ -37,38 +42,52 @@ const jcoVersion = JSON.parse(readFileSync(jcoPackage, "utf8")).version;
 if (jcoVersion !== pin.version) fail(`jco ${jcoVersion} is not the pinned ${pin.version}`);
 
 const out = join(here, "generated");
-rmSync(out, { recursive: true, force: true });
-mkdirSync(out, { recursive: true });
+const jcoBin = join(here, "node_modules", ".bin", "jco");
+// Transpile into a staging directory and move it into generated/ only after every check passes, so a
+// refused build never leaves generated/ wiped or half-written.
+let staging;
+let failure = null;
+try {
+  staging = mkdtempSync(join(here, ".generated-staging-"));
+  execFileSync(
+    jcoBin,
+    [
+      "transpile",
+      component,
+      "-o",
+      staging,
+      "--name",
+      pin.component,
+      "--no-wasi-shim",
+      "--no-nodejs-compat",
+      "--quiet",
+    ],
+    { stdio: "inherit" },
+  );
 
-execFileSync(
-  join(here, "node_modules", ".bin", "jco"),
-  [
-    "transpile",
-    component,
-    "-o",
-    out,
-    "--name",
-    pin.component,
-    "--no-wasi-shim",
-    "--no-nodejs-compat",
-    "--quiet",
-  ],
-  { stdio: "inherit" },
-);
-
-// The browser artifact may import only its own relative files, never an npm package or a Node
-// built-in.
-const specifier = /(?:from\s+|import\(\s*)["']([^"']+)["']/g;
-for (const name of readdirSync(out)) {
-  if (!name.endsWith(".js")) continue;
-  const source = readFileSync(join(out, name), "utf8");
-  for (const match of source.matchAll(specifier)) {
-    const target = match[1];
-    if (!target.startsWith("./") && !target.startsWith("../")) {
-      fail(`${name} imports a non-relative module: ${target}`);
+  // The browser artifact may import only its own relative files, never an npm package or a Node
+  // built-in. Matches `from "x"`, `import "x"` at the start of a line, and `import("x")`.
+  const specifier = /(?:\bfrom\s+|\bimport\s*\(\s*|^\s*import\s*)["']([^"']+)["']/gm;
+  for (const name of readdirSync(staging)) {
+    if (!name.endsWith(".js")) continue;
+    const source = readFileSync(join(staging, name), "utf8");
+    for (const match of source.matchAll(specifier)) {
+      const target = match[1];
+      if (!target.startsWith("./") && !target.startsWith("../")) {
+        throw new Error(`${name} imports a non-relative module: ${target}`);
+      }
     }
   }
+
+  rmSync(out, { recursive: true, force: true });
+  renameSync(staging, out);
+  staging = undefined;
+} catch (error) {
+  failure = error.message;
+} finally {
+  if (staging) rmSync(staging, { recursive: true, force: true });
 }
+if (failure !== null) fail(failure);
 
 for (const name of readdirSync(out).sort()) {
   const bytes = readFileSync(join(out, name));

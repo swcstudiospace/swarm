@@ -33,8 +33,8 @@ const CODES = new Set(["input", "timeout", "dep", "capacity", "contract", "polic
 
 /** A failed invoke: the guest's error code and its message, which never carries an input value. */
 export class InvokeFailure extends Error {
-  constructor(code, message) {
-    super(message);
+  constructor(code, message, options) {
+    super(message, options);
     this.name = "InvokeFailure";
     this.code = code;
   }
@@ -105,9 +105,9 @@ function toFailure(error) {
   if (error instanceof InvokeFailure) return error;
   const payload = error && error.payload;
   if (payload && CODES.has(payload.code) && typeof payload.message === "string") {
-    return new InvokeFailure(payload.code, payload.message);
+    return new InvokeFailure(payload.code, payload.message, { cause: error });
   }
-  return new InvokeFailure("internal", "the guest did not complete the call");
+  return new InvokeFailure("internal", "the guest did not complete the call", { cause: error });
 }
 
 /** The read route: snapshot bytes in, reply bytes out, as the server's orch_status_invoke answers. The loader refuses a request that reads as JSON and breaks the wire's object shape, depth limit or key set. Every other byte sequence reaches the guest unchanged, which decides it. */
