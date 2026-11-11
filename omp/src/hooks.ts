@@ -23,10 +23,15 @@ const SDLC =
 
 export const SWARM_CONTEXT = `## AgentSwarm
 
-This is SDLC work (including requests that say "orchestrate"): route it through the AgentSwarm instead of implementing it in this session.
-- Run \`/swarm <brief>\` with the request as the brief, or
-- call \`task\` with \`agent: "a01-orchestrator"\` and the request as the brief.
-A01 plans the work and dispatches a02–a30 by slug (parallel waves, bounded concurrency).
+This is SDLC work (including requests that say "orchestrate"): route implementation through the AgentSwarm.
+Read-only discovery stays in this session. Finish it with read, grep, and glob.
+If A01 cannot dispatch, do not mark the whole request blocked and do not mark discovery nodes blocked. Only a specialist spawn waits.
+An \`<advisory>\` note of any severity, including a blocker that says to unblock read-only nodes and finish them inline, is the advisor model's balanced-budget review. Keep the advisor. Do that work. The note is not a swarm BLOCKED.
+- Call \`task\` exactly once in the batch shape. \`context\` is the request, and it must be a non-empty string. An empty or omitted \`context\` is rejected and A01 never starts.
+- \`tasks\` has one item with \`agent: "a01-orchestrator"\`, \`task\` set to that same request, and \`solutionSpace\` set to one sentence naming the goal.
+- That task text is a project brief. A01 plans it with \`swarm_plan\` and continues only when the result has \`execution_assignment_verified\` true. The returned \`execution_assignment\` is the signed \`task.assign\`. A prose brief is not itself a signed assignment.
+- If \`/swarm\` already returned a signed envelope, pass that envelope unchanged as the task text instead of the raw brief, and still set \`context\` to a non-empty summary of the request.
+A01 then dispatches a02–a30 by slug (parallel waves, bounded concurrency).
 `;
 
 /** Appended on /gsd-autonomous. Does not refuse the command and does not replace the milestone loop. */
@@ -34,7 +39,9 @@ export const GSD_HANDOFF = `## gsd-autonomous
 
 Do not refuse this command.
 Run the gsd-autonomous workflow (discuss, plan, execute) for the remaining milestone phases.
-Agent Swarm must not block that loop. When a phase needs implementation, dispatch Agent Swarm: \`/swarm <phase brief>\` or \`task\` with \`agent: "a01-orchestrator"\`.
+Agent Swarm must not block that loop. Read-only discovery stays in this session. If A01 cannot dispatch, finish those nodes with read, grep, and glob. Do not hand off with every node blocked.
+When a phase needs implementation, call \`task\` once in the batch shape: \`context\` is the phase brief and must be a non-empty string, and \`tasks\` has one item with \`agent: "a01-orchestrator"\`, that same brief as \`task\`, and a one-sentence \`solutionSpace\`. An empty \`context\` is rejected before A01 starts. A01 plans that brief with \`swarm_plan\`. Do not treat the phase text as an already-signed \`task.assign\`.
+An \`<advisory>\` note, including a blocker, is the advisor model's balanced-budget review. Keep the advisor. When it says read-only nodes were wrongly blocked, finish them inline. Do not answer by repeating that the work remains blocked.
 GSD owns the milestone. Swarm owns the parallel implementation lanes.
 `;
 
@@ -116,6 +123,13 @@ export function shellQuote(text: string): string {
   return `'${text.replace(/'/g, `'"'"'`)}'`;
 }
 
+/** Where the fail-open catches in this module report what they swallowed. The default drops it, so production stays silent. */
+export interface HookLog {
+  debug(message: string, detail?: unknown): void;
+}
+
+const NO_LOG: HookLog = { debug: () => {} };
+
 /**
  * The systemPrompt with SWARM_CONTEXT appended, or undefined in subagents, swarm children, repeats and non-SDLC prompts.
  * An uplift XML prompt is classified by its <ORIGINAL>, so HOOK-01 agrees with the headless kickoff (WR-01).
@@ -125,6 +139,7 @@ export function swarmContext(
   ctx: Pick<ExtensionContext, "sessionManager">,
   env: Record<string, string | undefined>,
   classify: (prompt: string) => boolean = classifyPrompt,
+  log: HookLog = NO_LOG,
 ): BeforeAgentStartResult | undefined {
   const { agent, restricted } = sessionAgent(ctx);
   if (agent !== undefined || restricted) return undefined;
@@ -133,7 +148,8 @@ export function swarmContext(
   let text = event.prompt;
   try {
     text = classifiedText(event.prompt);
-  } catch {
+  } catch (error) {
+    log.debug("classifiedText failed; classifying the raw prompt", error);
     text = event.prompt;
   }
   if (/^\s*\/gsd-autonomous(?:\s|$)/i.test(text)) {
@@ -143,7 +159,8 @@ export function swarmContext(
   if (prior.includes(SWARM_CONTEXT)) return undefined;
   try {
     if (!classify(text)) return undefined;
-  } catch {
+  } catch (error) {
+    log.debug("classifier failed; prompt left untouched", error);
     return undefined;
   }
   return { systemPrompt: [...prior, SWARM_CONTEXT] };
@@ -174,6 +191,7 @@ export function runtimeContext(
   event: BeforeAgentStartEvent,
   ctx: Pick<ExtensionContext, "sessionManager">,
   root: () => string = swarmRoot,
+  log: HookLog = NO_LOG,
 ): BeforeAgentStartResult | undefined {
   try {
     const agent = callingAgent(ctx);
@@ -181,7 +199,8 @@ export function runtimeContext(
     const prior = event.systemPrompt ?? [];
     if (prior.some((p) => p.startsWith(`${RUNTIME_HEADING}\n`))) return undefined;
     return { systemPrompt: [...prior, runtimePart(root())] };
-  } catch {
+  } catch (error) {
+    log.debug("runtime part failed; prompt left untouched", error);
     return undefined;
   }
 }

@@ -2,6 +2,8 @@
 
 Milestone v2.4 · branch `feat/v2.4-rust-wasm-core` · A-spike (`plan/execution-waves.md:71-83`) · Status: DECIDED-PROVISIONAL until A03 and A11 approve, and A10 signs off (section 11).
 
+**Navigation (2026-11-08).** Sections 1 to 13 are dated history, including their run tables. Where an O2, target, or runtime sentence in those sections still reads as live, it is historical. Section 14, Current governing contract, is the contract a reader applies today. Original measurements stay in the sections that recorded them.
+
 Citation keys: `R:` `plan/rust-wasmer-omp-options.md` · `E:` `plan/execution-waves.md` · `D:` `plan/decompose.md` · `M:` `plan/missing-facts.md` · `K:` `plan/risks-tradeoffs.md` · `S:` `.planning/STATE.md` · `G:` `crates/gsd-security/src/lib.rs` · `J:` `jsonwebtoken-9.3.1/src/validation.rs` (local cargo registry) · `W:` WASI primary sources (URLs inline) · `P-sizing:` `plan/spike-parts/host-import-sizing.md` · `P-policy:` `plan/spike-parts/fs-net-policy-and-wasi.md` · `P-dist:` `plan/spike-parts/distribution-and-pins.md` · `P-route:` `plan/spike-parts/route-decisions.md` · `[RUN]` measured by the orchestrator's spike runs (values exact as recorded). `[MEASURE: pending]` = not measured; not inferred.
 
 ---
@@ -16,9 +18,9 @@ Citation keys: `R:` `plan/rust-wasmer-omp-options.md` · `E:` `plan/execution-wa
 2. **`wasm32-wasip1` runs** with deny-by-default shims. The round-trip check passes [RUN]. Warm `invoke` p50 is 0.990 µs and p95 is 7.111 µs over 200 warm round trips, with the leak caveat in section 3.
 3. **`wasm32-unknown-unknown` did not build.** The core guest failed in getrandom 0.4.3, which needs the `wasm_js` feature [RUN]. Not measured further.
 4. **O1: monolithic `gsd-core.<semver>.wasm`** (D-P3-2, `P-route` O1).
-5. **O2: plain core JSON over `alloc`, `dealloc` and `invoke`, for every route** (D-P3-3). The evidence confirms it, because components cannot run here.
+5. **O2: plain core JSON over `alloc`, `dealloc` and `invoke`, for every route** (D-P3-3). The evidence confirms it, because components cannot run here. *Historical (2026-11-08).* This O2 sentence is the Wasmer-era verdict. Section 14 is the current governing contract.
 6. **O3: host-side single-owner schema validation** (D-P3-4, `P-route` O3).
-7. **Q-8 (WASI version) resolves to 0.1 under D-P3-1.** WASI 0.2 and 0.3 are not runnable with this Wasmer [RUN]. A03 must record it.
+7. **Q-8 (WASI version) resolves to 0.1 under D-P3-1.** WASI 0.2 and 0.3 are not runnable with this Wasmer [RUN]. A03 must record it. *Historical (2026-11-08).* D-P3-1 is superseded. Q-8's current reading is section 14.
 8. **No value in this report is gate-ready.** The metrics carry a dealloc caveat (section 3), and most thresholds are `[MEASURE: pending]` (`P-route`, Summary).
 9. **Security defects found outside the spike** (section 9) block C3. Owner: P5 / A10.
 
@@ -219,7 +221,7 @@ Notes:
 - **W-N1 WASI version.** The pin is `wasm32-wasip2` (`Cargo.toml:157`; `R:154-157`), which means WASI 0.2 names. `wasi.dev` lists 0.2 as superseded by 0.3, released 2026-06-11, which removes `wasi:io` and changes `wasi:cli/exit` (`W: https://wasi.dev/releases`, `https://wasi.dev/roadmap`, `https://wasi.dev/releases/wasi-p3`). Most toolchains still target 0.2 (`W: https://wasi.dev/releases`). A03 MUST record the version before C1 (`E:310-318`). Rows W-12 and W-18 change names under 0.3. This is Q-8, resolved to 0.1 under D-P3-1 (section 2.3) and pending A03.
 - **W-N2 O2 dependence.** W-07, W-11 and W-13 depend on O2 (`R:256-257`). Under the plain JSON `invoke` decision (section 8), all three stay DENY.
 - **W-N3 Deny mechanism.** A denied WASI import is either absent at link (instantiation error, mapped to `E-DEP` by `R:86`) or stubbed to return a denial (use, mapped to `E-POLICY` by `R:89`). This is Q-1. The run used stubs (section 3.3).
-- **W-N4 Restatement under D-P5-13 (supersedes D-P3-1).** The decisions above do not change. The sandbox target is `wasm32-unknown-unknown`, wrapped as a WebAssembly component and run by wasmtime 50.0.0 with the `component-model` feature (D-P5-1, D-P5-13; `Cargo.toml:158`). The guest has no WASI import surface, so no WASI 0.1 or 0.2 name is imported. Deny-by-default holds: an import the host does not provide is refused at instantiation with E-DEP (D-P5-14), and the empty linker is the allowlist (D-P5-17, D-P5-20). The four WASI 0.1 imports of section 2.2 do not apply to the decided target.
+- **W-N4 Restatement under D-P5-13 (supersedes D-P3-1).** The decisions above do not change. The sandbox target is `wasm32-unknown-unknown`, wrapped as a WebAssembly component and run by wasmtime 50.0.0 with the `component-model` feature (D-P5-1, D-P5-13; `Cargo.toml:158`). The guest has no WASI import surface, so no WASI 0.1 or 0.2 name is imported. Deny-by-default holds: an import the host does not provide is refused at instantiation with E-DEP (D-P5-14), and the empty linker is the allowlist (D-P5-17, D-P5-20). The four WASI 0.1 imports of section 2.2 do not apply to the decided target. The wasmtime 50.0.0 name in this note is the 2026-10-23 record. The current pin is section 14 (wasmtime 50.0.1).
 
 ### 6.2 (b) FS and net deny-by-default policy draft
 
@@ -470,7 +472,7 @@ Rationale for per-route tokens rather than per-route modules: `storage` is "the 
 - Mitigation (c) batches lane-verb reads into single invokes (`R:244-245`). That works with one `invoke` export and does not depend on the ABI choice.
 - Whether Wasmer 7.5.0 instantiates a component artifact: **answered by the run: it does not** (section 2.2).
 
-**Decision (D-P3-3, provisional): (b) plain core JSON over one `invoke` export, for every route.**
+**Decision (D-P3-3, provisional): (b) plain core JSON over one `invoke` export, for every route.** *Historical (2026-11-08).* This is the Wasmer-era O2. Section 13 restated it for wasmtime 50.0.0. Section 14 is the current governing contract.
 - Boundary: `alloc`/`dealloc`/`invoke`; `invoke` takes argv + input-file paths + deadline as JSON bytes and returns the exit-code/JSON union as JSON bytes.
 - No WIT record types cross the boundary. The component option, whose only data export would be a `list<u8>` JSON pass-through, is not runnable with this Wasmer. It is ruled out for 7.5.0. [INFERENCE: this follows from the run result in section 2.2.]
 
@@ -524,6 +526,8 @@ Rationale for per-route tokens rather than per-route modules: `storage` is "the 
 | O3 (D-P3-4) | Host-side single-owner schema validation; guest typed parse only | DECIDED-PROVISIONAL | Fixtures 3/5/8 on-vs-off; validation cost in `invoke_warm_p50_us`; artifact size if guest validation is later added. |
 
 All thresholds are `[MEASURE: pending]`. No threshold is invented here.
+
+*Historical (2026-11-08).* The O2 row in the table above is the Wasmer-era decision. Section 14 restates O2. The table stays as the record of D-P3-2, D-P3-3 and D-P3-4 at the time they were written.
 
 ---
 
@@ -632,11 +636,11 @@ These runs happened after the parts were drafted, and the orchestrator executed 
 
 ## 13 Amendment 2026-10-22: runtime change (user decision)
 
-The user chose: keep the `wasm32-wasip2` target and change the runtime. Sections 1 to 12 describe the earlier Wasmer 7.5.0 route. Where they conflict with this section, this section governs.
+The user chose: keep the `wasm32-wasip2` target and change the runtime. Sections 1 to 12 describe the earlier Wasmer 7.5.0 route. On 2026-10-22 this section governed where it conflicted with sections 1 to 12. As of 2026-11-08 that governing claim is historical. Section 14, Current governing contract, is the contract that applies today. The measurements and the wasmtime 50.0.0 / `wasm32-wasip2` wording below stay as the 2026-10-22 record. They are not relabelled as 50.0.1 results.
 
 ### 13.1 Decision
 
-- D-P3-5: the sandbox runtime is wasmtime 50.0.0, with the `component-model` feature (crate `wasmtime`) and the `p2` feature (crate `wasmtime-wasi`). Target: `wasm32-wasip2`, kept.
+- D-P3-5: the sandbox runtime is wasmtime 50.0.0, with the `component-model` feature (crate `wasmtime`) and the `p2` feature (crate `wasmtime-wasi`). Target: `wasm32-wasip2`, kept. *Historical pin and target for 2026-10-22.* The current pin and guest target are section 14.
 - Supersedes D-P3-1 (the wasip1 pin change) and O2 as recorded in section 8. O2 becomes: the wasip2 component-model canonical ABI carries the frozen JSON bytes as `list<u8>` through a WIT `invoke` export. The wire shape is unchanged.
 - Wasmer 7.5.0 remains unable to run components (section 2.2). It is no longer the sandbox runtime.
 
@@ -661,3 +665,140 @@ The user chose: keep the `wasm32-wasip2` target and change the runtime. Sections
 - Guest: `cd /tmp/gsd-wasmer-spike/guest && RUSTUP_TOOLCHAIN=1.98.1 cargo build --target wasm32-wasip2 --release` (2 min 23 s).
 - Host: `cd /tmp/gsd-wasmer-spike/wasmtime-host && RUSTUP_TOOLCHAIN=1.98.1 cargo build --release` (25 min 45 s).
 - Run: `/tmp/gsd-wasmer-spike/wasmtime-host/target/release/gsd-wasmer-spike-wasmtime /tmp/gsd-wasmer-spike/guest/target/wasm32-wasip2/release/gsd_wasmer_spike_guest.wasm` (exit 0).
+
+## 14 Current governing contract
+
+Dated 2026-11-08. This section is the current governing contract for the Phase 8 report. Sections 1 to 13 stay as history. Amendment commit `1b77658` is part of the D-P3-5 record. Nothing here is a phase pass, an A03 approval, an A10 verdict, or an A11 pin sign-off.
+
+Read on the working tree at `8cde6dd4723efa13221c44c8b8388c31765b698b` (branch `feat/v2.4-rust-wasm-core`, dirty). No cargo test, Wasmer run, or Wasmtime run was executed for this addendum. Source and test names below are structural evidence only.
+
+### 14.1 Precedence
+
+1. Historical `08-CONTEXT` carries full core, `wasm32-wasip2`, and Wasmer 7.5.0. That history stays. It is not a current obligation.
+2. D-P3-5 (user, 2026-10-22) supersedes D-P3-1 and the section 8 O2: Wasmtime plus a component canonical ABI carrying JSON `list<u8>`. The 2026-10-22 text names wasmtime 50.0.0 and keeps `wasm32-wasip2` (section 13). Commit `1b77658`.
+3. D-P5-10 and D-P5-13 supersede the guest target and refine the WIT. D-P5-13 (user, 2026-10-23) builds the guest for `wasm32-unknown-unknown` and wraps it as a component with wit-component 0.247.0. It overrides the guest-target part of D-P5-1 only. No WASI interface version is imported. D-P5-14, D-P5-17 and D-P5-20: unresolved import is E-DEP, no stubs, empty production linker for this guest.
+4. The exact dependency answer "Update to 50.0.1" governs the crate pin now. `Cargo.toml` records `wasmtime = { version = "=50.0.1", features = ["component-model"] }`, metadata `wasmtime = "50.0.1"`, and `wasm_target = "wasm32-unknown-unknown"`. That record does not approve the runtime or pin review gate.
+5. AMB-4 (user, 2026-11-06, option (a), `.planning/STATE.md`): the listed gaps are accepted with reasons. Full-core sandboxing, the read-route and sandbox defaults, and the write-route flips move to a follow-on milestone. Original full-core compile, stub, budget, and size claims stay unmeasured.
+6. Python stays the default engine. No default flips here.
+
+### 14.2 Runtime, target, and boundary
+
+| Item | Current contract | Evidence read 2026-11-08 | Limit |
+|---|---|---|---|
+| Runtime | wasmtime 50.0.1, feature `component-model` | `Cargo.toml` workspace dependency and `[workspace.metadata.gsd-pins]` | Not an A10 or A11 sign-off. Section 13's 50.0.0 figures stay historical. |
+| Guest target | `wasm32-unknown-unknown`, wrapped as a component | D-P5-13 in `10-CONTEXT.md`; `crates/gsd-sandbox/build.rs` (`GUEST_TARGET`) | The 2026-10-22 "wasip2 kept" sentence is historical. |
+| WIT | `gsd:core@0.1.0` exports `invoke: func(input: list<u8>) -> result<list<u8>, invoke-error>` | D-P5-10 in `10-CONTEXT.md` | First route imports nothing. Payloads are frozen JSON. |
+| Linker | Empty production linker is the allowlist. An unresolved import is E-DEP. No stubs. | D-P5-14, D-P5-17, D-P5-20; `build.rs` states the component imports nothing | A separate host-bridge implementation is not an import of this guest. See 14.3. |
+| Data path | Host reads a Task Store snapshot. Guest has no filesystem or network. | D-P5-11 | No guest preopen of scripts, omp, or results. |
+| Fuel | No deadline: E-INTERNAL. Configured deadline: E-TIMEOUT. Epoch Interrupt: E-TIMEOUT. | D-P5-12; `classify` in `crates/gsd-sandbox/src/wasmtime_limits.rs` | Structural reading of the function. Not a fresh test log. |
+| Memory cap | `GuestLimiter` returns `Err(CapacityRefused)`; `classify` maps that to E-CAPACITY. | D-P5-18; test name `growth_past_the_cap_traps_as_capacity_refused` | Arbitrary host OOM is not this mapping. |
+| Fuel re-arm | Each call gets the full fuel budget. | D-P5-19; `arm_call_budget`; test name `every_call_gets_the_full_fuel_budget` | Configured ceilings are not measured consumption. Derived 6.2e7 fuel in the 2026-10-23 loaded-host note is not a direct measurement. |
+| Cancel | 500 ms cooperative epoch slices. | D-P5-15; `EPOCH_SLICE` in `wasmtime_limits.rs`; Phase 10 validation answer 2026-10-23 | The separate 3 s force-drop was accepted as not a mechanism for the no-host-import guest. No native preemption is promised. |
+
+Current component digests on disk, read 2026-11-08, one line each:
+
+- `crates/gsd-sandbox/guest-module.sha256` = `732857c13367ad18eb84571cbc11174a098d176c65aab2ae13763b2318d69a9e`
+- `crates/gsd-sandbox/guest-module-write.sha256` = `4626c3b14d7c29b5b5fd3ff907d45be6c17884d32e803b8c453812d0cef739f9`
+
+Fresh A10 and A11 records bound to 50.0.1 and these digests are outstanding (CP-PINS). The 2026-10-26 user acceptance covered wasmtime `=50.0.0` (commit `80f0e19`) and digest `ffa7b28a7879da7ea99a20c83999d0b79e757bd084878909dcce0054fe66cade` (commit `eb7a2b9`). The recording agent in `10-VERIFICATION.md` Sign-off record states that it does not sign as A10 or A11. Later records for `91b0970e` and `50b06310` do not sign today's pins. The 2026-11-07 A10 session produced no verdict. The 2026-11-07 A11 session returned FAIL.
+
+### 14.3 O1, O2, O3, and the four named routes
+
+O1 stays a provisional monolith design (D-P3-2, section 8.1). It is not a built whole core. Full-core cold start, peak memory, and artifact size stay `[MEASURE: pending]`.
+
+O2, restated for each originally named route. The shared intended host-to-guest ABI is the component canonical ABI carrying frozen JSON bytes (`list<u8>` in, `result<list<u8>, invoke-error>` out, D-P5-10). Routes:
+
+| Route | Intended ABI | What this addendum claims |
+|---|---|---|
+| read-only | Same canonical ABI, frozen JSON bytes | Contract intent only. Not proof the route runs in the guest. |
+| plan/assign | Same canonical ABI, frozen JSON bytes | Contract intent only. Not proof the route runs in the guest. |
+| gates | Same canonical ABI, frozen JSON bytes | Contract intent only. Not proof the route runs in the guest. |
+| swarm_run | Same canonical ABI, frozen JSON bytes | Contract intent only. The scheduler is not claimed to run in the guest. |
+
+Served scope is separate from that intent. `crates/gsd-sandbox/build.rs` builds one guest for `wasm32-unknown-unknown`, wraps it as a component, and states that the component imports nothing and instantiates with an empty linker. `crates/gsd-sandbox/src/wasmtime_host_bridge.rs` states that the read route's world (`gsd:core@0.1.0`) imports nothing and keeps that empty linker. The same file documents a separate `HostBridge` for `gsd:core-host@0.2.0` (`log`, `time`, `rand`, `storage`). That bridge is not an import wired into this no-import guest, and it is not full-core coverage. Deferred and unimplemented relative to the original full-core spike: the whole-core module, per-member feature splits, and any claim that read-only, plan/assign, gates, or swarm_run execute inside the guest.
+
+O3 stays host-side validation with typed guest parsing (D-P3-4, section 8.3). The on/off validation cost is not measured. No stdout command world, ambient WASI context, or legacy denial shim is the current path.
+
+### 14.4 Criterion dispositions
+
+Labels stay distinct. NOT MEASURED, NOT RE-OBSERVED, SUPERSEDED, and ACCEPTED DEFERRAL are not PASS. Owner of the text is the Phase 8 gap documentation pass (2026-11-08). Evidence providers are A03 (architectural authority), A10 (scoped security), and A11 (fresh pin evidence). They are not editors of this file.
+
+| ID | Original result | Governing decision | Reachable correction | Evidence | Remaining prerequisite | Disposition |
+|---|---|---|---|---|---|---|
+| C3 | PARTIAL. Section 4: gsd-proto PASS, gsd-serde PASS; gsd-failure, gsd-nexus, gsd-runtime, gsd-governor, gsd-pool, gsd-observability, gsd-security, gsd-scheduler FAIL. Eight stub cells say "not measured". Wasip1 per member not measured. | Nov 6 AMB-4 accepts the full-core deferral. | Retain all ten member rows and eight failed-member stub statuses as historical unmeasured data. | Section 4 [RUN] on wasm32-wasip2. Not re-run. | No new compile. A route guest's no-import boundary does not establish a per-member feature-split plan. | NOT MEASURED for stubs and wasip1. ACCEPTED DEFERRAL for the full-core split. |
+| C8 | PARTIAL. Section 8.2 and section 13.1 were both live O2 texts. | D-P3-5, then D-P5-10 and D-P5-13. | Sections 1, 8.2, 8.4, and 13 marked historical. Per-route ABI restated in 14.3. | Contract text plus `Cargo.toml` and D-P5-10. Serde share unmeasured. | Full-route guest coverage is not claimed. | SUPERSEDED as the live conflict. PARTIAL remains on unmeasured serde share. |
+| C10 | PARTIAL. Section 5 has payload bounds. U5.3 numeric budgets and full-core size are pending. | Separate first-route evidence and configured limits from missing whole-core budgets. Nov 6 AMB-4 defers the full-core portion. | No new numeric budget. | 10-CONTEXT loaded-host note of 2026-10-23 (compile 108 ms, request 140,721 bytes, caps, n=300 warm invoke). Historical, host load 3.9 to 4.2, not quiet qualification. Host marshal timings are not an isolated serde or guest-execution ratio. | Whole-core fuel, memory, serde, and size budgets. | NOT MEASURED for those budgets. ACCEPTED DEFERRAL for the full-core portion. |
+| C14 | PARTIAL. Section 11 is a paraphrase: reviewer named a10-security, overall CONDITIONAL, fault-injection scope and wasip1 direction called acceptable, plus a second review. | Recover the original raw output, or leave the evidence open. | Searched the tree for that verdict sentence. The only hit is section 11 of this file. No separate artifact. | Section 11, commit history named by `08-VERIFICATION.md` (`b06293e`). Absence recorded 2026-11-08. | CP-EVIDENCE. A fresh review cannot become the old raw review. The paraphrase stays labelled as a paraphrase. | NOT RE-OBSERVED as a verbatim verdict. |
+| C15 | PARTIAL. Section 11 fault-scope text is conditional and is a paraphrase. Section 13.3 left the runtime review pending, then a 2026-10-28 update points at user acceptance. | Map each fault-scope condition to its decision. A current scoped A10 record is still required. | Cited D-P5-12, D-P5-14, D-P5-18, D-P5-19 as later decisions. | `10-VERIFICATION.md` Sign-off record: user, 2026-10-26 chat, recorded 2026-10-28; agent does not sign as A10. Runtime then `=50.0.0`. Nov 7 A10: no verdict (`.planning/STATE.md`). | CP-AUTH for a current A10 fault-scope ruling. CP-PINS is separate. | User acceptance is not an A10 verdict. Current ruling BLOCKED. |
+| C16 | NOT MET. E-01 through E-16 listed; section 11 does not approve them. | Non-use on this guest is not approval. D-P21's two exceptions are the pin commit shape and the missing `ci.yml` guest-digest step. | Section 14.6 keeps one row per exception. | Empty-linker statements in `build.rs` and D-P5-17/20. Structural only. | CP-AUTH per item. | DENIED/NOT ENABLED is not PASS. |
+| C17 | PARTIAL. Q-3 was answered in section 11 while U5.3 still said E-CAPACITY. | Q-1 through Q-8 in section 14.5. F-03 text corrected in `plan/decompose.md` U5.3. | U5.3 line now names E-INTERNAL, E-TIMEOUT, and E-CAPACITY by cause. | `classify` source, dated 2026-11-08 read. Not a test run. | Imported-log overflow (Q-5) stays unruled. | F-03 text SUPERSEDED. Q-5 remains open for an imported log. |
+| C18 | NOT MET. Scope sentence said the spike was for the full core. Section 1 and section 12 say the guest is not the full core. | Nov 6 AMB-4. | Scope sentence in section 1 stays, qualified here: the measured guest is the spike guest (gsd-proto path in section 12), not the full core. | Section 12 reproduction. AMB-4 in `.planning/STATE.md` 2026-11-06. | No new full-core run. Scheduler reopening does not change this row. | ACCEPTED DEFERRAL. The original criterion was not literally met. |
+| C21 | PARTIAL. Summary omitted D-P3-5. Report sections still described Wasmer as if section 13 were the only later contract. | `1b77658` / D-P3-5, then D-P5-13, then 50.0.1. | Navigation note, historical markers, this section, and `08-SUMMARY.md`. | `Cargo.toml` pin read 2026-11-08. Old numbers kept with their units and sample counts. | CP-PINS. | Text drift corrected. Pin sign-off still open. |
+| C24 | NOT MET. No A03 approval of D-P3-1. | Successor facts are recorded. D-P3-1 approval is not requested again. | Quoted the A03 record. | `10-CONTEXT.md` heading "A03 record (A10 condition 5)": "It is not an approval, and no agent gives one here." User decisions D-P3-5 and D-P5-13. | CP-AUTH: A03 approval of the successor architecture and WASI applicability. | Facts recorded. Approval BLOCKED. |
+| C25 | NOT RUN. Verifier found `/tmp/gsd-wasmer-spike` absent. | Inspect retained evidence only. Do not rerun Wasmer. A new Wasmtime run cannot restore the old logs. | Commands and claimed values copied into 14.7. `ls` of `/tmp/gsd-wasmer-spike` on 2026-11-08: no such directory. | Sections 12 and 13.4. A missing cargo registry directory is not evidence of zero component matches. | CP-EVIDENCE until a real locator appears or authority accepts the limitation. | NOT RE-OBSERVED. |
+
+### 14.5 Question dispositions
+
+| Question | Reconciliation | Evidence and authority limit | Disposition |
+|---|---|---|---|
+| Q-1 | D-P5-14 and D-P5-20: an absent import is refused at link with E-DEP. The wasip1 errno-to-E-POLICY experiment is superseded and is not rerun. An empty import list does not exercise E-POLICY for a tokened listed import. | D-P5-14 text in `10-CONTEXT.md`. | SUPERSEDED as a wasip1 measurement. E-POLICY-on-listed-import is not shown by this guest. |
+| Q-2 | Stdio stays denied. The canonical invoke ABI is not a stdout command world. | D-P5-13 (no WASI stdio imports) and section 14.3. | DENIED/NOT ENABLED. |
+| Q-3 | Fuel without a deadline maps to E-INTERNAL. Fuel with a configured deadline maps to E-TIMEOUT. | D-P5-12 and `classify`. F-03 text is the U5.3 line. No fuel-consumption number is inferred. | Contract text corrected. Consumption NOT MEASURED. |
+| Q-4 | 500 ms cooperative epoch slices. The separate 3 s force-drop was accepted as not a mechanism for the no-host-import guest. | D-P5-15 and the Phase 10 validation answer (2026-10-23). `EPOCH_SLICE`. | Recorded. Native preemption is not promised. |
+| Q-5 | This guest has no production log import, so overflow is unreachable here. | `build.rs` and the read-route empty linker. The separate `HostBridge` documents `LOG_BATCH_CAP_BYTES` and an E-CONTRACT overflow on that bridge. That code is not a ruling for this guest, and it is not adopted as overflow semantics. | Unreachable on this guest. Imported-log policy UNRULED. Full-core portion ACCEPTED DEFERRAL under AMB-4. CP-AUTH if an imported log is proposed. |
+| Q-6 | Host reads the snapshot. No guest scripts, omp, or results preopens. | D-P5-11 and D-P5-13. | Non-use recorded. E-04 non-use is not an exception approval. |
+| Q-7 | Seconds TTL, no default secret, authorization binding. | D-P5-5, D-P5-6, D-P5-7 in `10-CONTEXT.md`. | Requirements recorded. No bearer token enters this no-import guest. The token-gated bridge is not claimed exercised by it. |
+| Q-8 | D-P3-1 is superseded. The component wraps `wasm32-unknown-unknown` and imports no WASI version. | D-P5-13. A03 record in `10-CONTEXT.md` states facts and says it is not an approval. | SUPERSEDED as a 0.1 pin. C24 approval remains CP-AUTH. |
+
+### 14.6 Exception dispositions
+
+Current effective behavior for every row is DENIED/NOT ENABLED on this guest. That observation is not a grant. No all-E waiver is offered. D-P21's accepted exceptions (combined pin commit `eb7a2b9`; no guest-digest step in `ci.yml`) do not approve any row below.
+
+| ID | Scope | Evidence of non-use | Authority still required | Allowed scope of a future grant | Why a decision is still open |
+|---|---|---|---|---|---|
+| E-01 | Results read preopen | Not used. D-P5-11 snapshot path. | A10, plus a measured need | That preopen only | Non-use is not approval. CP-AUTH. |
+| E-02 | Results or other write preopen | Not used. Host writes only. | A10 | That preopen only | No grant is inferred. CP-AUTH. |
+| E-03 | State-directory preopen | Not used. Host Task Store snapshot. | A10, plus a measured need | That preopen only | CP-AUTH. |
+| E-04 | scripts or omp preopen | Not used. Q-6 answered by D-P5-11. | Scoped A10 authority for the original exception | That preopen only | Q-6 non-use does not close the original approval obligation. CP-AUTH. |
+| E-05 | Outside-SWARM_DIR preopen | None proposed. | A10 if anyone proposes one | None proposed | Denied. CP-AUTH if a proposal appears. |
+| E-06 | UDS or gsd-ipc guest capability | Not imported. | A10 | Host-only or a later full-core design | No IPC implementation or removal in this addendum. CP-AUTH. |
+| E-07 | TCP, UDP, DNS, sockets | None proposed. | A10 if anyone proposes one | None proposed | Denied. CP-AUTH if a proposal appears. |
+| E-08 | wasi:http | None proposed. | A10 if anyone proposes one | None proposed | Denied. CP-AUTH if a proposal appears. |
+| E-09 | New model or tool import | Not present. | A03 or planner, and A10. A10 alone cannot widen. | No new native or MCP scope | This plan does not authorize widening. CP-AUTH. |
+| E-10 | Direct WASI clocks | None. | A10 if anyone proposes one | None | Denied. No wall-clock capability on this guest. CP-AUTH if a proposal appears. |
+| E-11 | Direct WASI randomness | None. | A10 if anyone proposes one | None | Denied. CP-AUTH if a proposal appears. |
+| E-12 | stdin | None. | A10 if anyone proposes one | None | Denied. CP-AUTH if a proposal appears. |
+| E-13 | stdout or stderr exception | Command model not selected. | A10 if anyone proposes one | None | Denied. CP-AUTH if a proposal appears. |
+| E-14 | Ambient environment passthrough | None. | A10 if anyone proposes one | None | Denied. CP-AUTH if a proposal appears. |
+| E-15 | Token over-deadline or cross-session cache | Prohibited by D-P5-5 and D-P5-7. | A10 for any exception | None granted | No exception granted. No token bridge is exercised here. CP-AUTH if an exception is proposed. |
+| E-16 | Historical default JWT secret | Prohibited by D-P5-6. | A10 for any exception | None granted | No exception granted. CP-AUTH if an exception is proposed. |
+
+### 14.7 C25 retained commands and claimed values
+
+Inspected 2026-11-08. `/tmp/gsd-wasmer-spike` is absent. These commands and values are the report's claims. They were not re-run. A missing `~/.cargo/registry/src/*/wasmer-7.5.0` tree would not prove zero component matches; that tree was not treated as a new observation.
+
+Wasmer era, section 12, rustc and cargo 1.98.1, host `x86_64-unknown-linux-gnu`:
+
+- `rustup target add wasm32-wasip2`, `wasm32-wasip1`, and `wasm32-unknown-unknown`.
+- Guest component: `cd /tmp/gsd-wasmer-spike/guest && RUSTUP_TOOLCHAIN=1.98.1 cargo build --target wasm32-wasip2 --release` (claimed 2m 40s). Artifact claimed 80,086 bytes. Run log claimed at `/tmp/gsd-wasmer-spike/run-wasip2.txt`, exit 1, validator error in section 2.2.
+- Guest core: same directory, `--target wasm32-wasip1 --release` (claimed 4m 02s). Artifact claimed 62,979 bytes. Run log claimed at `/tmp/gsd-wasmer-spike/run-wasip1.txt`, exit 0. Metrics in section 3.1: compile 205.584 ms, instantiate 0.055 ms, p50 0.990 us, p95 7.111 us, 200 trips, 1003-byte TaskId, 23 pages.
+- Host: `cd /tmp/gsd-wasmer-spike/host && RUSTUP_TOOLCHAIN=1.98.1 cargo build --release` (claimed 33m 06s).
+- Workspace check log claimed at `/tmp/gsd-wasmer-spike/wasip2-check.log`.
+- `wasm32-unknown-unknown` guest build claimed to fail in getrandom 0.4.3.
+- `grep -rli component ~/.cargo/registry/src/*/wasmer-7.5.0/src | wc -l` claimed 0. Not re-checked.
+
+Wasmtime 50.0.0 era, section 13.4. These numbers are not 50.0.1 measurements:
+
+- Guest: `cd /tmp/gsd-wasmer-spike/guest && RUSTUP_TOOLCHAIN=1.98.1 cargo build --target wasm32-wasip2 --release` (claimed 2 min 23 s). Component claimed 80,066 bytes.
+- Host: `cd /tmp/gsd-wasmer-spike/wasmtime-host && RUSTUP_TOOLCHAIN=1.98.1 cargo build --release` (claimed 25 min 45 s).
+- Run: `/tmp/gsd-wasmer-spike/wasmtime-host/target/release/gsd-wasmer-spike-wasmtime` on the wasip2 wasm, exit 0 claimed. Log claimed at `/tmp/gsd-wasmer-spike/run-wasmtime-wasip2.txt`. Claimed compile 205.358 ms, instantiate 0.423 ms, p50 1.350 us, p95 1.480 us, 200 trips, 1003-byte TaskId.
+
+### 14.8 Checkpoint packet
+
+Tasks 1 and 2 of `08-GAP-01` stop here. A general continue does not close these rows. Detail and the same packet: `.planning/phases/08-wasmer-full-core-spike-report/08-GAP-01-SUMMARY.md`.
+
+**CP-AUTH.** Still open: A03 approval of the successor architecture and WASI applicability (C24); a current A10 fault-scope ruling (C15); per-exception authority (C16, including E-01 through E-16, with E-09 requiring A03 or the planner and A10). Q-5 stays unruled for an imported log.
+
+**CP-EVIDENCE.** Still open: original A10 raw output (C14); original run logs (C25). Parent-owned commands, if a later execution is separately authorized, and only for current mapping and import policy: `cargo test -p gsd-sandbox wasmtime_limits --locked`; `cargo test -p gsd-sandbox --test guest_imports --locked`; `cargo test -p gsd-sandbox --features write-routes --test guest_imports --locked`. They do not restore historical Wasmer metrics or the old review text.
+
+**CP-PINS.** Still open: fresh independent A10 and A11 records bound to wasmtime 50.0.1 and the digests in section 14.2, plus the accepted CI boundaries. No push until those records exist. This addendum does not start those roles and does not edit CI or pins.

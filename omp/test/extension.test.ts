@@ -255,7 +255,12 @@ test("bridge once per tool: one recorded bridge call each with the expected scri
     expect(calls[0].script).toBe(script);
     expect(calls[0].args).toEqual(args);
     expect(calls[0].cwd).toBe(repo);
-    expect(res.content[0].text).toBe(`${script} ok`);
+    if (name === "swarm_plan") {
+      const parsed = JSON.parse(res.content[0].text);
+      expect(parsed.summary).toBe(`${script} ok`);
+    } else {
+      expect(res.content[0].text).toBe(`${script} ok`);
+    }
   }
   expect(spawn).toHaveBeenCalledTimes(0);
 });
@@ -337,7 +342,7 @@ test("registered assignment transport returns the canonical prompt and envelope 
     sig: "hmac:synthetic-controller-signature",
     payload: { task_id: "H-req", correlation_id: "c-hot", agent_id: "A02" },
   };
-  const prompt = `# task.assign (signed envelope)\n\`\`\`json\n${JSON.stringify(assignment)}\n\`\`\`\n\nCanonical specialist instructions.`;
+  const prompt = `# task.assign (signed envelope)\n\`\`\`json\n${JSON.stringify(assignment)}\n\`\`\`\n\nCanonical specialist instructions.\n--- prompt ---\nstill the prompt`;
   const canonical = {
     status: "ok", task_id: "H-req", correlation_id: "c-hot", agent_slug: "a02-requirements",
     assignment_verified: true, assignment, prompt,
@@ -360,7 +365,22 @@ test("registered assignment transport returns the canonical prompt and envelope 
   expect(requests[0].script).toBe("orch_assign");
   expect(requests[0].args).toEqual([`--root=${repo}`, "--task-id=H-req", "--correlation-id=c-hot"]);
   expect(requests[0].cwd).toBe(repo);
-  expect(result.content).toEqual([{ type: "text", text: prompt }]);
+  const marker = "\n--- prompt ---\n";
+  const header = {
+    status: "ok",
+    assignment_verified: true,
+    task_id: "H-req",
+    correlation_id: "c-hot",
+    agent_slug: "a02-requirements",
+  };
+  const text = result.content[0].text;
+  const splitAt = text.indexOf(marker);
+  expect(tool.description).toContain("after the first `--- prompt ---` marker, unchanged");
+  expect(result.content).toEqual([{ type: "text", text: `${JSON.stringify(header)}${marker}${prompt}` }]);
+  expect(splitAt).toBe(JSON.stringify(header).length);
+  expect(JSON.parse(text.slice(0, splitAt))).toEqual(header);
+  expect(text.slice(0, splitAt)).not.toContain(assignment.sig);
+  expect(text.slice(splitAt + marker.length)).toBe(prompt);
   expect(result.details).toEqual(canonical);
 });
 
@@ -480,7 +500,10 @@ test("registered command refuses a successful unsigned plan without starting or 
   expect(requests).toHaveLength(1);
   expect(requests[0].script).toBe("orch_plan");
   expect(requests[0].inflight).toBeInstanceOf(Set);
-  expect(log.map((entry) => entry.call)).toEqual(["notify"]);
-  expect(log[0].message).toContain("dispatch refused");
-  expect(log[0].level).toBe("error");
+  // The startup notifications before planning are pinned in commands.test.ts. Here only the refusal matters: it is the last
+  // notification, and nothing starts or waits for A01 (the single request above is the plan).
+  const refusal = log[log.length - 1];
+  expect(refusal.call).toBe("notify");
+  expect(refusal.message).toContain("dispatch refused");
+  expect(refusal.level).toBe("error");
 });

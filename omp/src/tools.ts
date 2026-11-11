@@ -165,6 +165,53 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 const ASSIGNMENT_HEADING = "# task.assign (signed envelope)\n```json\n";
+/**
+ * omp sends only `content` to the model. `details` is UI and log metadata, so the
+ * fields A01 requires (`status`, `assignment_verified`, `agent_slug`) have to lead
+ * the text. The header is one JSON line of fields `validAssignment` already accepted
+ * and carries no signature. The first marker splits the exact prompt back out, even
+ * when that prompt contains the same line.
+ */
+const ASSIGNMENT_PROMPT_MARKER = "\n--- prompt ---\n";
+
+function assignmentVisibleText(result: Record<string, unknown>): string {
+  const header = JSON.stringify({
+    status: result.status,
+    assignment_verified: result.assignment_verified,
+    task_id: result.task_id,
+    correlation_id: result.correlation_id,
+    agent_slug: result.agent_slug,
+  });
+  return `${header}${ASSIGNMENT_PROMPT_MARKER}${result.prompt as string}`;
+}
+
+/**
+ * omp sends only `content` to the model. A plan summary hides
+ * `execution_assignment_verified` and the signed envelope in `details`, so A01
+ * yields BLOCKED after Python has already signed the controller assignment.
+ * The envelope is included only when that flag is strictly true.
+ */
+function planVisibleText(result: Record<string, unknown>): string {
+  const verified = result.execution_assignment_verified === true;
+  const visible: Record<string, unknown> = {
+    status: result.status,
+    correlation_id: result.correlation_id,
+    pattern: result.pattern,
+    reused: result.reused === true,
+    execution_assignment_verified: verified,
+    summary: typeof result.summary === "string" ? result.summary : "",
+  };
+  if (verified && isObject(result.execution_assignment)) {
+    visible.execution_assignment = result.execution_assignment;
+  }
+  return JSON.stringify(visible);
+}
+
+function planResult(res: BridgeResult): ToolResult<Details> {
+  if (!isObject(res.json)) return toolResult(res);
+  const text = planVisibleText(res.json);
+  return { content: [{ type: "text", text: res.exitCode === 1 ? `FAIL: ${text}` : text }], details: res.json };
+}
 
 /** Python verifies the signature; this consumer refuses mismatched dispatch metadata or an unrelated prompt. */
 function validAssignment(res: BridgeResult, params: AssignmentParams): boolean {
@@ -225,7 +272,10 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     description:
       "Obtain the canonical verified signed task.assign envelope and exact specialist prompt for an existing " +
       "IN_PROGRESS leased task in this correlation. A01 only; refused in plan mode. Read-only Task Store access, " +
-      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input.",
+      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input. " +
+      "The model-visible text is one JSON object with status, assignment_verified, task_id, correlation_id and " +
+      "agent_slug, then a line `--- prompt ---`, then the exact specialist prompt. Dispatch only when status is " +
+      "\"ok\" and assignment_verified is true. Pass only the text after the first `--- prompt ---` marker, unchanged.",
     parameters: {
       type: "object",
       properties: {
@@ -264,7 +314,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       if (!validAssignment(res, params)) {
         throw new SwarmToolError("E-CONTRACT", "swarm_assignment refused: invalid canonical assignment response");
       }
-      return { content: [{ type: "text", text: res.json.prompt as string }], details: res.json };
+      return { content: [{ type: "text", text: assignmentVisibleText(res.json) }], details: res.json };
     },
   });
 
@@ -275,7 +325,11 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       "Plan a swarm run from a brief (A01): creates the pattern's task DAG in the Task Store (PLANNED, gates " +
       "derived from the risk class) under one correlation id. Re-running with the same brief, pattern, risk class, " +
       "priority, acceptance and correlation_id reuses the existing plan (`reused: true`) instead of duplicating it. " +
-      "dry_run lists the tasks that would be created without writing.",
+      "dry_run lists the tasks that would be created without writing. The model-visible text is one JSON object " +
+      "with status, correlation_id, pattern, reused, execution_assignment_verified and summary. When " +
+      "execution_assignment_verified is true, that object also contains execution_assignment, the signed " +
+      "swarm.v1.task.assign envelope. Continue only then. A dry-run or unsigned plan sets the flag false and " +
+      "omits the envelope.",
     parameters: {
       type: "object",
       properties: {
@@ -316,7 +370,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
     mutating: true,
     async run(_toolCallId, params, signal, ctx) {
-      return toolResult(await bridge({ script: "orch_plan", args: planArgs(ctx, params), cwd: ctx.cwd, signal }));
+      return planResult(await bridge({ script: "orch_plan", args: planArgs(ctx, params), cwd: ctx.cwd, signal }));
     },
   });
 

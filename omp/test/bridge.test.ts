@@ -3,10 +3,13 @@
  * Fixtures are written at test time; nothing is added to the repo's scripts/ or .swarm/.
  */
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type * as BridgeModule from "../src/bridge.ts";
-import { runScript, SwarmToolError, swarmRoot } from "../src/bridge.ts";
+import * as BridgeModule from "../src/bridge.ts";
+import type { BridgeTimers } from "../src/bridge.ts";
+import { runScript, SwarmToolError, swarmRoot, writeInputFile } from "../src/bridge.ts";
+import { swarmDir } from "../src/paths.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import { callTool, fakeCtx, fakePi, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
@@ -390,3 +393,98 @@ os._exit(0)
   if (settled === "pending") throw new Error("runScript did not settle within 3 s of the call while a setsid grandchild held stdout");
   expect(settled).toMatchObject({ res: { exitCode: 0, json: { status: "ok", n: 7 } } });
 });
+
+// ── TS-12 / TS-13 / TS-15 / TS-20 ──────────────────────────────────────────
+
+test.each([
+  ["EPERM", true],
+  ["ESRCH", false],
+])("killGroup: %s from process.kill is surfaced on stderr only when it is not ESRCH", (code, surfaced) => {
+  const kill = spyOn(process, "kill").mockImplementation(() => {
+    throw Object.assign(new Error(`${code}: operation failed`), { code });
+  });
+  const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+  try {
+    expect(() => BridgeModule.killGroup(4242, "SIGTERM")).not.toThrow();
+    expect(kill).toHaveBeenCalledWith(-4242, "SIGTERM");
+    const written = stderr.mock.calls.map(([chunk]) => String(chunk)).join("");
+    expect(written.includes(code)).toBe(surfaced);
+  } finally {
+    kill.mockRestore();
+    stderr.mockRestore();
+  }
+});
+
+test("writeInputFile: a .gitignore write that fails for a reason other than EEXIST is raised", () => {
+  const { cwd } = setup();
+  const realWrite = fs.writeFileSync;
+  const write = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+    if (String(file).endsWith(".gitignore")) throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+    return realWrite(file, data, options);
+  });
+  try {
+    expect(() => writeInputFile(cwd, "ingest", "tool-1", { ok: true })).toThrow("EPERM");
+  } finally {
+    write.mockRestore();
+  }
+});
+
+test("writeInputFile: an existing .gitignore is kept and EEXIST is tolerated", () => {
+  const { cwd } = setup();
+  const first = writeInputFile(cwd, "ingest", "tool-1", { n: 1 });
+  const second = writeInputFile(cwd, "ingest", "tool-2", { n: 2 });
+  expect(readFileSync(join(swarmDir(cwd), ".gitignore"), "utf8")).toBe("*");
+  expect(existsSync(first)).toBe(true);
+  expect(JSON.parse(readFileSync(second, "utf8"))).toEqual({ n: 2 });
+});
+
+test("spawner note: the bridge scope note names every omp/src module that starts a python3 child", () => {
+  const src = resolve(REPO_ROOT, "omp", "src");
+  const pythonSpawn = /(?:Bun\.spawn|\bspawn)\(\s*\[?\s*"python3"/;
+  const spawners = readdirSync(src).filter((f) => f.endsWith(".ts") && pythonSpawn.test(readFileSync(join(src, f), "utf8"))).sort();
+  expect(spawners).toEqual(["bridge.ts", "commands.ts"]);
+  const bridgeSource = readFileSync(join(src, "bridge.ts"), "utf8");
+  const note = bridgeSource.slice(0, bridgeSource.indexOf("*/"));
+  expect(note).toContain("commands.ts");
+});
+
+/** A timer handle from the injected seam: nothing is scheduled on the real clock; the test fires it by hand. */
+class FakeTimer {
+  cleared = false;
+  constructor(readonly ms: number, readonly fire: () => void) {}
+  unref(): this {
+    return this;
+  }
+}
+
+test("timers: the SIGTERM→SIGKILL grace runs on the injected timers, so escalation is observed without a real 3 s wait", async () => {
+  const { cwd, root } = setup();
+  const file = join(root, "pids.json");
+  const ac = new AbortController();
+  const scheduled: FakeTimer[] = [];
+  const timers: BridgeTimers = {
+    setTimeout: (fn, ms) => {
+      const handle = new FakeTimer(ms, fn);
+      scheduled.push(handle);
+      return handle;
+    },
+    clearTimeout: (handle) => {
+      if (handle instanceof FakeTimer) handle.cleared = true;
+    },
+  };
+  const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, signal: ac.signal, timers });
+  const outcome = p.then(() => null, (e: unknown) => e);
+  const pids = await pidsFrom(file);
+  const kill = spyOn(process, "kill");
+  try {
+    ac.abort(); // SIGTERM to the group; the escalation is armed on the injected timers
+    const grace = scheduled.find((t) => t.ms === 3_000 && !t.cleared);
+    expect(grace).toBeDefined();
+    grace?.fire(); // escalate now instead of after the real 3 s
+    expect(kill.mock.calls).toContainEqual([-pids.child, "SIGKILL"]);
+    expect(await outcome).toBeInstanceOf(SwarmToolError);
+    await expectGroupDead(pids);
+  } finally {
+    kill.mockRestore();
+  }
+}, 10_000);

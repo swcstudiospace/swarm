@@ -499,7 +499,7 @@ Only a run with hundreds of ready tasks that all declare `notes.claims` gains fr
 | `--swarm-timeout S` | 0 (off) | `swarm_run.py` | Cancel the whole run after S seconds, like a signal |
 | `SWARM_HEARTBEAT_S` | 10 | `telemetry.py`, `swarm_run.py`, bar | Heartbeat cadence; the bar's stale limit is three of these |
 | `SWARM_STALL_AFTER_S` | 180 | `telemetry.py` | No-activity limit for `stalled` |
-| `SWARM_CANCEL_GRACE_S` | 10 | `swarm_run.py` | Cooperative-cancel wait (see section 4 for the cap) |
+| `SWARM_CANCEL_GRACE_S` | 10 | `swarm_run.py`; `swarm/tools/shared_runtime.py` | Cooperative-cancel wait for agent sessions (see section 4 for the cap). Separate from the session-join window in gsd-state, which is fixed at 3 s and does not read this variable |
 | `SWARM_SHUTDOWN_BUDGET_S` | 15 | `swarm_run.py` | Whole-shutdown budget; set by `autonomous_run.py` from `SWARM_AUTONOMOUS_RUN_GRACE_S` |
 | `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 0.1 / 5 | `swarm/retry.py`; `swarm/limiter.py` | Backoff base and cap. When set, `SWARM_RETRY_CAP_S` also bounds `Retry-After` (its own default there stays 120 s) |
 | `SWARM_RATE_COOLDOWN_S` | 60 | `swarm/limiter.py` | Wait before one slot is added back after a rate limit or a failure circuit trip |
@@ -761,3 +761,7 @@ The new agents' L4 ceilings (a human decides) are: A16 `commitment_or_exit_plan`
 **Footer:** the footer status text `swarm: <counts>` (`setStatus`) is removed. The bar above the editor is the one place the counts appear; `SWARM_BAR=off` disables it ([swarm-bar.md](swarm-bar.md)).
 
 **Scanners and test isolation:** the A16–A30 scanners fail closed on in-scope input (section 12). `tests/conftest.py` points each test's GSD and Claude state mirrors away from the checkout with `SWARM_GSD_STATE_FILE` (empty) and `SWARM_CLAUDE_STATE_DIR` (section 10).
+
+## 17. Changelog v2.4 (unreleased)
+
+- The native write-route refusal suite no longer treats `IN_REVIEW → APPROVED` as unsupported. Approval remains covered by the signed-verdict and keyless-refusal cases. A credential-free CLI smoke confirms keyless approval returns `E-POLICY`, unsupported state syntax returns `E-DEP`, and neither changes the task database or writes effects.

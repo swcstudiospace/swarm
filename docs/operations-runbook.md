@@ -103,7 +103,11 @@ After leasing a specialist task `IN_PROGRESS`, A01 obtains its exact canonical p
 `swarm_assignment({task_id, correlation_id})`. The fixed `orch_assign` operation verifies
 the persisted task/correlation/manifest target and real signature without changing state,
 attempts, history, or logs. Only A01 can call it; no arbitrary code, envelope, agent, payload,
-key, or path is accepted. Pass the verified prompt unchanged to the specialist.
+key, or path is accepted. The model-visible text is one JSON line (`status`,
+`assignment_verified`, `task_id`, `correlation_id`, `agent_slug`), then a line `--- prompt ---`,
+then the exact specialist prompt. Dispatch only when `status` is `ok` and `assignment_verified`
+is true. Pass only the text after the first marker, unchanged. `details` keeps the canonical
+object for the UI and is not what the model reads.
 Missing, unleased, child/advisory, mismatched, and dry-run requests fail closed.
 Generic code-execution devices remain forbidden; this operation is not an eval exception.
 
@@ -249,22 +253,24 @@ python3 scripts/swarm_run.py --repo /path/to/codebase --swarm-timeout 3600   # c
 
 The continuous scheduler in `scripts/swarm_run.py` (`Scheduler`) has two engines. The Python `Scheduler` is the default and the oracle. The native runtime is opt-in: `run_scheduler` in the `swarm._native` extension (crates `gsd-sched-core` and `gsd-python`). This section changes no default.
 
-**Status of the switch.** The `GSD_ENGINE` selector for the scheduler is not wired yet (phase 14.4, unit S3.2). `scripts/swarm_run.py` does not read `GSD_ENGINE`, so every swarm run uses the Python `Scheduler` whatever that variable is set to. The extension exports `run_scheduler`, but no production run calls it. `GSD_ENGINE_BIN` is not read by the scheduler: its native runtime is the extension, not the `gsd_engine` binary. The flip record is [tests/parity/flip_record_scheduler.md](../tests/parity/flip_record_scheduler.md); its status is "not flipped".
+**Status of the switch.** The `GSD_ENGINE` selector for the scheduler is wired in `scripts/swarm_run.py`: `scheduler_engine()` (line 1538) reads it in `run()` (line 2554), before any claim. The default is still `python`, so every swarm run uses the Python `Scheduler` unless `GSD_ENGINE=rust` is set. `GSD_ENGINE_BIN` is not read by the scheduler: its native runtime is the extension, not the `gsd_engine` binary. The flip record is [tests/parity/flip_record_scheduler.md](../tests/parity/flip_record_scheduler.md); its status is "not flipped".
 
-**The switch once the selector is wired.** The selector reads `GSD_ENGINE` in `run()`, before any dispatch:
+**The switch.** The selector reads `GSD_ENGINE` in `run()`, before any claim or dispatch:
 
 | `GSD_ENGINE` | Scheduler |
 |---|---|
-| unset or empty | the default, `python` (the planned module constant `SCHEDULER_DEFAULT_ENGINE` is added with the selector) |
+| unset or empty | the default, `python` (`SCHEDULER_DEFAULT_ENGINE` in `scripts/swarm_run.py`) |
 | `python` | the Python `Scheduler`, the oracle |
 | `rust` | the native runtime, composed around the same `Scheduler` controller |
 | anything else | refused before anything is dispatched: `E-INPUT`, exit 2, the value is not echoed |
 
 - `SWARM_PURE_PYTHON=1` (exactly `1`) forces Python and wins over `GSD_ENGINE`.
-- A stale extension without `run_scheduler` warns once at selection time and the run uses Python. The engine never changes in the middle of a run.
+- An explicit `GSD_ENGINE=rust` whose extension cannot be imported, or lacks `run_scheduler` or `NativeCleanupFence`, is refused with `E-DEP` before any claim. The run does not warn and does not fall back to Python. The engine never changes in the middle of a run. The `swarm` package loads `swarm._native` on import unless `SWARM_PURE_PYTHON=1` (`swarm/__init__.py`), so the extension is present for every run that imports `swarm`; the scheduler's native functions are used only under `GSD_ENGINE=rust`.
 - Both engines log `scheduler_engine: <name>`. Check that line in the run log to see which engine answered.
 - `SWARM_SCHEDULER=rounds` is unchanged by this switch. Rounds mode must also match on both engines before any flip (flip record, criterion 6).
 - Rollback is one switch: `GSD_ENGINE=python`. Both engines use the same Task Store, leases, handoffs and telemetry, all in Python, so a rollback needs no data migration.
+- `GSD_ENGINE` is inherited. Sessions inherit the runner's environment (open question Q4 in `.planning/phases/14.4-rust-scheduler-runtime-and-default-flip/14.4-CONTEXT.md`), so `GSD_ENGINE=rust` in the runner also reaches `orch_status` calls made inside sessions. Those calls need the `gsd_engine` binary (`GSD_ENGINE_BIN`), and with no usable binary they exit 2 with `E-DEP`.
+- The two defaults are separate. The scheduler default is `SCHEDULER_DEFAULT_ENGINE` in `scripts/swarm_run.py`. The `orch_status` routes have their own rows (`DEFAULT_ENGINE`, `DEFAULT_ENGINE_WRITE`, `DEFAULT_ENGINE_INGEST` in `scripts/orch_status.py`), all `python`. See "Select the engine for `orch_status` reads" below.
 
 **Architecture B (approved).** Rust owns the worker pool threads and the decision loop, on the calling main thread. Python keeps the rest: session execution (`_worker`, `execute_one`), the Task Store, telemetry (`events.jsonl`, `live.json`), leases, handoffs, signals and abort, the final run result, and signing. The two sides meet only through sixteen Python callbacks: `begin_pass`, `agent_for`, `claims_for`, `block`, `lease`, `observe_pass`, `submit`, `worker`, `internal_failure`, `complete`, `set_retry_after`, `random_unit`, `cancel_state`, `cancel_begin`, `kill` and `log`. Signing keys never enter Rust.
 
@@ -276,9 +282,9 @@ The continuous scheduler in `scripts/swarm_run.py` (`Scheduler`) has two engines
 - Keys: keys never enter Rust. Signing and key material stay in Python.
 - Speed: no speed-up is claimed. Python stays the default until both paired p50 and paired p95 ratios (Rust over Python) are strictly below 1.00 on a qualifying quiet host (1-minute load below 1.5 for ten minutes), and the user has explicitly approved the flip, recorded in `.planning/STATE.md`. A ratio of exactly 1.00 fails. The existing A2 records are moderate-load runs and do not count.
 
-**What is still open.** The selector (S3.2), the port tests (`tests/test_scheduler_ports.py`), the thread and stuck-worker tests (`tests/parity/test_scheduler_threads.py`), the local S5 green, the feature-branch CI run, the quiet-host paired A2 run (S6), and the user's approval with an exercised rollback (S7). Until these are recorded, the default is Python and nothing in this section is a flip.
+**What is still open.** The port tests (`tests/test_scheduler_ports.py`), the thread and stuck-worker tests (`tests/parity/test_scheduler_threads.py`), the local S5 green, the feature-branch CI run, the quiet-host paired A2 run (S6), and the user's approval with an exercised rollback (S7). Until these are recorded, the default is Python and nothing in this section is a flip.
 
-**What operators do now.** Nothing changes: the default is Python. If you suspect the continuous scheduler, use `SWARM_SCHEDULER=rounds` (see above) and report what you saw. Once the selector is wired, use `GSD_ENGINE=rust` only in a test or canary run, and set `GSD_ENGINE=python` to roll back.
+**What operators do now.** Nothing changes: the default is Python. If you suspect the continuous scheduler, use `SWARM_SCHEDULER=rounds` (see above) and report what you saw. To try the native loop, use `GSD_ENGINE=rust` only in a test or canary run, and set `GSD_ENGINE=python` to roll back.
 
 ## Handover verification failures
 

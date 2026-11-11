@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { callingAgent } from "../src/context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, parseSignerDenyPaths, RULES, ruleReason, SWARM_SLUGS } from "../src/guard.ts";
+import { swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
@@ -154,6 +155,50 @@ describe("HOOK-04", () => {
     process.env.SWARM_AGENT = A01;
     const { run } = guardHandler({ activeTools: ["read"] });
     expect((run(call("bash", {}), fakeCtx(CWD)) as { reason?: string } | undefined)?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
+  });
+
+  test("advisor review surface is not the depth cap", () => {
+    for (const activeTools of [
+      ["read", "grep", "glob"],
+      ["read", "grep", "glob", "advise"],
+      ["grep", "glob"],
+      ["READ", "Grep", "Glob"],
+    ]) {
+      const facts = { ...capped, activeTools };
+      expect(guardToolCall(call("read", { path: "x" }), facts)).toBeUndefined();
+      expect(guardToolCall(call("bash", { command: "ls" }), facts)).toBeUndefined();
+      expect(guardToolCall(yieldData({ state: "IN_REVIEW" }), facts)).toBeUndefined();
+      const viaEval = guardToolCall(call("eval", { code: "p = workpool('scout')" }), facts);
+      expect(viaEval?.block).toBe(true);
+      expect(viaEval?.reason).toContain("eval-in-swarm");
+    }
+  });
+
+  test.each([
+    ["lone read", ["read"]],
+    ["read plus advise", ["read", "advise"]],
+    ["advise only", ["advise"]],
+    ["empty", [] as string[]],
+    ["orchestrator tools without task", ["read", "bash", "yield"]],
+    ["advisor set plus bash", ["read", "grep", "glob", "bash"]],
+    ["advisor set plus yield", ["read", "grep", "glob", "yield"]],
+    ["advisor set plus swarm_plan", ["read", "grep", "glob", "swarm_plan"]],
+  ])("active tools %s stay at the depth cap", (_name, activeTools) => {
+    const res = guardToolCall(call("read", { path: "x" }), { ...capped, activeTools });
+    expect(res?.block).toBe(true);
+    expect(res?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
+  });
+
+  test("registered handler: advisor review tools do not block A01", () => {
+    const { run } = guardHandler({ activeTools: ["read", "grep", "glob", "advise"] });
+    expect(run(call("read", { path: "x" }), a01Ctx())).toBeUndefined();
+    expect(run(call("bash", { command: "ls" }), a01Ctx())).toBeUndefined();
+  });
+
+  test("registered handler: advisor set plus an orchestrator tool stays capped", () => {
+    const { run } = guardHandler({ activeTools: ["read", "grep", "glob", "bash", "yield"] });
+    const res = run(call("bash", { command: "ls" }), a01Ctx()) as { reason?: string } | undefined;
+    expect(res?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
   });
 });
 
@@ -2034,6 +2079,13 @@ describe("HOOK-03 shell twin and D-08", () => {
     },
   );
 
+  test("an uncompilable glob such as [z-a]x may name a protected component, so the shell write is refused in a swarm", () => {
+    expect(guardToolCall(bash("echo x > [z-a]x"), facts(B05))).toEqual({
+      block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-shell)",
+    });
+    expect(guardToolCall(bash("echo x > [z-a]x"), facts(undefined))).toBeUndefined();
+  });
+
   test.each([
     "cat .swarm/tasks.db", "cp .omp/config.yml /tmp/x.yml", "echo x > out.txt", "ls 2>&1 | tee log.txt",
     // WR-06 negatives: reads and mutations elsewhere
@@ -2769,5 +2821,21 @@ describe("private signer file reads", () => {
   ])("comparison tools that print signer operands are refused: %s", (command) => {
     expect(guardToolCall(call("bash", { command }), facts)).toEqual(blockedShell);
     expect(guardToolCall(call("bash", { command: "diff src/guard.ts /dev/null" }), facts)).toBeUndefined();
+  });
+});
+
+describe("HOOK-01 fail-open is traced (TS-16)", () => {
+  test("a throwing classifier leaves the prompt untouched and logs one debug entry carrying the error", () => {
+    const debug: { message: string; detail: unknown }[] = [];
+    const log = { debug: (message: string, detail?: unknown) => void debug.push({ message, detail }) };
+    const boom = () => {
+      throw new Error("classifier exploded");
+    };
+    const out = swarmContext({ prompt: "implement the billing module", systemPrompt: ["base"] }, fakeCtx("/nonexistent-hook-cwd"), {}, boom, log);
+    expect(out).toBeUndefined();
+    expect(debug).toHaveLength(1);
+    expect(debug[0].message).toContain("classifier");
+    expect(debug[0].detail).toBeInstanceOf(Error);
+    expect((debug[0].detail as Error).message).toBe("classifier exploded");
   });
 });

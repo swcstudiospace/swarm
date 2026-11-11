@@ -27,8 +27,33 @@ export const SWARM_SLUGS: readonly string[] = [
 const SWARM_STATE_TOOLS: Record<string, true> = { swarm_transition: true, swarm_ingest: true };
 
 export const DEPTH_REASON =
-  `BLOCKED needs: depth — ${ORCHESTRATOR} is at the task depth cap (no \`task\` tool), so it cannot dispatch. ` +
+  `BLOCKED needs: depth — ${ORCHESTRATOR} is at the task depth cap (no \`task\` tool), so it cannot dispatch specialists. ` +
+  `Read-only discovery is not this block. ` +
   `The only permitted call is yield with data {task_id, state: "BLOCKED", needs: "depth"}.`;
+
+/**
+ * Omp's advisor review surface (`modelRoles.advisor`). The default advisor tools are read, grep and glob;
+ * `advise` is the note the advisor delivers. This is balanced-budget review, not the task depth cap.
+ * A lone `read` (the headless cap fixture) is excluded: `grep` or `glob` is required. Any other tool
+ * (bash, write, yield, swarm_*) means `task` was stripped from a real orchestrator set, and the cap stands.
+ */
+const ADVISOR_REVIEW_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "glob", "advise"]);
+
+/** True when every active tool is an advisor review tool and the set is not a read-only stub. */
+export function isAdvisorReviewSurface(tools: readonly string[] | undefined): boolean {
+  if (tools === undefined || tools.length === 0) return false;
+  let review = false;
+  const seen = new Set<string>();
+  for (const raw of tools) {
+    if (typeof raw !== "string") return false;
+    const name = raw.trim().toLowerCase();
+    if (name === "") continue;
+    if (!ADVISOR_REVIEW_TOOLS.has(name)) return false;
+    seen.add(name);
+    if (name === "grep" || name === "glob") review = true;
+  }
+  return review && seen.size > 0;
+}
 export const SWARM_STATE_REASON = "BLOCKED needs: human-approval (swarm-state)";
 export const SWARM_ASSIGNMENT_REASON = "BLOCKED needs: human-approval (swarm-assignment)";
 /** index.ts appends the error message and `)` when the guard itself throws inside a swarm session (D-02). */
@@ -43,6 +68,11 @@ export interface GuardFacts {
   planMode: boolean;
   /** getActiveTools() contains `task`; read only for a01-orchestrator, true otherwise. */
   hasTask: boolean;
+  /**
+   * getActiveTools() for a01-orchestrator; omitted for every other agent and for the pure depth-cap facts.
+   * The advisor review surface is not the depth cap (isAdvisorReviewSurface).
+   */
+  activeTools?: readonly string[];
   /** No session_init entry: the operator's main session or a headless `-p` swarm session. */
   topLevel: boolean;
   env: Readonly<Record<string, string | undefined>>;
@@ -107,8 +137,17 @@ function ownSubstrateTool(name: string, facts: GuardFacts): boolean {
 }
 
 export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCallResult | undefined {
-  // HOOK-04 (D-06): A01 without `task`, not a restricted child and not in plan mode, can only report BLOCKED/depth
-  if (facts.agent === ORCHESTRATOR && !facts.hasTask && !facts.restricted && !facts.planMode && !isDepthYield(event)) {
+  // HOOK-04 (D-06): A01 without `task`, not a restricted child and not in plan mode, can only report BLOCKED/depth.
+  // The advisor review surface is balanced-budget review (modelRoles.advisor stays). It must not block the session
+  // or work-pool creation. A real cap still holds orchestrator tools after `task` is stripped; a lone `read` stays capped.
+  if (
+    facts.agent === ORCHESTRATOR &&
+    !facts.hasTask &&
+    !facts.restricted &&
+    !facts.planMode &&
+    !isAdvisorReviewSurface(facts.activeTools) &&
+    !isDepthYield(event)
+  ) {
     return { block: true, reason: DEPTH_REASON };
   }
   // HOOK-03 (D-05): applies everywhere, swarm session or not

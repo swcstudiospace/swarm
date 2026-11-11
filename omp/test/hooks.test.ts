@@ -53,7 +53,12 @@ describe("fixture positives inject once, after the prior parts", () => {
       expect(out.systemPrompt.slice(0, -1)).toEqual(PRIOR);
       const added = out.systemPrompt.at(-1) ?? "";
       expect(added.startsWith("## AgentSwarm")).toBe(true);
-      expect(added).toContain("/swarm <brief>");
+      expect(added).toContain('agent: "a01-orchestrator"');
+      expect(added).toContain("swarm_plan");
+      expect(added).toContain("execution_assignment_verified");
+      expect(added).toContain("non-empty");
+      expect(added).toContain("`context`");
+      expect(added).not.toContain("/swarm <brief>");
       expect(added).toContain("task");
       expect(added).toContain("a01-orchestrator");
       expect(out.systemPrompt.filter((p) => p.includes("## AgentSwarm"))).toHaveLength(1);
@@ -79,6 +84,26 @@ describe("fixture negatives are silent except the gsd-autonomous handoff", () =>
 test("gsd-autonomous handoff text does not name the retired policy token", () => {
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join("-"));
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join(""));
+});
+
+test("auto-steer dispatches A01 with the brief and has A01 plan it", () => {
+  expect(SWARM_CONTEXT).toContain('agent: "a01-orchestrator"');
+  expect(SWARM_CONTEXT).toContain("swarm_plan");
+  expect(SWARM_CONTEXT).toContain("execution_assignment_verified");
+  expect(SWARM_CONTEXT).toContain("A prose brief is not itself a signed assignment");
+  expect(SWARM_CONTEXT).toContain("non-empty");
+  expect(GSD_HANDOFF).toContain("non-empty");
+  expect(SWARM_CONTEXT).not.toContain("yields BLOCKED");
+  expect(SWARM_CONTEXT).toContain("If A01 cannot dispatch");
+  expect(SWARM_CONTEXT).toContain("Read-only discovery stays in this session");
+  expect(SWARM_CONTEXT).toContain("not a swarm BLOCKED");
+  expect(GSD_HANDOFF).toContain("If A01 cannot dispatch");
+  expect(GSD_HANDOFF).toContain("Do not hand off with every node blocked");
+  expect(GSD_HANDOFF).toContain("finish them inline");
+  expect(GSD_HANDOFF).toContain('agent: "a01-orchestrator"');
+  expect(GSD_HANDOFF).toContain("swarm_plan");
+  expect(GSD_HANDOFF).toContain("Do not treat the phase text as an already-signed `task.assign`");
+  expect(GSD_HANDOFF).not.toContain("`/swarm <phase brief>` only");
 });
 
 test("gsd-autonomous handoff fires only for a leading /gsd-autonomous command", () => {

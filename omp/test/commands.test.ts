@@ -64,6 +64,8 @@ function session(outcome: BridgeResult | Error = PLAN) {
 }
 
 const calls = (log: CallLog) => log.map((e) => e.call);
+/** The five info notifications the startup step reports with a UI before planning (lifecycle, LOADING, INITIALIZING, trigger). */
+const STARTUP = ["notify", "notify", "notify", "notify", "notify"];
 const bridgeReq = (log: CallLog) => log.find((e) => e.call === "bridge")?.req as BridgeRequest | undefined;
 const dispatchText = (log: CallLog) => log.find((e) => e.call === "sendUserMessage")?.text as string | undefined;
 /** The task.assign payload line of the dispatch prompt (the one JSON object line). */
@@ -182,19 +184,19 @@ test("async start: waitForIdle resolves at once while the turn is in flight, yet
   await turn.observed(); // the handler polled with the turn in flight; a handler that did not hold would have settled
   expect(turn.ended()).toBe(false);
   expect(settled).toBe(false);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start"]); // waitForIdle not yet called
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "turn-start"]); // waitForIdle not yet called
 
   turn.finish(); // the turn ends on this call, not on a timer racing the assertions above
   await run;
   expect(turn.ended()).toBe(true);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "turn-end", "waitForIdle", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "turn-start", "turn-end", "waitForIdle", "notify"]);
   expect(log.at(-1)?.message).toContain(`plan ${CORR} dispatched`);
 });
 
 test("branch entry only: a turn that runs between two polls is seen through the dispatch message on the branch", async () => {
   const { log, swarm, ctx } = turnSession({ entryMs: 20, entry: DISPATCH_ENTRY });
   await swarm.handler(BRIEF, ctx);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "waitForIdle", "notify"]);
   expect(log.at(-1)?.level).toBe("info");
 });
 
@@ -202,7 +204,7 @@ test("branch entry: a dispatch message that was already on the branch does not c
   const { log, swarm, ctx } = turnSession({}, { startTimeoutMs: 100 });
   ctx.sessionManager.getBranch().push(DISPATCH_ENTRY); // an earlier /swarm of the same brief
   await swarm.handler(BRIEF, ctx);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "notify"]);
   expect(log.at(-1)?.level).toBe("error");
 });
 
@@ -211,7 +213,7 @@ test("never starts: after the start cap the handler reports the failure at level
   const t0 = Date.now();
   await swarm.handler(BRIEF, ctx);
   expect(Date.now() - t0).toBeLessThan(1000);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "notify"]);
   const last = log.at(-1);
   expect(last?.level).toBe("error");
   expect(String(last?.message)).toContain("dispatch did not start");
@@ -224,13 +226,13 @@ test("hold cap: a turn still running at the cap is reported at level warning as 
   const t0 = Date.now();
   await swarm.handler(BRIEF, ctx);
   expect(Date.now() - t0).toBeLessThan(1000);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "turn-start", "notify"]);
   const last = log.at(-1);
   expect(last?.level).toBe("warning");
   expect(String(last?.message)).toContain(`plan ${CORR} dispatched`);
   expect(String(last?.message)).toContain("still running after 0.1 s");
   expect(String(last?.message)).toContain(HOLD_ENV);
-  expect(log.some((e) => e.call === "notify" && e.level === "info")).toBe(false);
+  expect(log.some((e) => e.call === "notify" && e.level === "info" && String(e.message).includes("dispatched"))).toBe(false);
   turn.finish();
 });
 
@@ -286,7 +288,7 @@ test("sync start: isIdle already false on the first poll counts as started; the 
     },
   });
   await swarm.handler(BRIEF, ctx);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "waitForIdle", "notify"]);
   expect(reads).toEqual([false, true]);
 });
 
@@ -349,8 +351,8 @@ test.each<[string, BridgeResult | Error]>([
   const repo = gitRepo();
   const { log, swarm } = session(outcome);
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log }));
-  expect(calls(log)).toEqual(["bridge", "notify"]);
-  expect(String(log[1].message)).toContain("pass a new --correlation-id or --prefix");
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "notify"]);
+  expect(String(log.at(-1)?.message)).toContain("pass a new --correlation-id or --prefix");
 });
 
 test.each<[string, Error | BridgeResult]>([
@@ -362,7 +364,7 @@ test.each<[string, Error | BridgeResult]>([
   const repo = gitRepo();
   const { log, swarm } = session(outcome);
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log }));
-  expect(calls(log)).toEqual(["bridge", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "notify"]);
 });
 
 test("reused plan: an identical brief dispatches normally", async () => {
@@ -442,7 +444,7 @@ test.each([
   const entries: SessionEntry[] = [];
   let idleReads = 0;
   await swarm.handler(BRIEF, commandCtx(gitRepo(), entries, { log, isIdle: () => (idleReads++, false) }));
-  expect(calls(log)).toEqual(["bridge", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "bridge", "notify"]);
   expect(idleReads).toBe(0);
   expect(entries).toEqual([]);
   expect(log.at(-1)?.level).toBe("error");
@@ -581,7 +583,7 @@ test("scoped bridge: the command and swarm_plan share one session's inflight set
   expect(reqs[0].args).toEqual(reqs[1].args);
 });
 
-test("real orch_plan: the same brief reuses one plan; a different brief gets its own correlation", async () => {
+test("real orch_plan: the same brief reuses one plan", async () => {
   const repo = gitRepo();
   process.env.SWARM_DIR = tmpDir("swarm-omp-dir-");
   const log: CallLog = [];
@@ -597,31 +599,51 @@ test("real orch_plan: the same brief reuses one plan; a different brief gets its
 
   await swarm.handler(BRIEF, ctx);
   await swarm.handler(`  ${BRIEF} --risk=medium `, ctx);
-  await swarm.handler("fix the login bug --pattern=hotfix", ctx);
   const texts = log.filter((e) => e.call === "sendUserMessage").map((e) => String(e.text));
-  expect(texts).toHaveLength(3);
-  expect(planned).toHaveLength(3);
-  const expectedCorrelations = [BRIEF_CORR, BRIEF_CORR, swarmCorrelationId({
-    brief: "fix the login bug", pattern: "hotfix", risk_class: "medium",
-  })];
+  expect(texts).toHaveLength(2);
+  expect(planned).toHaveLength(2);
   for (let i = 0; i < planned.length; i++) {
     expect(planned[i].json.execution_assignment_verified).toBe(true);
-    expect(dispatchEvidence(payload(texts[i]), expectedCorrelations[i])).toEqual({ verified: true, authorized: true });
+    expect(dispatchEvidence(payload(texts[i]), BRIEF_CORR)).toEqual({ verified: true, authorized: true });
   }
   expect(planned[1].json.reused).toBe(true);
 
-  const [first, again, other] = texts.map(payload) as Array<{ correlation_id: string; payload: { ready_tasks: string[]; task_id: string; correlation_id: string } }>;
+  const [first, again] = texts.map(payload) as Array<{ correlation_id: string; payload: { ready_tasks: string[]; task_id: string } }>;
   expect(first.correlation_id).toBe(BRIEF_CORR);
   expect(again.payload.ready_tasks).toEqual(first.payload.ready_tasks);
   expect(again.payload.task_id).toBe(BRIEF_CORR);
-  expect(other.correlation_id).not.toBe(BRIEF_CORR);
-  expect(other.payload.ready_tasks).toHaveLength(1);
 
   // one plan for the brief in the store: the second run created nothing
   const mine = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: BRIEF_CORR }, fakeCtx(repo))).details);
   expect(mine).toHaveLength(13);
   expect(mine).toContain(first.payload.ready_tasks[0]);
-  const others = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: other.correlation_id }, fakeCtx(repo))).details);
+});
+
+// beforeEach has already planned BRIEF in this store (under CORR): this test plans only the other brief, so its body runs one cold plan
+test("real orch_plan: a different brief gets its own correlation beside another brief's plan", async () => {
+  const repo = gitRepo();
+  const log: CallLog = [];
+  const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
+  const planned: BridgeResult[] = [];
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    const result = await runPy(req);
+    if (req.script === "orch_plan") planned.push(result);
+    return result;
+  } }));
+  await pi.command("swarm").handler("fix the login bug --pattern=hotfix", commandCtx(repo, [], { log, hasUI: false }));
+  const texts = log.filter((e) => e.call === "sendUserMessage").map((e) => String(e.text));
+  expect(texts).toHaveLength(1);
+  expect(planned).toHaveLength(1);
+  expect(planned[0].json.execution_assignment_verified).toBe(true);
+  const otherCorr = swarmCorrelationId({ brief: "fix the login bug", pattern: "hotfix", risk_class: "medium" });
+  expect(dispatchEvidence(payload(texts[0]), otherCorr)).toEqual({ verified: true, authorized: true });
+
+  const other = payload(texts[0]) as { correlation_id: string; payload: { ready_tasks: string[] } };
+  expect(other.correlation_id).toBe(otherCorr);
+  expect(other.correlation_id).not.toBe(BRIEF_CORR);
+  expect(other.payload.ready_tasks).toHaveLength(1);
+
+  const others = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: otherCorr }, fakeCtx(repo))).details);
   expect(others).toHaveLength(8);
   expect(others).toContain(other.payload.ready_tasks[0]);
 });
@@ -675,5 +697,78 @@ test("reused live plan dispatches newly ready dependencies, not its stale initia
   expect(assignment.ready_tasks).not.toContain(root.task_id);
   expect(new Set(assignment.ready_tasks)).toEqual(new Set(tasks.filter((task) =>
     task.depends_on.length > 0 && task.depends_on.every((id) => id === root.task_id)).map((task) => task.task_id)));
-  expect(calls(log)).toEqual(["sendUserMessage", "waitForIdle", "notify"]);
+  expect(calls(log)).toEqual([...STARTUP, "sendUserMessage", "waitForIdle", "notify"]);
+});
+
+/**
+ * A /swarm session whose dispatch turn is scripted as `script`; `afterSend` runs once the dispatch is sent, which is
+ * after the lifecycle step and the deadline of the start wait, so a clock change it arms lands mid-wait.
+ */
+function dispatchedSession(script: ScriptedTurn, opts: SwarmCommandOptions, afterSend: () => void) {
+  const log: CallLog = [];
+  const entries: SessionEntry[] = [];
+  const turn = fakeTurn(script, entries, log);
+  const bridge: Bridge = async (req) => {
+    log.push({ call: "bridge", req });
+    return PLAN;
+  };
+  const pi = fakePi({
+    sendUserMessage: (text) => {
+      log.push({ call: "sendUserMessage", text });
+      turn.start();
+      afterSend();
+    },
+  });
+  pi.load(createSwarmExtension({ bridge }));
+  const swarm = swarmCommand(pi.api, bridge, opts);
+  const ctx = commandCtx(gitRepo(), entries, { log, isIdle: turn.isIdle });
+  return { log, swarm, ctx };
+}
+
+test("clock: a wall-clock jump during the dispatch-start wait does not fail a turn that starts on time", async () => {
+  // the poll deadlines run on performance.now(); a Date.now() jump mid-wait must not read as a start timeout
+  const realNow = Date.now;
+  let skew = 0;
+  const jumped = spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+  try {
+    const { log, swarm, ctx } = dispatchedSession({ entryMs: 30, entry: DISPATCH_ENTRY }, { startTimeoutMs: 5_000 }, () => {
+      setTimeout(() => (skew = 3_600_000), 1); // the jump lands between two polls
+    });
+    await swarm.handler(BRIEF, ctx);
+    expect(log.at(-1)?.level).toBe("info");
+    expect(String(log.at(-1)?.message)).toContain(`plan ${CORR} dispatched`);
+  } finally {
+    jumped.mockRestore();
+  }
+});
+
+test("cancel: an aborted signal stops both waits at once and reports the cancel at level warning", async () => {
+  const ac = new AbortController();
+  const { log, swarm, ctx } = dispatchedSession({}, { startTimeoutMs: 2_000, signal: ac.signal }, () => {
+    setTimeout(() => ac.abort(), 20); // the start wait is already polling when the abort lands
+  });
+  const t0 = performance.now();
+  await swarm.handler(BRIEF, ctx);
+  expect(performance.now() - t0).toBeLessThan(1000);
+  expect(log.at(-1)?.level).toBe("warning");
+  expect(String(log.at(-1)?.message)).toContain("cancelled");
+  expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);
+});
+
+test("startup progress goes through notify at info level, so a UI shows the init states", async () => {
+  const { log, swarm } = session();
+  await swarm.handler(BRIEF, commandCtx(gitRepo(), [], { log }));
+  const progress = log.filter((e) => e.call === "notify" && e.level === "info").map((e) => String(e.message));
+  expect(progress.some((m) => m.includes("state=LOADING"))).toBe(true);
+  expect(progress.some((m) => m.includes("state=INITIALIZING"))).toBe(true);
+});
+
+test("orch_plan result without a correlation id is refused with E-CONTRACT and never dispatched", async () => {
+  const { log, swarm } = session({ exitCode: 0, json: {}, swarmDir: "" });
+  await swarm.handler(BRIEF, commandCtx(gitRepo(), [], { log }));
+  expect(calls(log)).not.toContain("sendUserMessage");
+  expect(calls(log)).not.toContain("waitForIdle");
+  expect(log.at(-1)?.level).toBe("error");
+  expect(String(log.at(-1)?.message)).toContain("E-CONTRACT");
+  expect(String(log.at(-1)?.message)).toContain("correlation_id");
 });

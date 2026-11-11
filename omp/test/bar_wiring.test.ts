@@ -135,6 +135,9 @@ function fakeUi(options: { throwOnWidget?: boolean; theme?: BarTheme } = {}) {
   };
 }
 
+/** A wall clock pinned far from the real one: every mtime a test writes is derived from it, never from `Date.now()`. */
+const FIXED_WALL = Date.UTC(2001, 8, 9);
+
 interface Harness {
   pi: FakePi;
   bus: FakeBus;
@@ -175,7 +178,7 @@ function harness(
       bar: {
         env: { HOME: home, ...options.env },
         now: () => clock.mono,
-        wallNow: options.wallNow ?? (() => Date.now()),
+        wallNow: options.wallNow ?? (() => FIXED_WALL),
         timers,
         stderr: (text) => void stderr.push(text),
         swarmDir: dir === undefined ? () => join(tmpDir("swarm-nolive-"), "none") : () => dir,
@@ -989,7 +992,7 @@ describe("live.json", () => {
     expect(h.host.lines()[1]).toMatch(/a05-backend\s+35s/);
     // the producer writes a newer snapshot: queued work shows up
     writeFileSync(join(dir, "live.json"), doc([running, { run_id: "T2.a1", task_id: "T2", agent: "a06-frontend", state: "queued" }]));
-    utimesSync(join(dir, "live.json"), new Date(), new Date(Date.now() + 5000));
+    utimesSync(join(dir, "live.json"), new Date(FIXED_WALL), new Date(FIXED_WALL + 5000));
     h.clock.mono += 1000;
     h.timers.tickInterval();
     expect(h.host.lines()[1]).toContain("a06-frontend");
@@ -1011,11 +1014,11 @@ describe("live.json", () => {
     expect(() => h.fire("session_start")).not.toThrow();
     expect(h.host.lines()).toEqual(TELEMETRY);
     writeFileSync(path, JSON.stringify({ schema: "other.v9", runs: [] }));
-    utimesSync(path, new Date(), new Date(Date.now() + 3000));
+    utimesSync(path, new Date(FIXED_WALL), new Date(FIXED_WALL + 3000));
     h.fire("turn_start");
     expect(h.host.lines()).toEqual(TELEMETRY);
     writeFileSync(path, doc([running]));
-    utimesSync(path, new Date(), new Date(Date.now() + 6000));
+    utimesSync(path, new Date(FIXED_WALL), new Date(FIXED_WALL + 6000));
     h.clock.mono += 1000;
     h.fire("turn_start");
     expect(h.host.lines()[1]).toContain("a05-backend");
@@ -1026,7 +1029,7 @@ describe("live.json", () => {
     const dir = liveDir();
     const path = join(dir, "live.json");
     writeFileSync(path, doc([running]));
-    const old = new Date(Date.now() - 100_000);
+    const old = new Date(FIXED_WALL - 100_000);
     utimesSync(path, old, old);
     const h = harness({ swarmDir: dir });
     h.fire("session_start");
@@ -1037,7 +1040,7 @@ describe("live.json", () => {
     const dir = liveDir();
     const path = join(dir, "live.json");
     writeFileSync(path, doc([{ ...running, state: "completed" }]));
-    const old = new Date(Date.now() - 3_600_000);
+    const old = new Date(FIXED_WALL - 3_600_000);
     utimesSync(path, old, old);
     const h = harness({ swarmDir: dir });
     h.fire("session_start");
@@ -1048,7 +1051,7 @@ describe("live.json", () => {
     const dir = liveDir();
     const path = join(dir, "live.json");
     writeFileSync(path, doc([running]));
-    const old = new Date(Date.now() - 2 * 86_400_000);
+    const old = new Date(FIXED_WALL - 2 * 86_400_000);
     utimesSync(path, old, old);
     const h = harness({ swarmDir: dir });
     h.fire("session_start");
@@ -1066,7 +1069,7 @@ describe("live.json", () => {
     const dir = liveDir();
     const path = join(dir, "live.json");
     writeFileSync(path, doc([running]));
-    const old = new Date(Date.now() - 100_000);
+    const old = new Date(FIXED_WALL - 100_000);
     utimesSync(path, old, old);
     const h = harness({ swarmDir: dir });
     h.fire("session_start");
@@ -1109,7 +1112,7 @@ describe("live.json", () => {
     h.fire("session_start");
     expect(h.host.lines()).toEqual(TELEMETRY);
     writeFileSync(path, doc([running]));
-    utimesSync(path, new Date(), new Date(Date.now() + 3000));
+    utimesSync(path, new Date(FIXED_WALL), new Date(FIXED_WALL + 3000));
     h.fire("turn_start");
     expect(h.host.lines()[1]).toContain("a05-backend");
     // unlink
@@ -1122,7 +1125,7 @@ describe("live.json", () => {
   test("a wall-clock jump does not move a running timer", () => {
     const dir = liveDir();
     writeFileSync(join(dir, "live.json"), doc([running]));
-    let wall = Date.now();
+    let wall = FIXED_WALL;
     const h = harness({ swarmDir: dir, wallNow: () => wall });
     h.fire("session_start");
     wall += 86_400_000;
@@ -1192,7 +1195,7 @@ describe("idle watcher", () => {
     for (const present of [false, true]) {
       if (present) {
         writeFileSync(settled, doc([{ ...running, state: "completed" }]));
-        const t = new Date(Math.floor(Date.now() / 1000) * 1000 - 1000);
+        const t = new Date(FIXED_WALL - 1000);
         utimesSync(settled, t, t);
       }
       const h = harness({ swarmDir: dir });
@@ -1213,7 +1216,7 @@ describe("idle watcher", () => {
     const dir = liveDir();
     const path = join(dir, "live.json");
     writeFileSync(path, doc([{ ...running, state: "completed" }]));
-    const t = new Date(Math.floor(Date.now() / 1000) * 1000 - 1000);
+    const t = new Date(FIXED_WALL - 1000);
     utimesSync(path, t, t);
     const h = harness({ swarmDir: dir });
     h.fire("session_start");
@@ -1232,7 +1235,7 @@ describe("idle watcher", () => {
     const dir = liveDir();
     const path = join(dir, "live.json");
     writeFileSync(path, doc([running]));
-    const ancient = new Date(Date.now() - 2 * 86_400_000);
+    const ancient = new Date(FIXED_WALL - 2 * 86_400_000);
     utimesSync(path, ancient, ancient);
     const history = harness({ swarmDir: dir });
     history.fire("session_start");
@@ -1240,7 +1243,7 @@ describe("idle watcher", () => {
     expect(history.host.lines()).toEqual(IDLE);
     expect(history.host.widgetCalls()).toHaveLength(1); // the mount; the ancient file changed nothing since
 
-    const dead = new Date(Date.now() - 100_000);
+    const dead = new Date(FIXED_WALL - 100_000);
     utimesSync(path, dead, dead);
     const warned = harness({ swarmDir: dir });
     warned.fire("session_start");
@@ -1423,7 +1426,7 @@ describe("RV-F late fixes: the derived live.json, background specialists, the ev
     const path = join(dir, "live.json");
     writeFileSync(path, text);
     if (ageMs > 0) {
-      const old = new Date(Date.now() - ageMs);
+      const old = new Date(FIXED_WALL - ageMs);
       utimesSync(path, old, old);
     }
     return dir;

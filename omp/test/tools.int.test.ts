@@ -142,6 +142,59 @@ test("plan dash brief is passed intact", async () => {
   expect(tasks.tasks[0].notes.brief_excerpt).toBe(brief);
 });
 
+test("plan content shows a verified execution assignment and omits it when unsigned", { timeout: 30_000 }, async () => {
+  const { ctx } = tmpStore();
+  const { tool } = swarm();
+  const real = await callTool(tool("swarm_plan"), HOTFIX, ctx);
+  const details = real.details as {
+    status: string;
+    correlation_id: string;
+    summary: string;
+    execution_assignment_verified?: boolean;
+    execution_assignment?: { schema?: string; type?: string; target?: string; payload?: { capability?: string } };
+  };
+  const visible = JSON.parse(real.content[0].text) as Record<string, unknown>;
+  const verified = details.execution_assignment_verified === true;
+  expect(verified).toBe(true);
+  expect(visible.execution_assignment_verified).toBe(true);
+  expect(visible.status).toBe(details.status);
+  expect(visible.correlation_id).toBe("c-hot");
+  expect(visible.pattern).toBe("hotfix");
+  expect(visible.reused).toBe(false);
+  expect(visible.summary).toBe(details.summary);
+  expect(visible.execution_assignment).toEqual(details.execution_assignment);
+  expect(details.execution_assignment?.schema).toBe("swarm.v1.task.assign");
+  expect(details.execution_assignment?.type).toBe("task.assign");
+  expect(details.execution_assignment?.target).toBe("A01");
+  expect(details.execution_assignment?.payload?.capability).toBe("plan.execute");
+  expect(JSON.stringify(real)).not.toMatch(/SWARM_SIGNING_KEY|SWARM_ED25519_KEY_FILE|PRIVATE KEY/);
+
+  const again = await callTool(tool("swarm_plan"), HOTFIX, ctx);
+  const reused = JSON.parse(again.content[0].text) as { reused?: boolean; execution_assignment_verified?: boolean; execution_assignment?: { schema?: string } };
+  expect((again.details as { reused?: boolean }).reused).toBe(true);
+  expect(reused.reused).toBe(true);
+  expect(reused.execution_assignment_verified).toBe(true);
+  expect(reused.execution_assignment?.schema).toBe("swarm.v1.task.assign");
+
+  const dry = await callTool(tool("swarm_plan"), { ...HOTFIX, correlation_id: "c-dry", dry_run: true }, ctx);
+  const dryVisible = JSON.parse(dry.content[0].text) as Record<string, unknown>;
+  expect((dry.details as { execution_assignment_verified?: boolean }).execution_assignment_verified).not.toBe(true);
+  expect(dryVisible.execution_assignment_verified).toBe(false);
+  expect(dryVisible).not.toHaveProperty("execution_assignment");
+  expect(typeof dryVisible.summary).toBe("string");
+
+  delete process.env.SWARM_SIGNING_KEY;
+  try {
+    const unsigned = await callTool(tool("swarm_plan"), { ...HOTFIX, correlation_id: "c-open", prefix: "U" }, ctx);
+    const open = JSON.parse(unsigned.content[0].text) as Record<string, unknown>;
+    expect((unsigned.details as { execution_assignment_verified?: boolean }).execution_assignment_verified).not.toBe(true);
+    expect(open.execution_assignment_verified).toBe(false);
+    expect(open).not.toHaveProperty("execution_assignment");
+  } finally {
+    process.env.SWARM_SIGNING_KEY = ephemeralSigningKey();
+  }
+});
+
 test("assignment uses the real canonical script for a leased task without mutating task state", async () => {
   const { ctx, sdir } = tmpStore();
   const { calls, tool } = swarm();
@@ -163,7 +216,14 @@ test("assignment uses the real canonical script for a leased task without mutati
     },
   });
   const details = res.details as { prompt: string; assignment: { sig: string } };
-  expect(res.content).toEqual([{ type: "text", text: details.prompt }]);
+  const marker = "\n--- prompt ---\n";
+  const visible = res.content[0].text;
+  const splitAt = visible.indexOf(marker);
+  expect(JSON.parse(visible.slice(0, splitAt))).toEqual({
+    status: "ok", assignment_verified: true, task_id: "H-rca", correlation_id: "c-hot", agent_slug: "a14-maintenance",
+  });
+  expect(visible.slice(0, splitAt)).not.toContain(details.assignment.sig);
+  expect(visible.slice(splitAt + marker.length)).toBe(details.prompt);
   const embedded = /# task\.assign \(signed envelope\)\n```json\n([\s\S]*?)\n```/.exec(details.prompt);
   expect(embedded).not.toBeNull();
   expect(JSON.parse(embedded![1])).toEqual(details.assignment);
@@ -172,6 +232,9 @@ test("assignment uses the real canonical script for a leased task without mutati
   process.env.SWARM_AGENT = "a01-orchestrator";
   const headless = await callTool(tool("swarm_assignment"), { task_id: "H-rca", correlation_id: "c-hot" }, fakeCtx(ctx.cwd));
   expect(headless.details).toMatchObject({ assignment_verified: true, task_id: "H-rca", agent_slug: "a14-maintenance" });
+  const headlessText = headless.content[0].text;
+  const headlessPrompt = (headless.details as { prompt: string }).prompt;
+  expect(headlessText.slice(headlessText.indexOf(marker) + marker.length)).toBe(headlessPrompt);
   expect(readFileSync(db)).toEqual(before);
   expect(readdirSync(sdir, { recursive: true }).sort()).toEqual(files);
 });
@@ -331,6 +394,9 @@ test("assignment accepts the verified envelope when memory quotes the heading an
   createSwarmExtension({ bridge: async () => quoted })(pi.api);
   const res = await callTool(pi.tool("swarm_assignment"), params, controller);
   expect(res.details).toMatchObject({ assignment_verified: true, task_id: "H-rca", agent_slug: "a14-maintenance" });
+  const quotedText = res.content[0].text;
+  const quotedMarker = "\n--- prompt ---\n";
+  expect(quotedText.slice(quotedText.indexOf(quotedMarker) + quotedMarker.length)).toBe(quoted.json.prompt);
 
   const duplicated = structuredClone(valid);
   const real = valid.json.prompt as string;
@@ -777,7 +843,10 @@ test("quality outer supervision bounds a real delayed child group including its 
     // survives for its cleanup margin, and is then killed rather than recording success.
     expect(Date.now() - start).toBeGreaterThanOrEqual(60_000);
     const ids = JSON.parse(readFileSync(pids, "utf8")) as { parent: number; child: number };
-    for (const pid of [ids.parent, ids.child]) expect(() => process.kill(pid, 0)).toThrow();
+    // kill(0) stays true for a zombie. A SIGKILLed grandchild is reparented to init and
+    // stays in Z until init reaps it, which lags when the suite is loaded. A process
+    // still sleeping (S/R) is a missed group kill and must fail.
+    await expectGroupKilled([ids.parent, ids.child]);
     expect(existsSync(join(repo, "runner-started"))).toBe(false);
     expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
     expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
@@ -788,6 +857,35 @@ test("quality outer supervision bounds a real delayed child group including its 
     await work;
   }
 }, 75_000);
+
+/** `undefined` means the pid is gone. `Z` is a killed process init has not reaped yet. */
+function procState(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const end = stat.lastIndexOf(")");
+    if (end < 0 || end + 2 >= stat.length) return "unknown";
+    return stat[end + 2];
+  } catch {
+    return undefined;
+  }
+}
+
+async function expectGroupKilled(pids: number[]): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  const pending = new Set(pids);
+  while (pending.size > 0) {
+    for (const pid of pending) {
+      const state = procState(pid);
+      if (state === undefined || state === "Z") pending.delete(pid);
+    }
+    if (pending.size === 0) return;
+    if (Date.now() >= deadline) {
+      const detail = [...pending].map((pid) => `${pid}=${procState(pid) ?? "gone"}`).join(", ");
+      throw new Error(`process group still running after the group kill: ${detail}`);
+    }
+    await Bun.sleep(50);
+  }
+}
 
 function statusTool() {
   const pi = fakePi();

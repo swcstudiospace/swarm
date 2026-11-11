@@ -119,20 +119,17 @@ Live/reused `orch_plan` responses include a cryptographically verified `executio
 when a real signer is available. `/swarm` refuses missing, unsigned, or mismatched kickoff
 assignments instead of dispatching an unauthenticated A01 turn. Specialist sessions cannot
 auto-load private references. OMP uses normal `write` approvals (or `--approval-mode always-ask`);
-Grok headless dispatch currently fails closed because its installed interface does not support
-the old stdin transport. Start a fresh OMP process after updating the extension.
+Grok headless dispatch reads its assignment from a 0600 `--prompt-file` under `$SWARM_DIR/prompts`
+and runs in the workspace. Start a fresh OMP process after updating the extension.
 
 **Kill switch:** `SWARM_DISABLED=1` turns the swarm off for a session: the omp extension registers
 no tools, `/swarm`, hooks, guard or bar, and the UserPromptSubmit hook injects nothing. Start a
-blocked session with `SWARM_DISABLED=1 omp` to get back to normal work. A running omp session keeps
-the extension it loaded at start, so restart it to pick up a change.
+blocked session with `SWARM_DISABLED=1 omp` to get back to normal work.
 
 **Credentials:** each agent's `SUBSTRATE_TOKEN` is read from
 `~/.config/agent-swarm/agents/<hash>/<slug>.env`, where `<hash>` is the first 16 hex digits of the
-SHA-256 of the workspace's resolved path. A git worktree of the repo has its own path, so it reads
-its primary checkout's env files (`swarm/workspace.py` `primary_checkout`) unless it has its own.
-Without a token for an agent, A01 has no lease and blocks; copy the env files into a new hash
-directory only for a checkout that is not a worktree of an installed repo.
+SHA-256 of the workspace's resolved path. Moving or re-cloning the repo changes that path, so the
+credentials must be copied into the new hash directory. Without them A01 has no token and blocks.
 
 The omp `tool_call` guard (`omp/src/guard.ts`) covers every swarm session. It blocks with `BLOCKED needs: human-approval` the Web3 rows `chain-broadcast` and `chain-key-material` and the cluster lifecycle rows under `prod_infra` (`argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle`, `kubeadm-lifecycle`). Its per-agent lists are documentation, not an allow list. See [AGENTS.md](AGENTS.md) (HOOK-02).
 
