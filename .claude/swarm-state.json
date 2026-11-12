@@ -1,10 +1,8 @@
 {
+  "source": "orchestrate subcommand handler",
   "version": "1.0",
-  "correlation_id": "11a78d07-e51b-4a52-9844-a9eea90249d7",
-  "swarm_state": "COMPLETE",
-  "updated_at": "2026-10-20T03:52:48Z",
-  "progress": {},
-  "subagent_id": "subagent-X-docs-9a50f5c57112-1792468368500",
-  "task_id": "X-docs",
-  "wave": "wave1"
+  "correlation_id": "f0e5d91e-f092-5652-b93a-5f10b93c22e4",
+  "swarm_state": "INITIALIZING",
+  "updated_at": "2026-11-08T20:20:12Z",
+  "progress": {}
 }
