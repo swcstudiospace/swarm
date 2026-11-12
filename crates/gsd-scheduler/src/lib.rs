@@ -946,8 +946,8 @@ mod lease_tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = scheduler(1)?;
         scheduler.set_fail_next_refund();
-        let snap0 = scheduler.governor.get_budget_snapshot(SESSION_ID)?;
         scheduler.submit(task("t1")).await?;
+        let snap0 = scheduler.governor.get_budget_snapshot(SESSION_ID)?;
         let first = scheduler
             .complete(&task_id("t1"), LeaseOutcome::Succeeded)
             .await;
