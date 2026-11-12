@@ -60,8 +60,17 @@ if [[ ! -x "$host_toolchain/bin/cargo" ]]; then
   exit 1
 fi
 cargo_mounts+=(-v "$host_toolchain:/opt/rust-toolchain:ro")
+# gsd-proto's build script (prost-build) needs protoc, and the manylinux image has none. The CI job
+# fetches a pinned release into PROTOC_HOME (bin/protoc + include/); mount it read-only and point
+# prost at it. Unset PROTOC_HOME keeps the old behaviour: the build fails if protoc is missing.
+proto_env=()
+if [[ -n "${PROTOC_HOME:-}" ]]; then
+  cargo_mounts+=(-v "$PROTOC_HOME/bin/protoc:/opt/protoc/bin/protoc:ro" -v "$PROTOC_HOME/include:/opt/protoc/include:ro")
+  proto_env=(-e PROTOC=/opt/protoc/bin/protoc -e PROTOC_INCLUDE=/opt/protoc/include)
+fi
 
 exec docker run --rm \
+  "${proto_env[@]}" \
   -e SWARM_WHEEL_IN_CONTAINER=1 \
   -e CARGO_TARGET_DIR=/io/target/manylinux_2_28 \
   -v "$repo_root:/io" \

@@ -33,6 +33,17 @@ jobs:
           channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --no-self-update
+      # gsd-proto's build script needs protoc inside the manylinux container (see scripts/ci_build_wheel.sh).
+      - name: protoc for the manylinux build
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/protoc"
+          mkdir -p "$root"
+          curl -fsSL -o "$root/protoc.zip" https://github.com/protocolbuffers/protobuf/releases/download/v27.3/protoc-27.3-linux-x86_64.zip
+          unzip -q -o "$root/protoc.zip" -d "$root"
+          chmod +x "$root/bin/protoc"
+          "$root/bin/protoc" --version
+          echo "PROTOC_HOME=$root" >> "$GITHUB_ENV"
       - name: build abi3-py312 manylinux_2_28 x86_64 wheel
         run: scripts/ci_build_wheel.sh dist
       - name: upload wheel
