@@ -31,7 +31,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, cast
 
 from .clock import SYSTEM_CLOCK, Clock
 from .errors import ErrorCode, SwarmError
@@ -138,18 +138,18 @@ def canonical(doc: object) -> bytes:
     return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def compute_digest(doc: dict) -> str:
+def compute_digest(doc: dict[str, Any]) -> str:
     """`sha256:<hex>` over the canonical JSON of `doc` without its `digest` field."""
     body = {k: v for k, v in doc.items() if k != "digest"}
     return "sha256:" + hashlib.sha256(canonical(body)).hexdigest()
 
 
-def _plain(doc: dict) -> dict:
+def _plain(doc: dict[str, Any]) -> dict[str, Any]:
     """A deep copy without `digest`."""
     return {k: copy.deepcopy(v) for k, v in doc.items() if k != "digest"}
 
 
-def _sized(doc: dict) -> dict:
+def _sized(doc: dict[str, Any]) -> dict[str, Any]:
     """A copy whose `bytes` is the exact size of the stored file (canonical JSON including the digest field).
 
     `bytes` is part of the file, so its digits count toward its own value: pick the width d with len(str(base + d)) == d.
@@ -164,14 +164,15 @@ def _sized(doc: dict) -> dict:
     raise SwarmError(ErrorCode.E_INTERNAL, "cannot size handover")  # unreachable: a width always exists
 
 
-def stored_size(doc: dict) -> int:
+def stored_size(doc: dict[str, Any]) -> int:
     """Bytes the stored file of `doc` takes (the digest field included)."""
-    return _sized(doc)["bytes"]
+    size: int = _sized(doc)["bytes"]
+    return size
 
 
 # ---- validation -----------------------------------------------------------------------------------------------
 @functools.lru_cache(maxsize=1)
-def _schema() -> dict:
+def _schema() -> dict[str, Any]:
     return load_schema("handover.v1")
 
 
@@ -269,7 +270,7 @@ def _clip(text: str, limit: int = CLIP_ITEM) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
-def _first_fit(count: int, fits) -> int | None:
+def _first_fit(count: int, fits: Callable[[int], bool]) -> int | None:
     """Smallest k in 0..count with fits(k) true (fits is monotone: more dropped never grows the size); None if even
     dropping everything does not fit."""
     if not fits(count):
@@ -284,7 +285,7 @@ def _first_fit(count: int, fits) -> int | None:
     return lo
 
 
-def summarize_handover(doc: dict, max_bytes: int | None = None, *, best_effort: bool = False) -> dict:
+def summarize_handover(doc: dict[str, Any], max_bytes: int | None = None, *, best_effort: bool = False) -> dict[str, Any]:
     """The same handover within `max_bytes` (default `SWARM_HANDOVER_MAX_BYTES`), deterministically and without a model.
 
     A document that fits is returned unchanged apart from `bytes`. Otherwise `summarized` becomes true and, in this
@@ -301,10 +302,11 @@ def summarize_handover(doc: dict, max_bytes: int | None = None, *, best_effort: 
     completed = list(base.get("completed") or [])
     decisions = list(base.get("decisions") or [])
     artifacts = list(base.get("artifacts") or [])
-    verification = base.get("verification") if isinstance(base.get("verification"), dict) else {}
+    raw_verification = base.get("verification")
+    verification: dict[str, Any] = raw_verification if isinstance(raw_verification, dict) else {}
     checks = list(verification.get("checks") or [])
 
-    def build(kc: int, kd: int, ka: int, kk: int) -> dict:
+    def build(kc: int, kd: int, ka: int, kk: int) -> dict[str, Any]:
         out = copy.deepcopy(base)
         keep_c = [_clip(str(x)) for x in completed[kc:]]
         keep_d = [{"decision": _clip(str(d.get("decision", ""))), "rationale": _clip(str(d.get("rationale", "")))}
@@ -322,7 +324,7 @@ def summarize_handover(doc: dict, max_bytes: int | None = None, *, best_effort: 
     def fits(*ks: int) -> bool:
         return stored_size(build(*ks)) <= cap
 
-    stages = (
+    stages: tuple[tuple[int, Callable[[int], tuple[int, int, int, int]]], ...] = (
         (len(completed), lambda k: (k, 0, 0, 0)),
         (len(decisions), lambda k: (len(completed), k, 0, 0)),
         (len(artifacts), lambda k: (len(completed), len(decisions), k, 0)),
@@ -331,7 +333,7 @@ def summarize_handover(doc: dict, max_bytes: int | None = None, *, best_effort: 
     if fits(0, 0, 0, 0):
         return _sized(build(0, 0, 0, 0))
     for count, ks in stages:
-        found = _first_fit(count, lambda k, ks=ks: fits(*ks(k)))
+        found = _first_fit(count, lambda k: fits(*ks(k)))
         if found is not None:
             return _sized(build(*ks(found)))
     mandatory = stored_size(build(len(completed), len(decisions), len(artifacts), len(checks)))
@@ -469,12 +471,12 @@ def _next_seq(folder: Path, task_id: str) -> int:
     return max(seqs, default=0) + 1
 
 
-def _content_key(doc: dict) -> bytes:
+def _content_key(doc: dict[str, Any]) -> bytes:
     return canonical({k: v for k, v in doc.items() if k not in _GENERATED})
 
 
 # ---- Task Store (read-only) -----------------------------------------------------------------------------------
-def _loads(text: object, default):
+def _loads(text: object, default: object) -> object:
     try:
         value = json.loads(text) if isinstance(text, str) and text else default
     except ValueError:
@@ -497,7 +499,7 @@ class StoreReader:
     def __enter__(self) -> StoreReader:
         return self
 
-    def __exit__(self, *_exc) -> None:
+    def __exit__(self, *_exc: object) -> None:
         self.close()
 
     def close(self) -> None:
@@ -509,7 +511,7 @@ class StoreReader:
     def available(self) -> bool:
         return self.conn is not None
 
-    def task(self, task_id: str) -> dict | None:
+    def task(self, task_id: str) -> dict[str, Any] | None:
         """The task row with JSON columns decoded and `notes_json` (a dict), else None."""
         if self.conn is None:
             return None
@@ -522,17 +524,17 @@ class StoreReader:
         task["notes_json"] = _loads(task.get("notes"), {})
         return task
 
-    def transitions(self, task_id: str) -> list[dict]:
+    def transitions(self, task_id: str) -> list[dict[str, Any]]:
         if self.conn is None:
             return []
         return [dict(r) for r in self.conn.execute("SELECT * FROM transitions WHERE task_id=? ORDER BY id", (task_id,))]
 
-    def artifacts(self, task_id: str) -> list[dict]:
+    def artifacts(self, task_id: str) -> list[dict[str, Any]]:
         if self.conn is None:
             return []
         return [dict(r) for r in self.conn.execute("SELECT * FROM artifacts WHERE task_id=? ORDER BY id", (task_id,))]
 
-    def verdicts(self, task_id: str, task: dict | None = None) -> list[dict]:
+    def verdicts(self, task_id: str, task: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Latest verdict row per gate, findings decoded, each flagged `stale`.
 
         `stale` is true for a verdict issued before the task's last rework loop (`notes.verdicts_since`): the verdicts
@@ -545,7 +547,7 @@ class StoreReader:
             since = float(((task or {}).get("notes_json") or {}).get("verdicts_since") or 0)
         except (TypeError, ValueError):
             since = 0.0
-        latest: dict[str, dict] = {}
+        latest: dict[str, dict[str, Any]] = {}
         for row in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? ORDER BY id", (task_id,)):
             item = dict(row)
             item["findings"] = _loads(item.get("findings"), [])
@@ -555,7 +557,7 @@ class StoreReader:
         return list(latest.values())
 
 
-def read_task(task_id: str, *, root: str | Path | None = None) -> dict | None:
+def read_task(task_id: str, *, root: str | Path | None = None) -> dict[str, Any] | None:
     """One Task Store row (read-only) or None when the task or the store does not exist."""
     with StoreReader(root) as store:
         return store.task(task_id)
@@ -584,7 +586,7 @@ def _parse_ref(ref: str | Path, root: str | Path | None) -> Path:
     return path
 
 
-def read_handover(ref: str | Path, *, root: str | Path | None = None) -> dict:
+def read_handover(ref: str | Path, *, root: str | Path | None = None) -> dict[str, Any]:
     """Load, validate and integrity-check one stored handover.
 
     `ref` is `<task_id>.<seq>`, `<correlation_id>/<task_id>.<seq>` or a path under the handover directory. Raises
@@ -601,7 +603,7 @@ def read_handover(ref: str | Path, *, root: str | Path | None = None) -> dict:
     if size > MAX_FILE_BYTES:
         raise HandoverInvalid([f"/bytes: {path.name} is {size} bytes, over the {MAX_FILE_BYTES} byte read limit"])
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise HandoverInvalid([f"/: {path.name} is not valid JSON ({exc})"]) from None
     problems = validate_handover(doc)
@@ -622,7 +624,7 @@ def read_handover(ref: str | Path, *, root: str | Path | None = None) -> dict:
 
 
 def latest_handover(task_id: str, *, root: str | Path | None = None, to_agent: str | None = None,
-                    correlation_id: str | None = None) -> dict | None:
+                    correlation_id: str | None = None) -> dict[str, Any] | None:
     """The newest handover of a task (optionally only one addressed to `to_agent`), None when there is none.
     A malformed newest file raises HandoverInvalid: it is never skipped to an older one."""
     for cand in reversed(list_handovers(task_id, root=root, correlation_id=correlation_id)):
@@ -635,7 +637,7 @@ def latest_handover(task_id: str, *, root: str | Path | None = None, to_agent: s
 # ---- status ----------------------------------------------------------------------------------------------------
 def inspect_handover(task_id: str, *, root: str | Path | None = None, clock: Clock = SYSTEM_CLOCK,
                      correlation_id: str | None = None, seq: int | None = None,
-                     to_agent: str | None = None) -> tuple[dict, dict | None]:
+                     to_agent: str | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """`(status, document)`: `handover_status` plus the document when it is readable (ok, partial or stale). Without
     `seq` the newest handover is judged, with it that sequence number.
 
@@ -693,7 +695,7 @@ def inspect_handover(task_id: str, *, root: str | Path | None = None, clock: Clo
 
 
 def handover_status(task_id: str, *, root: str | Path | None = None, clock: Clock = SYSTEM_CLOCK,
-                    correlation_id: str | None = None, seq: int | None = None) -> dict:
+                    correlation_id: str | None = None, seq: int | None = None) -> dict[str, Any]:
     """`{status: ok|missing|partial|stale|malformed, reasons: [...]}` for the newest handover of `task_id`.
 
     missing: no file. malformed: unreadable, fails validation or the digest check. stale: older than
@@ -704,7 +706,7 @@ def handover_status(task_id: str, *, root: str | Path | None = None, clock: Cloc
     return inspect_handover(task_id, root=root, clock=clock, correlation_id=correlation_id, seq=seq)[0]
 
 
-def clarification_request(reason: str, missing: list[str], *, task_id: str | None = None) -> dict:
+def clarification_request(reason: str, missing: list[str], *, task_id: str | None = None) -> dict[str, Any]:
     """A ready BLOCKED `task.result` for a receiver that cannot continue from the handover it has: `needs` names the
     reason and what is missing so A01 can route the question. `task_id` is added when known (the schema requires it)."""
     if not isinstance(reason, str) or not reason.strip():
@@ -713,7 +715,7 @@ def clarification_request(reason: str, missing: list[str], *, task_id: str | Non
         raise HandoverInvalid(["/missing: must be a non-empty list of non-empty strings"])
     reason = _clip(redact_text(reason.strip()), 240)
     items = [_clip(redact_text(m.strip()), 160) for m in missing]
-    result: dict = {
+    result: dict[str, Any] = {
         "state": "BLOCKED",
         "needs": {"kind": "handover_clarification", "reason": reason, "missing": items},
         "summary_md": f"Blocked: {reason}\n\nMissing:\n" + "\n".join(f"- {m}" for m in items),
@@ -726,7 +728,7 @@ def clarification_request(reason: str, missing: list[str], *, task_id: str | Non
 _IDENTITY = ("schema_version", "handover_id", "task_id", "correlation_id", "from_agent", "to_agent")
 
 
-def _restore_identity(clean: dict, original: dict) -> dict:
+def _restore_identity(clean: dict[str, Any], original: dict[str, Any]) -> dict[str, Any]:
     """`clean` with the identity fields of `original` put back: ids, agent ids and digests are validated identifiers,
     not free text, and a token-shaped id (`sk-onboarding-flow-v2`) must not be rewritten to `[REDACTED]` (which then
     fails validation after the fact). Only free text is redacted."""
@@ -744,7 +746,7 @@ def _restore_identity(clean: dict, original: dict) -> dict:
 
 
 # ---- write -----------------------------------------------------------------------------------------------------
-def _prepare(doc: object, clock: Clock) -> dict:
+def _prepare(doc: object, clock: Clock) -> dict[str, Any]:
     if not isinstance(doc, dict):
         raise HandoverInvalid(["/: handover must be an object"])
     out = _plain(doc)
@@ -756,7 +758,7 @@ def _prepare(doc: object, clock: Clock) -> dict:
     return out
 
 
-def _emit(doc: dict, row: dict | None, root: str | Path | None, clock: Clock) -> bool:
+def _emit(doc: dict[str, Any], row: dict[str, Any] | None, root: str | Path | None, clock: Clock) -> bool:
     """`swarm.run.handover` through telemetry (chain of custody in events.jsonl and the live snapshot). Fail-open."""
     try:
         from . import telemetry  # lazy: telemetry imports the run log
@@ -775,8 +777,8 @@ def _emit(doc: dict, row: dict | None, root: str | Path | None, clock: Clock) ->
         return False
 
 
-def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = SYSTEM_CLOCK,
-                   max_bytes: int | None = None, emit: bool = True) -> dict:
+def write_handover(doc: dict[str, Any], *, root: str | Path | None = None, clock: Clock = SYSTEM_CLOCK,
+                   max_bytes: int | None = None, emit: bool = True) -> dict[str, Any]:
     """Validate, redact, size-cap and persist a handover; returns where and what was written.
 
     `doc` carries the content fields; `schema_version`, `handover_id`, `created_wall`, `summarized` and `bytes` are
@@ -796,7 +798,7 @@ def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = 
     # Size and summarize with the id shape the stored file will have (`<task_id>.<seq>`, a task id up to 128 characters):
     # a shorter provisional id would let a document near the cap pass this check and overflow once the real id is set.
     prepared["handover_id"] = f"{prepared['task_id']}.{_PENDING_ID}"
-    clean = _restore_identity(redact(prepared), prepared)
+    clean = _restore_identity(cast(dict[str, Any], redact(prepared)), prepared)  # redact() of a dict returns a dict
     redacted = clean != prepared
     sized = _sized(clean)
     body = sized if sized["bytes"] <= cap else summarize_handover(clean, cap)
@@ -812,7 +814,7 @@ def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = 
                         "ref": f"{corr}/{previous['handover_id']}", "path": existing[-1].path,
                         "digest": previous["digest"], "bytes": previous["bytes"], "summarized": previous["summarized"],
                         "duplicate": True, "redacted": redacted, "emitted": False, "document": previous}
-    built: dict = {}
+    built: dict[str, dict[str, Any]] = {}
 
     def build(seq: int) -> bytes:  # the document embeds its seq: rebuilt for every candidate seq
         candidate = dict(body)
@@ -848,7 +850,7 @@ def _receipt_list(name: str, value: object, limit: int = 50) -> list[str]:
 
 def write_receipt(task_id: str, *, by: str, digest: str, understood: list[str] | None = None,
                   questions: list[str] | None = None, accepted: bool = True, root: str | Path | None = None,
-                  clock: Clock = SYSTEM_CLOCK, correlation_id: str | None = None) -> tuple[dict, bool]:
+                  clock: Clock = SYSTEM_CLOCK, correlation_id: str | None = None) -> tuple[dict[str, Any], bool]:
     """Record what the receiver `by` ascertained from the handover with `digest`; returns `(receipt, duplicate)`.
 
     Idempotent: the key is task_id + to_agent + digest, the first receipt wins and a repeat returns it unchanged. The
@@ -881,7 +883,7 @@ def write_receipt(task_id: str, *, by: str, digest: str, understood: list[str] |
 RECEIPT_RECLAIM_S = 5.0  # an empty receipt file older than this was left by a writer that died before it wrote
 
 
-def _create_receipt(path: Path, receipt: dict) -> tuple[dict, bool]:
+def _create_receipt(path: Path, receipt: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Create `path` with the receipt in one atomic step (temp file, then `os.link`): the key is never visible empty,
     so a writer that dies leaves nothing behind. First write wins; a repeat returns the stored receipt unchanged.
     An empty file from an older crashed writer is reclaimed once it is `RECEIPT_RECLAIM_S` old."""
@@ -912,7 +914,7 @@ def _create_receipt(path: Path, receipt: dict) -> tuple[dict, bool]:
             tmp.unlink()
 
 
-def receipt_ref(receipt: dict) -> str:
+def receipt_ref(receipt: dict[str, Any]) -> str:
     """`<correlation_id>/<file name>` of a receipt, relative to the handover directory."""
     return f"{receipt['correlation_id']}/{receipt['task_id']}.receipt.{receipt['to_agent']}.{receipt['digest'].split(':', 1)[1][:16]}.json"
 

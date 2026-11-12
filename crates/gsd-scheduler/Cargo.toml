@@ -1,0 +1,40 @@
+[package]
+name = "gsd-scheduler"
+version = "0.1.0"
+edition = "2021"
+description = "Matrix Scheduler for GSD-Core: DAG-aware, priority-driven, dependency-respecting concurrent executor"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["concurrency", "scheduling", "graph", "development-tools"]
+keywords = ["scheduler", "dag", "concurrency", "orchestration"]
+
+[dependencies]
+tokio = { workspace = true }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-proto = { path = "../gsd-proto" }
+gsd-pool = { path = "../gsd-pool" }
+gsd-governor = { path = "../gsd-governor" }
+gsd-observability = { path = "../gsd-observability" }
+gsd-failure = { path = "../gsd-failure" }
+gsd-nexus = { path = "../gsd-nexus" }
+gsd-sched-core = { path = "../gsd-sched-core" }
+petgraph = { workspace = true }
+topo = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+crossbeam = { workspace = true }
+itertools = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

@@ -39,8 +39,9 @@ GATE_AGENTS satisfies Record<Gate, string>;
 
 /** Finding severities (copied from swarm/gates.py:10 SEVERITIES); BLOCKING_SEVERITY = "major". */
 const SEVERITIES = ["info", "minor", "major", "critical", "blocker"] as const;
-/** qa_gate's own --timeout default (1800 s) plus a margin, so the bridge never kills a test run first. */
-const QA_GATE_TIMEOUT_MS = (1800 + 60) * 1000;
+/** qa_gate's runner default plus time for canonical cleanup before the bridge kills its process group. */
+const QA_GATE_TIMEOUT_S = 1800;
+const QA_GATE_CLEANUP_S = 60;
 
 /** A finding (swarm/gates.py make_finding fields). No verdict field anywhere: severities decide (D-09). */
 const FINDING = {
@@ -94,6 +95,8 @@ export type GateParams = {
   task_id: string;
   correlation_id: string;
   per_target_findings?: Record<string, Finding[]>;
+  /** Quality only: per-invocation runner seconds, integer 1..7200; does not extend the task/session budget. */
+  timeout_s?: number;
   dry_run?: boolean;
 };
 export type CatalogParams = { kind?: (typeof CATALOG_KINDS)[number]; query?: string };
@@ -162,6 +165,53 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 const ASSIGNMENT_HEADING = "# task.assign (signed envelope)\n```json\n";
+/**
+ * omp sends only `content` to the model. `details` is UI and log metadata, so the
+ * fields A01 requires (`status`, `assignment_verified`, `agent_slug`) have to lead
+ * the text. The header is one JSON line of fields `validAssignment` already accepted
+ * and carries no signature. The first marker splits the exact prompt back out, even
+ * when that prompt contains the same line.
+ */
+const ASSIGNMENT_PROMPT_MARKER = "\n--- prompt ---\n";
+
+function assignmentVisibleText(result: Record<string, unknown>): string {
+  const header = JSON.stringify({
+    status: result.status,
+    assignment_verified: result.assignment_verified,
+    task_id: result.task_id,
+    correlation_id: result.correlation_id,
+    agent_slug: result.agent_slug,
+  });
+  return `${header}${ASSIGNMENT_PROMPT_MARKER}${result.prompt as string}`;
+}
+
+/**
+ * omp sends only `content` to the model. A plan summary hides
+ * `execution_assignment_verified` and the signed envelope in `details`, so A01
+ * yields BLOCKED after Python has already signed the controller assignment.
+ * The envelope is included only when that flag is strictly true.
+ */
+function planVisibleText(result: Record<string, unknown>): string {
+  const verified = result.execution_assignment_verified === true;
+  const visible: Record<string, unknown> = {
+    status: result.status,
+    correlation_id: result.correlation_id,
+    pattern: result.pattern,
+    reused: result.reused === true,
+    execution_assignment_verified: verified,
+    summary: typeof result.summary === "string" ? result.summary : "",
+  };
+  if (verified && isObject(result.execution_assignment)) {
+    visible.execution_assignment = result.execution_assignment;
+  }
+  return JSON.stringify(visible);
+}
+
+function planResult(res: BridgeResult): ToolResult<Details> {
+  if (!isObject(res.json)) return toolResult(res);
+  const text = planVisibleText(res.json);
+  return { content: [{ type: "text", text: res.exitCode === 1 ? `FAIL: ${text}` : text }], details: res.json };
+}
 
 /** Python verifies the signature; this consumer refuses mismatched dispatch metadata or an unrelated prompt. */
 function validAssignment(res: BridgeResult, params: AssignmentParams): boolean {
@@ -222,7 +272,10 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     description:
       "Obtain the canonical verified signed task.assign envelope and exact specialist prompt for an existing " +
       "IN_PROGRESS leased task in this correlation. A01 only; refused in plan mode. Read-only Task Store access, " +
-      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input.",
+      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input. " +
+      "The model-visible text is one JSON object with status, assignment_verified, task_id, correlation_id and " +
+      "agent_slug, then a line `--- prompt ---`, then the exact specialist prompt. Dispatch only when status is " +
+      "\"ok\" and assignment_verified is true. Pass only the text after the first `--- prompt ---` marker, unchanged.",
     parameters: {
       type: "object",
       properties: {
@@ -261,7 +314,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       if (!validAssignment(res, params)) {
         throw new SwarmToolError("E-CONTRACT", "swarm_assignment refused: invalid canonical assignment response");
       }
-      return { content: [{ type: "text", text: res.json.prompt as string }], details: res.json };
+      return { content: [{ type: "text", text: assignmentVisibleText(res.json) }], details: res.json };
     },
   });
 
@@ -272,7 +325,11 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       "Plan a swarm run from a brief (A01): creates the pattern's task DAG in the Task Store (PLANNED, gates " +
       "derived from the risk class) under one correlation id. Re-running with the same brief, pattern, risk class, " +
       "priority, acceptance and correlation_id reuses the existing plan (`reused: true`) instead of duplicating it. " +
-      "dry_run lists the tasks that would be created without writing.",
+      "dry_run lists the tasks that would be created without writing. The model-visible text is one JSON object " +
+      "with status, correlation_id, pattern, reused, execution_assignment_verified and summary. When " +
+      "execution_assignment_verified is true, that object also contains execution_assignment, the signed " +
+      "swarm.v1.task.assign envelope. Continue only then. A dry-run or unsigned plan sets the flag false and " +
+      "omits the envelope.",
     parameters: {
       type: "object",
       properties: {
@@ -313,7 +370,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
     mutating: true,
     async run(_toolCallId, params, signal, ctx) {
-      return toolResult(await bridge({ script: "orch_plan", args: planArgs(ctx, params), cwd: ctx.cwd, signal }));
+      return planResult(await bridge({ script: "orch_plan", args: planArgs(ctx, params), cwd: ctx.cwd, signal }));
     },
   });
 
@@ -382,8 +439,9 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       "that is not a target of the gate task is refused (E-INPUT). " +
       "To fail a target, include at least " +
       "one finding of severity major or higher (major, critical or blocker); minor and info findings pass. " +
-      "A failing verdict is returned as text starting `FAIL:`, not as an error. Call this before swarm_ingest of " +
-      "the gate task's result.",
+      "A failing verdict is returned as text starting `FAIL:`, not as an error. Quality alone accepts timeout_s " +
+      "(integer 1..7200 seconds); omission preserves the runner's 1800-second default. It does not extend task, " +
+      "lease or session limits. Call this before swarm_ingest of the gate task's result.",
     parameters: {
       type: "object",
       properties: {
@@ -396,6 +454,11 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
           description:
             "review, quality and security gates: {target task id: [finding]}. To fail a target include at least " +
             "one finding of severity major, critical or blocker; an empty list adds nothing to it.",
+        },
+        timeout_s: {
+          type: "integer", minimum: 1, maximum: 7200,
+          description: "Quality only: runner deadline in seconds, plus 60 seconds of outer cleanup supervision; " +
+            "omitted: 1800-second runner, 1860-second supervisor. Independent task/lease/session limits still apply.",
         },
         dry_run: { type: "boolean", description: "Canned dry-run verdict (per_target_findings is ignored)" },
       },
@@ -414,16 +477,28 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
             `not ${agent === undefined ? "an unidentified session" : JSON.stringify(agent)}`,
         );
       }
+      if ("timeout_s" in params) {
+        if (params.gate !== "quality") {
+          throw new SwarmToolError("E-INPUT", "timeout_s is accepted only by the quality gate");
+        }
+        if (typeof params.timeout_s !== "number" || !Number.isInteger(params.timeout_s) ||
+            params.timeout_s < 1 || params.timeout_s > 7200) {
+          throw new SwarmToolError("E-INPUT", "timeout_s must be an integer from 1 to 7200 seconds");
+        }
+      }
       if (params.per_target_findings !== undefined && params.gate === "release") {
         throw new SwarmToolError("E-INPUT", "per_target_findings is not accepted by the release gate");
       }
       // argv from whitelisted fields only: extra model keys (e.g. a forged verdict) never reach python (T-03-06)
       const args = [rootArg(ctx), `--task-id=${params.task_id}`, `--correlation-id=${params.correlation_id}`];
+      if (params.timeout_s !== undefined) args.push(`--timeout=${params.timeout_s}`);
       if (params.per_target_findings !== undefined) {
         args.push(`--per-target-findings=${writeInputFile(ctx.cwd, "findings", toolCallId, params.per_target_findings)}`);
       }
       if (params.dry_run) args.push("--dry-run");
-      const timeoutMs = params.gate === "quality" ? QA_GATE_TIMEOUT_MS : undefined;
+      const timeoutMs = params.gate === "quality"
+        ? ((params.timeout_s ?? QA_GATE_TIMEOUT_S) + QA_GATE_CLEANUP_S) * 1000
+        : undefined;
       return toolResult(await bridge({ script, args, cwd: ctx.cwd, signal, timeoutMs }));
     },
   });

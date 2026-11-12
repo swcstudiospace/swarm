@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import re
 from fractions import Fraction
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
+from swarm.errors import ErrorCode, SwarmError
 from swarm.tools.support import respond
 
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
@@ -41,7 +42,7 @@ def _statements(sql: str) -> list[str]:
     return [" ".join(part.split()) for part in cleaned.split(";") if part.strip()]
 
 
-def _no_statements() -> dict:
+def _no_statements() -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": "sql", "message": "no SQL statements after removing comments"}
 
 
@@ -90,8 +91,8 @@ def _destructive_kinds(statement: str) -> list[str]:
     return [kind for kind, pattern in _DESTRUCTIVE if pattern.search(upper)]
 
 
-def data_destructive_ddl_scan(payload: dict) -> dict:
-    def work() -> dict:
+def data_destructive_ddl_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         statements = _statements(payload["sql"])
         if not statements:
             return _no_statements()
@@ -110,7 +111,7 @@ def data_destructive_ddl_scan(payload: dict) -> dict:
             "kinds": sorted(kinds),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_not_null_default_check -----------------------------------------------------
@@ -122,8 +123,8 @@ _NEEDS_VALUE = re.compile(r"\bNOT\s+NULL\b|\bPRIMARY\s+KEY\b", re.I)
 _HAS_DEFAULT = re.compile(r"\bDEFAULT\b", re.I)
 
 
-def data_not_null_default_check(payload: dict) -> dict:
-    def work() -> dict:
+def data_not_null_default_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         statements = _statements(payload["sql"])
         if not statements:
             return _no_statements()
@@ -153,7 +154,7 @@ def data_not_null_default_check(payload: dict) -> dict:
             "safe": not unsafe,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_index_name_check -----------------------------------------------------------
@@ -169,8 +170,8 @@ _SNAKE = re.compile(r"[a-z0-9_]+")
 _MAX_IDENTIFIER = 63
 
 
-def data_index_name_check(payload: dict) -> dict:
-    def work() -> dict:
+def data_index_name_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         prefix = payload["prefix"]
         if not _PREFIX.fullmatch(prefix):
             return {
@@ -208,7 +209,7 @@ def data_index_name_check(payload: dict) -> dict:
             "conforming": not violations,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_fk_cycle_check -------------------------------------------------------------
@@ -243,8 +244,8 @@ def _find_cycle(graph: dict[str, set[str]]) -> list[str]:
     return []
 
 
-def data_fk_cycle_check(payload: dict) -> dict:
-    def work() -> dict:
+def data_fk_cycle_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         edges = payload["edges"]
         allow_self = payload.get("allow_self_reference", False)
         nodes = {edge["from"] for edge in edges} | {edge["to"] for edge in edges}
@@ -265,14 +266,14 @@ def data_fk_cycle_check(payload: dict) -> dict:
             "cycle": cycle,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_pii_tag_coverage -----------------------------------------------------------
 
 
-def data_pii_tag_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def data_pii_tag_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         columns = payload["columns"]
         names = [column["name"] for column in columns]
         if len(set(names)) != len(names):
@@ -291,15 +292,15 @@ def data_pii_tag_coverage(payload: dict) -> dict:
             "coverage": coverage,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_contract_field_compat ------------------------------------------------------
 
 
-def data_contract_field_compat(payload: dict) -> dict:
-    def work() -> dict:
-        indexes: dict[str, dict[str, dict]] = {}
+def data_contract_field_compat(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
+        indexes: dict[str, dict[str, dict[str, Any]]] = {}
         for label in ("before", "after"):
             index = {field["name"]: field for field in payload[label]}
             if len(index) != len(payload[label]):
@@ -333,14 +334,14 @@ def data_contract_field_compat(payload: dict) -> dict:
             "additive_count": len(additive),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_row_count_reconcile --------------------------------------------------------
 
 
-def data_row_count_reconcile(payload: dict) -> dict:
-    def work() -> dict:
+def data_row_count_reconcile(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         before, after, delta = payload["before"], payload["after"], payload["delta"]
         expected = before + delta
         if expected < 0:
@@ -363,7 +364,7 @@ def data_row_count_reconcile(payload: dict) -> dict:
             "reconciled": drift == 0,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_migration_version_order ----------------------------------------------------
@@ -371,7 +372,10 @@ def data_row_count_reconcile(payload: dict) -> dict:
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def _version_key(version: str) -> tuple:
+_VersionKey = tuple[tuple[int, int, str], ...]
+
+
+def _version_key(version: str) -> _VersionKey:
     """Natural order: digit runs compare as integers, other runs as text."""
     return tuple(
         (0, int(token), "") if token.isdigit() else (1, 0, token)
@@ -379,8 +383,8 @@ def _version_key(version: str) -> tuple:
     )
 
 
-def data_migration_version_order(payload: dict) -> dict:
-    def work() -> dict:
+def data_migration_version_order(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         versions = payload["versions"]
         for version in versions:
             if not _VERSION.fullmatch(version):
@@ -391,8 +395,8 @@ def data_migration_version_order(payload: dict) -> dict:
                 }
         duplicates: list[str] = []
         out_of_order: list[str] = []
-        seen: set[tuple] = set()
-        highest: tuple | None = None
+        seen: set[_VersionKey] = set()
+        highest: _VersionKey | None = None
         for version in versions:
             key = _version_key(version)
             if key in seen:
@@ -410,7 +414,7 @@ def data_migration_version_order(payload: dict) -> dict:
             "latest": max(versions, key=_version_key),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_reversible_pair_check ------------------------------------------------------
@@ -440,8 +444,8 @@ def _pair_key(filename: str) -> tuple[str, str, str] | None:
     return None
 
 
-def data_reversible_pair_check(payload: dict) -> dict:
-    def work() -> dict:
+def data_reversible_pair_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         filenames = payload["filenames"]
         forward: set[tuple[str, str]] = set()
         reverse: set[tuple[str, str]] = set()
@@ -464,7 +468,7 @@ def data_reversible_pair_check(payload: dict) -> dict:
             "ok": forward == reverse and not any(_unchecked_migration(name) for name in unrecognized),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_lock_risk_scan -------------------------------------------------------------
@@ -539,6 +543,8 @@ def _split_sql(sql: str) -> list[_Stmt]:
     position, size = 0, len(sql)
     while position < size:
         token = _SQL_TOKEN.match(sql, position)
+        if token is None:  # _SQL_TOKEN ends in '.', which matches any character under re.S, so this cannot happen
+            raise SwarmError(ErrorCode.E_INTERNAL, "SQL tokenizer produced no token")
         text = token.group(0)
         position = token.end()
         head = text[0]
@@ -728,15 +734,15 @@ def _lock_risks(statement: str) -> list[str]:
     return sorted(set(kinds), key=kinds.index)
 
 
-def data_lock_risk_scan(payload: dict) -> dict:
-    def work() -> dict:
+def data_lock_risk_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         top_level = _split_sql(payload["sql"])
         if not top_level:
             return _no_statements()
         flat: list[tuple[int, _Stmt, bool]] = []
         for position, statement in enumerate(top_level, 1):
             _expand(position, statement, False, 0, flat)
-        risks: list[dict] = []
+        risks: list[dict[str, Any]] = []
         state = _TimeoutState()
         unprotected = False
         for position, statement, inner in flat:
@@ -754,7 +760,7 @@ def data_lock_risk_scan(payload: dict) -> dict:
             "lock_timeout_declared": in_sql or payload.get("lock_timeout_s", 0) > 0,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 # --- data_explain_regression_check ---------------------------------------------------
@@ -762,17 +768,19 @@ def data_lock_risk_scan(payload: dict) -> dict:
 _DEFAULT_THRESHOLD_PCT = 20
 
 
-def _exact(value) -> Fraction:
+def _exact(value: object) -> Fraction:
     """Exact rational of a JSON number, so 20 % sits exactly on the boundary."""
     return Fraction(str(value))
 
 
-def data_explain_regression_check(payload: dict) -> dict:
-    def work() -> dict:
+def data_explain_regression_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         queries = payload["queries"]
+        if not queries:
+            return {"state": "INVALID_INPUT", "field": "queries", "message": "queries must not be empty"}
         threshold = _exact(payload.get("threshold_pct", _DEFAULT_THRESHOLD_PCT))
         seen: set[str] = set()
-        regressions: list[dict] = []
+        regressions: list[dict[str, Any]] = []
         worst: Fraction | None = None
         for position, query in enumerate(queries):
             qid = query["id"]
@@ -786,10 +794,20 @@ def data_explain_regression_check(payload: dict) -> dict:
                     "field": f"queries[{position}].baseline",
                     "message": "baseline must be greater than 0 to compute a percentage change",
                 }
-            pct = (_exact(query["shadow"]) - baseline) * 100 / baseline
+            try:
+                pct = (_exact(query["shadow"]) - baseline) * 100 / baseline
+                pct_value = round(float(pct), 2)
+            except (OverflowError, ValueError):
+                return {
+                    "state": "INVALID_INPUT",
+                    "field": f"queries[{position}].shadow",
+                    "message": "shadow is out of range for a percentage change",
+                }
             worst = pct if worst is None or pct > worst else worst
             if pct > threshold:
-                regressions.append({"id": qid, "pct": round(float(pct), 2)})
+                regressions.append({"id": qid, "pct": pct_value})
+        if worst is None:  # queries is non-empty (checked above), so the loop always sets worst
+            raise SwarmError(ErrorCode.E_INTERNAL, "explain regression loop set no worst case")
         return {
             "state": "SUCCESS",
             "checked": len(queries),
@@ -798,4 +816,4 @@ def data_explain_regression_check(payload: dict) -> dict:
             "within_budget": not regressions,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict

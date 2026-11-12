@@ -99,7 +99,8 @@ def brief(result: dict) -> list[tuple]:
 
 
 def cli(*args: str, tmp_path: Path) -> subprocess.CompletedProcess:
-    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "SWARM_DIR": str(tmp_path / ".swarm-state")}
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "SWARM_DIR": str(tmp_path / ".swarm-state"),
+           "SWARM_PURE_PYTHON": "1"}
     return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=env, cwd=ROOT)
 
 

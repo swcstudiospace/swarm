@@ -5,13 +5,17 @@ other agents call `report_status`,
 which is validated and applied by the orchestrator scripts.
 """
 from __future__ import annotations
+import builtins
 import json
+import logging
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
+from typing import Any, cast
 
 from .envelope import insecure_dev_key, real_key_configured
 from .errors import SwarmError, ErrorCode
@@ -61,6 +65,8 @@ DEFAULT_MAX_ATTEMPTS = 3
 GATES_BY_RISK = {"low": ["review"], "medium": ["review", "quality"],
                  "high": ["review", "quality", "security", "release"]}
 
+_LOG = logging.getLogger(__name__)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL, parent_id TEXT,
@@ -90,12 +96,16 @@ _VERIFIED = {"ok", "fail", "expired"}  # a verified, current envelope; reconcile
 _JSON_COLS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
 
 
-def _verdicts_since(task: dict) -> float:
+# A task row as read from SQLite. JSON columns hold per-column types, so their values stay Any.
+TaskRow = dict[str, Any]
+
+
+def _verdicts_since(task: TaskRow) -> float:
     """Rework cut-off that transition(CHANGES_REQUESTED) writes to notes.verdicts_since; 0 before any rework."""
     return float(task["notes_json"].get("verdicts_since") or 0)
 
 
-def _gates_of(task: dict) -> list[str]:
+def _gates_of(task: TaskRow) -> list[str]:
     override = (task.get("notes_json") or {}).get("gates")
     return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
 
@@ -108,8 +118,34 @@ class TaskStore:
         self.conn.row_factory = sqlite3.Row
         self._tx_depth = 0
         self._live_dirty = False  # a transition committed-in-intent inside transaction(): refresh live.json after the outermost commit
+        self._tune_journal()
         self.conn.executescript(_SCHEMA)
         self._migrate_verdicts()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> TaskStore:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def _tune_journal(self) -> None:
+        """Opt-in (SWARM_TASKSTORE_WAL=1, read at every open): WAL + synchronous=NORMAL, so a commit costs no fsync of
+        the main file instead of about two (measured 17% of a dry run). Off by default: default-on changes the scheduler's
+        retry-versus-priority ordering in timing-sensitive scenarios (faster commits) and makes read-only openers leave
+        tasks.db-wal and tasks.db-shm behind."""
+        if os.environ.get("SWARM_TASKSTORE_WAL") != "1":
+            return
+        try:
+            mode = str(self.conn.execute("PRAGMA journal_mode").fetchone()[0])
+            if mode.lower() != "wal":
+                self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error as exc:
+            # read-only filesystem, no shared memory, or a concurrent opener holds the lock: keep the current mode, only slower
+            _LOG.debug("journal_mode WAL not applied (%s); keeping the current mode", exc)
 
     def _migrate_verdicts(self) -> None:
         """D-14: in-place, idempotent add of the signed-envelope columns to a v1 verdicts table.
@@ -132,7 +168,7 @@ class TaskStore:
             self.conn.commit()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self) -> Iterator[TaskStore]:
         """All-or-nothing block: BEGIN IMMEDIATE (write lock) on outermost entry,
         commit on success, rollback on exception. Nested entries join the outer one."""
         if self._tx_depth == 0:
@@ -150,17 +186,22 @@ class TaskStore:
             raise
         self._tx_depth -= 1
         if self._tx_depth == 0:
-            self.conn.commit()
+            try:
+                self.conn.commit()
+            except BaseException:
+                self._live_dirty = False  # not committed: nothing to publish
+                self.conn.rollback()
+                raise
             if self._live_dirty:  # after the write lock is released
                 self._live_dirty = False
                 self._notify_committed()
 
     # ---- CRUD -------------------------------------------------------------
     def create(self, *, task_id: str, correlation_id: str, capability: str, title: str = "",
-               parent_id: str | None = None, dag_depth: int = 0, inputs=None, acceptance=None,
-               budget=None, risk_class: str = "low", priority: str = "P2", depends_on=None,
+               parent_id: str | None = None, dag_depth: int = 0, inputs: object = None, acceptance: object = None,
+               budget: object = None, risk_class: str = "low", priority: str = "P2", depends_on: object = None,
                agent_id: str | None = None, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-               notes: dict | None = None) -> dict:
+               notes: dict[str, Any] | None = None) -> TaskRow:
         now = time.time()
         self.conn.execute(
             "INSERT INTO tasks (task_id, correlation_id, parent_id, dag_depth, capability, agent_id, title,"
@@ -175,13 +216,13 @@ class TaskStore:
         self._commit()
         return self.get(task_id)
 
-    def get(self, task_id: str) -> dict:
+    def get(self, task_id: str) -> TaskRow:
         row = self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
             raise SwarmError(ErrorCode.E_INPUT, f"unknown task {task_id}")
         return self._row(row)
 
-    def list(self, *, correlation_id: str | None = None, state: str | None = None) -> list[dict]:
+    def list(self, *, correlation_id: str | None = None, state: str | None = None) -> builtins.list[TaskRow]:
         q, args = "SELECT * FROM tasks", []
         conds = []
         if correlation_id:
@@ -195,8 +236,9 @@ class TaskStore:
         q += " ORDER BY dag_depth, created_at"
         return [self._row(r) for r in self.conn.execute(q, args)]
 
-    def update(self, task_id: str, **fields) -> dict:
-        cols, args = [], []
+    def update(self, task_id: str, **fields: object) -> TaskRow:
+        cols: list[str] = []
+        args: list[Any] = []
         for k, v in fields.items():
             cols.append(f"{k}=?")
             args.append(json.dumps(v) if k in _JSON_COLS else v)
@@ -209,7 +251,7 @@ class TaskStore:
 
     # ---- state machine (A01 only) ----------------------------------------
     def transition(self, task_id: str, to_state: TaskState | str, *, actor: str = "A01",
-                   reason: str = "") -> dict:
+                   reason: str = "") -> TaskRow:
         to_state = TaskState(to_state)
         # WR-02: read, legality/cap checks and every write run under one BEGIN IMMEDIATE write lock, so
         # concurrent callers serialize and a state change never commits without its audit row.
@@ -279,33 +321,34 @@ class TaskStore:
             return
         try:
             from . import telemetry  # lazy: keeps taskstore import cost unchanged
-            telemetry.refresh_live(db_path=self.path)
+            telemetry.refresh_live(db_path=self.path, conn=self.conn)  # the commit is visible to the connection that made it
         except Exception:  # noqa: BLE001 - observer must never fail a committed transition
             import logging
             logging.getLogger("swarm.telemetry").warning("live.json refresh failed", exc_info=True)
 
-    def _apply(self, task_id, from_state, to_state, actor, reason, **extra):
+    def _apply(self, task_id: str, from_state: TaskState, to_state: TaskState, actor: str, reason: str,
+               **extra: object) -> None:
         """State write conditional on from_state plus its audit row; the caller's transaction() commits both."""
         cols = ["state=?", *(f"{k}=?" for k in extra), "updated_at=?"]
-        args = [to_state.value, *extra.values(), time.time(), task_id, from_state.value]
+        args: list[Any] = [to_state.value, *extra.values(), time.time(), task_id, from_state.value]
         cur = self.conn.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=? AND state=?", args)
         if cur.rowcount != 1:
             raise SwarmError(ErrorCode.E_CONTRACT, f"concurrent transition on {task_id}: expected {from_state.value}",
                              task_id=task_id)
         self._log(task_id, from_state, to_state, actor, reason)
 
-    def _log(self, task_id, from_state, to_state, actor, reason):
+    def _log(self, task_id: str, from_state: TaskState | None, to_state: TaskState, actor: str, reason: str) -> None:
         self.conn.execute("INSERT INTO transitions (task_id, from_state, to_state, actor, reason, ts)"
                           " VALUES (?,?,?,?,?,?)",
                           (task_id, from_state.value if from_state else None, to_state.value,
                            actor, reason, time.time()))
 
-    def history(self, task_id: str) -> list[dict]:
+    def history(self, task_id: str) -> builtins.list[TaskRow]:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM transitions WHERE task_id=? ORDER BY id", (task_id,))]
 
     # ---- gates ------------------------------------------------------------
-    def record_verdict(self, task_id: str, envelope: dict) -> None:
+    def record_verdict(self, task_id: str, envelope: dict[str, Any]) -> None:
         """Store a signed gate.verdict envelope as a row on task_id (the envelope's own task_id)."""
         p = validate_verdict(envelope)
         if p["task_id"] != task_id:
@@ -319,7 +362,7 @@ class TaskStore:
         self._commit()
 
     def latest_verdicts(self, task_id: str, *, include_stale: bool = False,
-                        verified_only: bool = False) -> dict[str, dict]:
+                        verified_only: bool = False) -> dict[str, TaskRow]:
         """Latest verdict per gate. Verdicts issued before the task's last rework loop are stale
         (the producer changed the artifact) and are ignored unless include_stale=True.
         verified_only=True drops rows whose signed envelope does not verify or disagrees with the row or task."""
@@ -330,10 +373,10 @@ class TaskStore:
             out = {g: d for g, d in out.items() if self._check_row(task, g, d, now) in _VERIFIED}
         return out
 
-    def _latest_rows(self, task: dict, *, include_stale: bool = False) -> dict[str, dict]:
+    def _latest_rows(self, task: TaskRow, *, include_stale: bool = False) -> dict[str, TaskRow]:
         """Highest-id row per gate of `task`, inserted at or after its last rework unless include_stale."""
         since = 0.0 if include_stale else _verdicts_since(task)
-        out: dict[str, dict] = {}
+        out: dict[str, TaskRow] = {}
         for r in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id",
                                    (task["task_id"], since)):
             d = dict(r)
@@ -341,12 +384,12 @@ class TaskStore:
             out[d["gate"]] = d
         return out
 
-    def required_gates(self, task_id: str) -> list[str]:
+    def required_gates(self, task_id: str) -> builtins.list[str]:
         """Gates from risk class, unless the plan overrides them via notes.gates (e.g. [] for
         non-code tasks such as requirements or docs, or gate tasks themselves)."""
         return _gates_of(self.get(task_id))
 
-    def _check_row(self, task: dict, gate: str, row: dict | None, now: float) -> str:
+    def _check_row(self, task: TaskRow, gate: str, row: TaskRow | None, now: float) -> str:
         """Verify one verdict row of `task` against its signed envelope. Returns ok | fail | expired
         (signature verified and current) or absent | unsigned | bad-sig | mismatch | stale | dry-run (not
         trustworthy for this task). mismatch: the signed gate/task_id/verdict disagree with the row, or the
@@ -394,7 +437,7 @@ class TaskStore:
                 out[g] = reason
         return out
 
-    def missing_gates(self, task_id: str) -> list[str]:
+    def missing_gates(self, task_id: str) -> builtins.list[str]:
         return list(self.missing_gate_reasons(task_id))
 
     def unaccepted_gates(self, task_id: str, reasons: dict[str, str] | None = None) -> dict[str, str]:
@@ -434,7 +477,7 @@ class TaskStore:
                 p = validate_verdict(json.loads(r["envelope_json"]))
                 if (p["gate"] == gate and p["task_id"] == target and p.get("gate_task") == gate_task_id
                         and float(p["issued_at"]) >= since):
-                    return p["verdict"]
+                    return cast(str, p["verdict"])  # validate_verdict only checks that the key exists; a signed verdict is a string
             except Exception:
                 continue
         return None
@@ -449,7 +492,7 @@ class TaskStore:
         self.update(task_id, outputs=outputs)
 
     # ---- DAG helpers ------------------------------------------------------
-    def deps_satisfied(self, task: dict, tasks: list[dict] | None = None) -> bool:
+    def deps_satisfied(self, task: TaskRow, tasks: builtins.list[TaskRow] | None = None) -> bool:
         """A dependency is satisfied once its work is complete (IN_REVIEW/APPROVED/DONE).
         Gates are a separate ledger: gate tasks consume IN_REVIEW work, and a failing gate
         pulls the producer back to CHANGES_REQUESTED, which un-satisfies its dependants."""
@@ -457,14 +500,14 @@ class TaskStore:
         ok = {t["task_id"] for t in tasks if t["state"] in SATISFIED_STATES}
         return all(d in ok for d in task["depends_on"])
 
-    def ready(self, correlation_id: str | None = None) -> list[dict]:
+    def ready(self, correlation_id: str | None = None) -> builtins.list[TaskRow]:
         """Schedulable tasks: PLANNED/RETRY (or CREATED/VALIDATED) with all dependencies satisfied."""
         tasks = self.list(correlation_id=correlation_id)
         return [t for t in tasks
                 if t["state"] in (S.PLANNED.value, S.RETRY.value, S.CREATED.value, S.VALIDATED.value)
                 and self.deps_satisfied(t, tasks)]
 
-    def _row(self, row) -> dict:
+    def _row(self, row: sqlite3.Row) -> TaskRow:
         d = dict(row)
         for c in _JSON_COLS:
             d[c] = json.loads(d[c] or ("{}" if c == "budget" else "[]"))
@@ -476,7 +519,7 @@ class TaskStore:
             d["notes_json"] = {}
         return d
 
-    def set_notes(self, task_id: str, **kv) -> dict:
+    def set_notes(self, task_id: str, **kv: object) -> TaskRow:
         """Merge kv into notes; re-read and write under one write lock so concurrent writers keep each other's keys."""
         with self.transaction():
             notes = self.get(task_id)["notes_json"]
@@ -484,7 +527,7 @@ class TaskStore:
             self.update(task_id, notes=json.dumps(notes))
         return self.get(task_id)
 
-    def append_feedback(self, task_id: str, entry: dict) -> dict:
+    def append_feedback(self, task_id: str, entry: dict[str, Any]) -> TaskRow:
         """Append entry to notes.feedback in one transaction; parallel gate scripts and runner threads lose none."""
         with self.transaction():
             notes = self.get(task_id)["notes_json"]

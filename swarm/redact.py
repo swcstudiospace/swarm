@@ -44,9 +44,15 @@ the same kind on its line (`"mysql -p" ok`: a flag in a sentence).
 from __future__ import annotations
 
 import functools
+import logging
+import os
 import re
+import threading
 from array import array
 from bisect import bisect_left, bisect_right
+from collections.abc import Callable
+
+from ._native_loader import load_native, pure_python_requested
 
 REDACTED = "[REDACTED]"
 
@@ -82,6 +88,8 @@ _PASS_CONTEXT = frozenset({"db", "database", "sql", "mysql", "pg", "postgres", "
 # Whole-word names too generic for the prose-prone `name: value` and `--flag value` forms; `=` and JSON pairs keep them.
 _WEAK_TOKENS = frozenset({"auth", "oauth", "private", "signing", "cookie", "cookies", "authentication", "authorization",
                           "authorisation", "bearer"})
+_Add = Callable[[tuple[int, int]], None]  # the span sink every detector reports into (the spans list's append)
+
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 _NAME_CAP = 256  # names longer than this are not credential names (and are never scanned in full)
@@ -299,6 +307,16 @@ class _Lexer:
     the mark it closes. `top[m]` (the innermost quote open after mark m, -1 for none), `par[m]` (the quote an OPEN mark is nested in) and
     `lost` (the ascending numbers of the quotes that nothing closes) are derived from those on first use."""
     __slots__ = ("pos", "lvl", "role", "link", "how", "_top", "_par", "_lost", "nx0", "nxl")
+    pos: array[int]
+    lvl: array[int]
+    role: bytearray
+    link: array[int]
+    how: bytearray
+    _top: array[int] | None
+    _par: array[int] | None
+    _lost: list[int] | None
+    nx0: array[int] | None
+    nxl: array[int] | None
 
     def __init__(self, s: str) -> None:
         pos, lvl, link = array("i"), array("i"), array("i")
@@ -403,7 +421,7 @@ class _Lexer:
         self.pos, self.lvl, self.role, self.link, self.how = pos, lvl, role, link, how
         self._top = self._par = self._lost = self.nx0 = self.nxl = None
 
-    def _derive(self) -> None:
+    def _derive(self) -> tuple[array[int], array[int]]:
         """`top` and `par` for every mark (one pass over the roles and links)."""
         n = len(self.pos)
         top, par = array("i", [-1]) * n, array("i", [-1]) * n
@@ -418,18 +436,21 @@ class _Lexer:
                 stack.append(i)
             top[i] = stack[-1] if stack else -1
         self._top, self._par = top, par
+        return top, par
 
     @property
-    def top(self) -> array:
-        if self._top is None:
-            self._derive()
-        return self._top
+    def top(self) -> array[int]:
+        top = self._top
+        if top is None:
+            top, _ = self._derive()
+        return top
 
     @property
-    def par(self) -> array:
-        if self._par is None:
-            self._derive()
-        return self._par
+    def par(self) -> array[int]:
+        par = self._par
+        if par is None:
+            _, par = self._derive()
+        return par
 
     @property
     def lost(self) -> list[int]:
@@ -443,9 +464,9 @@ class _Lexer:
         i = bisect_left(self.pos, p)
         return i if i < len(self.pos) and self.pos[i] == p else -1
 
-    def next_marks(self, s: str) -> tuple[array, array]:
+    def next_marks(self, s: str) -> tuple[array[int], array[int]]:
         """For every mark the next PLAIN mark of its kind, and the next mark of its kind and level (built on first use)."""
-        if self.nx0 is None:
+        if self.nx0 is None or self.nxl is None:
             n = len(self.pos)
             nx0, nxl = array("i", [-1]) * n, array("i", [-1]) * n
             last0 = [-1, -1]
@@ -776,7 +797,7 @@ def _cli_attached(rd: _Reader, at: int, end: int) -> bool:
     return any(ch not in _CLI_CLOSERS for ch in rd.s[v:end])
 
 
-def _cli_option_spans(s: str, add, rd: _Reader) -> None:
+def _cli_option_spans(s: str, add: _Add, rd: _Reader) -> None:
     """The values of `-u user:pass` (and `--user`, `--proxy-user`, also `=user:pass`) and of `-passin pass:X`."""
     if "-u" not in s and "-pass" not in s:
         return
@@ -785,7 +806,9 @@ def _cli_option_spans(s: str, add, rd: _Reader) -> None:
     colon_from, colon_at = 0, -1  # no ':' in [colon_from, colon_at), a ':' at colon_at (n when there is none)
     pushed_end = -1  # end of the last value reported: a later start (starts only grow) inside that run is covered
     for m in _CLI_OPTION_RE.finditer(s):
-        start = m.end() if m.group(1) == "=" else _CLI_BLANKS_RE.match(s, m.end()).end()
+        blanks = _CLI_BLANKS_RE.match(s, m.end())  # `[ \t]*` matches at every position
+        assert blanks is not None
+        start = m.end() if m.group(1) == "=" else blanks.end()
         if start < pushed_end or start >= n or s[start] in _CLI_STOPS:
             continue  # (a start inside a reported run is covered)
         op = rd.opener(start)
@@ -807,7 +830,9 @@ def _cli_option_spans(s: str, add, rd: _Reader) -> None:
                 pushed_end = end
             continue
         if not run_from <= start < run_to:
-            run_from, run_to = start, _CLI_UNQUOTED_RE.match(s, start).end()
+            word = _CLI_UNQUOTED_RE.match(s, start)
+            assert word is not None  # the opener check above excludes every quote and quote-escaping backslash, so a word starts here
+            run_from, run_to = start, word.end()
         if not colon_from <= start <= colon_at:
             colon_from = start
             colon_at = s.find(":", start)
@@ -828,7 +853,7 @@ def _cli_option_spans(s: str, add, rd: _Reader) -> None:
             pushed_end = end
 
 
-def _cli_command_spans(s: str, add, rd: _Reader) -> None:
+def _cli_command_spans(s: str, add: _Add, rd: _Reader) -> None:
     """The password flag of `mysql -pSECRET`, `docker login -p SECRET`, `sshpass -p`, `redis-cli -a`, `sqlcmd -P`, `ssh-keygen -N`: once
     a command is seen in a segment its flag is checked in EVERY later word of that segment, however long or numerous the arguments."""
     if not any(h in s for h in _CLI_COMMAND_HINTS):
@@ -880,7 +905,7 @@ def _cli_command_spans(s: str, add, rd: _Reader) -> None:
                 pending = _CLI_TWO_WORD[base]
 
 
-def _cli_spans(s: str, add, rd: _Reader) -> None:
+def _cli_spans(s: str, add: _Add, rd: _Reader) -> None:
     _cli_option_spans(s, add, rd)
     _cli_command_spans(s, add, rd)
 
@@ -915,7 +940,7 @@ def _yaml_value_end(s: str, start: int, indent: int) -> int:
     return end
 
 
-def _yaml_spans(s: str, add, rd: _Reader) -> None:
+def _yaml_spans(s: str, add: _Add, rd: _Reader) -> None:
     if "\n" not in s or ":" not in s:
         return
     for rx, indent_group in ((_YAML_NAME_RE, 3), (_YAML_BLOCK_KEY_RE, 1)):
@@ -960,6 +985,8 @@ def _continuation(s: str, pos: int, end: int, bare_re: re.Pattern[str], rd: _Rea
             return -1
     else:
         return -1
+    if gap is None:  # unreachable: every branch above returns when gap is None; this narrows the type for the checker
+        return -1
     if colon and s.startswith("//", gap.end()):
         return -1
     value_end = rd.read(gap.end(), bare_re)[0]
@@ -980,7 +1007,7 @@ def _tail_name_start(s: str, floor: int, end: int) -> int:
     return i
 
 
-def _scan(s: str, sep_re: re.Pattern[str], bare_re: re.Pattern[str], eq_sep: bool, add, rd: _Reader) -> None:
+def _scan(s: str, sep_re: re.Pattern[str], bare_re: re.Pattern[str], eq_sep: bool, add: _Add, rd: _Reader) -> None:
     """Report the value that follows every sensitive `NAME<sep>` match of `sep_re`: one forward pass with a cursor (no
     recursion, no rescans). A benign name only moves the cursor past its separator, so what looks like its value is scanned too."""
     pos = key_fail = 0
@@ -1013,7 +1040,7 @@ def _scan(s: str, sep_re: re.Pattern[str], bare_re: re.Pattern[str], eq_sep: boo
         pos = _tail_name_start(s, pos, end)
 
 
-def _pair_spans(s: str, add, rd: _Reader) -> None:
+def _pair_spans(s: str, add: _Add, rd: _Reader) -> None:
     """`"name": "value"` / `'name': 'value'` and the twice-serialised `\\"name\\": \\"value\\"` (any odd number of backslashes before the quotes). The
     value of a credential name is read to its closing quote (to the end of the line when it never closes); a benign pair does not hide a
     pair INSIDE its value (`{"message": "login 'password': 'x'"}`): the scan goes on inside it."""
@@ -1048,7 +1075,7 @@ def _header_end(rd: _Reader, value_start: int) -> int:
     return close if value_start < close < end else end  # a header that starts at the closing quote of an enclosing one is ambiguous: its line
 
 
-def _header_spans(s: str, add, rd: _Reader) -> None:
+def _header_spans(s: str, add: _Add, rd: _Reader) -> None:
     pos = 0
     while (m := _HEADER_RE.search(s, pos)) is not None:
         pos = _header_end(rd, m.end())
@@ -1081,11 +1108,71 @@ def _spans(s: str) -> list[tuple[int, int]]:
     return spans
 
 
+# Opt-in Rust span scanner (`swarm._native.redact_spans`, crate gsd-redact). The pure-Python detectors above are the oracle and the
+# default; `SWARM_REDACT_ENGINE=rust` only swaps who computes the spans, and every failure of the Rust path falls back to Python for that
+# call: redaction never fails because of a configuration typo, a missing or stale extension, or a scanner error.
+_ENGINE_ENV = "SWARM_REDACT_ENGINE"
+_engine_log = logging.getLogger("swarm.redact")
+# Reasons already reported this process. The two extension reasons double as a negative cache (no import retry per call); tests reset
+# it with `monkeypatch.setattr(redact, "_ENGINE_WARNED", set())`.
+_ENGINE_WARNED: set[str] = set()
+_engine_warn_lock = threading.Lock()
+
+
+def _engine_warn_once(reason: str, message: str) -> None:
+    with _engine_warn_lock:
+        if reason in _ENGINE_WARNED:
+            return
+        _ENGINE_WARNED.add(reason)
+    _engine_log.warning("%s: %s; using the pure-Python redactor", _ENGINE_ENV, message)
+
+
+def _rust_engine_selected() -> bool:
+    """True when `SWARM_REDACT_ENGINE=rust` is set and not overridden. Unset, empty or `python` is the default; `SWARM_PURE_PYTHON=1`
+    always wins over `rust`; any other value warns once and selects Python."""
+    engine = os.environ.get(_ENGINE_ENV, "")
+    if engine in ("", "python"):
+        return False
+    if engine != "rust":
+        _engine_warn_once("unknown-engine", f"unknown value {engine!r} (expected 'python' or 'rust')")
+        return False
+    if pure_python_requested():
+        _engine_warn_once("pure-python", "'rust' requested but SWARM_PURE_PYTHON=1 is set")
+        return False
+    return True
+
+
+def _native_spans(s: str) -> list[tuple[int, int]] | None:
+    """The spans from the Rust scanner, or None when this call must use the Python path."""
+    if "missing-extension" in _ENGINE_WARNED or "stale-extension" in _ENGINE_WARNED:
+        return None
+    try:
+        native = load_native()
+    except ImportError as exc:
+        _engine_warn_once("missing-extension", f"swarm._native is unavailable ({exc})")
+        return None
+    fn = getattr(native, "redact_spans", None)
+    if fn is None:
+        _engine_warn_once("stale-extension", "swarm._native has no redact_spans (stale build: reinstall with `pip install .`)")
+        return None
+    try:
+        return [(start, end) for start, end in fn(s)]
+    except UnicodeEncodeError:
+        return None  # a lone surrogate cannot be encoded for Rust: a normal input, answered by Python without a warning
+    except Exception as exc:  # noqa: BLE001 - any native failure must degrade to the oracle, never propagate
+        _engine_warn_once("native-error", f"swarm._native.redact_spans failed ({type(exc).__name__}: {str(exc)[:200]})")
+        return None
+
+
 def redact_spans(s: str) -> list[tuple[int, int]]:
     """The disjoint, ascending `(start, end)` ranges of `s` that `redact_text` replaces: the union of every detector's spans, where
     overlapping or touching spans become one range."""
     if not isinstance(s, str) or len(s) < 6:
         return []
+    if _rust_engine_selected():
+        native_spans = _native_spans(s)
+        if native_spans is not None:
+            return native_spans
     spans = [sp for sp in _spans(s) if sp[0] < sp[1]]  # an empty span hides nothing (the TypeScript union drops it too)
     if not spans:
         return []
@@ -1118,19 +1205,38 @@ def redact_text(s: str) -> str:
     return "".join(out)
 
 
-def _walk(value, level: int, max_depth: int, sensitive: bool):
+_BARE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _bare_credential_key(name: object) -> bool:
+    """Whether `name` is a credential name as a whole (`api_key`), not a key redacted for a token inside its text (`Authorization: Bearer x`)."""
+    return isinstance(name, str) and _BARE_NAME_RE.fullmatch(name) is not None and is_sensitive_key(name)
+
+
+def _dict_value(name: object, value: object, level: int, max_depth: int, sensitive: bool) -> object:
+    """A dict entry's value. A number or bool is a credential only when its key is a credential name as a whole (`{"api_key": 4821937}`),
+    so a key redacted only because it embeds a token (`"Authorization: Bearer x": 1`) keeps its number or bool; None stays None.
+    Strings and containers go through `_walk`, so list items keep its rules."""
+    credential = sensitive or _credential_pair(name, value)
+    if isinstance(value, (int, float)) and (sensitive or _bare_credential_key(name)):
+        return REDACTED
+    return _walk(value, level + 1, max_depth, credential)
+
+
+def _walk(value: object, level: int, max_depth: int, sensitive: bool) -> object:
     if isinstance(value, str):
         return REDACTED if sensitive and value else redact_text(value)
     if isinstance(value, (dict, list, tuple)):
         if level > max_depth:
             return REDACTED  # depth cap: never recurse unbounded (cycles included), never pass an unexamined subtree
         if isinstance(value, dict):
-            return {k: _walk(v, level + 1, max_depth, sensitive or _credential_pair(k, v)) for k, v in value.items()}
+            return {(redact_text(k) if isinstance(k, str) else k): _dict_value(k, v, level, max_depth, sensitive)
+                    for k, v in value.items()}
         return [_walk(v, level + 1, max_depth, sensitive) for v in value]
     return value
 
 
-def redact(value, *, max_depth: int = 12):
-    """A redacted copy of `value` (dict/list/tuple/str recursed, tuples become lists, other scalars unchanged).
+def redact(value: object, *, max_depth: int = 12) -> object:
+    """A redacted copy of `value` (dict/list/tuple/str recursed, tuples become lists; a number or bool that is a dict value under a credential name becomes `[REDACTED]`; other scalars unchanged).
     Containers nested more than `max_depth` levels deep are replaced by `[REDACTED]`."""
     return _walk(value, 1, max_depth, False)

@@ -24,6 +24,7 @@ import math
 import re
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, cast
 
 from swarm.tools.support import respond
 
@@ -43,8 +44,8 @@ _MUTABLE_TAGS = frozenset(
 )
 
 
-def env_tier(payload: dict) -> dict:
-    def work() -> dict:
+def env_tier(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         words = set(re.findall(r"[a-z]+", payload["env_name"].lower()))
         # Production wins over staging, and staging over ephemeral, so a mixed name fails closed.
         if words & _PRODUCTION_WORDS:
@@ -61,11 +62,11 @@ def env_tier(payload: dict) -> dict:
             }
         return {"state": "SUCCESS", "tier": tier, "autonomy": "L3" if tier == "production" else "L2"}
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def change_gate(payload: dict) -> dict:
-    def work() -> dict:
+def change_gate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         if payload["env_tier"] != "production":
             return {"state": "SUCCESS", "decision": "allowed", "missing": ""}
         evidence = {
@@ -78,10 +79,10 @@ def change_gate(payload: dict) -> dict:
             return {"state": "SUCCESS", "decision": "blocked", "missing": ", ".join(missing)}
         return {"state": "SUCCESS", "decision": "needs-human-approval", "missing": ""}
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def _state_map(pairs: list) -> dict | None:
+def _state_map(pairs: list[dict[str, Any]]) -> dict[str, str] | None:
     state: dict[str, str] = {}
     for pair in pairs:
         if pair["key"] in state:
@@ -90,8 +91,8 @@ def _state_map(pairs: list) -> dict | None:
     return state
 
 
-def drift_count(payload: dict) -> dict:
-    def work() -> dict:
+def drift_count(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         want = _state_map(payload["desired"])
         if want is None:
             return {"state": "INVALID_INPUT", "field": "desired", "message": "keys must be unique"}
@@ -116,11 +117,11 @@ def drift_count(payload: dict) -> dict:
             "action": action,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def cost_overrun(payload: dict) -> dict:
-    def work() -> dict:
+def cost_overrun(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         modeled = payload["modeled_cost"]
         actual = payload["actual_cost"]
         if modeled <= 0:
@@ -140,11 +141,11 @@ def cost_overrun(payload: dict) -> dict:
             "action": "auto-downscale" if overrun else "none",
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def image_tag_check(payload: dict) -> dict:
-    def work() -> dict:
+def image_tag_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         ref = payload["image_ref"]
         if any(ch.isspace() for ch in ref):
             return {"state": "INVALID_INPUT", "field": "image_ref", "message": "must not contain whitespace"}
@@ -175,7 +176,7 @@ def image_tag_check(payload: dict) -> dict:
             verdict, reason = "fail", "unrecognized-tag"
         return {"state": "SUCCESS", "verdict": verdict, "reason": reason, "tag": tag}
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 def _instant(text: str) -> datetime | None:
@@ -188,8 +189,8 @@ def _instant(text: str) -> datetime | None:
     return moment if moment.utcoffset() is not None else None
 
 
-def freeze_window(payload: dict) -> dict:
-    def work() -> dict:
+def freeze_window(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         now = _instant(payload["now"])
         if now is None:
             return {
@@ -214,10 +215,10 @@ def freeze_window(payload: dict) -> dict:
                 remaining = int((end - now).total_seconds())
         return {"state": "SUCCESS", "frozen": index != -1, "window_index": index, "remaining_s": remaining}
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
@@ -230,8 +231,8 @@ def _digest_pinned(image: str) -> bool:
     return bool(name) and bool(at) and _DIGEST.fullmatch(digest) is not None
 
 
-def provenance_gate(payload: dict) -> dict:
-    def work() -> dict:
+def provenance_gate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         record = payload["record"]
         provenance = record.get("provenance")
         provenance = provenance if isinstance(provenance, dict) else {}
@@ -272,11 +273,11 @@ def provenance_gate(payload: dict) -> dict:
             "warnings": warnings,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def deploy_gate(payload: dict) -> dict:
-    def work() -> dict:
+def deploy_gate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         blockers: list[str] = []
         verdict = payload["security_verdict"]
         # Fail closed: only an explicit pass from A10 opens the gate; a missing verdict blocks like a fail.
@@ -298,11 +299,11 @@ def deploy_gate(payload: dict) -> dict:
             decision = "allow"
         return {"state": "SUCCESS", "decision": decision, "blockers": blockers}
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def rollback_target(payload: dict) -> dict:
-    def work() -> dict:
+def rollback_target(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         seen: set[str] = set()
         best: tuple[datetime, str] | None = None
         for position, snapshot in enumerate(payload["snapshots"]):
@@ -324,7 +325,7 @@ def rollback_target(payload: dict) -> dict:
             action = "escalate"
         return {"state": "SUCCESS", "action": action, "target_id": target}
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 _TF_SHAPES = {
@@ -344,8 +345,8 @@ def _listed(items: list[str]) -> str:
     return shown + (f", +{len(items) - _NOTE_LISTED} more" if len(items) > _NOTE_LISTED else "")
 
 
-def tf_blast_radius(payload: dict) -> dict:
-    def work() -> dict:
+def tf_blast_radius(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         counts = {"create": 0, "update": 0, "delete": 0, "replace": 0}
         types: set[str] = set()
         destructive: list[str] = []
@@ -386,4 +387,4 @@ def tf_blast_radius(payload: dict) -> dict:
             "note": note,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict

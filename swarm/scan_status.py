@@ -10,11 +10,13 @@ Reasons carry labels and paths only, never the value that failed to parse: a mis
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+
 BLOCKING_SEVERITIES = ("blocker", "major")
 MAX_REASONS_SHOWN = 5
 
 
-def incomplete_findings(reasons, analysed: int) -> list[dict]:
+def incomplete_findings(reasons: Iterable[object], analysed: int) -> list[dict[str, str]]:
     """One major ``scan-incomplete`` finding when any in-scope input was not analysed, or none was."""
     listed = [str(reason) for reason in reasons if str(reason)]
     if not listed and analysed > 0:
@@ -30,6 +32,6 @@ def incomplete_findings(reasons, analysed: int) -> list[dict]:
     }]
 
 
-def scan_status(findings) -> str:
+def scan_status(findings: Iterable[Mapping[str, object]]) -> str:
     """``fail`` when any finding is blocking, otherwise ``ok``."""
     return "fail" if any(finding.get("severity") in BLOCKING_SEVERITIES for finding in findings) else "ok"

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Any, TypeGuard
 
 from swarm.tools.support import respond
 
@@ -33,12 +34,12 @@ _OR = re.compile(r"\s+OR\s+", re.IGNORECASE)
 _AND = re.compile(r"\s+AND\s+", re.IGNORECASE)
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def openapi_path_params(payload: dict) -> dict:
-    def work() -> dict:
+def openapi_path_params(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         template = payload["template"]
         if not template.startswith("/"):
             return _invalid("template", "template must start with '/'")
@@ -72,8 +73,8 @@ def _route_shape(path: str) -> str:
     return shaped.rstrip("/") or "/"
 
 
-def route_collision(payload: dict) -> dict:
-    def work() -> dict:
+def route_collision(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         groups: dict[tuple[str, str], list[str]] = {}
         for index, route in enumerate(payload["routes"]):
             method = route["method"].strip().upper()
@@ -96,8 +97,8 @@ def route_collision(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def method_status_check(payload: dict) -> dict:
-    def work() -> dict:
+def method_status_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         method = payload["method"].strip()
         if not _METHOD.match(method):
             return _invalid("method", "method must be 1-10 ASCII letters")
@@ -120,8 +121,8 @@ def method_status_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def semver_range_class(payload: dict) -> dict:
-    def work() -> dict:
+def semver_range_class(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         text = payload["range"].strip()
         if text in ("", "*", "x", "X"):
             kind, bounded = "wildcard", False
@@ -167,8 +168,8 @@ def _license_allowed(expression: str, allowed: set[str]) -> bool:
     )
 
 
-def license_allowlist_check(payload: dict) -> dict:
-    def work() -> dict:
+def license_allowlist_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         allowed = {item.strip().lower() for item in payload["allowlist"]}
         packages = payload["packages"]
         violations = [
@@ -186,8 +187,8 @@ def license_allowlist_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def coverage_delta(payload: dict) -> dict:
-    def work() -> dict:
+def coverage_delta(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         before = payload["before"]
         after = payload["after"]
         for field, value in (("before", before), ("after", after)):
@@ -203,8 +204,8 @@ def coverage_delta(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def acceptance_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def acceptance_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         criteria = list(dict.fromkeys(payload["criteria"]))
         if not criteria:
             return _invalid("criteria", "at least one acceptance criterion is required")
@@ -223,12 +224,12 @@ def acceptance_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _finite_number(value: object) -> bool:
+def _finite_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def perf_regression(payload: dict) -> dict:
-    def work() -> dict:
+def perf_regression(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         benchmarks = payload["benchmarks"]
         limit = payload.get("max_regression_pct", 10)
         if not _finite_number(limit) or not 0 <= limit <= 1000:
@@ -236,7 +237,7 @@ def perf_regression(payload: dict) -> dict:
         if not isinstance(benchmarks, list) or not benchmarks:
             return _invalid("benchmarks", "at least one benchmark is required")
         seen: set[str] = set()
-        regressions: list[dict] = []
+        regressions: list[dict[str, Any]] = []
         worst: float | None = None
         for index, item in enumerate(benchmarks):
             if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip():
@@ -283,8 +284,8 @@ def _dep_name(value: object) -> str | None:
     return name if name and len(name) <= 214 and not any(ch.isspace() for ch in name) else None
 
 
-def dependency_class(payload: dict) -> dict:
-    def work() -> dict:
+def dependency_class(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         manifest: dict[str, tuple[int, int, int]] = {}
         spelled: dict[str, str] = {}
         for package, version in payload["manifest"].items():
@@ -306,7 +307,7 @@ def dependency_class(payload: dict) -> dict:
         if not isinstance(proposed, list) or not proposed:
             return _invalid("proposed", "at least one proposed dependency is required")
         seen: set[str] = set()
-        items: list[dict] = []
+        items: list[dict[str, Any]] = []
         for index, entry in enumerate(proposed):
             name = _dep_name(entry.get("package")) if isinstance(entry, dict) else None
             target = _dep_version(entry.get("version")) if isinstance(entry, dict) else None
@@ -347,8 +348,8 @@ def dependency_class(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def route_auth_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def route_auth_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         public: set[tuple[str, str]] = set()
         for index, entry in enumerate(payload["public"]):
             method = entry["method"].strip().upper()
@@ -397,12 +398,12 @@ def _is_branch_for(branch: object, task_id: str) -> bool:
     return prefix is not None and branch[prefix.end():] == task_id
 
 
-def patch_shape_check(payload: dict) -> dict:
-    def work() -> dict:
+def patch_shape_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         patch = payload["patch"]
         if not isinstance(patch, dict):
             return _invalid("patch", "patch must be an object")
-        problems: list[dict] = []
+        problems: list[dict[str, Any]] = []
 
         def flag(field: str, message: str) -> None:
             problems.append({"field": field, "msg": message})

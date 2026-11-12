@@ -11,7 +11,9 @@ import json
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, NoReturn
 
 from .errors import ErrorCode, SwarmError
 from .manifest import by_capability, get_agent
@@ -61,7 +63,7 @@ _GATE_ROWS = {
 _MAX_SLICES = 32
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise SwarmError(ErrorCode.E_INPUT, message)
 
 
@@ -84,7 +86,7 @@ def _overlaps(left: str, right: str) -> bool:
     return long.startswith(short + "/")
 
 
-def normalize_slices(raw: object) -> list[dict]:
+def normalize_slices(raw: object) -> list[dict[str, Any]]:
     """Validate a blast-radius array. Paths are disjoint, ids are task-id safe, agents are implementers."""
     if not isinstance(raw, list):
         _fail("blast radii must be a JSON array")
@@ -92,7 +94,7 @@ def normalize_slices(raw: object) -> list[dict]:
         _fail("a parallel plan needs at least two disjoint blast radii")
     if len(raw) > _MAX_SLICES:
         _fail(f"a parallel plan accepts at most {_MAX_SLICES} blast radii")
-    slices: list[dict] = []
+    slices: list[dict[str, Any]] = []
     seen: list[tuple[str, str]] = []
     ids: set[str] = set()
     for item in raw:
@@ -157,13 +159,14 @@ def slices_from_brief(brief: str) -> object | None:
     if len(found) > 1:
         _fail("brief has more than one ```blast-radii``` block")
     try:
-        return json.loads(found[0])
+        parsed: object = json.loads(found[0])
+        return parsed
     except json.JSONDecodeError as exc:
         _fail(f"blast-radii block is not JSON: {exc.msg}")
     return None
 
 
-def load_slices(*, brief: str, slices_json: str | None, slices_path: str | None) -> list[dict] | None:
+def load_slices(*, brief: str, slices_json: str | None, slices_path: str | None) -> list[dict[str, Any]] | None:
     """The one slice source. A brief block, --slices, and --slices-json together are an input error."""
     found: list[tuple[str, object]] = []
     fenced = slices_from_brief(brief)
@@ -187,7 +190,7 @@ def load_slices(*, brief: str, slices_json: str | None, slices_path: str | None)
     return normalize_slices(found[0][1])
 
 
-def parallel_rows(slices: list[dict], risk: str) -> list[tuple]:
+def parallel_rows(slices: list[dict[str, Any]], risk: str) -> list[tuple[Any, ...]]:
     """Lanes with no per-lane review, a join, then the risk class's gates once on the merged branch.
 
     Slice rows leave `gates` as None so the slice keeps the risk-class gate set. The review that
@@ -197,7 +200,7 @@ def parallel_rows(slices: list[dict], risk: str) -> list[tuple]:
     if risk not in GATES_BY_RISK:
         _fail(f"unknown risk class {risk!r}")
     ids = [item["id"] for item in slices]
-    rows: list[tuple] = []
+    rows: list[tuple[Any, ...]] = []
     for item in slices:
         rows.append((item["id"], item["capability"], item["agent"], item["title"], [], None, None,
                      list(item["acceptance"]), {"role": "slice", "blast_radius": list(item["paths"])}))
@@ -219,7 +222,7 @@ def parallel_rows(slices: list[dict], risk: str) -> list[tuple]:
     return rows
 
 
-def lane_notes(lane: dict, prefix: str, suffix: str) -> dict:
+def lane_notes(lane: dict[str, Any], prefix: str, suffix: str) -> dict[str, Any]:
     """Task-store notes for one parallel-plan row. Branch names are fixed at plan time."""
     role = lane.get("role")
     if role == "slice":
@@ -230,7 +233,7 @@ def lane_notes(lane: dict, prefix: str, suffix: str) -> dict:
     return {key: value for key, value in lane.items() if key != "slices"}
 
 
-def lane_section(notes: dict) -> str:
+def lane_section(notes: dict[str, Any]) -> str:
     """Assignment text for a lane, the join, or the single Greptile review. Empty for every other task."""
     role = notes.get("role")
     if role == "slice":
@@ -277,10 +280,11 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
 
-def prepare_slice_worktree(repo: Path, dest: Path, branch: str) -> Path:
+def prepare_slice_worktree(repo: Path, dest: Path, branch: str, *,
+                           sleep: Callable[[float], None] = time.sleep) -> Path:
     """A worktree at `dest` on `branch`, created from HEAD when the branch is new.
 
-    Parallel lanes call this together. Git locks the main checkout, so a lock failure is retried.
+    Parallel lanes call this together. Git locks the main checkout, so a lock failure is retried; `sleep` is injectable (as `acp.Bus`).
     """
     if not branch or branch.startswith("-") or ".." in branch.split("/"):
         raise SwarmError(ErrorCode.E_CONTRACT, f"refusing blast-radius branch {branch!r}")
@@ -289,6 +293,11 @@ def prepare_slice_worktree(repo: Path, dest: Path, branch: str) -> Path:
         raise SwarmError(ErrorCode.E_DEP, f"{repo} is not a git checkout; blast-radius lanes need worktrees")
     dest = dest.resolve()
     if (dest / ".git").exists():
+        head = _git(dest, "symbolic-ref", "--quiet", "HEAD")
+        current = head.stdout.strip().removeprefix("refs/heads/") if head.returncode == 0 else ""
+        if current != branch:
+            raise SwarmError(ErrorCode.E_CONTRACT,
+                             f"worktree {dest} is on {current or 'no branch'}, not {branch}; refusing to reuse it")
         return dest
     if dest.exists():
         raise SwarmError(ErrorCode.E_CONTRACT, f"worktree path {dest} exists and is not a worktree")
@@ -304,7 +313,7 @@ def prepare_slice_worktree(repo: Path, dest: Path, branch: str) -> Path:
         last = (proc.stderr or proc.stdout or "worktree add failed").strip()
         if "lock" not in last.lower() or attempt == 4:
             break
-        time.sleep(0.05 * (attempt + 1))
+        sleep(0.05 * (attempt + 1))
     raise SwarmError(ErrorCode.E_DEP, f"worktree for {branch} failed: {last[-400:]}")
 
 
@@ -323,7 +332,7 @@ def merge_branches(repo: Path, branches: list[str]) -> None:
             raise SwarmError(ErrorCode.E_CONTRACT, f"cannot merge {branch}: {detail[-400:]}")
 
 
-def join_result_text(repo: Path, task: dict) -> str:
+def join_result_text(repo: Path, task: dict[str, Any]) -> str:
     """Merge the lane branches, then the same IN_REVIEW payload a finished implementer returns."""
     branches = list(task["notes_json"].get("merge_branches") or [])
     merge_branches(repo, branches)

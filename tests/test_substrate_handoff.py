@@ -12,15 +12,20 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 
 from swarm import substrate_client, substrate_handoff as hand_mod, substrate_lease as lease_mod, substrate_tee as tee_mod
 from swarm import workspace as ws_mod
+from swarm.claims import make_claim_table, parse_claims
+from swarm.errors import ErrorCode, SwarmError
 from swarm.manifest import load_manifest
 from swarm.results import reconcile
-from swarm.taskstore import MAX_REWORK_LOOPS, TaskStore
+from swarm.subagent_lifecycle import SubagentLifecycleManager
+from swarm.taskstore import MAX_REWORK_LOOPS, TaskStore, TaskState as S
+from swarm.telemetry import Telemetry
 from swarm.verdicts import record_gate_verdicts
 
 from test_substrate_lease import CORR, GID, FakeSubstrate, _args, _iso, _load, _refusal, _store
@@ -885,3 +890,266 @@ def test_a_refused_packet_is_recorded_and_not_retried(tmp_path, fake):
 def test_no_handoffs_without_leases(tmp_path, runner):
     ctx = SimpleNamespace(emit=lambda *a, **k: None)
     assert runner.handoff_bridge(tmp_path / "t.db", CORR, tmp_path, ctx, None) is None
+
+
+# --- cooperative cancel: a stop is asked only before the next independent unit ----------------------------------------
+def _counting(n: int):
+    """A stop predicate that answers False to its first `n` questions and True after: one question per unit."""
+    asked: list[None] = []
+
+    def stop() -> bool:
+        asked.append(None)
+        return len(asked) > n
+
+    return stop
+
+
+def _boundary(n: int):
+    return hand_mod.boundary(round_="dispatch@T-x", part=f"dep:D{n}", sender="A03", receiver="A05", node_id="T-x",
+                             goal="build on D", dod=[], files=[], blockers=[], body=f"D{n} is done",
+                             occurred_at=float(n + 1))
+
+
+def test_a_flush_stops_before_its_next_boundary_and_the_rest_stay_pending(tmp_path, fake):
+    fake.register("T-x")
+    store, events = _store(tmp_path), []
+    _task(store, "T-x", "A05")
+    _, handoffs = _bridges(store, events)
+    assert handoffs.graph_id() == GID  # resolved while the substrate answers
+    fake.down = True  # every send is unsent: queued for the flush
+    assert [handoffs.send(_boundary(n)) for n in range(3)] == ["unsent"] * 3
+    fake.down = False
+    substrate_client.reset()
+    assert handoffs.flush(stop_requested=_counting(1)) == 1 and len(_packets(fake)) == 1
+    assert handoffs.flush() == 2 and len(_packets(fake)) == 3
+    assert handoffs.flush() == 0
+
+
+def test_a_stop_after_a_granted_lease_keeps_that_pair_and_leases_no_later_one(tmp_path, fake, runner):
+    fake.register("T-1", "T-2")
+    store, events = _store(tmp_path), []
+    _task(store, "T-1", "A03")
+    _task(store, "T-2", "A05")
+    leases, _ = _bridges(store, events)
+
+    def granted() -> bool:
+        return fake.node("T-1")["lease_id"] is not None
+
+    batch, waiting = runner.select_batch(store, [store.get("T-1"), store.get("T-2")], 4, leases, stop_requested=granted)
+    assert [t["task_id"] for t, _ in batch] == ["T-1"] and waiting == []
+    assert fake.node("T-1")["lease_id"] is not None and leases.held("T-1") is not None
+    assert fake.node("T-2")["lease_id"] is None and leases.held("T-2") is None
+
+
+def test_a_stop_before_a_lease_gives_the_claims_back(tmp_path, fake, runner):
+    fake.register("T-1")
+    store, events = _store(tmp_path), []
+    _task(store, "T-1", "A05", claims=["src/a.py"])
+    leases, _ = _bridges(store, events)
+    claims = make_claim_table()
+    batch, _ = runner.select_batch(store, [store.get("T-1")], 4, leases, claims=claims,
+                                   stop_requested=lambda: bool(claims.held()))
+    assert batch == [] and fake.node("T-1")["lease_id"] is None
+    assert claims.acquire("T-2", parse_claims({"claims": ["src/a.py"]})).ok  # the pattern is free again
+
+
+def test_a_stop_admits_no_further_retry_and_leaves_the_rest_failed(tmp_path, fake, runner):
+    store, events = _store(tmp_path), []
+    for tid in ("T-r1", "T-r2"):
+        _task(store, tid, "A05")
+        _walk(store, tid, "CLAIMED")
+        store.transition(tid, "FAILED", reason="E-TIMEOUT: task_timeout exceeded")
+
+    def emit(kind, payload, **_k):
+        events.append((kind, payload))
+
+    ready = runner.dispatchable(store, CORR, emit, handoffs=None, stop_requested=_counting(1))
+    assert len(ready) == 1
+    assert sorted(store.get(t)["state"] for t in ("T-r1", "T-r2")) == [S.FAILED.value, S.RETRY.value]
+    again = runner.dispatchable(store, CORR, emit, handoffs=None)  # the rest is admitted on the next pass
+    assert len(again) == 2 and {store.get(t)["state"] for t in ("T-r1", "T-r2")} == {S.RETRY.value}
+
+
+class _Pool:
+    """The scheduler's pool stand-in: records what it is given and runs nothing; the test runs a worker itself."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple] = []
+
+    def submit(self, fn, *args) -> Future:
+        self.submitted.append(args)
+        return Future()
+
+    def shutdown(self, wait: bool = True, **_k) -> None:
+        return None
+
+
+@pytest.fixture()
+def controller(tmp_path, fake, runner):
+    """The original Python Scheduler over real leases and handoffs on the fake substrate."""
+    store, events = _store(tmp_path), []
+    leases, handoffs = _bridges(store, events)
+    args = _args(max_parallel=4, max_rounds=10, once=False)
+    args.dry_run = True
+    ctx = SimpleNamespace(root=tmp_path, correlation_id=CORR, emit=lambda t, p, **k: events.append((t, p)))
+    mgr = SubagentLifecycleManager(4, root=tmp_path, correlation_id=CORR, dry_run=True)
+    tel = Telemetry(root=tmp_path, correlation_id=CORR, tee=False, live=False)
+    sched = runner.Scheduler(args, ctx, store=store, store_path=store.path, repo=tmp_path, corr=CORR, mgr=mgr, tel=tel,
+                             leases=leases, handoffs=handoffs, cancel=runner.CancelRequest(), barrier=False,
+                             sdir=store.path.parent)
+    sched.pool = _Pool()
+    yield SimpleNamespace(sched=sched, store=store, leases=leases, mgr=mgr, fake=fake)
+    sched.close()
+    store.conn.close()
+
+
+def test_an_uncancelled_pass_admits_every_selected_pair(controller):
+    rig = controller
+    rig.fake.register("T-n1", "T-n2")
+    _task(rig.store, "T-n1", "A03")
+    _task(rig.store, "T-n2", "A05")
+    res = rig.sched._schedule()
+    assert res.submitted == 2 and sorted(rig.sched.inflight) == ["T-n1", "T-n2"]
+    assert len(rig.sched.pool.submitted) == 2
+
+
+def test_a_cancel_before_the_pass_selects_nothing(controller):
+    rig = controller
+    rig.fake.register("T-p")
+    _task(rig.store, "T-p", "A05")
+    rig.sched.cancel.request("test")
+    res = rig.sched._schedule()
+    assert res.submitted == 0 and rig.sched.inflight == {}
+    assert rig.fake.at("graph_claim") == [] and rig.store.get("T-p")["state"] == S.PLANNED.value
+
+
+def test_a_cancel_after_one_submission_admits_one_pair_and_gives_back_the_selected_rest(controller, monkeypatch):
+    rig = controller
+    rig.fake.register("T-s1", "T-s2")
+    _task(rig.store, "T-s1", "A03")
+    _task(rig.store, "T-s2", "A05")
+    real_submit = rig.sched._submit
+
+    def submit_then_cancel(task, agent):
+        real_submit(task, agent)
+        rig.sched.cancel.request("test")  # the next selected pair must not be admitted
+
+    monkeypatch.setattr(rig.sched, "_submit", submit_then_cancel)
+    res = rig.sched._schedule()
+    (admitted,) = rig.sched.inflight
+    other = "T-s2" if admitted == "T-s1" else "T-s1"
+    assert res.submitted == 1
+    assert rig.store.get(other)["state"] == S.PLANNED.value
+    assert rig.fake.node(admitted)["lease_id"] is not None  # the admitted pair keeps its lease for its worker
+    assert rig.fake.node(other)["lease_id"] is None  # selected but never admitted: settled by its real state
+    assert len(rig.fake.at("graph_release")) == 1
+    assert other not in rig.sched.claims.held()
+
+
+def test_a_cancel_during_the_retry_jitter_admits_no_retry_note(controller, runner, monkeypatch):
+    rig = controller
+    for tid in ("T-q1", "T-q2"):
+        _task(rig.store, tid, "A05")
+        _walk(rig.store, tid, "CLAIMED")
+        rig.store.transition(tid, "FAILED", reason="E-TIMEOUT: task_timeout exceeded")
+    monkeypatch.setattr(runner, "backoff_s", lambda attempt, **kw: 0.25)
+    rig.sched._schedule_retry(rig.store.get("T-q1"), "E-TIMEOUT: task_timeout exceeded", None)
+    assert "retry_after" in rig.store.get("T-q1")["notes_json"]  # control: an uncancelled retry is noted
+
+    def jitter(attempt, **kw):
+        rig.sched.cancel.request("test")  # the cancel lands while the jitter is drawn
+        return 0.25
+
+    monkeypatch.setattr(runner, "backoff_s", jitter)
+    before = len(rig.sched.log)
+    rig.sched._schedule_retry(rig.store.get("T-q2"), "E-TIMEOUT: task_timeout exceeded", None)
+    assert "retry_after" not in rig.store.get("T-q2")["notes_json"] and len(rig.sched.log) == before
+
+
+def test_a_cancel_that_lands_during_a_pass_drains_once_and_is_never_read_as_idle(controller, monkeypatch):
+    rig = controller
+    rig.fake.register("T-l1")
+    _task(rig.store, "T-l1", "A03")
+    real_submit = rig.sched._submit
+
+    def submit_then_cancel(task, agent):
+        real_submit(task, agent)
+        rig.sched.cancel.request("test")
+
+    drains: list[int] = []
+    monkeypatch.setattr(rig.sched, "_submit", submit_then_cancel)
+    monkeypatch.setattr(rig.sched, "_cancel_drain", lambda: drains.append(len(rig.sched.inflight)))
+    monkeypatch.setattr(rig.sched, "_idle", lambda res: pytest.fail("a partial pass was read as idle"))
+    rig.sched.loop()
+    assert drains == [1]
+
+
+@pytest.mark.parametrize("path", ["pre-pickup", "post-acquire", "normal", "acquire-error"])
+def test_the_shared_worker_settles_its_lease_once_unless_the_run_proceeds(controller, runner, monkeypatch, path):
+    rig = controller
+    rig.fake.register("T-w")
+    _task(rig.store, "T-w", "A05")
+    task = rig.store.get("T-w")
+    agent = runner.resolve_agent(task)
+    assert rig.leases.acquire(task, "A05").dispatch  # the pair the worker was submitted with holds its lease
+    item = rig.sched._open_run(task, agent).item
+    settled: list[str] = []
+    executed: list[str] = []
+    real_settle = rig.leases.settle
+
+    def counting_settle(tid):
+        settled.append(tid)
+        return real_settle(tid)
+
+    def execute(store_path, task_, agent_, args, ctx, repo, leases, handoffs):
+        executed.append(task_["task_id"])
+        return task_["task_id"], agent_["id"], "IN_REVIEW"
+
+    monkeypatch.setattr(rig.leases, "settle", counting_settle)
+    monkeypatch.setattr(runner, "execute_one", execute)
+    if path == "pre-pickup":
+        rig.sched.cancel.request("test")
+    elif path == "post-acquire":
+        real_acquire = rig.mgr.acquire
+
+        def acquire_then_cancel(sid):
+            real_acquire(sid)
+            rig.sched.cancel.request("test")  # the cancel lands while this worker waits for its slot
+
+        monkeypatch.setattr(rig.mgr, "acquire", acquire_then_cancel)
+    elif path == "acquire-error":
+        def refuse(sid):
+            raise SwarmError(ErrorCode.E_CAPACITY, "full")
+
+        monkeypatch.setattr(rig.mgr, "acquire", refuse)
+    done = rig.sched._worker(task, agent, item.sid, item.run)
+    assert rig.mgr.active_ids() == [] and rig.mgr.release(item.sid) is None
+    cut = path in ("pre-pickup", "post-acquire")
+    assert done.outcome == {"pre-pickup": "SKIPPED", "post-acquire": "SKIPPED", "normal": "IN_REVIEW",
+                            "acquire-error": "FAILED"}[path]
+    assert executed == ([] if cut or path == "acquire-error" else ["T-w"])
+    assert settled == ([] if path == "normal" else ["T-w"])
+    assert (rig.fake.node("T-w")["lease_id"] is None) == (path != "normal")
+    item.future.set_result(done)
+    rig.sched._complete(item.future)
+    assert rig.sched.inflight == {} and rig.mgr.active_ids() == []
+
+
+def test_a_cancel_after_selection_and_before_the_first_submission_admits_nothing(controller, runner, monkeypatch):
+    rig = controller
+    rig.fake.register("T-f1", "T-f2")
+    _task(rig.store, "T-f1", "A03")
+    _task(rig.store, "T-f2", "A05")
+    real_select = runner.select_batch
+
+    def select_then_cancel(*args, **kwargs):
+        out = real_select(*args, **kwargs)
+        rig.sched.cancel.request("test")  # both pairs are selected and leased, but none is admitted yet
+        return out
+
+    monkeypatch.setattr(runner, "select_batch", select_then_cancel)
+    res = rig.sched._schedule()
+    assert res.submitted == 0 and rig.sched.inflight == {} and rig.sched.pool.submitted == []
+    assert rig.fake.node("T-f1")["lease_id"] is None and rig.fake.node("T-f2")["lease_id"] is None
+    assert len(rig.fake.at("graph_release")) == 2  # every selected pair was given back by its real state
+    assert rig.store.get("T-f1")["state"] == S.PLANNED.value and rig.store.get("T-f2")["state"] == S.PLANNED.value

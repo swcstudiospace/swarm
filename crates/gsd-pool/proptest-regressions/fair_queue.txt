@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 67c0ba09c74b13052e820b8a60fd0873e68096cb80fdd9ce0cfbf2fe6bf62998 # shrinks to cap = 4, window = 1, ops = [Offer { thread: 2, msg: 0 }, Offer { thread: 3, msg: 0 }, Offer { thread: 0, msg: 0 }, Offer { thread: 5, msg: 21 }, Take, Take, Take, Offer { thread: 0, msg: 0 }, Offer { thread: 5, msg: 0 }, Take, Offer { thread: 5, msg: 21 }]
+cc cc738b354785ed8985f1f2502413beadf7217c98bff22c26b864abab3ba707e2 # shrinks to cap = 5, window = 1, ops = [Offer { thread: 0, msg: 0 }, Offer { thread: 2, msg: 18 }, Offer { thread: 2, msg: 0 }, Offer { thread: 2, msg: 18 }]

@@ -14,8 +14,8 @@ Don't use for: Do not implement domain artifacts (code/docs/IaC).
 
 ## Procedure
 
-1. Dispatch via the omp `task` tool with `agent: a01-orchestrator` (definition: `omp/agents/a01-orchestrator.md`), passing the signed `task.assign` payload.
-2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.
+1. If the message is one signed `task.assign` envelope (`schema` `swarm.v1.task.assign`, `target` `A01`, `payload.capability` `plan.execute`), continue with it. If it is a project brief, call `swarm_plan` with that text before any BLOCKED yield. A prose brief is not an unsigned assignment. When `execution_assignment_verified` is not true, yield BLOCKED with needs `execution assignment` and spawn nothing.
+2. Finish by calling `yield` with a `task.result` object.
 3. Don't use it for: Do not implement domain artifacts (code/docs/IaC).
 
 ## Registered tools

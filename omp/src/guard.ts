@@ -54,7 +54,6 @@ export function isAdvisorReviewSurface(tools: readonly string[] | undefined): bo
   }
   return review && seen.size > 0;
 }
-
 export const SWARM_STATE_REASON = "BLOCKED needs: human-approval (swarm-state)";
 export const SWARM_ASSIGNMENT_REASON = "BLOCKED needs: human-approval (swarm-assignment)";
 /** index.ts appends the error message and `)` when the guard itself throws inside a swarm session (D-02). */
@@ -175,6 +174,8 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
     const mcp = devices.find((p) => MCP_DEVICE.test(p) && !ownSubstrateTool(p, facts));
     if (mcp !== undefined) return { block: true, reason: reason("mcp", mcp) };
   }
+  // TS-02: an ast_edit write whose content names no `paths` array would act on files the guard cannot see: refused
+  if (event.toolName === "write" && astEditUnjudgeable(event.input)) return { block: true, reason: reason("protected_path", "ast-edit-unjudgeable") };
   if ((event.toolName === "read" || event.toolName === "grep") && signerToolRead(event, facts)) {
     return { block: true, reason: reason("signer_credential", "signer-file-read") };
   }
@@ -259,6 +260,24 @@ export function editTargets(input: unknown): string[] {
     if (Array.isArray(paths)) for (const p of paths) add(p);
   }
   return out;
+}
+
+/**
+ * TS-02: a `write` to the `xd://ast_edit` device whose `content` is not JSON with a `paths` array names no file the guard
+ * can judge, yet the device still acts on it: such a call is refused, never passed on with its targets dropped. (`edit` has
+ * no `content` parameter, so only the write shape carries the device payload.)
+ */
+function astEditUnjudgeable(input: unknown): boolean {
+  if (typeof input !== "object" || input === null) return false;
+  const { path, file_path, content } = input as { path?: unknown; file_path?: unknown; content?: unknown };
+  if (![path, file_path].some((p) => typeof p === "string" && AST_EDIT_DEVICE.test(p.trim()))) return false;
+  let args: { paths?: unknown } | null | undefined;
+  try {
+    args = typeof content === "string" ? JSON.parse(content) : undefined;
+  } catch {
+    return true;
+  }
+  return !Array.isArray(args?.paths);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -382,6 +401,10 @@ export interface Segment {
   /** Its stdin is a pipe (a pipeline member after the first). */
   piped: boolean;
   cwd: string | undefined;
+  /** Set past MAX_LITERAL_DEPTH on a segment whose shell body (`sh -c`, su/trap/alias/env -S) is not unwrapped: nothing judges it. */
+  unjudged?: true;
+  /** Set when a substitution stayed uncut past the cut cap: nothing judges its text, so the unjudged-substitution rule refuses it. */
+  uncut?: true;
 }
 type Matcher = (seg: Segment, facts: GuardFacts, command: string) => boolean;
 
@@ -438,19 +461,19 @@ const SHELL_WORD = /^(?:sh|bash|rbash|zsh|dash|ash|ksh|mksh|oksh|pdksh|yash|posh
 const JOINS_ARGS = /^\s*(?:(?:\S*\/)?(?:eval|watch|parallel)\b|(?:\S*\/)?sudo\b.*\s(?:-[A-Za-z]*[si]|--shell|--login)(?:\s|$))/;
 /** `env -S LINE` / `--split-string=LINE` once the `env` word was stripped: the rest of the line is the command. */
 const SPLIT_STRING = /^(?:-[A-Za-z]*S\s*|--split-string(?:=|\s+))/;
-/** Nesting cap for `sh -c "sh -c '…'"` recursion. */
+/** Nesting cap for `sh -c "sh -c '…'"` recursion: past it a shell body is refused as unjudged (nested-shell-depth), never dropped. */
 const MAX_LITERAL_DEPTH = 3;
 
-/** The value of the `$'…'` escape whose letter is at `word[i]`, and the index of its last character. */
-function ansiEscape(word: string, i: number): [string, number] {
+/** The value of the `$'…'` escape whose letter is at `word[i]`, and the index of its last character; read within `word[..end)`. */
+function ansiEscape(word: string, i: number, end = word.length): [string, number] {
   const c = word[i];
   if (Object.hasOwn(ANSI_ESCAPE, c)) return [ANSI_ESCAPE[c], i];
-  const code = /^(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3}))/.exec(word.slice(i, i + 9));
+  const code = /^(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3}))/.exec(word.slice(i, Math.min(i + 9, end)));
   if (code !== null) {
     const value = Number.parseInt(code[1] ?? code[2] ?? code[3] ?? code[4], code[4] === undefined ? 16 : 8);
     return [String.fromCodePoint(Math.min(value, 0x10ffff)), i + code[0].length - 1];
   }
-  if (c === "c" && i + 1 < word.length) return [String.fromCharCode(word.charCodeAt(i + 1) & 31), i + 1];
+  if (c === "c" && i + 1 < end) return [String.fromCharCode(word.charCodeAt(i + 1) & 31), i + 1];
   return [`\\${c}`, i];
 }
 const ANSI_ESCAPE: Record<string, string> = {
@@ -458,45 +481,98 @@ const ANSI_ESCAPE: Record<string, string> = {
 };
 
 /**
+ * `word[start, end)` read with dequote's rules: its plain text is pushed onto `out` when one is given (a caller joins
+ * them), and the result says whether every quote it opens is closed. One pass; no string is made per character.
+ */
+function scanQuoted(word: string, start: number, end: number, out: string[] | undefined): boolean {
+  let quote: string | undefined;
+  for (let i = start; i < end; i++) {
+    const c = word[i];
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      else out?.push(c);
+    } else if (quote === "$'") {
+      if (c === "'") quote = undefined;
+      else if (c === "\\" && i + 1 < end) {
+        const [value, at] = ansiEscape(word, i + 1, end);
+        out?.push(value);
+        i = at;
+      } else out?.push(c);
+    } else if (c === "\\" && i + 1 < end) {
+      const next = word[++i];
+      out?.push(quote === '"' && !/[$`"\\\n]/.test(next) ? c + next : next);
+    } else if (quote === '"') {
+      if (c === '"') quote = undefined;
+      else out?.push(c);
+    } else if (c === "$" && i + 1 < end && (word[i + 1] === "'" || word[i + 1] === '"')) quote = word[++i] === "'" ? "$'" : '"';
+    else if (c === "'" || c === '"') quote = c;
+    else out?.push(c);
+  }
+  return quote === undefined;
+}
+
+/**
  * A shell word without its quoting (`'…'` literal; `"…"` and `$"…"` where `\` escapes only `$`, backtick, `"`, `\`
  * and newline; `$'…'` with its C escapes decoded; a bare `\x` is x), and whether every quote it opens is closed.
  */
 function dequote(word: string): { text: string; closed: boolean } {
   if (!/["'\\]/.test(word)) return { text: word, closed: true };
-  let text = "";
-  let quote: string | undefined;
-  for (let i = 0; i < word.length; i++) {
-    const c = word[i];
-    if (quote === "'") {
-      if (c === "'") quote = undefined;
-      else text += c;
-    } else if (quote === "$'") {
-      if (c === "'") quote = undefined;
-      else if (c === "\\" && i + 1 < word.length) {
-        const [value, end] = ansiEscape(word, i + 1);
-        text += value;
-        i = end;
-      } else text += c;
-    } else if (c === "\\" && i + 1 < word.length) {
-      const next = word[++i];
-      text += quote === '"' && !/[$`"\\\n]/.test(next) ? c + next : next;
-    } else if (quote === '"') {
-      if (c === '"') quote = undefined;
-      else text += c;
-    } else if (c === "$" && (word[i + 1] === "'" || word[i + 1] === '"')) quote = word[++i] === "'" ? "$'" : '"';
-    else if (c === "'" || c === '"') quote = c;
-    else text += c;
-  }
-  return { text, closed: quote === undefined };
+  const out: string[] = [];
+  const closed = scanQuoted(word, 0, word.length, out);
+  return { text: out.join(""), closed };
 }
 const unquote = (word: string): string => dequote(word).text;
+
+/** Whitespace by `\s`: ASCII runs in place, any other code unit through the regex (same set, exactly). */
+const SIMPLIFY_SPACE = /\s/;
+const isBlankCode = (c: number): boolean =>
+  c === 32 || (c >= 9 && c <= 13) || (c > 127 && SIMPLIFY_SPACE.test(String.fromCharCode(c)));
 
 /**
  * The shell words of a segment, as written: split on blanks outside quotes, a quoted run (with its blanks) or an
  * escape staying inside its word. With a quote left open (bash would reject the line) the blanks split everywhere.
  */
 function shellWords(text: string): string[] {
-  const words: string[] = [];
+  return Array.from(shellWordsEach(text));
+}
+
+/** Whether shellWords' quoting leaves a quote open at the end of `text` (the blanks then split everywhere). */
+function shellQuoteOpen(text: string): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < text.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+    } else if (c === "$" && text[i + 1] === "'") {
+      quote = "$'";
+      i++;
+    } else {
+      if (c === "'" || c === '"') quote = c;
+      else if (c === "\\" && i + 1 < text.length) i++;
+    }
+  }
+  return quote !== undefined;
+}
+
+/**
+ * The words of shellWords, one at a time: a caller that reads only the leading words never builds the array of a
+ * long line (a 1 MB segment of one-character words is a million strings).
+ */
+function* shellWordsEach(text: string): Generator<string> {
+  if (shellQuoteOpen(text)) {
+    // the blanks split everywhere (as `text.split(/\s+/)`): each run of non-blanks is a word
+    let from = -1;
+    for (let i = 0; i <= text.length; i++) {
+      if (i < text.length && !isBlankCode(text.charCodeAt(i))) {
+        if (from === -1) from = i;
+      } else if (from !== -1) {
+        yield text.slice(from, i);
+        from = -1;
+      }
+    }
+    return;
+  }
   let start = 0;
   let quote: string | undefined;
   for (let i = 0; i < text.length; i++) {
@@ -505,7 +581,7 @@ function shellWords(text: string): string[] {
       if (c === "\\" && quote !== "'" && i + 1 < text.length) i++;
       else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
     } else if (c === " " || c === "\t" || c === "\n" || c === "\r") {
-      if (start < i) words.push(text.slice(start, i));
+      if (start < i) yield text.slice(start, i);
       start = i + 1;
     } else if (c === "$" && text[i + 1] === "'") {
       quote = "$'";
@@ -515,9 +591,7 @@ function shellWords(text: string): string[] {
       else if (c === "\\" && i + 1 < text.length) i++;
     }
   }
-  if (quote !== undefined) return text.split(/\s+/).filter((w) => w !== "");
-  if (start < text.length) words.push(text.slice(start));
-  return words;
+  if (start < text.length) yield text.slice(start);
 }
 
 /**
@@ -525,12 +599,39 @@ function shellWords(text: string): string[] {
  * PREFIX, the shell `-c` parsing and the regex rows see the command bash runs. A token whose unquoted form holds a blank, quote,
  * operator, expansion, glob, `=`, `#`, `!` or `~`, or that leaves a quote open, keeps its quotes.
  */
-const simplifyWords = (text: string): string =>
-  text.replace(/\S+/g, (token) => {
-    if (!/["'\\]/.test(token)) return token;
-    const { text: plain, closed } = dequote(token);
-    return closed && plain !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(plain) ? plain : token;
-  });
+const simplifyWords = (text: string): string => {
+  // one forward pass over the characters, not a regex match per token: a token is a run of non-blanks, and only one
+  // holding a quote or backslash is unquoted. Per-token matches allocate per token and go superlinear on a long line.
+  let out = "";
+  let copied = 0; // text before `copied` is already in `out`
+  const plain: string[] = []; // one accumulator for every token: the pieces of the token's unquoted text
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (isBlankCode(text.charCodeAt(i))) {
+      i++;
+      continue;
+    }
+    const start = i;
+    let special = false;
+    for (; i < n && !isBlankCode(text.charCodeAt(i)); i++) {
+      const c = text.charCodeAt(i);
+      if (c === 34 || c === 39 || c === 92) special = true; // `"`, `'`, `\`
+    }
+    if (!special) continue;
+    // a token that leaves a quote open is kept as written: that is found with nothing built (no array push, no string)
+    if (scanQuoted(text, start, i, undefined)) {
+      plain.length = 0;
+      scanQuoted(text, start, i, plain);
+      const unquoted = plain.join("");
+      if (unquoted !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(unquoted)) {
+        out += text.slice(copied, start) + unquoted;
+        copied = i;
+      }
+    }
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+};
 
 /** The value of a `-c LINE` / `-cLINE` / `--command[=]LINE` option among `words` (unquoted). */
 function dashC(words: string[]): string | undefined {
@@ -548,15 +649,17 @@ function dashC(words: string[]): string | undefined {
  * `bash -cl LINE`, `sh -c -- LINE`; the words after it are `$0`, `$1` …), or — failing closed, since shells differ on
  * it — the text attached to the `c` of the cluster (`bash -c'LINE'`, `sh -ec"LINE"`), the words after that being `$0`,
  * `$1` … too. Attached text of letters only (`-cl`, `-cls`) may be more options or a line: both it and the next
- * operand count. Undefined when `words` is not a shell given `-c`.
+ * operand count. Undefined when `text` is not a shell given `-c`.
  */
-function shellDashC(words: string[]): string[] | undefined {
-  if (!SHELL_WORD.test(posix.basename(unquote(words[0] ?? "")))) return undefined;
+function shellDashC(text: string): string[] | undefined {
+  const words = shellWordsEach(text);
+  const head = words.next();
+  if (head.done === true || !SHELL_WORD.test(posix.basename(unquote(head.value)))) return undefined;
   let c = false;
   const out: string[] = [];
-  for (let i = 1; i < words.length; i++) {
-    const w = unquote(words[i]);
-    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(w)) i++;
+  for (let next = words.next(); next.done !== true; next = words.next()) {
+    const w = unquote(next.value);
+    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(w)) words.next();
     else if (/^-[A-Za-z]*c/.test(w)) {
       c = true;
       const attached = w.slice(w.indexOf("c") + 1);
@@ -581,16 +684,16 @@ function otherCommandLines(seg: string): string[] {
     const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
     return [[unquote(first), ...rest].join(" ")];
   }
-  const words = shellWords(seg);
-  const first = unquote(words[0] ?? "");
+  const first = unquote(shellWordsEach(seg).next().value ?? "");
   const cmd = posix.basename(first);
   if (first.startsWith("-c") || first.startsWith("--command") || /^(?:su|runuser|script)$/.test(cmd)) {
+    const words = shellWords(seg);
     const line = dashC(first.startsWith("-") ? words : words.slice(1));
     return line === undefined ? [] : [line];
   }
-  if (cmd === "alias") return words.slice(1).map(unquote).filter((w) => /^[^=\s-][^=\s]*=/.test(w)).map((w) => w.slice(w.indexOf("=") + 1));
+  if (cmd === "alias") return shellWords(seg).slice(1).map(unquote).filter((w) => /^[^=\s-][^=\s]*=/.test(w)).map((w) => w.slice(w.indexOf("=") + 1));
   if (cmd === "trap") {
-    const action = words.slice(1).find((w) => w !== "--");
+    const action = shellWords(seg).slice(1).find((w) => w !== "--");
     return action === undefined || /^-[lp]$/.test(action) ? [] : [unquote(action)];
   }
   return [];
@@ -598,6 +701,11 @@ function otherCommandLines(seg: string): string[] {
 
 /** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
 const HEREDOC = /<<-?[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s<>|&;()]+))/y;
+/** Hoisted out of splitTopLevel's loop: a regex literal there is a new object per evaluation. Stateless (no g/y flag). */
+const SPLIT_SPACE = /\s/;
+const SPLIT_EXTGLOB_OPEN = /[@!+*?]/;
+const SPLIT_BRACE_BEFORE = /[\s;]/;
+const SPLIT_BRACE_AFTER = /[\s;&|)]/;
 
 /** The shell operator that ends a split piece; a newline reads as `;`, the end of the text as `""`. */
 type Op = ";" | "&&" | "||" | "|" | "&" | "(" | ")" | "{" | "}" | "";
@@ -636,11 +744,14 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     blank = true;
   };
   /** The index of the newline that ends the heredoc delimiter line at or after `from` (text.length when absent). */
-  const heredocEnd = (from: number): number => {
+  const heredocEnd = (from: number, delimiter: string): number => {
     for (let j = from; j < text.length; ) {
-      const nl = text.indexOf("\n", j);
+      // the line matches once its leading tabs (`<<-`) are skipped; compared in place, so no line is copied
+      let start = j;
+      while (text[start] === "\t") start++;
+      const nl = text.indexOf("\n", start);
       const end = nl === -1 ? text.length : nl;
-      if (text.slice(j, end).replace(/^\t+/, "") === heredoc) return end;
+      if (end - start === delimiter.length && text.startsWith(delimiter, start)) return end;
       j = end + 1;
     }
     return text.length;
@@ -674,7 +785,7 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
       i++;
       to = i + 1;
       blank = false;
-    } else if (c === "#" && (blank || /\s/.test(text[i - 1]))) {
+    } else if (c === "#" && (blank || SPLIT_SPACE.test(text[i - 1]))) {
       // a comment runs to the end of the line; the newline itself is the segment boundary
       const nl = text.indexOf("\n", i);
       i = (nl === -1 ? text.length : nl) - 1;
@@ -686,7 +797,7 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     } else if (c === "\n") {
       boundary(";", i + 1);
       if (heredoc !== undefined) {
-        const end = heredocEnd(i + 1);
+        const end = heredocEnd(i + 1, heredoc);
         out[out.length - 1].body = text.slice(i + 1, end);
         i = end;
         heredoc = undefined;
@@ -695,7 +806,7 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     } else if (extglob > 0 && (c === "(" || c === ")" || c === "|")) {
       to = i + 1;
       if (c !== "|") extglob += c === "(" ? 1 : -1;
-    } else if (c === "(" && /[@!+*?]/.test(before) && !(before === "!" && text.slice(from, to).trim() === "!")) {
+    } else if (c === "(" && SPLIT_EXTGLOB_OPEN.test(before) && !(before === "!" && text.slice(from, to).trim() === "!")) {
       // an extglob group `@(…)`, `x!(…)`, `*(…)`: part of the word, not a subshell (`! (…)` negates one)
       extglob = 1;
       to = i + 1;
@@ -714,14 +825,14 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     } else if (c === "(" || c === ")") {
       // a subshell `( … )`: its body is its own segment list (`$(…)` was cut out before the split)
       boundary(c, i + 1);
-    } else if (c === "{" && blank && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
+    } else if (c === "{" && blank && (i + 1 === text.length || SPLIT_SPACE.test(text[i + 1]))) {
       // a brace group `{ …; }` opener as a word of its own (`${VAR}` and `{a,b}` are glued, never split)
       boundary("{", i + 1);
-    } else if (c === "}" && (i === 0 || /[\s;]/.test(text[i - 1])) && (i + 1 === text.length || /[\s;&|)]/.test(text[i + 1]))) {
+    } else if (c === "}" && (i === 0 || SPLIT_BRACE_BEFORE.test(text[i - 1])) && (i + 1 === text.length || SPLIT_BRACE_AFTER.test(text[i + 1]))) {
       boundary("}", i + 1);
     } else {
       to = i + 1;
-      if (blank && !/\s/.test(c)) blank = false;
+      if (blank && !SPLIT_SPACE.test(c)) blank = false;
       redirect = c === "<" || c === ">";
       plain = c;
     }
@@ -766,6 +877,10 @@ interface Normalized {
   piped: boolean;
   /** A top-level item of a `$(…)`/backtick body in `payload`: it expands before the command's own prefix assignment takes effect. */
   substitution?: boolean;
+  /** Set past MAX_LITERAL_DEPTH on an item whose shell body is not unwrapped (see Segment.unjudged). */
+  unjudged?: true;
+  /** Set on every item of a level whose text keeps a substitution past the cut cap (see Segment.uncut). */
+  uncut?: true;
 }
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
@@ -800,6 +915,67 @@ const CUT_TOKEN = /\u0001([\uE000-\uF8FF])/g;
 /** Substitutions cut per command (the private-use range holds 6400). */
 const MAX_CUTS = 4096;
 
+/** Push a substitution body onto the cut table; returns the marker that stands for it in the text. */
+function cutBody(cuts: string[], body: string): string {
+  const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
+  pushCut(cuts, body);
+  return marker;
+}
+
+/**
+ * The substitutions the cut loop takes out of `text`, in the loop's order, at most 256 here and MAX_CUTS in all. Each cut
+ * is the leftmost complete substitution of the text as it stands: a `$(` with no paren in its body, or a backtick pair with
+ * no backtick in it. One forward pass finds them all: `out` holds the cut text before `from`, and `text` from `from` on is
+ * untouched. A cut completes at most one substitution before `from`: the `$(` whose paren is the last one kept, once the
+ * paren after the cut is a `)`. That one is leftmost, so it is cut next, and so on (`$(a$(b)c)`). No text is copied per cut.
+ */
+function cutSubstitutions(text: string, cuts: string[]): { rest: string; count: number } {
+  const parens: number[] = [];
+  const paren = /[()]/g;
+  for (let m = paren.exec(text); m !== null; m = paren.exec(text)) parens.push(m.index);
+  const substitution = /\$\(([^()]*)\)|`([^`]*)`/g;
+  const out: string[] = []; // the cut text before `from`: text pieces, markers and the parens kept
+  const kept: { at: number; pos: number }[] = []; // the parens kept: `at` indexes `out`, `pos` indexes `text`
+  let from = 0;
+  let next = 0; // parens[next]: the first paren at or after `from` that is neither kept nor cut
+  let count = 0;
+  while (count < 256 && cuts.length < MAX_CUTS) {
+    const top = kept[kept.length - 1];
+    if (top !== undefined && next < parens.length && text[top.pos] === "(" && text[top.pos - 1] === "$" && text[parens[next]] === ")") {
+      // the `$(` whose paren is the last one kept now runs to a `)`: complete, and leftmost of what is left
+      const close = parens[next];
+      const body = out.slice(top.at + 1).join("") + text.slice(from, close);
+      out.length = top.at;
+      out[top.at - 1] = out[top.at - 1].slice(0, -1); // its `$`
+      out.push(cutBody(cuts, body));
+      kept.pop();
+      next++;
+      from = close + 1;
+      count++;
+      continue;
+    }
+    substitution.lastIndex = from;
+    const m = substitution.exec(text);
+    if (m === null) break;
+    const start = m.index;
+    const end = start + m[0].length;
+    let at = from;
+    while (next < parens.length && parens[next] < start) {
+      const p = parens[next++];
+      if (p > at) out.push(text.slice(at, p));
+      kept.push({ at: out.length, pos: p });
+      out.push(text[p]);
+      at = p + 1;
+    }
+    if (start > at) out.push(text.slice(at, start));
+    while (next < parens.length && parens[next] < end) next++; // the parens inside a substitution are cut with it
+    out.push(cutBody(cuts, m[1] ?? m[2] ?? ""));
+    from = end;
+    count++;
+  }
+  return { rest: out.join("") + text.slice(from), count };
+}
+
 /**
  * Normalize `command` (see normalize). A `$(…)`/backtick substitution is cut out into `cuts` and leaves CUT plus the
  * index of its body in its place; the body becomes a payload (a subshell) of the piece that holds it, so it runs in
@@ -809,15 +985,14 @@ const MAX_CUTS = 4096;
 function normalizeSegments(command: string, depth: number, cuts: string[]): Normalized[] {
   // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
   // `${IFS}` / `$IFS` separate words exactly like a blank
-  let rest = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
+  const input = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
   const first = cuts.length;
-  const sub = /\$\(([^()]*)\)|`([^`]*)`/;
-  for (let m = sub.exec(rest), n = 0; m !== null && n < 256 && cuts.length < MAX_CUTS; m = sub.exec(rest), n++) {
-    const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
-    cuts.push(m[1] ?? m[2] ?? "");
-    rest = `${rest.slice(0, m.index)}${marker}${rest.slice(m.index + m[0].length)}`;
-  }
-  const items: Normalized[] = [];
+  const { rest, count: n } = cutSubstitutions(input, cuts);
+  // OSA-01: past the cut cap a substitution left in the text is unjudged: every item of this level is refused.
+  // The cut loop ends on no match (none left) or on a cap, so the cap state alone says whether one was left. Exactly
+  // 256 cuts also refuse, which is fail-closed (a 257th may follow unseen). Constant time per level.
+  const uncut = n >= 256 || cuts.length >= MAX_CUTS;
+  const items: Normalized[] = [], extra: Normalized[] = [];
   const attached = new Set<number>();
   /** The bodies of the substitutions `text` holds, normalized, as payload of `item`. */
   const attach = (item: Normalized, text: string) => {
@@ -851,8 +1026,10 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     // `sudo -e FILE` edits FILE
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
+    // TS-04: past the depth cap a shell body is not unwrapped; the segment is marked unjudged and refused, never passed on
+    const shellLines = seg === "" ? undefined : shellDashC(seg);
+    const unjudged = seg !== "" && depth >= MAX_LITERAL_DEPTH && (shellLines !== undefined || otherCommandLines(seg).length > 0);
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
-      const shellLines = shellDashC(shellWords(seg));
       if (shellLines !== undefined) {
         // a literal `-c` body runs with the shell's stdin: the pipe, and `< file` / `0<file` (not `bash -c "$VAR"`)
         const suffix = stdinFileSuffix(`${prefix} ${seg}`);
@@ -874,16 +1051,16 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     const runtime = info?.runtime;
     if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
     const opaque = /(?:^|\s)(?:\u0001[\uE000-\uF8FF])+(?:\s|$)/.test(prefix);
-    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn };
+    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn, ...(unjudged ? { unjudged: true as const } : {}), ...(uncut ? { uncut: true as const } : {}) };
     attach(item, `${prefix} ${seg} ${piece.body ?? ""}`);
     items.push(item);
     pipeIn = piece.end === "|" || (pipeIn && seg === "" && (piece.end === "(" || piece.end === "{"));
   }
   for (let n = first; n < cuts.length; n++) {
-    if (attached.has(n) || cuts.slice(first).some((body) => body.includes(`${CUT}${String.fromCharCode(0xe000 + n)}`))) continue;
-    for (const item of normalizeSegments(cuts[n], depth, cuts)) items.unshift({ ...item, chdirs: [CUT, ...item.chdirs] });
+    if (attached.has(n) || (cutHolders.get(cuts)?.get(n) ?? -1) >= first) continue;
+    for (const item of normalizeSegments(cuts[n], depth, cuts)) extra.push({ ...item, chdirs: [CUT, ...item.chdirs] });
   }
-  return items;
+  return [...extra.reverse(), ...items];
 }
 
 /** A redirection that gives a command its stdin: `<`, `0<`, `<>`, a heredoc `<<`/`<<-` or a here-string `<<<`. */
@@ -995,7 +1172,7 @@ const REDIRECT_WORD = new RegExp(`^${REDIRECT_OP}`);
  * scan reads their targets from `marked`), unquoted brace lists expanded (`{touch,.swarm/x}`, `cp a{,.bak}`) and
  * run-time operands marked CUT; `cwd` is set by the caller.
  */
-function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque" | "piped">): Segment {
+function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque" | "piped" | "unjudged" | "uncut">): Segment {
   const all: string[] = [];
   const raw = shellWords(item.text);
   for (let i = 0; i < raw.length; i++) {
@@ -1018,7 +1195,7 @@ function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "op
   // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
   const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
   const text = item.text.replace(CUT_TOKEN, " ").trim();
-  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix };
+  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix, ...(item.unjudged ? { unjudged: true as const } : {}), ...(item.uncut ? { uncut: true as const } : {}) };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -3469,6 +3646,20 @@ export const RULES: readonly Rule[] = [
       "cast wallet public-key --raw-private-key 0x01",
     ],
   },
+  // TS-04: a shell body past MAX_LITERAL_DEPTH is not unwrapped, so nothing judges what it runs: refused, not passed with the body unread
+  {
+    id: "nested-shell-depth",
+    capability: "eval",
+    pattern: (seg) => seg.unjudged === true,
+    samples: [String.raw`sh -c "sh -c \"sh -c \\\"sh -c 'echo nested'\\\"\""`],
+  },
+  // OSA-01: a substitution the cut cap left in the text is unjudged: the call is refused, not judged as if complete
+  {
+    id: "unjudged-substitution",
+    capability: "eval",
+    pattern: (seg) => seg.uncut === true,
+    samples: ["$(:) ".repeat(257) + "echo x"],
+  },
 ];
 
 /** One possible shell state while walking a command: the directory and the pushd stack (undefined: unknown). */
@@ -3652,3 +3843,19 @@ export function matchRule(command: string, facts: GuardFacts, start: string | un
 }
 
 export const ruleReason = (rule: Rule): string => rule.reason ?? reason(rule.capability, rule.id);
+
+/**
+ * Per cut table: for each cut index, the highest body index whose text holds that cut's marker. Bodies are pushed in
+ * index order, so an overwrite keeps the highest; the cut-held check reads it in O(1) instead of rescanning every body.
+ */
+const cutHolders = new WeakMap<string[], Map<number, number>>();
+/** Push a substitution body onto the cut table, recording the cut markers the body holds (see cutHolders). */
+function pushCut(cuts: string[], body: string): void {
+  let holders = cutHolders.get(cuts);
+  if (holders === undefined) {
+    holders = new Map();
+    cutHolders.set(cuts, holders);
+  }
+  for (const held of body.matchAll(CUT_TOKEN)) holders.set(held[1].charCodeAt(0) - 0xe000, cuts.length);
+  cuts.push(body);
+}

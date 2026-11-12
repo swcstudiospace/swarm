@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -33,9 +34,10 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from swarm.script_base import AgentScript, check_task_id  # noqa: E402
+from swarm.script_base import AgentScript, Ctx, check_task_id  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.manifest import by_capability, get_agent  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
@@ -43,6 +45,8 @@ from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm import substrate_client, substrate_tee  # noqa: E402
 from swarm.blast_radius import lane_notes, load_slices, parallel_rows  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope, verify_envelope, real_key_configured, signing_config_error  # noqa: E402
+
+_LOG = logging.getLogger("swarm.orch_plan")
 
 # (suffix, capability, agent, title, depends_on suffixes, gate spec), or the 8-field row
 # (..., gate spec, risk_class, acceptance) when a row pins its own risk class.
@@ -149,7 +153,7 @@ def _budget(risk: str) -> dict:
 
 
 def load_custom(path: Path) -> list[tuple]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     rows = []
     for t in data["tasks"]:
         if re.search(r"\.r\d+$", str(t["id"])):  # rework reruns take <task>.rN; a planned task must not claim that name
@@ -503,5 +507,143 @@ def add_args(p):
                                                     "default: env SUBSTRATE_GRAPH_ID, a Graph ID in the brief, else minted")
 
 
+# Engine selector. The default row stays Python. `GSD_ENGINE=rust` hands the call to the host plan route (`write_route::plan`),
+# which decides the grammar it serves; an argv outside the flags below stays this body. `ENGINE_ROUTES` is the registry of routes
+# this script registers and stays empty: the plan route is the one route, wired in this block.
+_PLAN_NO_VALUE = frozenset({"--json", "--dry-run"})
+_PLAN_VALUE = frozenset({"--root", "--repo", "--brief", "--brief-text", "--pattern", "--slices", "--slices-json", "--plan",
+                         "--risk-class", "--priority", "--prefix", "--acceptance", "--graph-id", "--correlation-id", "--task-id"})
+_PLAN_EVENTS = frozenset({"plan.updated"})
+
+
+def _plan_options(argv: list[str]) -> list[tuple[str, str | None]] | None:
+    """The (name, value) pairs of an argv made only of this script's long flags, or None when a token is anything else.
+
+    A scalar option given twice is None too: argparse takes the last one, the host grammar serves each scalar once, so the
+    binary is not started for it. `--repo` is `--root` (both are the same destination)."""
+    options: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    index = 0
+    while index < len(argv):
+        name, equals, value = argv[index].partition("=")
+        if name in _PLAN_NO_VALUE and not equals:
+            options.append((name, None))
+            index += 1
+            continue
+        if name not in _PLAN_VALUE:
+            return None
+        if equals:
+            index += 1
+        elif index + 1 < len(argv):
+            value = argv[index + 1]
+            index += 2
+        else:
+            return None
+        key = "--root" if name == "--repo" else name
+        if key != "--acceptance":
+            if key in seen:
+                return None
+            seen.add(key)
+        options.append((name, value))
+    return options
+
+
+def _claims_plan(argv: list[str]) -> bool:
+    return _plan_options(argv) is not None
+
+
+def _plan_root(argv: list[str]) -> Path:
+    """The repository root the call names: the last `--root` or `--repo`, else the working directory (`Path(args.root).resolve()`)."""
+    root = "."
+    for name, value in _plan_options(argv) or []:
+        if name in ("--root", "--repo") and value is not None:
+            root = value
+    return Path(root).resolve()
+
+
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    if route != "plan":
+        raise KeyError(route)
+    names = set(BINARY_ENV_NAMES) | {"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
+                                     "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT",
+                                     "SUBSTRATE_URL", "SUBSTRATE_DISABLED", "XDG_CONFIG_HOME"}
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _plan_events(body: object) -> list[tuple[str, dict[str, Any]]] | None:
+    """The events of a plan manifest, or None when the file is not the shape the host route writes."""
+    if not isinstance(body, dict) or not isinstance(body.get("effects"), list) or not isinstance(body.get("live_refresh"), bool):
+        return None
+    correlation = body.get("correlation_id")
+    events = []
+    for item in body["effects"]:
+        if not (isinstance(item, dict) and item.get("type") in _PLAN_EVENTS and isinstance(item.get("payload"), dict)
+                and item.get("task_id") is None):
+            return None
+        events.append((item["type"], item["payload"]))
+    if events and not isinstance(correlation, str):
+        return None
+    return events
+
+
+def _plan_effects_lost(call: list[str], why: str) -> None:
+    """A missing or unreadable manifest is a lost event: say so on the ledger and on stderr. The plan is committed; it is not run again."""
+    _LOG.warning("orch_plan: effects lost: %s", why)
+    try:
+        Ctx("A01", "orch_plan", None, None, False, _plan_root(call)).emit("orch_plan.effects_lost", {"reason": why})
+    except Exception:  # noqa: BLE001 - the answer stands; the stderr line above says what was lost
+        pass
+
+
+def _plan_commit(call: list[str], _before: None, effects_path: str, reply: dict[str, Any],
+                 stdout: bytes) -> tuple[dict[str, Any], bytes]:
+    """Replays a committed plan: its `plan.updated` events in order, then one live refresh when the manifest asks for it."""
+    try:
+        body: object = json.loads(Path(effects_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        body = None
+    events = _plan_events(body)
+    if events is None:
+        _plan_effects_lost(call, "effects manifest missing or unparsable")
+        return reply, stdout
+    try:
+        ctx = Ctx("A01", "orch_plan", None, body["correlation_id"], False, _plan_root(call))  # type: ignore[index]
+        for event_type, payload in events:
+            ctx.emit(event_type, payload)
+        if body["live_refresh"]:  # type: ignore[index]
+            from swarm import telemetry  # lazy, as TaskStore._notify_committed does
+            store = TaskStore(root=ctx.root)
+            telemetry.refresh_live(db_path=store.path, conn=store.conn)
+    except Exception as exc:  # noqa: BLE001 - the plan is committed: say what was lost, never run it again
+        _plan_effects_lost(call, f"replay failed: {type(exc).__name__}")
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A01", "orch_plan", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A01", "orch_plan", run, description=__doc__, add_args=add_args)
+    answer = None
+    if ENGINE_ROUTES or os.environ.get("GSD_ENGINE", "python") not in ("python", ""):
+        from swarm import engine_select
+        if ENGINE_ROUTES:
+            answer = engine_select.select_engine(engine_select.Selector(script, ENGINE_ROUTES), sys.argv[1:])
+        else:
+            route = engine_select.Route(
+                claims=_claims_plan, parse=lambda argv: argv if _claims_plan(argv) else None,
+                default=lambda: "python", env_route=lambda argv, call: "plan",
+                write=engine_select.WriteFlow(
+                    before=lambda call: None, commit=_plan_commit,
+                    unknown=lambda call: ("the plan was not written", {}),
+                    preexec=lambda route: engine_select.no_core_dumps,
+                ),
+            )
+            answer = engine_select.select_engine(
+                engine_select.Selector(script, (route,), binary_env=_binary_env,
+                                       env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+                                                 "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT")),
+                sys.argv[1:],
+            )
+    sys.exit(answer if answer is not None else script.main())

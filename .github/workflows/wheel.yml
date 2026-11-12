@@ -1,0 +1,128 @@
+name: wheel
+
+# Runs on GitHub-hosted ubuntu-24.04, like every job in ci.yml. The manylinux wheel is built inside a Docker container
+# (scripts/ci_build_wheel.sh), so the jobs need a runner with Docker. Decision D-P22, by the user, 2026-10-28. Not chosen: `maturin --zig`,
+# a self-hosted Docker runner on the VPS (srv1778002), no wheel job. The workflow uses no secrets and a read-only token.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-24.04
+    # A cold Rust build of the extension inside the manylinux container; bound it so a stuck build cannot hold a runner for 6 hours.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install maturin
+        run: python3 -m pip install maturin==1.15.0
+      - name: install mypy
+        run: python3 -m pip install mypy==1.18.2
+      - name: mypy (strict, repo config)
+        run: mypy --cache-dir "$RUNNER_TEMP/mypy-cache"
+      - name: install pinned Rust toolchain for the manylinux build
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+      # gsd-proto's build script needs protoc inside the manylinux container (see scripts/ci_build_wheel.sh).
+      - name: protoc for the manylinux build
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/protoc"
+          mkdir -p "$root"
+          curl -fsSL -o "$root/protoc.zip" https://github.com/protocolbuffers/protobuf/releases/download/v27.3/protoc-27.3-linux-x86_64.zip
+          unzip -q -o "$root/protoc.zip" -d "$root"
+          chmod +x "$root/bin/protoc"
+          "$root/bin/protoc" --version
+          echo "PROTOC_HOME=$root" >> "$GITHUB_ENV"
+      - name: build abi3-py312 manylinux_2_28 x86_64 wheel
+        run: scripts/ci_build_wheel.sh dist
+      - name: upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-wheel-cp312-abi3-manylinux_2_28_x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+      - name: upload the parity suite for the installed-wheel gate
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-parity-suite
+          path: |
+            tests/parity/test_extension_parity.py
+            tests/parity/test_extension_threads.py
+            scripts/orch_status.py
+          if-no-files-found: error
+      - name: upload the catalog gate sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-catalog-sources
+          path: |
+            scripts/swarm_tool.py
+            agents.json
+          if-no-files-found: error
+
+  install-and-gate:
+    needs: wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: python:3.12-slim-bookworm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-wheel-cp312-abi3-manylinux_2_28_x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-parity-suite
+          path: /tmp/gate
+      - name: install wheel and mypy into the clean container
+        run: python -m pip install --no-cache-dir dist/*.whl mypy==1.18.2
+      # Gates run from /tmp, outside the repository, so the installed wheel is checked, not the source tree.
+      - name: import gate
+        run: |
+          cd /tmp
+          python -c "import swarm._native"
+      - name: stubtest gate
+        run: |
+          cd /tmp
+          python -m mypy.stubtest swarm._native
+      - name: install pytest into the clean container
+        run: python -m pip install --no-cache-dir pytest==9.1.1
+      # U5 parity gate, run from /tmp/gate: the parity tests and the orch_status script, but no swarm/
+      # package, so every swarm import resolves to the installed wheel.
+      - name: U5 parity gate (installed wheel)
+        run: |
+          cd /tmp/gate
+          python -m pytest -o addopts="" -q tests/parity/test_extension_parity.py tests/parity/test_extension_threads.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-catalog-sources
+          path: /tmp/catalog-src
+      # Catalog gate, run from /tmp/catalog outside the repository: swarm_tool.py and agents.json are copied out of the
+      # artifact, SWARM_AGENTS_FILE points at the copy, and the installed wheel supplies the swarm package.
+      - name: swarm_tool catalog gate (installed wheel)
+        run: |
+          rm -rf /tmp/catalog
+          mkdir -p /tmp/catalog
+          cp /tmp/catalog-src/scripts/swarm_tool.py /tmp/catalog-src/agents.json /tmp/catalog/
+          cd /tmp/catalog
+          code=0
+          SWARM_AGENTS_FILE=/tmp/catalog/agents.json python3 swarm_tool.py catalog --caller A05 --json > catalog.json || code=$?
+          cat catalog.json
+          test "$code" -eq 0
+          python3 - <<'PY'
+          import json
+          with open("catalog.json", encoding="utf-8") as fh:
+              report = json.load(fh)
+          if report.get("status") != "ok":
+              raise SystemExit(f"catalog gate: status is {report.get('status')!r}, expected 'ok'")
+          PY

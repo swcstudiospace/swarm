@@ -96,7 +96,7 @@ def classify(text: str) -> str:
     return "non-sdlc"
 
 
-def detect_completion(payload: str | dict | None) -> dict | None:
+def detect_completion(payload: str | dict[str, object] | None) -> dict[str, str] | None:
     """Detect a01-orchestrator complete or uplift end.
     Requires a01/ultrathink identifier + specific state (greptile: avoid unrelated text).
     Uses unescaped ORIGINAL extraction for ultrathink mode.
@@ -122,7 +122,7 @@ def detect_completion(payload: str | dict | None) -> dict | None:
     return None
 
 
-def is_a01_session(transcript: str | list) -> bool:
+def is_a01_session(transcript: str | list[object]) -> bool:
     """Check if transcript/session is a01-orchestrator or swarm orchestrate."""
     t = str(transcript).lower()
     return "a01-orchestrator" in t or "orchestrate" in t or ("swarm" in t and "plan" in t)

@@ -14,7 +14,9 @@ own), and writes a signed `gate.verdict` (gate=review) envelope to
 from __future__ import annotations
 import json
 import math
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
 from swarm.verdicts import agent_finding, check_per_target_keys, issue_gate, load_per_target  # noqa: E402
+from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(_test|\.test|\.spec|_spec)\.[a-z]+$|(^|/)test_[^/]+\.py$")
@@ -85,7 +88,10 @@ def collect_changes(root: Path, base: str | None) -> dict[str, dict]:
         elif line.startswith("Binary files") and cur is not None:
             cur["binary"] = True
     skip = {".swarm", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
-    for rel in sh(["git", "ls-files", "--others", "--exclude-standard", "."], cwd=root).stdout.splitlines():
+    # `-z`: names come back as raw bytes, not quoted octal; decoded with the filesystem encoding so the real path is read.
+    listed = subprocess.run(["git", "ls-files", "-z", "--others", "--exclude-standard", "."], cwd=root, capture_output=True, timeout=600).stdout
+    for raw in listed.split(b"\0"):
+        rel = os.fsdecode(raw)
         if rel and not skip & set(Path(rel).parts):
             whole(root / rel, rel)
     return changes
@@ -125,11 +131,11 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
                 add("minor", "dead-code", "commented-out code block (>=3 lines)", loc)
             for rx in SECRET_RES if not self_file else ():
                 m = rx.search(text)
-                if m and not PLACEHOLDER_RE.search(text):
+                if m:
                     val = m.group(m.lastindex or 0)
-                    if m.lastindex and _entropy(val) < 3.2:
+                    if PLACEHOLDER_RE.search(val) or (m.lastindex and _entropy(val) < 3.2):
                         continue
-                    add("major", "secret", "secret-looking string added (value redacted)", loc, val[:4] + "…")
+                    add("major", "secret", "secret-looking string added (value redacted)", loc, f"value not recorded ({len(val)} chars)")
     if src_changed and not tests_changed:
         add("minor", "coverage", "source files changed but no test files changed", "tests/")
     return findings
@@ -138,7 +144,10 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
 def load_extra(path: str | None, offset: int) -> list[dict]:
     if not path:
         return []
-    raw = json.loads(Path(path).read_text())
+    try:
+        raw = json.loads(Path(path).read_text())
+    except json.JSONDecodeError as exc:
+        raise SwarmError(ErrorCode.E_INPUT, f"findings file {path} is not valid JSON (line {exc.lineno})") from exc
     raw = raw.get("findings", raw) if isinstance(raw, dict) else raw
     return [agent_finding(f, i, path) for i, f in enumerate(raw, offset + 1)]
 
@@ -190,5 +199,38 @@ def add_args(p):
     p.add_argument("--max-lines", type=int, default=800, help="changed-lines threshold per file for a major 'size' finding")
 
 
+# Engine selector (swarm/engine_select.py). The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::rev_gate`
+# accepts (`--json`, not `--dry-run`) and leaves every other argv to this body. `ENGINE_ROUTES` is the seam a route registers in.
+# The route writes (the binary records the review gate's verdict in issue_gate's transaction), so it is a write route: Python
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"XDG_CONFIG_HOME", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION"}
+    if route != "rev-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_rev(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _rev_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A09", "rev_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A09", "rev_gate", run, description=__doc__, add_args=add_args)
+    answer = None
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
+        from swarm import engine_select
+        answer = engine_select.run_gate_engine(
+            script, ENGINE_ROUTES, sys.argv[1:], claims=_claims_rev, route_name="rev-gate", binary_env=_binary_env,
+            env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION"), commit=_rev_commit)
+    sys.exit(answer if answer is not None else script.main())

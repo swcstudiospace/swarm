@@ -11,8 +11,11 @@ Each ready task is dispatched to its agent as a headless session, run with the t
 picks omp (use --runtime omp or SWARM_RUNTIME=omp). Preflight checks only the selected runtime's binary (and
 `claude auth status` for claude). The omp result is the `yield` payload of the terminal agent_end, falling back
 to the last fenced json block in the final assistant text.
-Grok dispatch is refused: its documented single-prompt interface does not support this runner's stdin assignment
-transport. No runtime is launched with permission bypasses; OMP keeps extension discovery and its explicit guard.
+    grok --prompt-file $SWARM_DIR/prompts/<slug>-<id>.md --agent <slug> --output-format json
+        --permission-mode <mode> --max-turns <n> --add-dir <agent-swarm> --add-dir <repo>   (--runtime grok)
+Grok reads the assignment from a bridge-owned 0600 file (its single-prompt interface takes no stdin); the file is
+removed when the session ends. No runtime is launched with permission bypasses; OMP keeps extension discovery and
+its explicit guard.
 
 Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>); OMP receives
 only bounded deny-path guard metadata, never loading references. A gate script they run records nothing.
@@ -61,6 +64,7 @@ import queue
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -77,6 +81,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from swarm.atomic_file import write_text_atomic  # noqa: E402
 from swarm.observability import emit_gsd_omp, stream_subagent_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
@@ -91,9 +96,9 @@ from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
 from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee, workspace  # noqa: E402
-from swarm.claims import ClaimTable, parse_claims  # noqa: E402
+from swarm.claims import ClaimStore, make_claim_table, parse_claims  # noqa: E402
 from swarm.lifecycle import RunEvent  # noqa: E402
-from swarm.limiter import AimdLimiter, detect_rate_limit  # noqa: E402
+from swarm.limiter import AimdLimiter, detect_rate_limit, env_seconds  # noqa: E402
 from swarm.retry import backoff_s, is_transient  # noqa: E402
 from swarm.subagent_lifecycle import get_manager, resolve_max_parallel  # noqa: E402
 from swarm.telemetry import Telemetry, heartbeat_default  # noqa: E402
@@ -105,7 +110,7 @@ from swarm.tools.shared_runtime import cancel_flag_path  # noqa: E402  # one pat
 # SWARM_TASK_ID and SWARM_CORRELATION_ID are the runner's own defaults for script flags. A child that
 # inherits them binds its gate scripts to the parent's task (T-06-19).
 AGENT_SESSION_STRIPPED = (
-    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
     "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
 )
 
@@ -204,7 +209,9 @@ def handover_section(task: dict, repo: Path) -> str:
     Bounded: HANDOVER_DEP_CHARS per dependency, HANDOVER_TOTAL_CHARS overall."""
     try:
         handover = importlib.import_module("swarm.handover")  # written by the handover unit: absent means nothing to add
-    except ImportError:
+    except ImportError as exc:
+        if exc.name != "swarm.handover":  # the module is there, but one of its own imports is missing: a fault, not absence
+            raise
         return ""
     inspect_fn = getattr(handover, "inspect_handover", None)
     if inspect_fn is None:
@@ -217,7 +224,8 @@ def handover_section(task: dict, repo: Path) -> str:
             # receiver's own handover first (a task can hand over to several receivers, A15 and A14 of one release), the
             # newest one as context when none is addressed to it: exactly what the shared handover tools would return
             status, doc = inspect_fn(dep, root=repo, to_agent=receiver or None, correlation_id=task.get("correlation_id"))
-        except (SwarmError, OSError, ValueError):
+        except (SwarmError, OSError, ValueError) as exc:
+            _LOG.debug("handover of %s skipped (%s: %s)", dep, type(exc).__name__, exc)
             continue
         if (status or {}).get("status") in ("ok", "partial") and isinstance(doc, dict):
             blocks.append(_handover_block(dep, doc))
@@ -299,6 +307,15 @@ Swarm runtime lives at {ROOT} (scripts: `python3 {ROOT}/scripts/<script>.py --ro
 Execute the task per your agent instructions and finish with your summary and the single ```json result block."""
 
 
+def _witness_engine(engine: str) -> None:
+    """Appends the scheduler engine this run used to the file named by SWARM_SCHEDULER_WITNESS, when that is set. The native gate
+    (scripts/ci_scheduler_rust.sh) reads that file, so a leg whose children ran on another engine cannot pass unnoticed. Unset: no-op."""
+    witness = os.environ.get("SWARM_SCHEDULER_WITNESS")
+    if witness:
+        with open(witness, "a", encoding="utf-8") as handle:
+            handle.write(engine + "\n")
+
+
 def preflight_signing() -> None:
     """Refuse before any task is claimed when task.assign cannot be signed.
 
@@ -327,8 +344,10 @@ def preflight_auth(claude_bin: str) -> None:
     try:
         proc = subprocess.run([claude_bin, "auth", "status"], capture_output=True, text=True, timeout=30)
         status = json.loads(proc.stdout or "{}")
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        return  # older CLI without `auth status`; let the first task surface any problem
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
+        # older CLI without `auth status`; let the first task surface any problem
+        _LOG.debug("claude auth status unavailable (%s: %s); continuing", type(exc).__name__, exc)
+        return
     if status.get("loggedIn") is False:
         raise SwarmError(ErrorCode.E_DEP, "claude CLI is not logged in — run `claude login` (or `claude setup-token` for headless use) "
                                           "or export ANTHROPIC_API_KEY; use --dry-run to simulate without credentials")
@@ -336,6 +355,7 @@ def preflight_auth(claude_bin: str) -> None:
 
 RUNTIMES = ("claude", "grok", "omp")
 CLAUDE_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+GROK_PERMISSION_MODES = CLAUDE_PERMISSION_MODES  # grok's --permission-mode accepts these; bypassPermissions stays refused
 OMP_APPROVAL_MODES = ("write", "always-ask")
 # the child-env deltas every runtime gets; --dry-run prints exactly these (never key material)
 CHILD_ENV_KEYS = ("SWARM_DIR", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_AGENT", "AIO_UPLIFT", "AIO_SWARM")
@@ -359,16 +379,22 @@ def runtime_bin(runtime: str, args) -> str:
     return {"claude": getattr(args, "claude_bin", "claude"), "grok": getattr(args, "grok_bin", "grok"),
             "omp": getattr(args, "omp_bin", "omp")}[runtime]
 
+def unsupported_approval(runtime: str, args) -> tuple[ErrorCode, str] | None:
+    """The named refusal for an unsupported transport or bypass mode, as (code, message); None when it may be dispatched."""
+    if runtime == "grok" and args.permission_mode not in GROK_PERMISSION_MODES:
+        return (ErrorCode.E_INPUT, "grok requires normal permission mode: default, acceptEdits or plan")
+    if runtime == "omp" and getattr(args, "approval_mode", "write") not in OMP_APPROVAL_MODES:
+        return (ErrorCode.E_INPUT, "omp requires normal approval mode: write or always-ask")
+    if runtime == "claude" and args.permission_mode not in CLAUDE_PERMISSION_MODES:
+        return (ErrorCode.E_INPUT, "claude requires normal permission mode: default, acceptEdits or plan")
+    return None
+
+
 def validate_runtime_approval(runtime: str, args) -> None:
     """Refuse unsupported transports and bypass modes before a task or lease is claimed."""
-    if runtime == "grok":
-        raise SwarmError(ErrorCode.E_DEP, "grok headless dispatch is unsupported: its documented single-prompt "
-                         "interface does not accept this runner's stdin assignment transport; use --runtime claude "
-                         "or --runtime omp with normal approval controls")
-    if runtime == "omp" and getattr(args, "approval_mode", "write") not in OMP_APPROVAL_MODES:
-        raise SwarmError(ErrorCode.E_INPUT, "omp requires normal approval mode: write or always-ask")
-    if runtime == "claude" and args.permission_mode not in CLAUDE_PERMISSION_MODES:
-        raise SwarmError(ErrorCode.E_INPUT, "claude requires normal permission mode: default, acceptEdits or plan")
+    refused = unsupported_approval(runtime, args)
+    if refused is not None:
+        raise SwarmError(*refused)
 
 
 
@@ -377,7 +403,7 @@ def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
     frontmatter stripped, written to $SWARM_DIR/agents/<slug>.md (a missing file would be appended as literal text)."""
     src = ROOT / "omp" / "agents" / f"{slug}.md"
     try:
-        raw = src.read_text()
+        raw = src.read_text(encoding="utf-8")
     except OSError as e:
         raise SwarmError(ErrorCode.E_DEP, f"omp agent body {src} unreadable ({e.strerror}); run scripts/build_agents.py") from e
     fm = FRONTMATTER.match(raw)
@@ -391,20 +417,26 @@ def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
     body.parent.mkdir(parents=True, exist_ok=True)
     # atomic: parallel tasks of one agent rewrite the same file while an earlier child may be reading it
     tmp = body.with_name(f".{slug}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(raw[fm.end():])
-    os.replace(tmp, body)
+    try:
+        tmp.write_text(raw[fm.end():], encoding="utf-8")
+        os.replace(tmp, body)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return ",".join(tools), body
 
 
-def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) -> tuple[list[str], dict, Path]:
-    """(argv, env, cwd) of one agent session; the prompt goes on stdin. Shared by the live path and --dry-run.
+def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args,
+                     prompt_file: Path | None = None) -> tuple[list[str], dict, Path]:
+    """(argv, env, cwd) of one agent session; the prompt goes on stdin, or for grok in `prompt_file`. Shared by the
+    live path and --dry-run.
 
     `repo` is the installed workspace (ADR 0001 S4). The child's environment holds no token but its own: every
     SUBSTRATE_TOKEN* the runner has is dropped, and SUBSTRATE_TOKEN is set from the agent's env file, the one the lease
     calls use too (swarm/workspace.py). Each runtime reads the `substrate` MCP entry the install wrote:
     - claude runs in this checkout, where a workspace `.mcp.json` is never read, so it is passed as --mcp-config
       (strict: the agent's tools list admits no other server anyway) and its tools are added to --allowedTools;
-    - grok is refused until a supported stdin assignment transport is available;
+    - grok reads the assignment from `prompt_file` (--prompt-file), its MCP entry from the workspace's .grok config;
     - omp reads `.mcp.json` from its --cwd, and its --tools list does not hide MCP tools (they are xd:// devices)."""
     validate_runtime_approval(runtime, args)
     slug = agent["slug"]
@@ -429,6 +461,12 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         env.pop(workspace.TOKEN, None)
         env.pop("SUBSTRATE_URL", None)
         env.pop("SWARM_SUBSTRATE_AGENT", None)
+    if runtime == "grok":
+        # the assignment is read from a file: grok's single-prompt interface does not read this runner's stdin
+        # grok works only in its cwd (it refuses --add-dir), so the session runs in the workspace that holds .grok/agents
+        prompt_argv = ["--prompt-file", str(prompt_file)] if prompt_file is not None else []
+        return [binary, *prompt_argv, "--agent", slug, "--output-format", "json",
+                "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns), *model], env, repo
     if runtime == "omp":
         if wired and env.get(workspace.TOKEN):
             env["SWARM_SUBSTRATE_AGENT"] = slug
@@ -569,8 +607,10 @@ _stop_reason = SHUTDOWN_REASON  # what a session that registers after kill_sessi
 def kill_group(pgid: int, sig: int) -> None:
     try:
         os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
+    except ProcessLookupError:
+        pass  # the group has already gone
+    except PermissionError as exc:
+        _LOG.warning("signal %s to process group %s refused: %s", sig, pgid, exc)
 
 
 def _group_alive(pgid: int) -> bool:
@@ -616,8 +656,8 @@ def kill_sessions(grace: float = 5, reason: str = SHUTDOWN_REASON) -> None:
 
 
 def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
-    """SIGTERM the child's whole process group, SIGKILL it after STOP_GRACE_S; the partial (stdout, stderr). Returns
-    once every process in the group is gone, not only the leader."""
+    """SIGTERM the child's whole process group, SIGKILL it after STOP_GRACE_S; the partial (stdout, stderr).
+    Waits for the leader, then for the group, bounded by STOP_GRACE_S: members still alive at that bound are SIGKILLed."""
     deadline = time.monotonic() + STOP_GRACE_S
     for sig in (signal.SIGTERM, signal.SIGKILL):
         kill_group(proc.pid, sig)
@@ -628,7 +668,10 @@ def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
         _end_group(proc.pid, deadline)
         return out
     proc.kill()  # a descendant that left the group still holds the pipes
-    proc.wait()
+    try:
+        proc.wait(timeout=KILL_SETTLE_S)
+    except subprocess.TimeoutExpired:
+        _LOG.error("child pid %s did not exit within %.1fs of SIGKILL; abandoned", proc.pid, KILL_SETTLE_S)
     return "", ""
 
 
@@ -738,6 +781,17 @@ class StderrScan:
             return self._message
 
 
+def write_grok_prompt(sdir: Path, slug: str, prompt: str) -> Path:
+    """The assignment for one grok session: a new 0600 file under SWARM_DIR/prompts (O_EXCL, never reused)."""
+    folder = sdir / "prompts"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{slug}-{os.urandom(8).hex()}.md"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    return path
+
+
 def _write_stdin(proc: subprocess.Popen, prompt: str) -> None:
     """stdin is the unbuffered binary pipe of an agent session."""
     try:
@@ -779,8 +833,8 @@ def _drain(stream, parts: list[str], scan: StderrScan | None, tap: OmpActivity |
         tail = decoder.decode(b"", final=True)
         if tail:
             seen(tail)
-    except (ValueError, OSError):
-        pass
+    except (ValueError, OSError) as exc:
+        _LOG.warning("session output read failed after %d characters, so it is truncated: %s", sum(map(len, parts)), exc)
 
 
 def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
@@ -795,10 +849,18 @@ def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[
     text = stdout or ""
     try:
         data = json.loads(text)
-        meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
-        text = data.get("result", "") if isinstance(data, dict) else text
     except json.JSONDecodeError:
-        pass
+        return text, meta
+    if runtime == "grok" and isinstance(data, dict):
+        # grok's --output-format json: the reply is `text`, the session is `sessionId`, and success is stopReason
+        # end_turn (there is no is_error). A session that never started is {"type": "error", "message": ...}.
+        failed = data.get("type") == "error" or data.get("stopReason") != "end_turn"
+        meta.update(total_cost_usd=data.get("total_cost_usd"), num_turns=data.get("num_turns"), is_error=failed,
+                    session_id=data.get("sessionId"))
+        return str(data.get("message" if data.get("type") == "error" else "text") or ""), meta
+    if isinstance(data, dict):
+        meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
+        text = data.get("result", "")
     return text, meta
 
 
@@ -810,12 +872,21 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
     drains are waited out until they finish or the task deadline. A deadline that arrives with a drain still blocked
     is a timeout, and close reaps the group because that kill set a deadline."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
-    cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
+    prompt_file = write_grok_prompt(swarm_dir(repo), agent["slug"], prompt) if runtime == "grok" else None
     try:
-        # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
-        group = ChildGroup(cmd, cwd=cwd, env=env, text=False)
-    except OSError as e:
-        raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
+        extra = {} if prompt_file is None else {"prompt_file": prompt_file}  # other runtimes keep their call shape
+        cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args, **extra)
+        try:
+            # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
+            group = ChildGroup(cmd, cwd=cwd, env=env, text=False)
+        except OSError as e:
+            raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
+    except BaseException:
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)
+        raise
+    # grok's prompt is in its file, so its stdin carries nothing but the end-of-input the pump sends
+    stdin_prompt = "" if prompt_file is not None else prompt
     proc = group.proc
     out_parts: list[str] = []
     err_parts: list[str] = []
@@ -831,7 +902,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         handle.started(runtime)
         tap = OmpActivity(handle.activity) if runtime == "omp" else None
     pumps = [
-        threading.Thread(target=_write_stdin, args=(proc, prompt), daemon=True),
+        threading.Thread(target=_write_stdin, args=(proc, stdin_prompt), daemon=True),
         threading.Thread(target=_drain, args=(proc.stdout, out_parts, None, tap), daemon=True),
         threading.Thread(target=_drain, args=(proc.stderr, err_parts, scan), daemon=True),
     ]
@@ -870,7 +941,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                _LOG.warning("child pid %s did not exit after SIGKILL; abandoned", proc.pid)
     finally:
         for pump in pumps:
             if pump.ident is not None:  # join() raises on a thread that was never started
@@ -878,6 +949,8 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         if on_session is not None:
             on_session(None)
         group.close()
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)  # the assignment never outlives its session
     out, err = "".join(out_parts), "".join(err_parts)
     # T-06-10: the live path records the producing runtime and argv like --dry-run does, so a stored
     # result names what produced it. Last so a session payload can never clobber the runner's own keys.
@@ -900,8 +973,11 @@ def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) ->
     replayable `env -u … K=V … argv < file` line, then where the session's SUBSTRATE_TOKEN comes from; spawn nothing.
     The token's value is never printed: a replay sources the agent's env file for it."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
-    cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
     slug = agent["slug"]
+    # grok's live assignment file is created per run; the dry run names where it will go
+    placeholder = sdir / "prompts" / f"{slug}-<id>.md" if runtime == "grok" else None
+    extra = {} if placeholder is None else {"prompt_file": placeholder}
+    cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args, **extra)
     token, source, problem = workspace.credential(agent["id"], repo, os.environ)
     # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06, INST-03).
     # SUBSTRATE_TOKEN is not unset only when the agent has an own credential: the operator sources the agent's env file
@@ -1098,16 +1174,25 @@ def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     return path
 
 
-def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=frozenset()) -> list[dict]:
+def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=frozenset(),
+                 stop_requested: Callable[[], bool] | None = None) -> list[dict]:
     """Tasks to dispatch now: ready (PLANNED/RETRY with their dependencies met), reworks, and FAILED tasks with attempts
     left (moved to RETRY here); FAILED tasks out of attempts are escalated. Tasks named in `skip` (the scheduler's
-    in-flight dispatches) are left exactly as they are."""
+    in-flight dispatches) are left exactly as they are.
+
+    `stop_requested`, when given, is asked before each next task and before a FAILED task's retry or escalation is
+    admitted. An admitted task finishes its transition, emit, packet and settlement; on a stop, the tasks gathered so
+    far are returned and nothing more is admitted."""
     ready = [t for t in store.ready(corr) if t["task_id"] not in skip]
     # rework tasks sit in IN_PROGRESS with no running session; treat them as ready too
     for t in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
+        if stop_requested is not None and stop_requested():
+            return ready
         if t["task_id"] not in skip and t["notes_json"].get("running") is None and store.deps_satisfied(t):
             ready.append(t)
     for t in store.list(correlation_id=corr, state=S.FAILED.value):
+        if stop_requested is not None and stop_requested():
+            return ready
         if t["task_id"] in skip:
             continue
         if t["attempt"] < t["max_attempts"]:
@@ -1131,7 +1216,8 @@ def dispatchable(store: TaskStore, corr: str, emit, handoffs=None, *, skip=froze
 
 
 def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases, *, running: dict[str, int] | None = None,
-                 claims: ClaimTable | None = None, skipped: dict[str, str] | None = None) -> tuple[list[tuple[dict, dict]], list[str]]:
+                 claims: ClaimStore | None = None, skipped: dict[str, str] | None = None,
+                 stop_requested: Callable[[], bool] | None = None) -> tuple[list[tuple[dict, dict]], list[str]]:
     """(task, agent) pairs to dispatch now, and the tasks left waiting on a lease.
 
     `max_parallel` is the number of free global slots. The same agent fills more than one of them, up to that
@@ -1144,51 +1230,77 @@ def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases,
     or run (LEASE-05).
 
     `skipped`, when given, receives {task_id: reason} for every task left out: `no-free-slot`,
-    `class-ceiling:<agent>`, `claim-conflict:<holder task>`, `lease:<status>`."""
+    `class-ceiling:<agent>`, `claim-conflict:<holder task>`, `lease:<status>`.
+
+    `stop_requested`, when given, is asked before each candidate and again before its lease is requested. A candidate
+    stopped there gives its claims back and selection ends. A candidate granted its lease is selected before the loop
+    looks again, so every returned pair holds a real lease; the caller owns each pair it does not submit. If this call
+    raises, it gives back the claims and leases it took for its candidates before the exception propagates."""
     batch, waiting, slots, replicas = [], [], max_parallel, dict(running or {})
     skip = skipped if skipped is not None else {}
-    for t in ready:
-        tid = t["task_id"]
-        if slots <= 0:
-            skip.setdefault(tid, "no-free-slot")
-            continue
-        try:
-            agent = resolve_agent(t)
-        except (KeyError, IndexError):
-            store.transition(tid, S.BLOCKED, reason="no agent for capability")
-            slots -= 1
-            continue
-        ceiling = max(1, int(agent.get("max_parallel") or 1))
-        if replicas.get(agent["id"], 0) >= ceiling:
-            skip[tid] = f"class-ceiling:{agent['id']}"
-            continue  # a later task of another class can still take a free global slot
-        if claims is not None:
+    open_tid: str | None = None  # the candidate holding a claim or lease that has not joined batch yet
+    try:
+        for t in ready:
+            if stop_requested is not None and stop_requested():
+                break
+            tid = t["task_id"]
+            if slots <= 0:
+                skip.setdefault(tid, "no-free-slot")
+                continue
             try:
-                wanted = parse_claims(t["notes_json"])
-            except ValueError as e:
-                store.transition(tid, S.BLOCKED, reason=f"E-INPUT: invalid notes.claims: {e}"[:500])
+                agent = resolve_agent(t)
+            except (KeyError, IndexError):
+                store.transition(tid, S.BLOCKED, reason="no agent for capability")
                 slots -= 1
                 continue
-            taken = claims.acquire(tid, wanted)
-            if not taken.ok:
-                skip[tid] = f"claim-conflict:{taken.conflicts[0].owner}"
-                continue
-        if leases is not None:
-            claim = leases.acquire(t, agent["id"])
-            if not claim.dispatch:
+            ceiling = max(1, int(agent.get("max_parallel") or 1))
+            if replicas.get(agent["id"], 0) >= ceiling:
+                skip[tid] = f"class-ceiling:{agent['id']}"
+                continue  # a later task of another class can still take a free global slot
+            if claims is not None:
+                try:
+                    wanted = parse_claims(t["notes_json"])
+                except ValueError as e:
+                    store.transition(tid, S.BLOCKED, reason=f"E-INPUT: invalid notes.claims: {e}"[:500])
+                    slots -= 1
+                    continue
+                taken = claims.acquire(tid, wanted)
+                if not taken.ok:
+                    skip[tid] = f"claim-conflict:{taken.conflicts[0].owner}"
+                    continue
+            open_tid = tid
+            if stop_requested is not None and stop_requested():  # stopped before any lease: nothing of this one is held
                 if claims is not None:
                     claims.release(tid)
-                holder = (claim.holder or {}).get("session_id")
-                waiting.append(f"{tid}: {claim.status}" + (f" (held by {holder})" if holder else ""))
-                skip[tid] = f"lease:{claim.status}"
+                break
+            if leases is not None:
+                claim = leases.acquire(t, agent["id"])
+                if not claim.dispatch:
+                    if claims is not None:
+                        claims.release(tid)
+                    holder = (claim.holder or {}).get("session_id")
+                    waiting.append(f"{tid}: {claim.status}" + (f" (held by {holder})" if holder else ""))
+                    skip[tid] = f"lease:{claim.status}"
+                    open_tid = None
+                    continue
+            if not take_agent_slot(replicas, agent["id"], ceiling):
+                if claims is not None:
+                    claims.release(tid)
+                skip[tid] = f"class-ceiling:{agent['id']}"
+                open_tid = None
                 continue
-        if not take_agent_slot(replicas, agent["id"], ceiling):
+            batch.append((t, agent))
+            open_tid = None
+            slots -= 1
+    except BaseException:
+        # the batch is never handed back, so none of it is the caller's: give back what it and the candidate in progress
+        # hold, then re-raise
+        for held in [t["task_id"] for t, _agent in batch] + ([open_tid] if open_tid is not None else []):
             if claims is not None:
-                claims.release(tid)
-            skip[tid] = f"class-ceiling:{agent['id']}"
-            continue
-        batch.append((t, agent))
-        slots -= 1
+                claims.release(held)
+            if leases is not None:
+                leases.settle(held)
+        raise
     return batch, waiting
 
 
@@ -1429,6 +1541,7 @@ def _extension_failed(store: TaskStore, tid: str) -> bool:
 _LOG = logging.getLogger("swarm.run")
 PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 SCHEDULERS = ("continuous", "rounds")
+SCHEDULER_DEFAULT_ENGINE = "python"  # GSD_ENGINE unset or empty; only the separately approved S7 change flips it to "rust"
 CANCEL_GRACE_DEFAULT_S = 10.0
 SHUTDOWN_BUDGET_DEFAULT_S = 15.0  # the supervisor's SIGTERM -> SIGKILL window (hooks/autonomous_run.py default)
 KILL_GRACE_S = 5.0  # SIGTERM -> SIGKILL between the runner and its session groups at the end of a cancel
@@ -1439,15 +1552,13 @@ SKIPPED_REPORT_MAX = 64  # entries of `skipped` in one scheduler tick
 
 
 def _env_seconds(name: str, default: float) -> float:
-    """A non-negative number of seconds from the environment; a malformed value is refused, naming the variable."""
+    """A non-negative number of seconds from the environment (0 included); a malformed value is refused, naming the variable.
+    The parse is swarm.limiter.env_seconds: NaN marks a value it does not take."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
-    try:
-        value = float(raw)
-    except ValueError:
-        value = -1.0
-    if not value >= 0 or value == float("inf"):
+    value = env_seconds(name, math.nan, zero_ok=True)
+    if math.isnan(value):
         raise SwarmError(ErrorCode.E_INPUT, f"{name} must be a number of seconds >= 0, got {raw!r}")
     return value
 
@@ -1475,6 +1586,52 @@ def scheduler_mode() -> str:
     if mode not in SCHEDULERS:
         raise SwarmError(ErrorCode.E_INPUT, f"SWARM_SCHEDULER must be one of {list(SCHEDULERS)}, got {mode!r}")
     return mode
+
+
+def scheduler_engine() -> str:
+    """The engine this run executes on: `python`, the Scheduler, or `rust`, the native loop composed around that Scheduler.
+
+    GSD_ENGINE unset or empty takes SCHEDULER_DEFAULT_ENGINE; `python` and `rust` are themselves; any other value is E-INPUT and
+    is not echoed. SWARM_PURE_PYTHON=1 forces python and wins over rust, with one warning on stderr."""
+    if os.environ.get("SWARM_PURE_PYTHON") == "1":
+        if os.environ.get("GSD_ENGINE") == "rust":
+            print("SWARM_PURE_PYTHON=1 forces the python scheduler; GSD_ENGINE=rust is not used", file=sys.stderr, flush=True)
+        return "python"
+    requested = os.environ.get("GSD_ENGINE", "") or SCHEDULER_DEFAULT_ENGINE
+    if requested not in ("python", "rust"):
+        raise SwarmError(ErrorCode.E_INPUT, "GSD_ENGINE must be 'python' or 'rust'")
+    return requested
+
+
+def _native_scheduler() -> tuple[Callable[..., dict], Callable[[], object]]:
+    """`(run_scheduler, NativeCleanupFence)` of the loaded extension. The rust engine fails closed: an extension that cannot be
+    imported, or that lacks either name, refuses the run with E-DEP before anything is claimed, and Python never runs instead."""
+    try:
+        native = importlib.import_module("swarm._native")
+    except ImportError as err:
+        raise SwarmError(ErrorCode.E_DEP, f"GSD_ENGINE=rust needs the native scheduler extension swarm._native: {err}") from err
+    run_native = getattr(native, "run_scheduler", None)
+    fence = getattr(native, "NativeCleanupFence", None)
+    if not callable(run_native) or not callable(fence):
+        raise SwarmError(ErrorCode.E_DEP, "GSD_ENGINE=rust needs run_scheduler and NativeCleanupFence in swarm._native")
+    return run_native, fence
+
+
+def _native_execution(sched: Scheduler, native: tuple[Callable[..., dict], Callable[[], object]]):
+    """The native loop composed around the active controller, bound to this runner's helpers and the settings read now."""
+    from swarm.limiter import _env_cooldown, _retry_cap_s
+    from swarm.retry import DEFAULT_BASE_S, DEFAULT_CAP_S
+    from swarm.rust_scheduler import RunnerHelpers, RunSettings, RustScheduler
+    run_native, fence = native
+    helpers = RunnerHelpers(dispatchable=dispatchable, resolve_agent=resolve_agent, extension_failed=_extension_failed,
+                            kill_sessions=kill_sessions, write_cancel_flag=write_cancel_flag, safe=_safe)
+    settings = RunSettings(cooldown_s=_env_cooldown(), retry_cap_s=_retry_cap_s(),
+                           backoff_base_s=env_seconds("SWARM_RETRY_BASE_S", DEFAULT_BASE_S),
+                           backoff_cap_s=env_seconds("SWARM_RETRY_CAP_S", DEFAULT_CAP_S),
+                           wait_tick_s=WAIT_TICK_S, internal_failure_limit=INTERNAL_FAILURE_LIMIT,
+                           kill_grace_s=KILL_GRACE_S, kill_settle_s=KILL_SETTLE_S)
+    return RustScheduler(sched, helpers=helpers, settings=settings, run_native=run_native, fence_factory=fence,
+                         limiter=sched.limiter)
 
 
 def resolve_agent(task: dict) -> dict:
@@ -1520,33 +1677,63 @@ class CancelRequest:
         self.signum: int | None = None
         self.at: float | None = None  # time.monotonic() of the first request: the shutdown budget runs from here
         self._lock = threading.Lock()
+        self._nested_signum: int | None = None  # signum of a signal that found _lock held: the outer request applies it
+
+    @property
+    def exit_signum(self) -> int | None:
+        """The signal whose exit status the run reports: the request's own signal, else one that re-entered it."""
+        return self.signum if self.signum is not None else self._nested_signum
 
     def request(self, reason: str, signum: int | None = None) -> bool:
-        with self._lock:
+        # A signal handler runs on the main thread, possibly inside this method while that thread holds _lock. A signal
+        # caller therefore never blocks: if the lock is already held, a cancel is under way and the signal forces it; its
+        # signum waits in _nested_signum for that cancel to apply, so the signal's exit status survives.
+        if signum is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(blocking=False):
+            self._nested_signum = signum
+            self.force.set()
+            return False
+        try:
             if self.event.is_set():
                 if signum is not None:
                     self.force.set()
+                    if self.signum is None:  # a signal that lands after the cancel ended still sets the exit status
+                        self.signum = signum
                 return False
             self.reason, self.signum, self.at = reason, signum, time.monotonic()
+            if self.signum is None:  # a signal that re-entered this request while it ran supplies the exit status
+                self.signum = self._nested_signum
+            # D-02 (residual): force.set() and event.set() take Condition locks. A signal that interrupts this thread while it
+            # holds one of them deadlocks if its handler sets the same flag. Accepted residual.
             self.event.set()
             return True
+        finally:
+            if self.signum is None:  # a nested signal that landed after the body applied _nested_signum
+                self.signum = self._nested_signum
+            self._lock.release()
 
 
+
+
+def _cancel_flag_path(sdir: Path, corr: str) -> Path:
+    """The flag of one correlation id. '', '.' and '..' resolve to a directory, not a flag: refused (E-INPUT)."""
+    if corr in ("", ".", ".."):
+        raise SwarmError(ErrorCode.E_INPUT, f"correlation id {corr!r} cannot name a cancel flag")
+    return cancel_flag_path(sdir, corr)
 
 
 def write_cancel_flag(sdir: Path, corr: str, reason: str, grace_s: float) -> Path:
     """`<swarm_dir>/cancel/<correlation_id>` = {requested_wall, reason, grace_s}, atomic. Sessions poll it (the shared
     cancel-check tool); the runner waits `grace_s` for them to finish before it kills their process groups."""
-    path = cancel_flag_path(sdir, corr)
+    path = _cancel_flag_path(sdir, corr)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"requested_wall": time.time(), "reason": reason, "grace_s": grace_s}))
-    os.replace(tmp, path)
+    write_text_atomic(path, json.dumps({"requested_wall": time.time(), "reason": reason, "grace_s": grace_s}))
     return path
 
 
 def clear_cancel_flag(sdir: Path, corr: str) -> None:
-    cancel_flag_path(sdir, corr).unlink(missing_ok=True)
+    _cancel_flag_path(sdir, corr).unlink(missing_ok=True)
 
 
 # ---- one run's handle: what the worker thread reports to Telemetry and back to the scheduler -------------------------
@@ -1744,6 +1931,22 @@ class Inflight(NamedTuple):
     future: Future
 
 
+class OpenRun(NamedTuple):
+    """Registered dispatch and its optional setup failure; no worker has been submitted.
+
+    `item.future` is passive (already resolved to `failure` on setup failure). Python
+    `_submit` replaces it with the pool's Future only on successful submission.
+    """
+    item: Inflight
+    failure: Done | None
+
+
+class FinishedRun(NamedTuple):
+    """Lifecycle result consumed by the engine's own completion decisions."""
+    failed: bool
+    reason: str
+
+
 class Pass(NamedTuple):
     """One scheduling pass: dispatchable tasks seen, tasks submitted, lease waits, earliest backoff expiry (wall)."""
     ready: int
@@ -1797,6 +2000,7 @@ class WorkerPool:
     def shutdown(self, wait: bool = True) -> None:
         """Stop the workers once the queue is empty. `wait=False` drops calls not yet started and returns at once."""
         with self._lock:
+            first = not self._closed
             self._closed = True
             threads = list(self._threads)
             if not wait:
@@ -1807,8 +2011,9 @@ class WorkerPool:
                         break
                     if item is not None:
                         item[0].cancel()
-            for _ in threads:
-                self._queue.put(None)
+            if first:
+                for _ in threads:
+                    self._queue.put(None)
         if wait:
             for thread in threads:
                 thread.join()
@@ -1832,7 +2037,7 @@ class Scheduler:
         self.repo, self.corr, self.mgr, self.tel, self.sdir = repo, corr, mgr, tel, sdir
         self.leases, self.handoffs, self.cancel, self.barrier = leases, handoffs, cancel, barrier
         self.limiter = AimdLimiter(mgr.max_concurrent)
-        self.claims = ClaimTable()
+        self.claims = make_claim_table()
         self.error_handler = ErrorHandler()
         self.book = RunBook(tel)
         self.inflight: dict[str, Inflight] = {}
@@ -1863,6 +2068,14 @@ class Scheduler:
     def start(self) -> None:
         self.t0 = time.monotonic()
         self.pool = WorkerPool(self.mgr.max_concurrent, "swarm-run")
+        self._start_monitor()
+
+    def _start_monitor(self) -> None:
+        """Start only this controller's monitor; allocate/submit no Python worker pool.
+
+        `start` owns the Python pool and resets t0. A non-Python engine sets its run
+        start time before calling this bound helper and retains abort/close ownership.
+        """
         self._monitor = threading.Thread(target=self._watch, name="swarm-monitor", daemon=True)
         self._monitor.start()
 
@@ -1925,11 +2138,16 @@ class Scheduler:
     def _schedule(self) -> Pass:
         self.rounds += 1
         corr, store, ctx = self.corr, self.store, self.ctx
-        self.log += reconcile(store, corr, ctx.emit, leases=self.leases, handoffs=self.handoffs)
+        # the original cancel event, passed explicitly to each helper below; a stop ends the pass before its next unit
+        stop = self.cancel.event.is_set
+        self.log += reconcile(store, corr, ctx.emit, leases=self.leases, handoffs=self.handoffs, stop_requested=stop)
         log_phase("reconcile", {"round": self.rounds}, source="A01@swarm_run", correlation_id=corr, root=self.repo)
         if self.handoffs is not None:
-            self.handoffs.flush()
-        ready = dispatchable(store, corr, ctx.emit, handoffs=self.handoffs, skip=frozenset(self.inflight))
+            self.handoffs.flush(stop_requested=stop)
+        if stop():
+            return Pass(0, 0, [], None)
+        ready = dispatchable(store, corr, ctx.emit, handoffs=self.handoffs, skip=frozenset(self.inflight),
+                             stop_requested=stop)
         now = time.time()
         skipped: dict[str, str] = {}
         eligible: list[dict] = []
@@ -1947,25 +2165,36 @@ class Scheduler:
         tasks = store.list(correlation_id=corr)
         ready_ids = {t["task_id"] for t in ready}
         for t in tasks:
+            if stop():  # before each RunBook item: an unregistered task has no run, and close() settles the rest
+                return Pass(len(ready), 0, [], None)
             if t["task_id"] in self.inflight:
                 continue
             if t["task_id"] in ready_ids:
                 self.book.seen(t, waiting=False, queue_depth=len(ready))
             elif t["state"] in (S.CREATED.value, S.VALIDATED.value, S.PLANNED.value, S.RETRY.value):
                 self.book.seen(t, waiting=True, queue_depth=len(ready))
+        if stop():
+            return Pass(len(ready), 0, [], None)
         eff = self.effective_parallel()
         free = max(0, eff - len(self.inflight))
         if not self.barrier:  # `--max-rounds` is a total: never start more than what is left of it in one pass
             free = min(free, max(0, self.budget - self.dispatched))
         per_class = Counter(i.agent["id"] for i in self.inflight.values())
         batch, waiting = select_batch(store, eligible, free, self.leases, running=per_class, claims=self.claims,
-                                      skipped=skipped)
+                                      skipped=skipped, stop_requested=stop)
         self.error_handler.detect_parallel(len(batch), self.mgr.max_concurrent)
-        for t, a in batch:
-            self._submit(t, a)
-        self._tick(len(ready), len(batch), eff, free, skipped)
+        submitted = 0
+        try:
+            for t, a in batch:
+                if stop():  # before each submission: a pair not yet admitted is never started; it is given back below
+                    break
+                self._submit(t, a)
+                submitted += 1
+        finally:
+            self._release_unsubmitted(batch[submitted:])
+        self._tick(len(ready), submitted, eff, free, skipped)
         self._wake_wall = backoff_wall
-        return Pass(len(ready), len(batch), waiting, backoff_wall)
+        return Pass(len(ready), submitted, waiting, backoff_wall)
 
     def _tick(self, ready: int, submitted: int, eff: int, free: int, skipped: dict) -> None:
         per_agent: dict[str, dict] = {}
@@ -1979,13 +2208,24 @@ class Scheduler:
               free_slots=max(0, free - submitted), max_parallel=self.mgr.max_concurrent, effective_parallel=eff,
               per_agent=per_agent, skipped=reported)
 
-    def _submit(self, task: dict, agent: dict) -> None:
+    def _open_run(self, task: dict, agent: dict) -> OpenRun:
+        """Register one dispatch on this controller, without submitting any worker.
+
+        Owns RunBook opening, RunHandle/SID creation, immediate dispatch status,
+        inflight insertion and the dispatched increment (including setup failure).
+        The task/agent dicts and RunHandle are retained by identity. The Future is
+        passive; a setup Exception is recorded once through _internal_failure,
+        resolves that Future and releases an allocated SID before returning.
+        As before, RunBook/RunHandle construction errors precede the setup guard.
+        """
         tid = task["task_id"]
         corr, ctx, dry = self.corr, self.ctx, self.args.dry_run
         run_id = self.book.seen(task, waiting=False, queue_depth=0)
         self.book.opened(run_id)
         run = RunHandle(self.tel, run_id, tid, agent["slug"], "",
                         float(task["budget"].get("max_wall_s") or self.args.task_timeout))
+        future: Future = Future()
+        failure: Done | None = None
         try:
             run.sid = sid = self.mgr.new_subagent_id(tid, root=ctx.root, correlation_id=corr)
             # immediate emit calls for spawn events, subagent IDs, real-time status to OMP
@@ -1995,24 +2235,57 @@ class Scheduler:
                          root=ctx.root, dry_run=dry)
             emit_gsd_omp("consolidated", subagent_id=sid, task_id=tid, audit="spawn", wave="wave1", corr=corr,
                          root=ctx.root, dry_run=dry)
-            future = self.pool.submit(self._worker, task, agent, sid, run)
         except Exception as exc:  # noqa: BLE001 - a dispatch that cannot even be queued fails that task only
-            future = Future()
-            future.set_result(self._internal_failure(task, agent, exc))
+            failure = self._internal_failure(task, agent, exc)
+            future.set_result(failure)
             if run.sid:
                 self.mgr.release(run.sid)
-        self.inflight[tid] = Inflight(task, agent, run.sid, run, future)
+        item = Inflight(task, agent, run.sid, run, future)
+        self.inflight[tid] = item
         self.dispatched += 1
+        return OpenRun(item, failure)
+
+    def _submit(self, task: dict, agent: dict) -> None:
+        opened = self._open_run(task, agent)
+        if opened.failure is not None:
+            return
+        item = opened.item
+        try:
+            future = self.pool.submit(self._worker, task, agent, item.sid, item.run)
+        except Exception as exc:  # noqa: BLE001 - preserve the failed-submission Future path
+            future = item.future
+            future.set_result(self._internal_failure(task, agent, exc))
+            if item.sid:
+                self.mgr.release(item.sid)
+        self.inflight[task["task_id"]] = item._replace(future=future)
+
+    def _skipped(self, tid: str, agent: dict) -> Done:
+        """A dispatch the cancel stopped before its session started: its lease is settled by the task's real state (a
+        HOLDING state keeps it), and the result is SKIPPED, which is not a failure."""
+        if self.leases is not None:
+            self.leases.settle(tid)
+        return Done(tid, agent["id"], "SKIPPED")
+
+    def _release_unsubmitted(self, pairs: list[tuple[dict, dict]]) -> None:
+        """Selected pairs this pass did not admit: give back their claims and settle their leases by the task's real
+        state. A pair already admitted (in `inflight`) is the worker's: its claims, lease and session are its own."""
+        for t, _agent in pairs:
+            tid = t["task_id"]
+            if tid in self.inflight:
+                continue
+            self.claims.release(tid)
+            if self.leases is not None:
+                self.leases.settle(tid)
 
     # ---- the worker (runs on a pool thread) ------------------------------------------------------------------------
     def _worker(self, task: dict, agent: dict, sid: str, run: RunHandle) -> Done:
         tid = task["task_id"]
         try:
             if self.cancel.event.is_set():  # cancelled between the pass and the pool picking this up: never starts
-                if self.leases is not None:
-                    self.leases.settle(tid)
-                return Done(tid, agent["id"], "SKIPPED")
+                return self._skipped(tid, agent)
             self.mgr.acquire(sid)
+            if self.cancel.event.is_set():  # cancelled while waiting for a slot: the session never starts
+                return self._skipped(tid, agent)
             run.slot_acquired()
             with run_scope(run):
                 tid, aid, outcome = execute_one(self.store_path, task, agent, self.args, self.ctx, self.repo,
@@ -2080,6 +2353,27 @@ class Scheduler:
                                           else RuntimeError(repr(crashed)))
         else:
             done = future.result()
+        finished = self._finish_run(item, done)
+        self._backpressure(run, finished.failed, item.task, finished.reason)
+        if finished.failed and not self.cancel.event.is_set():
+            self._schedule_retry(item.task, finished.reason, run.rate_limited)
+        if _extension_failed(self.store, tid) and not self.extension_down:
+            self.extension_down = True
+            self.closed = True
+            self.log.append("stopped: omp extension failed to load; no further sessions this run")
+
+    def _finish_run(self, item: Inflight, done: Done) -> FinishedRun:
+        """Finish lifecycle/telemetry/status/log only; make no engine decisions.
+
+        The completion caller must remove inflight, release SID (idempotent), and
+        release its engine's claims exactly once BEFORE calling this helper.
+        Python _complete retains that order before resolving its Future, then
+        consumes this result for AIMD, retry and extension checks in that order.
+        Native callers pass their Done directly, not the passive Future's result;
+        they own the equivalent pre-finish cleanup and native decisions. Neither
+        this helper nor close submits work or settles leases (the worker does).
+        """
+        tid, run = item.task["task_id"], item.run
         aid, outcome = done.agent_id, done.outcome
         failed = done.error is not None or outcome == S.FAILED.value
         reason = (done.error or last_failure(self.store, tid)) if failed else ""
@@ -2100,13 +2394,7 @@ class Scheduler:
                      corr=self.corr, root=self.ctx.root, dry_run=self.args.dry_run)
         emit_gsd_omp("consolidated", subagent_id=item.sid, task_id=tid, audit="result", outcome=outcome,
                      corr=self.corr, root=self.ctx.root, dry_run=self.args.dry_run)
-        self._backpressure(run, failed, item.task, reason)
-        if failed and not self.cancel.event.is_set():
-            self._schedule_retry(item.task, reason, run.rate_limited)
-        if _extension_failed(self.store, tid) and not self.extension_down:
-            self.extension_down = True
-            self.closed = True
-            self.log.append("stopped: omp extension failed to load; no further sessions this run")
+        return FinishedRun(failed, reason)
 
     def _backpressure(self, run: RunHandle, failed: bool, task: dict, reason: str) -> None:
         """AIMD: a rate-limited session halves the effective parallelism (swarm.degraded) once per burst, a success adds
@@ -2160,6 +2448,8 @@ class Scheduler:
         delay = backoff_s(max(1, int(current["attempt"])))
         if rate_hit:
             delay = max(delay, min(float(rate_hit), backoff_s(62, jitter=0)))  # 62 doublings: the configured cap
+        if self.cancel.event.is_set():  # a cancel that landed during the jitter: no new retry note is admitted
+            return
         self.store.set_notes(task["task_id"], retry_after=time.time() + delay)
         self.log.append(f"{task['task_id']}: transient failure, re-dispatch in {delay:.1f}s")
 
@@ -2193,6 +2483,9 @@ class Scheduler:
             if need_pass and not self.closed and not (self.barrier and self.inflight):
                 need_pass = False
                 res = self._schedule()
+                if self.cancel.event.is_set():  # a partial pass is not idle: no once/budget/idle verdict; drain once
+                    self._cancel_drain()
+                    return
                 if self.once or self.extension_down or (self.barrier and self.rounds >= self.max_rounds) \
                         or (not self.barrier and self.dispatched >= self.budget):
                     self.closed = True
@@ -2265,18 +2558,24 @@ def non_negative_seconds(value, name: str) -> float:
     return seconds
 
 
+def validate_signer_deny_policy(controller_env: dict[str, str]) -> None:
+    """Refuse a malformed SWARM_SIGNER_DENY_PATHS before any claim. headless_command parses the policy again for each
+    session; this is the controller's own up-front check, and it returns nothing."""
+    signer_deny_metadata(controller_env)
+
+
 def run(args, ctx) -> dict:
     from swarm.envelope import perform_signing_key_lifecycle
     repo = Path(args.repo).resolve()
     # A malformed deny-path policy is a controller configuration error. Refuse it here, before the lifecycle, leases or
     # any claim; per-task rejection would burn each task's attempts (headless_command re-checks it defensively).
-    signer_deny_metadata(dict(os.environ))
+    validate_signer_deny_policy(dict(os.environ))
     # the run's workspace: its keys, state and status writes are scoped to it, not to the cwd it started in
     ctx.root = repo
     key_state = perform_signing_key_lifecycle(root=ctx.root)
     message = key_state.get("message") or ""
     if message:
-        print(message, file=sys.stderr, flush=True)
+        _LOG.log(logging.INFO if key_state.get("status") == "full" else logging.WARNING, message)
         ctx.emit("signing.key.lifecycle", key_state)
     if key_state.get("status") == "blocked":
         raise SwarmError(ErrorCode.E_POLICY, message or "signing key lifecycle blocked")
@@ -2291,9 +2590,10 @@ def run(args, ctx) -> dict:
         ss.append_gsd_line("RUNNING", root=ctx.root)
         ss.update("RUNNING", corr=ctx.correlation_id, extra={"wave": "wave1"})
     except Exception:
-        pass
+        _LOG.warning("swarm state store could not record the run start; the run goes on without it", exc_info=True)
     sdir = swarm_dir(repo, create=True)
-    # one absolute state dir for this process and every child it spawns (D-10)
+    # one absolute state dir for this process and every child it spawns (D-10): a deliberate process-wide write that the
+    # child sessions and gate scripts inherit
     os.environ["SWARM_DIR"] = str(sdir)
     store_path = sdir / "tasks.db"
     store = TaskStore(store_path)
@@ -2311,6 +2611,8 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
                          "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
     mode = scheduler_mode()
+    engine = scheduler_engine()
+    native = _native_scheduler() if engine == "rust" else None  # before any claim: an incomplete extension refuses here
     swarm_timeout = non_negative_seconds(getattr(args, "swarm_timeout", 0), "--swarm-timeout")
     args.swarm_timeout = swarm_timeout
     # read once, before anything is dispatched: a malformed value is an input error now, not a surprise at cancel time
@@ -2328,7 +2630,10 @@ def run(args, ctx) -> dict:
                            dry_run=args.dry_run)
     emit_gsd_omp("consolidated", audit="run.init", wave="wave1", corr=corr, root=ctx.root, dry_run=args.dry_run)
     args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
-    validate_runtime_approval(args.runtime, args)
+    refused = unsupported_approval(args.runtime, args)
+    if refused is not None:  # under rust the named refusals are E-POLICY; still before any claim, lease or dispatch
+        refused_code, refused_message = refused
+        raise SwarmError(ErrorCode.E_POLICY if engine == "rust" else refused_code, refused_message)
     if not args.dry_run:
         name = runtime_bin(args.runtime, args)
         binary = shutil.which(name)
@@ -2344,7 +2649,8 @@ def run(args, ctx) -> dict:
     tel = Telemetry(root=ctx.root, correlation_id=corr, tee=not args.dry_run)  # one per run: its correlation id
     leases = lease_bridge(args, store_path, corr, repo, ctx)
     handoffs = handoff_bridge(store_path, corr, repo, ctx, leases)
-    log: list[str] = []
+    log: list[str] = [f"scheduler_engine: {engine}"]
+    _witness_engine(engine)  # T-14.4-08: the gate's witness of the engine this child ran on (a no-op unless the gate set the file)
     cancel = CancelRequest()
     # T-06-12: SIGTERM/SIGHUP/SIGINT to the runner start a cooperative cancel (flag, grace, then the process-group
     # kill), then the previous handlers come back. WR-10: a signal inherited as ignored (nohup, a parent's SIG_IGN)
@@ -2357,6 +2663,8 @@ def run(args, ctx) -> dict:
     sched = Scheduler(args, ctx, store=store, store_path=store_path, repo=repo, corr=corr, mgr=mgr, tel=tel,
                       leases=leases, handoffs=handoffs, cancel=cancel, barrier=mode == "rounds", sdir=sdir,
                       cancel_grace=cancel_grace, shutdown_budget=shutdown_budget, fail_streak=fail_streak)
+    # the native loop composed around this controller; None keeps the Python Scheduler's own start and loop
+    rust = _native_execution(sched, native) if native is not None else None
     clear_cancel_flag(sdir, corr)  # a flag left by an earlier run of this plan must not cancel this one
     previous = ({s: signal.signal(s, _on_signal) for s in _FORWARDED
                  if signal.getsignal(s) is not signal.SIG_IGN}
@@ -2378,9 +2686,13 @@ def run(args, ctx) -> dict:
         emit_gsd_omp("consolidated", audit="dispatch.start", wave="wave1", corr=corr, root=ctx.root,
                      dry_run=args.dry_run)
         log.append("error_handler_unit: " + sched.error_handler.spec()["version"])
-        sched.start()
+        if rust is None:
+            sched.start()
         try:
-            sched.loop()
+            if rust is None:
+                sched.loop()
+            else:
+                rust.run()
         except BaseException:
             sched.abort()
             raise
@@ -2394,17 +2706,19 @@ def run(args, ctx) -> dict:
             leases.close()
     log += sched.log
     # note: the outer finally was collapsed; original had reconcile after
-    log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
-    if handoffs is not None:
-        handoffs.flush()
+    try:
+        log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
+    finally:
+        if handoffs is not None:  # the packets written so far reach the ledger even when the reconcile fails
+            handoffs.flush()
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}
     for t in tasks:
         counts[t["state"]] = counts.get(t["state"], 0) + 1
     complete = all(t["state"] in (S.DONE.value, S.CANCELLED.value) for t in tasks)
     escalated = [t["task_id"] for t in tasks if t["state"] == S.ESCALATED.value]
-    if cancel.signum is not None:  # the signal's exit status, once the sessions are gone and the records are final
-        raise SystemExit(128 + cancel.signum)
+    if cancel.exit_signum is not None:  # the signal's exit status, once the sessions are gone and the records are final
+        raise SystemExit(128 + cancel.exit_signum)
     return {
         "status": "ok" if complete else "fail",
         "correlation_id": corr,
@@ -2446,7 +2760,7 @@ def add_args(p):
     p.add_argument("--omp-bin", default="omp")
     p.add_argument("--runtime", choices=["auto", *RUNTIMES], default="auto",
                    help="headless runner: claude -p --agent, omp -p --mode json, or auto "
-                        "(claude/grok; Grok dispatch is currently refused; omp only when explicit or SWARM_RUNTIME=omp)")
+                        "(claude/grok; omp only when explicit or SWARM_RUNTIME=omp)")
     p.add_argument("--allowed-tools", default="Bash(python3:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Read,Grep,Glob",
                    help="comma list passed to claude --allowedTools so headless agents can run their scripts unattended")
 

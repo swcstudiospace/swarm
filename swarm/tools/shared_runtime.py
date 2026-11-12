@@ -24,17 +24,23 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from swarm import runlog
 from swarm.clock import SYSTEM_CLOCK, Clock
+from swarm.limiter import env_seconds
 from swarm.paths import latest_correlation, swarm_dir
 from swarm.redact import redact, redact_text
 from swarm.tools.support import current_caller, respond
 
+if TYPE_CHECKING:
+    from swarm.taskstore import TaskStore
+
 try:  # POSIX advisory locks give the scratchpad cross-process mutual exclusion that dies with the holder
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
-    fcntl = None  # type: ignore[assignment]
+    fcntl = None  # type: ignore[assignment]  # no fcntl module on non-POSIX; None is the fallback
 
 CLOCK: Clock = SYSTEM_CLOCK  # tests replace this with a FakeClock
 
@@ -47,6 +53,8 @@ SCRATCH_VALUE_MAX_BYTES = 8 * 1024
 SCRATCH_MAX_KEYS = 64
 SCRATCH_LOCK_WAIT_S = 5.0
 STATUS_EMIT_INTERVAL_S = 1.0
+# Default for SWARM_CANCEL_GRACE_S: how long an agent session gets to leave after a cancel request. A separate concept from
+# gsd-state's fixed 3 s session-join window (CANCEL_GRACE), which the variable does not set.
 DEFAULT_CANCEL_GRACE_S = 10.0
 STATUS_KINDS = ("progress", "blocked", "done")
 LOG_LEVELS = ("debug", "info", "warn", "error")
@@ -58,29 +66,30 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 class _Refusal(Exception):
     """A handler outcome that is not an error of the tool: the result dict is returned as is."""
 
-    def __init__(self, result: dict):
+    def __init__(self, result: dict[str, Any]) -> None:
         super().__init__(result.get("message") or result.get("reason") or result.get("state"))
         self.result = result
 
 
-def _invalid(field: str, message: str, **extra) -> _Refusal:
+def _invalid(field: str, message: str, **extra: Any) -> _Refusal:
     return _Refusal({"state": "INVALID_INPUT", "field": field, "message": message, **extra})
 
 
-def _guarded(payload: dict, fn):
+def _guarded(payload: dict[str, Any], fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """`respond` plus the refusal convention: `fn()` may raise `_Refusal` to return a non-SUCCESS result."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             return fn()
         except _Refusal as refusal:
             return refusal.result
 
-    return respond(payload, work)
+    # respond() in swarm/tools/support.py is untyped, so its result is Any; work() always returns a result dict.
+    return cast(dict[str, Any], respond(payload, work))
 
 
 # ---- shared helpers ----------------------------------------------------------------------------------------------
-def _name(payload: dict, field: str) -> str:
+def _name(payload: dict[str, Any], field: str) -> str:
     """A file-name safe identifier (task or correlation id); never a path."""
     value = payload.get(field)
     if not isinstance(value, str) or not _NAME_RE.fullmatch(value) or set(value) <= {"."}:
@@ -95,13 +104,13 @@ def _caller() -> str:
     return caller
 
 
-def _text(value, limit: int = TEXT_CLIP) -> str:
+def _text(value: object, limit: int = TEXT_CLIP) -> str:
     """Redacted then clipped: a secret is replaced on the full text, so clipping never leaves half of one."""
     clean = redact_text(value) if isinstance(value, str) else ""
     return clean if len(clean) <= limit else clean[: limit - 1] + "…"
 
 
-def _atomic_json(path: Path, doc: dict) -> None:
+def _atomic_json(path: Path, doc: dict[str, Any]) -> None:
     """Temp file in the same directory, then os.replace: readers see the old or the new document, never a torn one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
@@ -115,7 +124,7 @@ def _atomic_json(path: Path, doc: dict) -> None:
         raise
 
 
-def _read_json(path: Path) -> dict | None:
+def _read_json(path: Path) -> dict[str, Any] | None:
     """The parsed object, or None when the file is absent. A file that is not a JSON object is an OSError."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -130,7 +139,7 @@ def _read_json(path: Path) -> dict | None:
     return doc
 
 
-def _load_task(task_id: str) -> dict | None:
+def _load_task(task_id: str) -> dict[str, Any] | None:
     """The Task Store row, read-only. No store file or no such task is None; the store is never created here."""
     db = swarm_dir() / "tasks.db"
     if not db.is_file():
@@ -152,12 +161,15 @@ def _load_task(task_id: str) -> dict | None:
         return None
     task = dict(row)
     task["depends_on"] = _json_value(task.get("depends_on"), [])
-    notes = _json_value(task.get("notes"), {})
+    notes: object = _json_value(task.get("notes"), {})
     task["notes_json"] = notes if isinstance(notes, dict) else {}
     return task
 
 
-def _json_value(text, default):
+_T = TypeVar("_T")
+
+
+def _json_value(text: str | None, default: _T) -> _T:
     try:
         value = json.loads(text) if text else default
     except ValueError:
@@ -165,25 +177,25 @@ def _json_value(text, default):
     return value if isinstance(value, type(default)) else default
 
 
-def _require_task(task_id: str) -> dict:
+def _require_task(task_id: str) -> dict[str, Any]:
     task = _load_task(task_id)
     if task is None:
         raise _invalid("task_id", f"unknown task {task_id}")
     return task
 
 
-def _assigned_agent(task: dict) -> str | None:
+def _assigned_agent(task: dict[str, Any]) -> str | None:
     return task.get("agent_id") or task.get("assigned_to") or None
 
 
-def _require_assigned(task: dict, caller: str) -> None:
+def _require_assigned(task: dict[str, Any], caller: str) -> None:
     assigned = _assigned_agent(task)
     if assigned != caller:
         raise _Refusal({"state": "UNAUTHORIZED", "caller": caller, "target": task["task_id"],
                         "reason": f"caller is not the agent assigned to the task (assigned: {assigned or 'none'})"})
 
 
-def _run_id(task: dict) -> str:
+def _run_id(task: dict[str, Any]) -> str:
     return f"{task['task_id']}.a{max(int(task.get('attempt') or 0), 1)}"
 
 
@@ -203,7 +215,7 @@ def _carried_calls(run_id: str) -> int:
     return 0
 
 
-def _emit_activity(task: dict, caller: str, text: str) -> None:
+def _emit_activity(task: dict[str, Any], caller: str, text: str) -> None:
     from swarm.telemetry import Telemetry, refresh_live
 
     run_id = _run_id(task)
@@ -218,8 +230,8 @@ def _emit_activity(task: dict, caller: str, text: str) -> None:
     refresh_live(clock=CLOCK)
 
 
-def status_report(payload: dict) -> dict:
-    def run() -> dict:
+def status_report(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         task_id = _name(payload, "task_id")
         kind = payload.get("kind")
         if kind not in STATUS_KINDS:
@@ -251,7 +263,7 @@ def status_report(payload: dict) -> dict:
         since = now - float(previous["updated_wall"]) if previous and isinstance(previous.get("updated_wall"), (int, float)) else None
         # a burst of progress reports is one event per second; a state change (blocked/done) is always worth an event
         throttled = (since is not None and 0 <= since < STATUS_EMIT_INTERVAL_S
-                     and previous.get("kind") == kind and kind == "progress")
+                     and previous is not None and previous.get("kind") == kind and kind == "progress")
         if not throttled:
             from swarm.telemetry import status_label
 
@@ -268,22 +280,23 @@ def _scratch_dir(correlation_id: str) -> Path:
 
 
 @contextlib.contextmanager
-def _scratch_lock(directory: Path):
+def _scratch_lock(directory: Path, *, clock: Clock | None = None, sleep: Callable[[float], None] = time.sleep) -> Iterator[None]:
     """Exclusive per-correlation lock shared by threads and processes (flock on separate open files excludes both)."""
     if fcntl is None:  # pragma: no cover - non-POSIX
         raise OSError("scratchpad locking needs POSIX flock")
     directory.mkdir(parents=True, exist_ok=True)
     fd = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        deadline = time.monotonic() + SCRATCH_LOCK_WAIT_S
+        source = SYSTEM_CLOCK if clock is None else clock
+        deadline = source.monotonic() + SCRATCH_LOCK_WAIT_S
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
+                if source.monotonic() >= deadline:
                     raise OSError("scratchpad is busy: lock not acquired in time") from None
-                time.sleep(0.005)
+                sleep(0.005)
         try:
             yield
         finally:
@@ -292,7 +305,7 @@ def _scratch_lock(directory: Path):
         os.close(fd)
 
 
-def _scratch_key(payload: dict, *, required: bool) -> str | None:
+def _scratch_key(payload: dict[str, Any], *, required: bool) -> str | None:
     key = payload.get("key")
     if key is None and not required:
         return None
@@ -301,7 +314,7 @@ def _scratch_key(payload: dict, *, required: bool) -> str | None:
     return key
 
 
-def _meta(entry: dict) -> dict:
+def _meta(entry: dict[str, Any]) -> dict[str, Any]:
     return {name: entry.get(name) for name in ("key", "owner", "shared", "version", "bytes", "updated", "updated_by")}
 
 
@@ -309,8 +322,8 @@ def _entry_files(directory: Path) -> list[Path]:
     return sorted(p for p in directory.glob("*.json") if p.is_file()) if directory.is_dir() else []
 
 
-def scratchpad_put(payload: dict) -> dict:
-    def run() -> dict:
+def scratchpad_put(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         correlation_id = _name(payload, "correlation_id")
         key = _scratch_key(payload, required=True)
         value = payload.get("value")
@@ -324,7 +337,7 @@ def scratchpad_put(payload: dict) -> dict:
             raise _invalid("if_version", "if_version must be an integer >= 0 (0 means the key must not exist yet)")
         caller = _caller()
         try:
-            raw_bytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            raw_bytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
         except (TypeError, ValueError) as exc:
             raise _invalid("value", f"value is not JSON serializable: {exc}") from exc
         if raw_bytes > SCRATCH_VALUE_MAX_BYTES:
@@ -360,8 +373,8 @@ def scratchpad_put(payload: dict) -> dict:
     return _guarded(payload, run)
 
 
-def scratchpad_get(payload: dict) -> dict:
-    def run() -> dict:
+def scratchpad_get(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         correlation_id = _name(payload, "correlation_id")
         key = _scratch_key(payload, required=False)
         directory = _scratch_dir(correlation_id)
@@ -386,7 +399,7 @@ def scratchpad_get(payload: dict) -> dict:
 class _StoreView:
     """The one method `substrate_handoff.escalation_owner` calls on a store, answered from the read-only loader."""
 
-    def get(self, task_id: str) -> dict:
+    def get(self, task_id: str) -> dict[str, Any]:
         from swarm.errors import ErrorCode, SwarmError
 
         task = _load_task(task_id)
@@ -395,14 +408,15 @@ class _StoreView:
         return task
 
 
-def _owner_of(task: dict) -> str:
+def _owner_of(task: dict[str, Any]) -> str:
     from swarm import substrate_handoff
 
-    return substrate_handoff.escalation_owner(_StoreView(), task)
+    # escalation_owner() only calls store.get(), which _StoreView provides; its annotation names TaskStore.
+    return substrate_handoff.escalation_owner(cast("TaskStore", _StoreView()), task)
 
 
-def escalate(payload: dict) -> dict:
-    def run() -> dict:
+def escalate(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         task_id = _name(payload, "task_id")
         reason_code = payload.get("reason_code")
         if reason_code not in REASON_CODES:
@@ -434,8 +448,8 @@ def escalate(payload: dict) -> dict:
     return _guarded(payload, run)
 
 
-def escalation_owner(payload: dict) -> dict:
-    def run() -> dict:
+def escalation_owner(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         task_id = _name(payload, "task_id")
         owner = _owner_of(_require_task(task_id))
         return {"state": "SUCCESS", "task_id": task_id, "owner": owner,
@@ -445,16 +459,12 @@ def escalation_owner(payload: dict) -> dict:
 
 
 # ---- cancellation ------------------------------------------------------------------------------------------------
-def _number(value) -> float | None:
+def _number(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
 def _grace_default() -> float:
-    try:
-        value = float(os.environ["SWARM_CANCEL_GRACE_S"])
-    except (KeyError, ValueError):
-        return DEFAULT_CANCEL_GRACE_S
-    return value if math.isfinite(value) and value >= 0 else DEFAULT_CANCEL_GRACE_S
+    return env_seconds("SWARM_CANCEL_GRACE_S", DEFAULT_CANCEL_GRACE_S, zero_ok=True)
 
 
 def cancel_flag_path(sdir: str | Path, correlation_id: str) -> Path:
@@ -492,8 +502,8 @@ def _cancel_flag(correlation_id: str) -> tuple[float, str, float] | None:
             grace if grace is not None and grace >= 0 else _grace_default())
 
 
-def cancel_check(payload: dict) -> dict:
-    def run() -> dict:
+def cancel_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         task_id = _name(payload, "task_id")
         task = _require_task(task_id)
         now = CLOCK.wall()
@@ -515,8 +525,8 @@ def cancel_check(payload: dict) -> dict:
 
 
 # ---- log ---------------------------------------------------------------------------------------------------------
-def log_emit(payload: dict) -> dict:
-    def run() -> dict:
+def log_emit(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         level = payload.get("level")
         if level not in LOG_LEVELS:
             raise _invalid("level", f"level must be one of {', '.join(LOG_LEVELS)}")
@@ -543,7 +553,7 @@ def log_emit(payload: dict) -> dict:
             correlation_id = latest_correlation()
         body = {"level": level, "message": _text(message, LOG_MESSAGE_MAX), "agent": caller,
                 "fields": {name: (_text(v, LOG_FIELD_VALUE_CLIP) if isinstance(v, str) else v)
-                           for name, v in redact(fields).items()}}
+                           for name, v in cast(dict[str, Any], redact(fields)).items()}}  # redact() copies a dict; its annotation is object
         record = runlog.emit("agent.log", body, source=f"agent.{caller}", correlation_id=correlation_id, task_id=task_id,
                              tee=False)
         return {"state": "SUCCESS", "msg_id": record["msg_id"], "level": level, "correlation_id": correlation_id or "",
@@ -553,7 +563,7 @@ def log_emit(payload: dict) -> dict:
 
 
 # ---- routing -----------------------------------------------------------------------------------------------------
-def _route_reason(table: dict, sender: str, recipient: str, message_type: str) -> str:
+def _route_reason(table: dict[str, dict[str, Any]], sender: str, recipient: str, message_type: str) -> str:
     if sender not in table:
         return f"unknown sender {sender}"
     if recipient not in table:
@@ -567,8 +577,8 @@ def _route_reason(table: dict, sender: str, recipient: str, message_type: str) -
     return ""
 
 
-def route_check(payload: dict) -> dict:
-    def run() -> dict:
+def route_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def run() -> dict[str, Any]:
         values = {}
         for field in ("sender", "recipient", "message_type"):
             value = payload.get(field)

@@ -9,7 +9,7 @@ import pytest
 from conftest import ROOT, run_script
 
 from swarm.blast_radius import merge_branches, normalize_slices, parallel_rows, prepare_slice_worktree
-from swarm.errors import SwarmError
+from swarm.errors import ErrorCode, SwarmError
 from swarm.taskstore import TaskStore
 
 
@@ -194,6 +194,44 @@ def test_lanes_get_worktrees_and_the_join_merges_them(tmp_path):
         raise AssertionError("conflicting lane merged")
     assert not (clash / ".git" / "MERGE_HEAD").exists()
     assert (clash / "same.txt").read_text(encoding="utf-8") == "left\n"
+
+
+def test_prepare_slice_worktree_refuses_existing_worktree_on_other_branch(tmp_path):
+    """SA-06: a lane path that already holds a worktree on another branch is refused, not reused. The lane's edits would
+    otherwise land on that branch and the join would merge it."""
+    repo = _repo(tmp_path)
+    dest = tmp_path / "wt-api"
+    prepare_slice_worktree(repo, dest, "swarm/X/other")
+    with pytest.raises(SwarmError) as refused:
+        prepare_slice_worktree(repo, dest, "swarm/X/api")
+    assert refused.value.code == ErrorCode.E_CONTRACT
+
+
+def test_prepare_slice_worktree_reuses_a_worktree_on_its_own_branch(tmp_path):
+    """CONTROL (passes today): a second call for the branch the worktree already has returns the same path."""
+    repo = _repo(tmp_path)
+    dest = tmp_path / "wt-api"
+    first = prepare_slice_worktree(repo, dest, "swarm/X/api")
+    assert prepare_slice_worktree(repo, dest, "swarm/X/api") == first == dest.resolve()
+
+
+def test_prepare_slice_worktree_backs_off_linearly_on_a_lock_failure(tmp_path, monkeypatch):
+    """P5-16: each lock retry sleeps through the injected `sleep`, growing by 0.05 s per attempt (no real sleeping)."""
+    import swarm.blast_radius as blast
+
+    repo = _repo(tmp_path)
+    delays = []
+
+    def locked(repo_path, *args):
+        if args[0] == "rev-parse":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=128, stdout="", stderr="fatal: Unable to create index.lock: File exists.")
+
+    monkeypatch.setattr(blast, "_git", locked)
+    with pytest.raises(SwarmError) as failed:
+        prepare_slice_worktree(repo, tmp_path / "wt-lock", "swarm/X/lock", sleep=delays.append)
+    assert failed.value.code == ErrorCode.E_DEP
+    assert delays == pytest.approx([0.05, 0.10, 0.15, 0.20])
 
 
 def test_runner_join_merges_without_a_model(tmp_path, monkeypatch):

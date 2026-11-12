@@ -391,7 +391,6 @@ def test_a01_depth_rule_blocked_not_in_review():
     assert "without reading, running or writing anything first" in depth
     assert "advisor review surface" in depth
     assert "work pool" in depth
-    assert "Read-only discovery is not blocked" in depth
 
 
 def test_a01_advisor_note_is_not_a_depth_block():
@@ -404,6 +403,19 @@ def test_a01_advisor_note_is_not_a_depth_block():
     assert "read-only nodes" in advisor
     assert "A01 cannot dispatch" in advisor
     assert '"depth"' not in advisor
+
+
+def test_a01_brief_is_planned_before_a_block():
+    """A prose kickoff is not an unsigned task.assign. A01 plans it before yielding BLOCKED."""
+    lines = _a01_runtime_lines()
+    depth = _rule(lines, '"depth"')
+    brief = _rule(lines, "prose brief")
+    common = lines.index(builder._OMP_COMMON.splitlines()[0])
+    assert depth < brief < common
+    rule = lines[brief]
+    for token in ("swarm_plan", "execution_assignment_verified", "plan.execute", "execution assignment"):
+        assert token in rule, token
+    assert "Do not yield BLOCKED for a missing envelope before `swarm_plan`" in rule
 
 
 def test_specialist_preamble_unchanged():

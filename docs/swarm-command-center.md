@@ -6,8 +6,9 @@ agents, one telemetry channel feeds the logs and the UI, and the omp swarm bar (
 shows every subagent's state and elapsed time and the session's token savings. Nothing here changes the Task Store state machine, the signed envelopes, the gates or the classifier: the new
 runtime state is a projection over them.
 
-Each statement below was checked against the code and, where it names a command, run in a scratch copy with a
-temporary `SWARM_DIR`. Section 13 lists the known limits, and why.
+The descriptions below follow repository code. Explicit historical command exercises used a scratch copy
+with a temporary `SWARM_DIR`; interface documentation is not evidence of runtime activation or an executed
+long quality run. Section 13 lists the known limits, and why.
 
 v2.3 grows the roster from 15 to 30 agents (A16 to A30) on the same runtime. The counts below are the 30-agent
 state; section 9.1 is the checklist for adding an agent and section 16 lists what v2.3 changed.
@@ -82,7 +83,9 @@ dependencies are open as `waiting`. `await_input` and `begin_handoff` are in the
 One channel, two sinks, both written by `swarm.telemetry.Telemetry`.
 
 **`<swarm_dir>/events.jsonl`** (schema `swarm/schemas/swarm.event.v1.json`). Records are
-`{ts, type, source, correlation_id, task_id, payload, msg_id}`; every payload passes `swarm.redact`.
+`{ts, type, source, correlation_id, task_id, payload, msg_id}`; every payload passes `swarm.redact`. Each record is appended with one
+`write(2)` on an `O_APPEND` descriptor (`swarm.paths.append_text`) and nothing is buffered across calls: an event that `emit` returned
+survives a SIGKILL of the writer, and records from several threads or processes never mix inside a line.
 
 | Type | Payload |
 |---|---|
@@ -118,6 +121,13 @@ One channel, two sinks, both written by `swarm.telemetry.Telemetry`.
   transition, so an in-session run (A01 driving `orch_status.py` through `swarm_transition`/`swarm_ingest`, no
   scheduler process) feeds the same file. A derived writer never replaces a fresh scheduler document whose pid is
   alive.
+- The derived refresh is cheap enough to run after every committed transition (record: `tests/perf/records/14.4/refresh-cost.txt`).
+  `TaskStore.transition` hands it its own connection (`refresh_live(..., conn=...)`); the task rows come without their JSON
+  columns and the transition history is folded inside SQLite (two statements); row objects are built only for the 64 listed
+  runs (the counters, the ordering and the elapsed span still cover every task); and while `live.json` is still the file this
+  process wrote last (same inode, size and mtime) the next `seq` comes from memory instead of reading the file back. Nothing
+  is debounced, no `fsync` is added or removed, and the bytes written for a given store state are unchanged
+  (`tests/test_telemetry_refresh_cost.py` compares them with a frozen copy of the earlier code).
 - A snapshot older than three heartbeats (`3 x SWARM_HEARTBEAT_S`) is stale. `scripts/swarm_live.py` then derives the
   view instead; the bar shows `live.json stale`.
 
@@ -199,6 +209,52 @@ slow task never holds back newly ready work.
   backoff) still applies. A value other than `continuous` or `rounds` exits 2 with E-INPUT before anything is claimed.
 
 `swarm_run.py --json` reports `scheduler`, `max_parallel`, `effective_parallel`, `rounds`, `counts` and `cancelled`.
+
+### 4.1 Per-invocation quality deadlines in omp
+
+The normal owner-only `swarm_gate` tool accepts optional `timeout_s` **only for `gate: "quality"`** (A08).
+It is an integer number of seconds in **1..7200 inclusive**. A supplied null, boolean, string, nonfinite
+number, fraction, zero, negative number or value above 7200 is refused with E-INPUT. Supplying the field
+to review, security or release is also refused. Validation occurs before a findings file, bridge child,
+Task Store write or verdict effect; owner-only and plan-mode refusals remain in force.
+
+For example, an appropriately authorized, leased quality task may call:
+
+```json
+{"gate":"quality","task_id":"T-example-qa","correlation_id":"c-example","timeout_s":7200}
+```
+
+This forwards `--timeout=7200` to the normal canonical `qa_gate.py` runner and supervises the **whole
+bridge request** for 7260 seconds: the requested runner seconds plus the existing 60-second cleanup
+margin. Canonical runner selection, risk-derived tiers, parsing, signing, per-target findings and current
+task/correlation/lease checks are unchanged. The outer timer is per request, not a shared or renewed
+allowance; concurrent or later calls do not inherit another invocation's deadline. On cancellation or
+outer timeout the existing bridge terminates the child's process group, escalating to SIGKILL when
+needed. A timeout/cancelled run is not a successful gate: inspect the actual Task Store and signed rows
+before retrying. In the canonical Python path, a runner's `subprocess.TimeoutExpired` currently maps to
+E-INTERNAL with no quality verdict; outer supervision and session deadline aborts report E-TIMEOUT.
+
+Omitting `timeout_s` sends no CLI override: the runner still defaults to **1800 seconds** and its outer
+supervisor to **1860 seconds**. Other gates retain their existing deadlines and behavior. This is not an
+arbitrary command/argv interface, a review API, or a global timeout configuration.
+
+**Independent limits still apply.** This field does not extend a signed task's wall budget, its lease,
+an omp session deadline, or the headless runner's `--task-timeout`/`--swarm-timeout`. A shorter enclosing
+limit can end the call first. Approval of a longer quality run, or an annotation of that approval, does
+not itself change the signed assignment or Task Store budget. Align those prerequisites through the
+normal authorized controller/budget/lease route before executing the long run; do not reset history or
+disable guards, session identity, signing or gate policies.
+
+**Activation is session-scoped and must be proved separately.** Load the intended extension source
+through the supported CLI/extension/resume path, with guards and signing active, and inspect the
+resulting session's actual tool schema for `timeout_s` before claiming it is available. `SWARM_ROOT`
+only selects the Python script root for the bridge; changing it does **not** reload the TypeScript
+extension or prove which schema is loaded. No active/global runtime or configuration change is implied.
+The canonical headless runner currently re-runs gate scripts after the agent session with its own keys
+(`scripts/swarm_run.py:run_gate_script`) and does **not** pass CLI `--timeout`; this tool option does not
+change that recording path. A long owner invocation therefore still needs legitimate scoped activation
+and alignment of the recording path and independent execution limits; this API alone is not evidence
+that a long headless run can complete or record a verdict.
 
 ## 5. Handover protocol
 
@@ -425,6 +481,10 @@ session's token savings chips on the right; row 2: one row per run, worst state 
 <activity>`, or `no subagents running` when idle. Every state has a glyph and a word. The full legend, states, colors,
 token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 
+### 9.5 Use the native claim table
+
+Only a run with hundreds of ready tasks that all declare `notes.claims` gains from it: one scheduling pass over 500 such tasks costs about 5 s of CPU in the Python claim table and about 11 ms in the native one; with few or no claims the claim check is a small part of a pass and the difference is invisible. Build the extension (`pip install .`), make sure `SWARM_PURE_PYTHON` is not `1`, and start the run with `SWARM_CLAIMS_ENGINE=rust` (for example `SWARM_CLAIMS_ENGINE=rust python3 scripts/swarm_run.py ...`). Nothing else changes: the same tasks wait for the same holders (`claim-conflict:<holder>`). A warning from the logger `swarm.claims` on stderr means the run uses the Python table instead (the message names the reason); unset the variable to go back. To see which table a process gets: `SWARM_CLAIMS_ENGINE=rust python3 -c "import swarm.claims as c; print(type(c.make_claim_table()).__name__)"` prints `NativeClaimTable`; `tests/perf/claims_engine.py` measures the cost on your host.
+
 ## 10. Configuration
 
 | Name | Default | Read by | Meaning |
@@ -439,9 +499,9 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `--swarm-timeout S` | 0 (off) | `swarm_run.py` | Cancel the whole run after S seconds, like a signal |
 | `SWARM_HEARTBEAT_S` | 10 | `telemetry.py`, `swarm_run.py`, bar | Heartbeat cadence; the bar's stale limit is three of these |
 | `SWARM_STALL_AFTER_S` | 180 | `telemetry.py` | No-activity limit for `stalled` |
-| `SWARM_CANCEL_GRACE_S` | 10 | `swarm_run.py` | Cooperative-cancel wait (see section 4 for the cap) |
+| `SWARM_CANCEL_GRACE_S` | 10 | `swarm_run.py`; `swarm/tools/shared_runtime.py` | Cooperative-cancel wait for agent sessions (see section 4 for the cap). Separate from the session-join window in gsd-state, which is fixed at 3 s and does not read this variable |
 | `SWARM_SHUTDOWN_BUDGET_S` | 15 | `swarm_run.py` | Whole-shutdown budget; set by `autonomous_run.py` from `SWARM_AUTONOMOUS_RUN_GRACE_S` |
-| `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 2 / 120 | `swarm/retry.py`, `swarm/limiter.py` | Backoff base and cap; the cap also bounds `Retry-After` |
+| `SWARM_RETRY_BASE_S` / `SWARM_RETRY_CAP_S` | 0.1 / 5 | `swarm/retry.py`; `swarm/limiter.py` | Backoff base and cap. When set, `SWARM_RETRY_CAP_S` also bounds `Retry-After` (its own default there stays 120 s) |
 | `SWARM_RATE_COOLDOWN_S` | 60 | `swarm/limiter.py` | Wait before one slot is added back after a rate limit or a failure circuit trip |
 | `SWARM_FAIL_STREAK` | 3 | `scripts/swarm_run.py` | Consecutive failures of distinct tasks (no success between) that halve the effective parallelism once; `0` disables the circuit; a malformed value is an input error |
 | `SWARM_HANDOVER_MAX_BYTES` | 16384 | `swarm/handover.py` | Size cap of one handover |
@@ -452,6 +512,7 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `SWARM_BAR_REDUCED_MOTION` | unset | bar | `1` freezes the spinner |
 | `SWARM_BAR_IDLE_POLL_MS` | 2000 | `omp/src/swarm_bar.ts` | Period of the idle `stat` watcher of `live.json`; clamped to 500..30000, a malformed value means 2000 |
 | `notes.claims` | none | `select_batch` | Task notes: file claims (section 4) |
+| `SWARM_CLAIMS_ENGINE` | `python` | `swarm/claims.py` (`make_claim_table`, called by `Scheduler`) | Opt-in, default python, no flip: `rust` decides file-claim conflicts in `swarm._native.ClaimTable` through `NativeClaimTable` (same results, held view, first conflict owner and idempotent release as the Python table). Unset, empty or `python` uses Python; any other value warns once and uses Python; `SWARM_PURE_PYTHON=1` wins (one warning); a missing or stale extension falls back when the table is built, a native error later falls back in mid-run keeping the claims held, one warning per reason per process. CPU of 50 single-claim acquires: 2.2 ms Python (11.9 ms on first sight), 0.26 ms native; of 500: 5.2 s and 10.6 ms (`tests/perf/records/14.4/claims-engine.txt`) |
 | `notes.retry_after` | none | `Scheduler._schedule` | Task notes: epoch wall time before which the task is not re-dispatched; written by the scheduler |
 
 A malformed `SWARM_CANCEL_GRACE_S`, `SWARM_SHUTDOWN_BUDGET_S` or `SWARM_FAIL_STREAK` exits 2 with E-INPUT before anything
@@ -462,7 +523,7 @@ Other variables the runtime reads, documented where they belong:
 
 | Name | Default | Read by | Meaning |
 |---|---|---|---|
-| `SWARM_DIR` | `<git toplevel>/.swarm` | `swarm/paths.py`, bar | State dir (made absolute); every file named in this page lives under it |
+| `SWARM_DIR` | `<git toplevel>/.swarm` | `swarm/paths.py`, bar | State dir (made absolute); every file named in this page lives under it. `swarm_dir()` reads the environment per call and remembers one resolution per input (`SWARM_DIR`, the `root` argument, and the cwd where one of them is relative or absent), so a changed value resolves again |
 | `SWARM_ROOT` | the package's repo | `omp/src/bridge.ts` | Repo whose `scripts/` the omp bridge runs; must hold `scripts/orch_plan.py` |
 | `SWARM_DISPATCH_HOLD_MS` | 30 min with a UI, none headless | `omp/src/commands.ts` | How long `/swarm` holds the session; a positive integer |
 | `SWARM_LEASE_TTL_S` / `SWARM_REPLICA` | 900 (30..86400) / `r0` | `swarm/substrate_lease.py`, `swarm/substrate_tee.py` | Substrate lease TTL and replica name; a malformed value is refused when `swarm_run.py` starts |
@@ -700,3 +761,7 @@ The new agents' L4 ceilings (a human decides) are: A16 `commitment_or_exit_plan`
 **Footer:** the footer status text `swarm: <counts>` (`setStatus`) is removed. The bar above the editor is the one place the counts appear; `SWARM_BAR=off` disables it ([swarm-bar.md](swarm-bar.md)).
 
 **Scanners and test isolation:** the A16–A30 scanners fail closed on in-scope input (section 12). `tests/conftest.py` points each test's GSD and Claude state mirrors away from the checkout with `SWARM_GSD_STATE_FILE` (empty) and `SWARM_CLAUDE_STATE_DIR` (section 10).
+
+## 17. Changelog v2.4 (unreleased)
+
+- The native write-route refusal suite no longer treats `IN_REVIEW → APPROVED` as unsupported. Approval remains covered by the signed-verdict and keyless-refusal cases. A credential-free CLI smoke confirms keyless approval returns `E-POLICY`, unsupported state syntax returns `E-DEP`, and neither changes the task database or writes effects.

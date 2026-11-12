@@ -1,0 +1,26 @@
+date_utc: 2026-10-28T23:23:04Z
+binary: /root/.cache/gsd-redact-work/target-rel/release/gsd_engine
+binary_sha256: 10238b571383886703ebf8b874eca697227dde9d7f7dd67530e638c41866db9f
+binary_bytes: 18459528
+git_head: 53df964e70fd8f3b6f82eae2281b0df635f885b2
+git_dirty_paths: 33
+binary_built_from: 64f5759 (feat(scheduler) SWARM_TEST_ENGINE rig), a clean `git worktree` of that commit with its own target directory: `cargo build -p gsd-adapter --bin gsd_engine --release --locked`, 65m16s on this loaded host. git_head above is the working tree the legs ran from (later commits plus uncommitted files); the binary does not contain them.
+status: INTERIM. Taken before the guest-affecting gsd-route commits (decision D-P25) and before the flip build; the evidence for the flip is the same script on the flip build (the four legs plus WAL).
+guest_digest: ffa7b28a7879da7ea99a20c83999d0b79e757bd084878909dcce0054fe66cade
+python: Python 3.12.3
+host: Linux 6.8.0-147-generic x86_64; 8 CPUs
+python load_start: 50.49 57.15 53.69
+python load_end: 49.23 56.06 53.44
+rust-host load_start: 49.23 56.06 53.44
+rust-host load_end: 30.42 49.69 51.43
+rust-sandbox load_start: 30.42 49.69 51.43
+rust-sandbox load_end: 25.27 44.23 49.42
+python-wal load_start: 25.27 44.23 49.42
+python-wal load_end: 39.11 45.58 49.69
+rust-host-wal load_start: 39.11 45.58 49.69
+rust-host-wal load_end: 53.27 48.42 50.42
+python: 11/11 cases pass
+rust-host: 11/11 cases pass
+rust-sandbox: 11/11 cases pass
+python-wal: 11/11 cases pass
+rust-host-wal: 11/11 cases pass

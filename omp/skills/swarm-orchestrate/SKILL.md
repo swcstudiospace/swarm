@@ -9,15 +9,17 @@ disable-model-invocation: false
 ## When to Use
 - You are a01-orchestrator and a wave is ready, or the user explicitly asked for the full SDLC through the swarm.
 - You were given a plan whose tasks carry `agent` fields.
+- You were given a project brief and no correlation yet: call `swarm_plan` first (step 0). A missing signed envelope is not a reason to stop before that call.
 
 Never use from a specialist session.
 
 ## Prerequisites
 - Tools: swarm_plan, swarm_status, swarm_transition, swarm_assignment, swarm_ingest, task (plus read tools). You do **not** have `swarm_gate`: the gate agents (a08-qa, a09-reviewer, a10-security, a12-release) run it themselves.
-- A correlation from swarm_plan or /swarm.
+- A correlation from swarm_plan or /swarm. Create it in step 0 when the assignment text is a brief.
 
 ## Procedure
 
+0. No correlation yet, and the assignment text is not a signed `swarm.v1.task.assign` envelope aimed at A01 with capability `plan.execute`: call `swarm_plan` with that text as the brief (pattern and risk from the text, otherwise `feature` / `medium`). Continue only when the result is a persisted plan. If `execution_assignment_verified` is not true, yield BLOCKED with needs `execution assignment` and spawn nothing. Do not yield BLOCKED for a missing envelope before this call.
 1. `swarm_status` for the correlation → the ready tasks, each with its `agent` and gate notes (`gate`, `gate_for`).
 2. Lease every task of the ready wave with `swarm_transition`: PLANNED → CLAIMED, then CLAIMED → IN_PROGRESS. Lease gate tasks before their gate agent runs: `swarm_gate` refuses a gate task that is not IN_PROGRESS.
    Obtain each leased task's canonical prompt with `swarm_assignment({task_id, correlation_id})`; require `assignment_verified: true`. Do not construct signatures or use generic code-execution devices.

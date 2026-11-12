@@ -3,9 +3,12 @@ A->B round trip, bounded bundles, artifact and definition-of-done checks, Task S
 read/write tier boundary. The tools come from the merged registry (agents.json)."""
 import hashlib
 import importlib
+import importlib.util
 import json
+import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -392,6 +395,15 @@ def test_dod_check_never_guesses_met(env):
     assert ref["results"][0]["status"] == "met"
     refused = env.call("shared_dod_check", "A08", {"result": {}})
     assert refused["state"] == "INVALID_INPUT" and refused["field"] == "criteria"
+
+
+def test_dod_check_does_not_mark_a_contradicted_criterion_met(env):
+    """'remains unfixed' contradicts 'No critical vulnerabilities remain'. _NEGATIVE lacks remains/unfixed/still/open,
+    so the summary line counts as affirmative evidence and the criterion is marked met."""
+    out = env.call("shared_dod_check", "A08", {"criteria": ["No critical vulnerabilities remain"], "result": {
+        "summary_md": "Critical vulnerability found in parser; remains unfixed."}})
+    assert out["results"][0]["status"] == "unknown"
+    assert out["all_met"] is False
 
 
 def test_dod_check_takes_the_tasks_acceptance_criteria(env):
@@ -1229,6 +1241,19 @@ def test_one_unreadable_file_does_not_abort_the_check(env, monkeypatch):
     assert result["failed"] == 2 and result["ok"] is False
 
 
+def test_artifact_check_reports_a_nul_uri_as_unchecked_and_keeps_other_outputs(env):
+    """SW-03: Path.resolve() raises ValueError on a NUL byte inside _local_path, which no guard catches. One bad uri failed
+    the whole check and the good output beside it was lost."""
+    (env.root / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    digest = "sha256:" + hashlib.sha256(b"print(1)\n").hexdigest()
+    outputs = [{"kind": "file", "uri": "out\x00.txt", "producer": "A05"},
+               {"kind": "file", "uri": "ok.py", "digest": digest, "producer": "A05"}]
+    result = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "agent": "A05", "outputs": outputs})
+    assert result["state"] == "SUCCESS", result
+    bad, good = result["results"]
+    assert bad["status"] == "unchecked" and good["status"] == "ok"
+
+
 def test_validate_sizes_a_draft_with_the_id_the_write_will_use(env, monkeypatch):
     """RV-I P3-2: the pre-check used `pending.999999`, so a document near the cap of a long task id was declared fine and
     then summarized by the write (which sizes with `<task_id>.999999`)."""
@@ -1266,3 +1291,58 @@ def test_bundle_says_when_it_dropped_artifacts(env):
         store.add_artifact("T-be", kind="file", uri=f"src/part{i:02d}.py", digest="sha256:" + f"{i:02x}" * 32, producer="A05")
     bundle = env.call("shared_handover_bundle", "A05", {"task_id": "T-be"})
     assert len(bundle["artifacts"]) == 25 and bundle["truncated"] is True
+
+
+# --- PY-09: the assignment's handover section must not hide faults (P3-03, P3-20) -----------------------------------------
+@pytest.fixture()
+def swarm_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    spec = importlib.util.spec_from_file_location("swarm_run_handover_under_test", ROOT / "scripts" / "swarm_run.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_handover_section_reraises_inner_import_error(swarm_run, monkeypatch, tmp_path):
+    real = importlib.import_module
+
+    def inner_dependency_missing(name, package=None):
+        if name == "swarm.handover":  # the module is there, but one of its own imports is not
+            raise ModuleNotFoundError("No module named 'swarm.missing_dep'", name="swarm.missing_dep")
+        return real(name, package)
+
+    monkeypatch.setattr(swarm_run.importlib, "import_module", inner_dependency_missing)
+    task = {"agent_id": "A08", "correlation_id": "c1", "depends_on": ["T-up"]}
+    with pytest.raises(ModuleNotFoundError) as raised:
+        swarm_run.handover_section(task, tmp_path)
+    assert raised.value.name == "swarm.missing_dep"
+
+
+def test_handover_section_is_empty_when_the_module_is_absent(swarm_run, monkeypatch, tmp_path):
+    real = importlib.import_module
+
+    def absent(name, package=None):
+        if name == "swarm.handover":
+            raise ModuleNotFoundError("No module named 'swarm.handover'", name="swarm.handover")
+        return real(name, package)
+
+    monkeypatch.setattr(swarm_run.importlib, "import_module", absent)
+    assert swarm_run.handover_section({"agent_id": "A08", "correlation_id": "c1", "depends_on": ["T-up"]}, tmp_path) == ""
+
+
+def test_handover_section_logs_the_dependency_it_skips(swarm_run, monkeypatch, caplog, tmp_path):
+    real = importlib.import_module
+
+    def inspect(dep, *, root=None, to_agent=None, correlation_id=None):
+        if dep == "T-bad":
+            raise ValueError("handover document is not valid JSON")
+        return {"status": "ok"}, {"goal": "ship the export", "from_agent": "A05", "to_agent": "A08"}
+
+    fake = SimpleNamespace(inspect_handover=inspect)
+    monkeypatch.setattr(swarm_run.importlib, "import_module", lambda name, package=None: fake if name == "swarm.handover" else real(name, package))
+    task = {"agent_id": "A08", "correlation_id": "c1", "depends_on": ["T-bad", "T-good"]}
+    with caplog.at_level(logging.DEBUG, logger="swarm.run"):
+        section = swarm_run.handover_section(task, tmp_path)
+    assert "ship the export" in section  # the good dependency still reaches the assignment
+    skipped = [r for r in caplog.records if r.name == "swarm.run" and r.levelno == logging.DEBUG]
+    assert len(skipped) == 1 and "T-bad" in skipped[0].getMessage()

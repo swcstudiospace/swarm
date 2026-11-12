@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from swarm.tools.support import respond, script, target_root
 
 
-def ci_kind(payload: dict) -> dict:
-    def work() -> dict:
+def ci_kind(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         kind = script("devops_ci_check").classify(Path(payload["rel"]))
         if kind is None:
             return {"state": "INVALID_INPUT", "field": "rel", "message": "path is not a CI or IaC manifest"}
@@ -16,8 +17,8 @@ def ci_kind(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def build_systems(payload: dict) -> dict:
-    def work() -> dict:
+def build_systems(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         if payload["scan"] is not True:
             return {"state": "INVALID_INPUT", "field": "scan", "message": "scan must be true"}
         found = script("devops_build_record").detect_build_systems(target_root())
@@ -26,8 +27,8 @@ def build_systems(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def canary_steps(payload: dict) -> dict:
-    def work() -> dict:
+def canary_steps(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         plan = script("rel_plan").build_plan(payload["release_id"], payload["risk"], [], ["quality"], [])
         return {
             "state": "SUCCESS",
@@ -38,8 +39,8 @@ def canary_steps(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def error_burn(payload: dict) -> dict:
-    def work() -> dict:
+def error_burn(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         if payload["objective"] >= 1 or payload["objective"] < 0:
             return {"state": "INVALID_INPUT", "field": "objective", "message": "objective must be in [0, 1)"}
         slo = script("obs_slo")
@@ -55,15 +56,15 @@ def error_burn(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def spec_pin(payload: dict) -> dict:
-    def work() -> dict:
+def spec_pin(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         return {"state": "SUCCESS", "pin": script("maint_deps")._pin_state(payload["spec"])}
 
     return respond(payload, work)
 
 
-def heading_order(payload: dict) -> dict:
-    def work() -> dict:
+def heading_order(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         docs = script("docs_bundle")
         body = docs.strip_code(payload["markdown"])
         previous = 0

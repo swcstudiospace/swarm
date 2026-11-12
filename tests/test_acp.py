@@ -199,8 +199,19 @@ def test_busy_handler_is_not_retried(monkeypatch):
     assert result["retryable"] is True
 
 
-def test_independent_calls_wait_and_do_not_open_the_circuit():
+def test_independent_calls_wait_and_do_not_open_the_circuit(monkeypatch):
     import threading
+    real = Bus.request.__globals__["invoke_bounded"]
+
+    def slowed_failure(fn, arg, timeout):
+        try:
+            return real(fn, arg, timeout)
+        except Exception:
+            if arg["correlation_id"] == "first":
+                time.sleep(1.5)  # the failed first call answers only after 1.5 s, past the 1 s poll below
+            raise
+
+    monkeypatch.setitem(Bus.request.__globals__, "invoke_bounded", slowed_failure)
 
     entered = threading.Event()
     release = threading.Event()
@@ -216,9 +227,12 @@ def test_independent_calls_wait_and_do_not_open_the_circuit():
     bus = Bus(sleep=lambda _seconds: None, max_attempts=1, breaker_threshold=3)
     bus.register("A03", handler)
     results = {}
+    first_answered = threading.Event()
 
     def run(correlation_id, timeout):
         results[correlation_id] = bus.request({**HAPPY, "correlation_id": correlation_id, "timeout_hint_s": timeout})
+        if correlation_id == "first":
+            first_answered.set()
 
     first = threading.Thread(target=run, args=("first", 0.05))
     first.start()
@@ -227,9 +241,7 @@ def test_independent_calls_wait_and_do_not_open_the_circuit():
     third = threading.Thread(target=run, args=("third", 2))
     second.start()
     third.start()
-    deadline = time.monotonic() + 1
-    while "first" not in results and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert first_answered.wait(10), "the first call never answered"
     assert results["first"]["state"] == "DEAD_LETTERED"
     assert "second" not in seen
     assert "third" not in seen

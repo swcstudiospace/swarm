@@ -1275,6 +1275,7 @@ def test_oracle_node_pool_capacity_matches_exact_rational_arithmetic():
     from fractions import Fraction
     import random
     rng = random.Random(11)
+    executed = 0
     for _ in range(400):
         nodes, cpu, mem = rng.randint(0, 12), rng.choice([500, 1000, 2000, 3999]), rng.choice([1024, 4096, 7000])
         ds_c, ds_m, fail, pct = rng.choice([0, 100, 250]), rng.choice([0, 128, 512]), rng.randint(0, 3), rng.choice([1, 50, 70, 85, 99, 100])
@@ -1283,6 +1284,7 @@ def test_oracle_node_pool_capacity_matches_exact_rational_arithmetic():
         pool_doc = {"name": "p", "nodes": nodes, "allocatable_cpu_m": cpu, "allocatable_memory_mib": mem, "daemonset_cpu_m": ds_c, "daemonset_memory_mib": ds_m}
         if cpu - ds_c <= 0 or mem - ds_m <= 0:
             continue
+        executed += 1
         row = _handlers()._nodepool_capacity({"pools": [pool_doc], "workloads": loads, "tolerated_node_failures": fail, "max_utilization_pct": pct})["pools"][0]
         rc, rm = (sum(w["replicas"] * w[k] for w in loads) for k in ("cpu_request_m", "memory_request_mib"))
         uc, um, survivors = cpu - ds_c, mem - ds_m, max(0, nodes - fail)
@@ -1299,6 +1301,7 @@ def test_oracle_node_pool_capacity_matches_exact_rational_arithmetic():
         while not (rc <= Fraction(pct, 100) * needed * uc and rm <= Fraction(pct, 100) * needed * um):
             needed += 1
         assert (row["status"], row["recommended_nodes"]) == (status, needed + fail if rc or rm else 0), (pool_doc, loads, fail, pct)
+    assert executed >= 100, f"{executed} of 400 capacity cases ran"
 
 
 def test_oracle_pdb_budget_matches_the_disruption_controller_rounding():
@@ -1360,6 +1363,7 @@ def test_oracle_upgrade_plan_never_breaks_the_kubelet_skew_between_steps():
     import random
     import re
     rng = random.Random(5)
+    executed = 0
 
     def limit(minor):
         return 2 if minor < 25 else 3
@@ -1373,6 +1377,7 @@ def test_oracle_upgrade_plan_never_breaks_the_kubelet_skew_between_steps():
         control, version = cur, {p["name"]: int(p["version"].split(".")[1]) for p in pools}
         if not all(0 <= control - v <= limit(v) for v in version.values()):
             continue
+        executed += 1
         for step in steps:
             minor = int(step["target_version"].split(".")[1])
             if step["phase"] == "control_plane":
@@ -1383,6 +1388,7 @@ def test_oracle_upgrade_plan_never_breaks_the_kubelet_skew_between_steps():
                 version[re.search(r"upgrade pool (\S+) to", step["action"]).group(1)] = minor
             assert all(0 <= control - v <= limit(v) for v in version.values()), (cur, tgt, pools, step)
         assert control == tgt and set(version.values()) <= {tgt}, (cur, tgt, pools)
+    assert executed >= 100, f"{executed} of 500 upgrade-plan cases ran"
 
 
 def test_oracle_maintenance_window_matches_a_quarter_hour_simulation():

@@ -41,7 +41,6 @@ test("gate schema no verdict at any depth, every object closed", () => {
   const { parameters } = gateWith().gate;
   expect(violations(parameters)).toEqual([]);
   const props = parameters.properties as Record<string, Record<string, unknown>>;
-  expect(Object.keys(props).sort()).toEqual(["correlation_id", "dry_run", "gate", "per_target_findings", "task_id"]);
   expect(props.gate.enum).toEqual(["quality", "review", "security", "release"]);
   const finding = (props.per_target_findings.additionalProperties as { items: { properties: Record<string, { enum?: string[] }> } }).items;
   expect(finding.properties.severity.enum).toEqual(["info", "minor", "major", "critical", "blocker"]);

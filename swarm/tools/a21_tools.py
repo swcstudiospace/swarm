@@ -36,13 +36,17 @@ pod overhead, pod-level resources, LimitRange Pod and PersistentVolumeClaim item
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any, cast
 
 from swarm.tools.support import respond
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
 HUNDRED = Decimal(100)
+JsonObject = dict[str, Any]  # caller-supplied JSON payloads and the result dicts built from them: untyped values
+Finding = dict[str, str]
 
 # Version skew policy (https://kubernetes.io/releases/version-skew-policy/): kubelet and kube-proxy may be up to
 # three minor versions older than kube-apiserver (two for versions below 1.25).
@@ -134,24 +138,28 @@ class _Bad(Exception):
         self.field = field
 
 
-def _invalid(field: str, message: str) -> dict:
+def _respond(payload: JsonObject, work: Callable[[], JsonObject]) -> JsonObject:
+    return cast(JsonObject, respond(payload, work))  # support.respond is untyped (Any); work() always returns a JsonObject
+
+
+def _invalid(field: str, message: str) -> JsonObject:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr), so boundaries are exact."""
     return Decimal(repr(value))
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> Finding:
     return {"id": fid, "severity": severity, "summary": summary}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[Finding]) -> list[Finding]:
     return sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
 
 
-def _worst(findings: list[dict]) -> int:
+def _worst(findings: list[Finding]) -> int:
     return max((SEVERITY_RANK[f["severity"]] for f in findings), default=-1)
 
 
@@ -166,7 +174,7 @@ def _days(delta: timedelta) -> float:
     return (hundredths if micros >= 0 else -hundredths) / 100
 
 
-def _pct(numerator, denominator) -> float:
+def _pct(numerator: int, denominator: int) -> float:
     return round(float(Decimal(numerator) * HUNDRED / Decimal(denominator)), 2)
 
 
@@ -203,7 +211,7 @@ def _skew_older_limit(minor: int) -> int:
     return SKEW_OLDER_LIMIT_LEGACY if minor < SKEW_LEGACY_BELOW_MINOR else SKEW_OLDER_LIMIT
 
 
-def _unique(items: list[dict], key: str, field: str, what: str) -> None:
+def _unique(items: list[JsonObject], key: str, field: str, what: str) -> None:
     seen: set[str] = set()
     for item in items:
         if item[key] in seen:
@@ -214,10 +222,10 @@ def _unique(items: list[dict], key: str, field: str, what: str) -> None:
 # --- k8s_version_skew -----------------------------------------------------------------------------------------------
 
 
-def _version_skew(payload: dict) -> dict:
+def _version_skew(payload: JsonObject) -> JsonObject:
     api_minors = [_minor(v, "apiserver_versions") for v in payload["apiserver_versions"]]
     newest, oldest = max(api_minors), min(api_minors)
-    findings: list[dict] = []
+    findings: list[Finding] = []
     if newest - oldest > 1:
         findings.append(_finding(
             "apiserver/spread", "major",
@@ -282,7 +290,7 @@ def _version_skew(payload: dict) -> dict:
     # The hop moves every kube-apiserver one minor up; each component is checked against the same rule the policy applies at that position.
     # A kubelet/kube-proxy breach always carries a current-state finding that names it: too-old or at-skew-limit for lag, newer-than-apiserver for a minor above the oldest kube-apiserver.
     upgrade_safe = newest - oldest <= 1
-    upgrade_findings: list[dict] = []
+    upgrade_findings: list[Finding] = []
     for comp in payload["components"]:
         minor = _minor(comp["version"], "components")
         kind, name = comp["kind"], comp["name"]
@@ -314,25 +322,25 @@ def _version_skew(payload: dict) -> dict:
     }
 
 
-def version_skew(payload: dict) -> dict:
+def version_skew(payload: JsonObject) -> JsonObject:
     """Version skew policy: kubelet/kube-proxy not newer than the oldest kube-apiserver and at most 3 (2 below 1.25) minors older than the newest; controller-manager/scheduler at most 1 older; kubectl within 1 minor of every apiserver."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _version_skew(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_deprecated_api_scan ----------------------------------------------------------------------------------------
 
 
-def _deprecated_api_scan(payload: dict) -> dict:
+def _deprecated_api_scan(payload: JsonObject) -> JsonObject:
     target = _minor(payload["target_version"], "target_version")
     horizon = payload.get("horizon_minors", 1)
-    findings: list[dict] = []
+    findings: list[Finding] = []
     removed = upcoming = 0
     for resource in payload["resources"]:
         entry = REMOVED_APIS.get((resource["api_version"], resource["kind"])) or REMOVED_APIS.get((resource["api_version"], "*"))
@@ -358,16 +366,16 @@ def _deprecated_api_scan(payload: dict) -> dict:
     }
 
 
-def deprecated_api_scan(payload: dict) -> dict:
+def deprecated_api_scan(payload: JsonObject) -> JsonObject:
     """APIs removed up to and including the target minor are blockers; APIs removed within horizon_minors (default 1) after it are minor findings."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _deprecated_api_scan(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_nodepool_capacity ------------------------------------------------------------------------------------------
@@ -380,14 +388,14 @@ def _utilization(requested: int, per_node: int, nodes: int) -> float:
     return -1.0 if nodes == 0 else _pct(requested, nodes * per_node)
 
 
-def _nodepool_capacity(payload: dict) -> dict:
+def _nodepool_capacity(payload: JsonObject) -> JsonObject:
     failures = payload.get("tolerated_node_failures", 1)
     max_pct = payload.get("max_utilization_pct", 85)
     pools = payload["pools"]
     _unique(pools, "name", "pools", "pool name")
     by_name = {pool["name"]: pool for pool in pools}
     requested = {name: [0, 0] for name in by_name}
-    findings: list[dict] = []
+    findings: list[Finding] = []
     unschedulable: set[str] = set()
     for workload in payload["workloads"]:
         pool = by_name.get(workload["pool"])
@@ -402,7 +410,7 @@ def _nodepool_capacity(payload: dict) -> dict:
             findings.append(_finding(
                 f"workload/{workload['name']}/exceeds-node", "blocker",
                 f"a pod of {workload['name']} requests more than one {pool['name']} node can offer after daemonsets; it can never be scheduled"))
-    rows: list[dict] = []
+    rows: list[JsonObject] = []
     for pool in sorted(pools, key=lambda p: p["name"]):
         usable_cpu = pool["allocatable_cpu_m"] - pool.get("daemonset_cpu_m", 0)
         usable_mem = pool["allocatable_memory_mib"] - pool.get("daemonset_memory_mib", 0)
@@ -463,26 +471,26 @@ def _nodepool_capacity(payload: dict) -> dict:
     }
 
 
-def nodepool_capacity(payload: dict) -> dict:
+def nodepool_capacity(payload: JsonObject) -> JsonObject:
     """Per node pool: requests must fit on (nodes - tolerated failures) nodes; above max_utilization_pct (house default 85) after the loss the pool is tight, above 100% it is at risk. A pod that fits no node or a recommended size above max_nodes also puts the pool at risk. Aggregate requests only: no bin-packing or fragmentation model."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _nodepool_capacity(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_upgrade_plan -----------------------------------------------------------------------------------------------
 
 
-def _step(steps: list[dict], phase: str, action: str, target: str, batches: int = 0) -> None:
+def _step(steps: list[JsonObject], phase: str, action: str, target: str, batches: int = 0) -> None:
     steps.append({"order": len(steps) + 1, "phase": phase, "action": action, "target_version": target, "batches": batches})
 
 
-def _upgrade_plan(payload: dict) -> dict:
+def _upgrade_plan(payload: JsonObject) -> JsonObject:
     cur_minor, cur_patch, _ = _parse_version(payload["current_version"], "current_version")
     tgt_minor, tgt_patch, tgt_has_patch = _parse_version(payload["target_version"], "target_version")
     if tgt_minor == cur_minor and not tgt_has_patch:
@@ -495,7 +503,7 @@ def _upgrade_plan(payload: dict) -> dict:
     pools = payload["node_pools"]
     _unique(pools, "name", "node_pools", "pool name")
     state: dict[str, tuple[int, int]] = {}
-    findings: list[dict] = []
+    findings: list[Finding] = []
     for pool in pools:
         minor, patch, _ = _parse_version(pool["version"], "node_pools")
         if pool["max_surge"] + pool["max_unavailable"] == 0:
@@ -511,7 +519,7 @@ def _upgrade_plan(payload: dict) -> dict:
             findings.append(_finding(f"pool/{pool['name']}/whole-pool-unavailable", "major", f"pool {pool['name']} may take all {pool['nodes']} node(s) out at once (max_unavailable {pool['max_unavailable']})"))
     by_name = {pool["name"]: pool for pool in pools}
     batches_of = {p["name"]: _ceil_div(p["nodes"], p["max_surge"] + p["max_unavailable"]) for p in pools}
-    steps: list[dict] = []
+    steps: list[JsonObject] = []
     _step(steps, "preflight", f"snapshot etcd, scan manifests for APIs removed by {target_label}, verify add-on compatibility and PDB budgets, confirm the maintenance window", target_label)
     hops = list(range(cur_minor + 1, tgt_minor + 1))
     if not hops and tgt_patch > cur_patch:
@@ -547,16 +555,16 @@ def _upgrade_plan(payload: dict) -> dict:
     }
 
 
-def upgrade_plan(payload: dict) -> dict:
+def upgrade_plan(payload: JsonObject) -> JsonObject:
     """Ordered plan: preflight, one control-plane hop per minor (pools upgraded first when kubelet skew requires it), add-ons, node pools smallest first with surge batches, verify."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _upgrade_plan(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_drain_feasibility ------------------------------------------------------------------------------------------
@@ -565,23 +573,25 @@ def upgrade_plan(payload: dict) -> dict:
 _PDB_SELECTORS = ("min_available", "min_available_percent", "max_unavailable", "max_unavailable_percent")
 
 
-def _desired_healthy(pdb: dict) -> int:
+def _desired_healthy(pdb: JsonObject) -> int:
     """The disruption controller rounds percentages up for minAvailable and maxUnavailable alike."""
-    expected = pdb["expected_pods"]
+    expected: int = pdb["expected_pods"]
     if "min_available" in pdb:
-        return pdb["min_available"]
+        minimum: int = pdb["min_available"]
+        return minimum
     if "min_available_percent" in pdb:
         return _ceil_div(pdb["min_available_percent"] * expected, 100)
     if "max_unavailable" in pdb:
-        return max(0, expected - pdb["max_unavailable"])
+        unavailable: int = pdb["max_unavailable"]
+        return max(0, expected - unavailable)
     return max(0, expected - _ceil_div(pdb["max_unavailable_percent"] * expected, 100))
 
 
-def _drain_feasibility(payload: dict) -> dict:
+def _drain_feasibility(payload: JsonObject) -> JsonObject:
     pdbs = payload["pdbs"]
     seen: set[tuple[str, str]] = set()
-    findings: list[dict] = []
-    rows: list[dict] = []
+    findings: list[Finding] = []
+    rows: list[JsonObject] = []
     for pdb in sorted(pdbs, key=lambda p: (p["namespace"], p["name"])):
         key = (pdb["namespace"], pdb["name"])
         if key in seen:
@@ -626,22 +636,22 @@ def _drain_feasibility(payload: dict) -> dict:
     }
 
 
-def drain_feasibility(payload: dict) -> dict:
+def drain_feasibility(payload: JsonObject) -> JsonObject:
     """disruptionsAllowed = max(0, currentHealthy - desiredHealthy) with percentages rounded up; 0 allowed with pods on the drained nodes blocks the drain; a minAvailable above the expected pods is a major finding and makes the verdict blocked."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _drain_feasibility(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_etcd_health ------------------------------------------------------------------------------------------------
 
 
-def _etcd_health(payload: dict) -> dict:
+def _etcd_health(payload: JsonObject) -> JsonObject:
     size = payload["db_size_bytes"]
     quota = payload.get("quota_bytes", ETCD_DEFAULT_QUOTA_BYTES)
     in_use = payload.get("db_size_in_use_bytes")
@@ -650,7 +660,7 @@ def _etcd_health(payload: dict) -> dict:
     if quota <= 0:
         raise _Bad("quota_bytes", "quota_bytes must be greater than 0")
     _unique(payload["members"], "name", "members", "member name")
-    findings: list[dict] = []
+    findings: list[Finding] = []
     used_pct = Decimal(size) * HUNDRED / Decimal(quota)
     if used_pct > ETCD_QUOTA_BLOCKER_PCT:
         findings.append(_finding("etcd/quota-exhausted", "blocker", f"database uses {round(float(used_pct), 2)}% of its {quota}-byte quota; at 100% etcd raises NOSPACE and rejects writes: compact and defragment now"))
@@ -713,16 +723,16 @@ def _etcd_health(payload: dict) -> dict:
     }
 
 
-def etcd_health(payload: dict) -> dict:
+def etcd_health(payload: JsonObject) -> JsonObject:
     """Quota use >= 80% major (house) and > 95% blocker (etcd mixin alerts fire above 95%; exactly 95% is major); leader changes at 4 or more per 15 min, WAL fsync p99 above 500 ms or commit p99 above 250 ms major (etcd mixin); fsync above 10 ms and commit above 25 ms are minor (etcd FAQ guidance); quorum from voting members."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _etcd_health(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_autoscaler_sanity ------------------------------------------------------------------------------------------
@@ -731,12 +741,12 @@ _VPA_UPDATING = ("Recreate", "Auto", "InPlaceOrRecreate")
 _METRIC_RESOURCE = {"cpu_utilization": "cpu", "memory_utilization": "memory"}
 
 
-def _autoscaler_sanity(payload: dict) -> dict:
+def _autoscaler_sanity(payload: JsonObject) -> JsonObject:
     hpas, pools = payload["hpas"], payload.get("pools", [])
     _unique(hpas, "name", "hpas", "HPA name")
     _unique(pools, "name", "pools", "pool name")
     by_pool = {pool["name"]: pool for pool in pools}
-    findings: list[dict] = []
+    findings: list[Finding] = []
     demand: dict[str, list[int]] = {name: [0, 0] for name in by_pool}
     for hpa in sorted(hpas, key=lambda h: h["name"]):
         name = hpa["name"]
@@ -792,29 +802,29 @@ def _autoscaler_sanity(payload: dict) -> dict:
     }
 
 
-def autoscaler_sanity(payload: dict) -> dict:
+def autoscaler_sanity(payload: JsonObject) -> JsonObject:
     """HPA bounds and metrics versus requests and VPA, node pool min/max versus current size and the HPA demand ceiling."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _autoscaler_sanity(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_cert_expiry ------------------------------------------------------------------------------------------------
 
 
-def _cert_expiry(payload: dict) -> dict:
+def _cert_expiry(payload: JsonObject) -> JsonObject:
     now = _timestamp(payload["now"], "now")
     _unique(payload["certs"], "name", "certs", "certificate name")
     if not payload["certs"]:
         raise _Bad("certs", "at least one certificate is required")
-    rows: list[tuple[datetime, dict]] = []
+    rows: list[tuple[datetime, JsonObject]] = []
     counts = {"expired": 0, "critical": 0, "warning": 0, "notice": 0, "ok": 0}
-    findings: list[dict] = []
+    findings: list[Finding] = []
     not_yet_valid = 0
     for cert in payload["certs"]:
         not_after = _timestamp(cert["not_after"], "certs")
@@ -866,16 +876,16 @@ def _cert_expiry(payload: dict) -> dict:
     }
 
 
-def cert_expiry(payload: dict) -> dict:
+def cert_expiry(payload: JsonObject) -> JsonObject:
     """Leaf certs (house buckets): expired after not_after (inclusive), critical < 7 d, warning < 30 d, notice < 90 d; CA certs 30/180/365 d; a not-yet-valid certificate makes the verdict critical."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _cert_expiry(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_quota_fit --------------------------------------------------------------------------------------------------
@@ -883,10 +893,10 @@ def cert_expiry(payload: dict) -> dict:
 _RESOURCES = (("cpu", "cpu_m", "cpu_request_m", "cpu_limit_m"), ("memory", "memory_mib", "memory_request_mib", "memory_limit_mib"))
 
 
-def _quota_fit(payload: dict) -> dict:
+def _quota_fit(payload: JsonObject) -> JsonObject:
     replicas = payload["replicas"]
     hard, used, rng = payload.get("quota_hard", {}), payload.get("quota_used", {}), payload.get("limit_range", {})
-    findings: list[dict] = []
+    findings: list[Finding] = []
     per_replica = {"requests_cpu_m": 0, "requests_memory_mib": 0, "limits_cpu_m": 0, "limits_memory_mib": 0}
     for container in payload["containers"]:
         cname = container["name"]
@@ -957,22 +967,22 @@ def _quota_fit(payload: dict) -> dict:
     }
 
 
-def quota_fit(payload: dict) -> dict:
+def quota_fit(payload: JsonObject) -> JsonObject:
     """Apply API request-from-limit defaulting, LimitRange API defaulting (default limit from max, default request from default limit or min) and Container min/max/ratio, then the namespace ResourceQuota (a replica set that exactly fills the quota fits). Init containers and pod overhead are not modelled."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _quota_fit(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_addon_compatibility ----------------------------------------------------------------------------------------
 
 
-def _addon_compatibility(payload: dict) -> dict:
+def _addon_compatibility(payload: JsonObject) -> JsonObject:
     cur, tgt = _minor(payload["current_version"], "current_version"), _minor(payload["target_version"], "target_version")
     if tgt < cur:
         raise _Bad("target_version", "target_version is older than current_version")
@@ -980,8 +990,8 @@ def _addon_compatibility(payload: dict) -> dict:
         raise _Bad("target_version", f"more than {UPGRADE_PATH_MINORS} minor versions ahead of current_version")
     _unique(payload["addons"], "name", "addons", "add-on name")
     path = list(range(cur, tgt + 1))
-    rows: list[dict] = []
-    findings: list[dict] = []
+    rows: list[JsonObject] = []
+    findings: list[Finding] = []
     for addon in sorted(payload["addons"], key=lambda a: a["name"]):
         name = addon["name"]
         lo, hi = _minor(addon["min_k8s"], "addons"), _minor(addon["max_k8s"], "addons")
@@ -1044,16 +1054,16 @@ def _addon_compatibility(payload: dict) -> dict:
     }
 
 
-def addon_compatibility(payload: dict) -> dict:
+def addon_compatibility(payload: JsonObject) -> JsonObject:
     """An add-on must support every minor on the upgrade path; otherwise find the earliest control-plane minor supported by both the installed and candidate versions at which it can be swapped for a candidate version covering the rest."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _addon_compatibility(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_fleet_drift ------------------------------------------------------------------------------------------------
@@ -1061,7 +1071,7 @@ def addon_compatibility(payload: dict) -> dict:
 _ENV_RANK = {"dev": 0, "test": 1, "staging": 2, "prod": 3}
 
 
-def _fleet_drift(payload: dict) -> dict:
+def _fleet_drift(payload: JsonObject) -> JsonObject:
     latest = _minor(payload["latest_version"], "latest_version")
     allowed_lag = payload.get("max_minor_lag", 1)
     clusters = payload["clusters"]
@@ -1070,8 +1080,8 @@ def _fleet_drift(payload: dict) -> dict:
         if cluster["environment"] not in _ENV_RANK:
             raise _Bad("clusters", f"cluster {cluster['name']!r}: environment must be one of {', '.join(_ENV_RANK)}")
     parsed = [(c, _minor(c["version"], "clusters")) for c in sorted(clusters, key=lambda c: c["name"])]
-    findings: list[dict] = []
-    rows: list[dict] = []
+    findings: list[Finding] = []
+    rows: list[JsonObject] = []
     for cluster, minor in parsed:
         lag = latest - minor
         name = cluster["name"]
@@ -1111,16 +1121,16 @@ def _fleet_drift(payload: dict) -> dict:
     }
 
 
-def fleet_drift(payload: dict) -> dict:
+def fleet_drift(payload: JsonObject) -> JsonObject:
     """Minor lag behind latest_version: > max_minor_lag (default 1) is out of policy, >= 3 is also outside upstream patch support; higher environments must not lead lower ones."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _fleet_drift(payload)
         except _Bad as bad:
             return _invalid(bad.field, str(bad))
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- k8s_maintenance_window -----------------------------------------------------------------------------------------
@@ -1133,7 +1143,7 @@ def _clock_minutes(value: str, field: str) -> int:
     return int(match.group(1)) * 60 + int(match.group(2))
 
 
-def _occurrences(window: dict, around: datetime, days: int):
+def _occurrences(window: JsonObject, around: datetime, days: int) -> Iterator[tuple[str, datetime, datetime]]:
     """Window occurrences whose start is within [-1, days] local days of `around`, as (name, start, end)."""
     zone = timezone(timedelta(minutes=window["utc_offset_minutes"]))
     start_min = _clock_minutes(window["start"], "windows")
@@ -1146,7 +1156,7 @@ def _occurrences(window: dict, around: datetime, days: int):
             yield window["name"], begin, begin + timedelta(minutes=length)
 
 
-def _maintenance_window(payload: dict) -> dict:
+def _maintenance_window(payload: JsonObject) -> JsonObject:
     start = _timestamp(payload["proposed_start"], "proposed_start")
     if payload["duration_minutes"] < 1:
         raise _Bad("duration_minutes", "duration_minutes must be at least 1")
@@ -1181,7 +1191,7 @@ def _maintenance_window(payload: dict) -> dict:
                         earliest = candidate
                     break
                 candidate = max(b[2] for b in hit)
-    findings: list[dict] = []
+    findings: list[Finding] = []
     if containing and not conflicting:
         verdict = "allowed"
     elif containing:
@@ -1205,10 +1215,10 @@ def _maintenance_window(payload: dict) -> dict:
     }
 
 
-def maintenance_window(payload: dict) -> dict:
+def maintenance_window(payload: JsonObject) -> JsonObject:
     """The whole [start, start + duration) interval must lie inside one occurrence of a weekly window and must not overlap any blackout (touching is allowed); the next compliant start within 14 days is reported."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         try:
             return _maintenance_window(payload)
         except _Bad as bad:
@@ -1216,4 +1226,4 @@ def maintenance_window(payload: dict) -> dict:
         except OverflowError:  # a date near year 1 or 9999 cannot take the duration, the search horizon or a local-date shift
             return _invalid("proposed_start", "too close to the limits of the supported date range")
 
-    return respond(payload, work)
+    return _respond(payload, work)

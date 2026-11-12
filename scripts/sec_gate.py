@@ -11,10 +11,12 @@ Finding ids are stable hashes so --allow-list can suppress them with a justifica
 Writes a signed `gate.verdict` (gate=security) to .swarm/verdicts/<task_id>.security.json.
 """
 from __future__ import annotations
+import codecs
 from collections import Counter
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -49,6 +51,8 @@ IAC_RULES = [(n, re.compile(p), sev) for n, p, sev in (
     ("iac.host-network", r"host(Network|PID|IPC)\s*[:=]\s*true", "major"),
     ("iac.priv-escalation", r"allowPrivilegeEscalation\s*:\s*true|runAsUser\s*:\s*0\b", "minor"))]
 COMMENT_RE = re.compile(r"^\s*(#|//|/\*|\*|--)")
+MAX_SCAN_BYTES = 2_000_000  # an in-scope text file strictly larger than this is not read; it is scan-incomplete
+PREFIX_BYTES = 8192  # bytes read from a file's head to decide it binary before the size check
 AUDITS = [  # (name, manifest globs, binary, command)
     ("pip-audit", ("requirements*.txt", "pyproject.toml"), "pip-audit", ["pip-audit", "--format", "json", "--progress-spinner", "off"]),
     ("npm-audit", ("package-lock.json", "package.json"), "npm", ["npm", "audit", "--json"]),
@@ -64,6 +68,21 @@ def fid(*parts: str) -> str:
     return "SEC-" + hashlib.sha1("|".join(parts).encode()).hexdigest()[:8]
 
 
+def _binary_prefix(path: Path) -> bool:
+    """True when the first PREFIX_BYTES of a file are not UTF-8 with an error that is not an incomplete sequence at the
+    prefix end, which the prefix may have cut. A prefix that cannot be read proves nothing, so the file is not binary."""
+    try:
+        with path.open("rb") as fh:
+            prefix = fh.read(PREFIX_BYTES)
+    except OSError:
+        return False
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
 def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
     findings, seen = [], {"secrets": 0, "sast": 0, "iac": 0}
 
@@ -73,24 +92,38 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
                                      location=loc, ac_ref=cwe, owner_suggestion="A05"))
 
     for p in iter_files(root):
-        if p.resolve() == self_path or p.stat().st_size > 2_000_000:
+        if p.resolve() == self_path:
+            continue
+        if _binary_prefix(p):
+            continue
+        rel, ext = p.relative_to(root).as_posix(), p.suffix
+        size = p.stat().st_size
+        if size > MAX_SCAN_BYTES:
+            # An in-scope text file over the cap is not read: it is one major scan-incomplete finding (AGENTS.md doctrine).
+            findings.append(make_finding(fid("secrets", "scan-incomplete", rel), "major", "secrets",
+                                         f"scan-incomplete: scan incomplete, status is fail until every in-scope input is analysed: {rel} is {size} bytes, over the {MAX_SCAN_BYTES}-byte scan cap",
+                                         evidence=f"{size} bytes exceeds the {MAX_SCAN_BYTES}-byte scan cap; not analysed",
+                                         location=rel))
             continue
         try:
             text = p.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        rel, ext = p.relative_to(root).as_posix(), p.suffix
         for no, line in enumerate(text.splitlines(), 1):
             loc = f"{rel}:{no}"
             for name, rx in SECRET_RULES:
                 m = rx.search(line)
-                if not m or PLACEHOLDER_RE.search(line):
+                if not m:
                     continue
                 val = m.group(m.lastindex) if name in ("generic-credential", "aws-secret-key") else m.group(0)
+                # The placeholder test runs on the captured value. A placeholder word elsewhere on the line, such as a
+                # comment that says `example`, does not make a real token a placeholder.
+                if PLACEHOLDER_RE.search(val):
+                    continue
                 if name == "generic-credential" and (_entropy(val) < 3.2 or val.isalpha()):
                     continue
                 add(name, "critical", "secrets", "credential material committed (value redacted)", loc,
-                    evidence=val[:4] + "…" + f" ({len(val)} chars)", cwe="CWE-798")
+                    evidence=f"value not recorded ({len(val)} chars)", cwe="CWE-798")
             if ext in CODE_EXTS and not COMMENT_RE.match(line):
                 for name, rx, exts, sev in SAST_RULES:
                     if ext in exts and rx.search(line):
@@ -106,6 +139,14 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
     return findings, seen
 
 
+def _audit_env() -> dict[str, str]:
+    # The audit child gets what the audit tools need: the names `_binary_env` grants a child, XDG_CONFIG_HOME and the locale
+    # variables. Every SWARM_* variable, signing material included, is left out.
+    from swarm.engine_select import BINARY_ENV_NAMES
+    return {key: value for key, value in os.environ.items()
+            if key in BINARY_ENV_NAMES or key == "XDG_CONFIG_HOME" or key.startswith("LC_")}
+
+
 def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
     findings, runs = [], {}
     for name, globs, binary, cmd in AUDITS:
@@ -115,7 +156,7 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
             runs[name] = "skipped:tool-missing"
             continue
         try:
-            proc = sh(cmd, cwd=root, timeout=timeout)
+            proc = sh(cmd, cwd=root, timeout=timeout, env=_audit_env())
         except Exception as e:  # noqa: BLE001 - timeout etc. ⇒ fail-closed advisory
             runs[name] = "fail"
             findings.append(make_finding(fid("deps", name, "run"), "major", "deps", f"{name} did not complete: {e}"))
@@ -137,7 +178,9 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
             crit = data.get("vulnerabilities", {}).get("count", 0)
         elif name == "govulncheck":
             high = sum(1 for ln in out.splitlines() if '"finding"' in ln and '"trace"' in ln)
-        elif proc.returncode != 0:
+        if proc.returncode != 0 and not (crit or high or other):
+            # P4-01/P4-02: a non-zero exit that counts no vulnerability did not complete the audit (npm's {"error": ...}
+            # JSON, a govulncheck load failure with no finding lines): fail closed, as an unparseable run does.
             high = 1
         runs[name] = "pass" if not (crit or high or other) else "fail"
         if kev or crit:
@@ -153,19 +196,27 @@ def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
 def apply_allow_list(findings: list[dict], path: str | None) -> tuple[list[dict], list[dict]]:
     if not path:
         return findings, []
-    raw = json.loads(Path(path).read_text())
-    entries = raw.get("allow", raw) if isinstance(raw, dict) else raw
-    allow = {}
-    for e in entries:
-        e = {"id": e} if isinstance(e, str) else e
-        if not e.get("justification"):
-            raise SwarmError(ErrorCode.E_POLICY, f"allow-list entry {e.get('id')} lacks a justification")
-        if e.get("expires") and time.strptime(e["expires"], "%Y-%m-%d") < time.gmtime():
-            continue
-        allow[e["id"]] = e["justification"]
+    allow, expired = {}, []
+    try:
+        raw = json.loads(Path(path).read_text())
+        entries = raw.get("allow", raw) if isinstance(raw, dict) else raw
+        for e in entries:
+            e = {"id": e} if isinstance(e, str) else e
+            if not e.get("justification"):
+                raise SwarmError(ErrorCode.E_POLICY, f"allow-list entry {e.get('id')} lacks a justification")
+            if e.get("expires") and time.strptime(e["expires"], "%Y-%m-%d") < time.gmtime():
+                expired.append((e["id"], e["expires"]))
+                continue
+            allow[e["id"]] = e["justification"]
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise SwarmError(ErrorCode.E_INPUT, f"allow-list {path} is malformed ({type(exc).__name__})") from exc
     kept, suppressed = [], []
     for f in findings:
         (suppressed if f["id"] in allow else kept).append({**f, "justification": allow[f["id"]]} if f["id"] in allow else f)
+    # P4-26: an expired suppression no longer applies; the info finding names the entry that lapsed
+    kept += [make_finding(fid("allow-list", "expired", str(entry_id)), "info", "allow-list",
+                          f"allow-list entry {entry_id} expired on {expires}; its suppression no longer applies")
+             for entry_id, expires in expired]
     return kept, suppressed
 
 
@@ -213,5 +264,38 @@ def add_args(p):
                         "gets the scan's findings plus only its own (targets it omits get the script's findings only)")
 
 
+# Engine selector (swarm/engine_select.py). The default row stays Python. `GSD_ENGINE=rust` serves the grammar `gates::sec_gate`
+# accepts (`--json`, not `--dry-run`) and leaves every other argv to this body. `ENGINE_ROUTES` is the seam a route registers in.
+# The route writes (the binary records the security gate's verdict in issue_gate's transaction), so it is a write route: Python
+# answers only a binary reply that says nothing was written. A route that commits a verdict reports a committed outcome
+# as final, so Python is not re-run.
+def _binary_env(route: str) -> dict[str, str]:
+    from swarm.engine_select import BINARY_ENV_NAMES
+    names = set(BINARY_ENV_NAMES) | {"XDG_CONFIG_HOME", "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                                     "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENT_SESSION"}
+    if route != "sec-gate":
+        raise KeyError(route)
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def _claims_sec(argv: list[str]) -> bool:
+    return "--json" in argv and "--dry-run" not in argv and "--help" not in argv and "-h" not in argv
+
+
+def _sec_commit(call, before, effects_path, reply, stdout):
+    # The binary has committed the verdict and its reply is final; the gate routes write no effects manifest to replay.
+    return reply, stdout
+
+
+ENGINE_ROUTES: tuple = ()
+
+
 if __name__ == "__main__":
-    sys.exit(AgentScript("A10", "sec_gate", run, description=__doc__, add_args=add_args).main())
+    script = AgentScript("A10", "sec_gate", run, description=__doc__, add_args=add_args)
+    answer = None
+    if os.environ.get("GSD_ENGINE", "python") not in ("python", "") or ENGINE_ROUTES:
+        from swarm import engine_select
+        answer = engine_select.run_gate_engine(
+            script, ENGINE_ROUTES, sys.argv[1:], claims=_claims_sec, route_name="sec-gate", binary_env=_binary_env,
+            env_keys=("SWARM_DIR", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION"), commit=_sec_commit)
+    sys.exit(answer if answer is not None else script.main())

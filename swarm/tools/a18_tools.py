@@ -41,14 +41,19 @@ import bisect
 import json
 import re
 import shlex
+from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any, TypeAlias, TypedDict, TypeVar, cast
 
 from swarm.tools.support import respond
 
 FINDINGS_CAP = 200
 _RANK = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
 _DIGEST_HEX_LEN = {"sha256": 64, "sha384": 96, "sha512": 128}
+JsonObject = dict[str, Any]  # caller-supplied JSON objects and the result objects built from them: values are untyped JSON
+Finding = dict[str, str]  # {id, severity, summary, location}: every value is a string
+_T = TypeVar("_T")
 
 
 # ---- shared helpers -----------------------------------------------------------------------------------------------
@@ -180,7 +185,7 @@ _TOKEN_SHAPES = re.compile(
     r"|\b(?:[a-z]{3,8} ){11,23}[a-z]{3,8}\b"  # a recovery phrase: 12 to 24 lowercase words
 )
 
-def _scrub(text) -> str:
+def _scrub(text: object) -> str:
     """Every string a finding, output field, skipped entry or location echoes passes through here, so a credential cannot reach a result.
     The echo sites are: _show, _f, _clip and the echo helpers, which all call this; and the CLI scripts/supply_image_lint.py, which calls
     it in scan() on every skipped entry, every reason handed to swarm/scan_status.py:incomplete_findings and every finding location
@@ -197,29 +202,33 @@ def _scrub(text) -> str:
     return _TOKEN_SHAPES.sub("***", value)
 
 
-def _show(text, limit: int) -> str:
+def _show(text: object, limit: int) -> str:
     """Scrub first, then cut: a token cut in half would no longer match its shape."""
     return _scrub(text)[:limit]
 
 
-def _invalid(field: str, message: str) -> dict:
+def _respond(payload: JsonObject, work: Callable[[], JsonObject]) -> JsonObject:
+    return cast(JsonObject, respond(payload, work))  # support.respond is untyped (Any); work() always returns a JsonObject
+
+
+def _invalid(field: str, message: str) -> JsonObject:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": _show(message, 400)}
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr)."""
     return Decimal(repr(value))
 
 
-def _f(fid: str, severity: str, summary: str, location: str = "") -> dict:
+def _f(fid: str, severity: str, summary: str, location: str = "") -> Finding:
     return {"id": _show(fid, 120), "severity": severity, "summary": _show(summary, 240), "location": _show(location, 300)}
 
 
-def _fit(items: list, limit: int) -> list:
+def _fit(items: Sequence[_T], limit: int) -> list[_T]:
     """The leading items (at most FINDINGS_CAP) whose JSON stays within `limit` bytes, so a result with maximal strings stays far below
     the 256 KiB result limit. Counts next to a list are always totals; only the listing is cut, never reordered."""
-    out: list = []
+    out: list[_T] = []
     used = 2
     for item in items[:FINDINGS_CAP]:
         used += len(json.dumps(item)) + 2
@@ -229,7 +238,7 @@ def _fit(items: list, limit: int) -> list:
     return out
 
 
-def _result(findings: list[dict]) -> dict:
+def _result(findings: list[Finding]) -> JsonObject:
     """The three findings keys every analysis returns: total, blocking (blocker+major) and the worst-first list (cut at 64 KB)."""
     ordered = sorted(findings, key=lambda f: (_RANK[f["severity"]], f["id"], f["location"], f["summary"]))
     return {
@@ -239,11 +248,11 @@ def _result(findings: list[dict]) -> dict:
     }
 
 
-def _verdict(findings: list[dict]) -> str:
+def _verdict(findings: list[Finding]) -> str:
     return "fail" if any(_RANK[f["severity"]] <= _RANK["major"] for f in findings) else "pass"
 
 
-def _timestamp(value) -> datetime | None:
+def _timestamp(value: object) -> datetime | None:
     """ISO-8601 with an explicit offset (or Z); naive and unparseable values give None."""
     if not isinstance(value, str):
         return None
@@ -254,7 +263,7 @@ def _timestamp(value) -> datetime | None:
     return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
-def _calendar_date(value) -> date | None:
+def _calendar_date(value: object) -> date | None:
     """A YYYY-MM-DD date, optionally followed by a time part (`T...`), as endoflife.date publishes it."""
     if not isinstance(value, str) or len(value) < 10 or (len(value) > 10 and value[10] not in "T "):
         return None
@@ -266,7 +275,7 @@ def _calendar_date(value) -> date | None:
         return None
 
 
-def _valid_digest(value) -> tuple[str, str] | None:
+def _valid_digest(value: object) -> tuple[str, str] | None:
     """(algorithm, lowercase hex) for `sha256:<64 hex>` / sha384 / sha512 (OCI digest grammar), else None."""
     if not isinstance(value, str):
         return None
@@ -303,7 +312,7 @@ _REGISTRY_ALIASES = {"index.docker.io": "docker.io", "registry-1.docker.io": "do
 _MUTABLE_BRANCHES = {"main", "master", "develop", "dev", "trunk", "head", "latest"}
 
 
-def _parse_ref(ref: str) -> tuple[dict | None, str]:
+def _parse_ref(ref: str) -> tuple[dict[str, str] | None, str]:
     """Parse an OCI/Docker image reference into {registry, repository, tag, digest} or (None, reason).
 
     Mirrors the distribution/reference grammar: the first path component is a registry host when it holds a `.`
@@ -333,7 +342,7 @@ def _parse_ref(ref: str) -> tuple[dict | None, str]:
     return {"registry": registry, "repository": repository, "tag": tag, "digest": digest.lower()}, ""
 
 
-def _ref_pinning(parsed: dict) -> str:
+def _ref_pinning(parsed: dict[str, str]) -> str:
     """digest | latest (no tag or :latest and no digest) | tag."""
     if parsed["digest"]:
         return "digest"
@@ -411,7 +420,23 @@ def _tokens(text: str) -> list[str]:
         return text.split()
 
 
-def _parse_dockerfile(content: str) -> list[dict]:
+class _Instruction(TypedDict):
+    line: int
+    kw: str
+    flags: list[str]
+    args: str
+    text: str
+
+
+class _Stage(TypedDict):
+    line: int
+    base: str
+    name: str
+    parent: int | None
+    instructions: list[_Instruction]
+
+
+def _parse_dockerfile(content: str) -> list[_Instruction]:
     """Logical instructions {line, kw, flags, args, text}: continuations joined, comments dropped, heredoc bodies kept."""
     lines = content.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n").split("\n")  # Docker ignores a UTF-8 byte order mark
     escape = "\\"
@@ -423,7 +448,7 @@ def _parse_dockerfile(content: str) -> list[dict]:
         if match.group(1).lower() == "escape" and match.group(2) in ("\\", "`"):
             escape = match.group(2)
         index += 1
-    out: list[dict] = []
+    out: list[_Instruction] = []
     terminators: dict[str, list[int]] = {}  # stripped line -> ascending line numbers, so each heredoc terminator is a bisect, never a rescan
     for number, line in enumerate(lines):
         terminators.setdefault(line.strip(), []).append(number)
@@ -465,12 +490,12 @@ def _parse_dockerfile(content: str) -> list[dict]:
     return out
 
 
-def _expand(text: str, variables: dict) -> tuple[str, bool]:
+def _expand(text: str, variables: dict[str, str]) -> tuple[str, bool]:
     """Substitute ${V}, $V and ${V:-default} from `variables`; the flag is False when something stayed unresolved, including a form this
     reader does not evaluate (`${V:+word}`, `${V#pattern}`, ...), which Docker may expand to a different value."""
     resolved = not _UNSUPPORTED_VAR.search(text)
 
-    def replace(match: re.Match) -> str:
+    def replace(match: re.Match[str]) -> str:
         nonlocal resolved
         name = match.group(1) or match.group(3)
         value = variables.get(name)
@@ -487,21 +512,21 @@ def _expand(text: str, variables: dict) -> tuple[str, bool]:
     return _VAR.sub(replace, text), resolved
 
 
-def _resolved(value: str, variables: dict) -> str:
+def _resolved(value: str, variables: dict[str, str]) -> str:
     """`value` with its `$NAME` and `${NAME}` read from `variables`, as Docker expands them at build time. A value that stays unresolved
     becomes `_UNKNOWN`: a later use is unresolved too, even under a `:-` default, and never a literal `$X` or a known empty value."""
     expanded, resolved = _expand(value, variables)
     return expanded if resolved else _UNKNOWN
 
 
-def _bind(variables: dict, name: str, value: str) -> None:
+def _bind(variables: dict[str, str], name: str, value: str) -> None:
     """Bind one ARG value in instruction order, expanded through the variables bound so far."""
     variables[name] = _resolved(value, variables)
 
 
-def _stages(instructions: list[dict]) -> tuple[list[dict], dict]:
-    stages: list[dict] = []
-    global_args: dict = {}
+def _stages(instructions: list[_Instruction]) -> tuple[list[_Stage], dict[str, str]]:
+    stages: list[_Stage] = []
+    global_args: dict[str, str] = {}
     names: dict[str, int] = {}
     for ins in instructions:
         if ins["kw"] == "FROM":
@@ -525,7 +550,7 @@ def _stages(instructions: list[dict]) -> tuple[list[dict], dict]:
     return stages, global_args
 
 
-def _last_in_chain(stages: list[dict], index: int, keyword: str) -> dict | None:
+def _last_in_chain(stages: list[_Stage], index: int, keyword: str) -> _Instruction | None:
     """Last `keyword` instruction effective in stage `index`, following `FROM <earlier stage>` inheritance."""
     seen: set[int] = set()
     current: int | None = index
@@ -543,10 +568,10 @@ def _env_pairs(args: str) -> list[tuple[str, str]]:
     tokens = _tokens(args)
     if tokens and "=" not in tokens[0]:
         return [(tokens[0], " ".join(tokens[1:]))]
-    return [tuple(t.partition("=")[::2]) for t in tokens]
+    return [(key, value) for key, _eq, value in (t.partition("=") for t in tokens)]
 
 
-def _run_stage(stage: dict, global_args: dict, inherited: tuple[dict, dict], before: int) -> tuple[dict, dict]:
+def _run_stage(stage: _Stage, global_args: dict[str, str], inherited: tuple[dict[str, str], dict[str, str]], before: int) -> tuple[dict[str, str], dict[str, str]]:
     """(variables, env) at position `before` of one stage. `inherited` is the (variables, env) pair its in-file parent ends with, both empty
     for an external base image: that image's ENV is not known to the scanner, see dockerfile_lint. Docker carries a parent stage's build
     arguments into a child stage through FROM as well as its ENV, so `variables` starts from the parent's build-time variables, which
@@ -577,11 +602,11 @@ def _run_stage(stage: dict, global_args: dict, inherited: tuple[dict, dict], bef
     return variables, env
 
 
-def _stage_scopes(stages: list[dict], global_args: dict) -> list[tuple[dict, dict]]:
+def _stage_scopes(stages: list[_Stage], global_args: dict[str, str]) -> list[tuple[dict[str, str], dict[str, str]]]:
     """(variables, env) at the end of each stage, indexed by stage: what its in-file children inherit through FROM. A parent always
     precedes its child, so one pass in stage order computes every entry from finished entries: no recursion, and each stage runs once,
     so the cost is linear in the instructions."""
-    table: list[tuple[dict, dict]] = []
+    table: list[tuple[dict[str, str], dict[str, str]]] = []
     for stage in stages:
         parent = stage["parent"]
         inherited = table[parent] if parent is not None else ({}, {})
@@ -589,7 +614,7 @@ def _stage_scopes(stages: list[dict], global_args: dict) -> list[tuple[dict, dic
     return table
 
 
-def _effective_user(stages: list[dict], table: list[tuple[dict, dict]], global_args: dict, index: int) -> tuple[dict | None, dict]:
+def _effective_user(stages: list[_Stage], table: list[tuple[dict[str, str], dict[str, str]]], global_args: dict[str, str], index: int) -> tuple[_Instruction | None, dict[str, str]]:
     """The USER instruction effective in stage `index` (inherited through FROM) and the build variables visible to it."""
     seen: set[int] = set()
     current: int | None = index
@@ -606,12 +631,12 @@ def _effective_user(stages: list[dict], table: list[tuple[dict, dict]], global_a
 
 
 
-def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin: bool) -> tuple[dict | None, list[dict]]:
+def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin: bool) -> tuple[JsonObject | None, list[Finding]]:
     instructions = _parse_dockerfile(content)
     stages, global_args = _stages(instructions)
     if not stages:
         return None, []
-    findings: list[dict] = []
+    findings: list[Finding] = []
     final = len(stages) - 1
 
     for stage in stages:
@@ -725,21 +750,21 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
     return facts, findings
 
 
-def dockerfile_lint(payload: dict) -> dict:
+def dockerfile_lint(payload: JsonObject) -> JsonObject:
     """Lint one Dockerfile: mutable or unpinned bases, root user, ADD misuse, package caches, pipe-to-shell, secrets.
 
     Scope of the ARG and ENV analysis: values come from this file only, that is its global ARG, its stage ARG and ENV, and the ENV of an
     in-file parent stage named with `FROM <alias>`. The ENV of an external base image (for example `FROM alpine`) is NOT known to the
     scanner, so a USER that only the image's own ENV sets is not analysed; the scanner does not guess it."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         content = payload["content"]
         facts, findings = _lint_dockerfile(content, payload.get("require_healthcheck", True), payload.get("require_digest_pin", False))
         if facts is None:
             return _invalid("content", "the Dockerfile has no FROM instruction")
         return {"state": "SUCCESS", **facts, "verdict": _verdict(findings), **_result(findings)}
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- base image policy ------------------------------------------------------------------------------------------------
@@ -756,7 +781,7 @@ def _registry_rule(entry: str) -> tuple[str, str] | None:
     return _REGISTRY_ALIASES.get(host, host), path
 
 
-def _registry_allowed(parsed: dict, rules: list[tuple[str, str]]) -> bool:
+def _registry_allowed(parsed: dict[str, str], rules: list[tuple[str, str]]) -> bool:
     for host, path in rules:
         if parsed["registry"] != host:
             continue
@@ -765,12 +790,12 @@ def _registry_allowed(parsed: dict, rules: list[tuple[str, str]]) -> bool:
     return False
 
 
-def base_image_policy(payload: dict) -> dict:
+def base_image_policy(payload: JsonObject) -> JsonObject:
     """Check base image references against allowed registries, digest pinning, a maximum age and end-of-life dates.
     A date is end of life from `eol_date` itself (endoflife.date `eolFrom`: the first day without support), compared with the
     calendar date of `as_of` in its own offset; an image older than `max_age_days` x 24 h fails (exactly that old passes)."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         as_of = _timestamp(payload["as_of"])
         if as_of is None:
             return _invalid("as_of", "as_of must be an ISO-8601 timestamp with an explicit offset")
@@ -783,7 +808,7 @@ def base_image_policy(payload: dict) -> dict:
         max_age = payload.get("max_age_days")
         warn_days = payload.get("eol_warning_days", EOL_WARNING_DAYS_DEFAULT)
         require_digest = payload["require_digest"]
-        findings: list[dict] = []
+        findings: list[Finding] = []
         violating: set[int] = set()
         for position, entry in enumerate(payload["images"]):
             ref = entry["ref"]
@@ -834,7 +859,7 @@ def base_image_policy(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- SBOM parsing, validation, diff ---------------------------------------------------------------------------------
@@ -860,16 +885,49 @@ def _clip(text: str, limit: int) -> str:
     return _show(text, limit)
 
 
-def _text(value) -> str:
+def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _list(value) -> list:
+def _list(value: object) -> list[Any]:
     """`value` when it is a JSON array, else an empty list: SBOM documents are untrusted and may carry any JSON type."""
     return value if isinstance(value, list) else []
 
 
-def _load_json(text: str, field: str, what: str):
+class _SbomLoad(TypedDict):
+    kind: str
+    doc: JsonObject
+
+
+class _Subject(TypedDict):
+    name: str
+    digests: dict[str, str]
+
+
+class _Component(TypedDict):
+    name: str
+    group: str
+    version: str
+    purl: str
+    supplier: bool
+    identified: bool
+    ref: str
+    license: str
+
+
+class _CdxFacts(TypedDict):
+    author: bool
+    timestamp: bool
+    root: int
+
+
+class _Group(TypedDict):
+    name: str
+    versions: set[str]
+    licenses: dict[str, str]
+
+
+def _load_json(text: str, field: str, what: str) -> tuple[JsonObject | None, JsonObject | None]:
     """json.loads for a bounded document; a non-object or parse failure is an INVALID_INPUT naming `field`."""
     try:
         doc = json.loads(text)
@@ -880,7 +938,7 @@ def _load_json(text: str, field: str, what: str):
     return doc, None
 
 
-def _cdx_license(component: dict) -> str:
+def _cdx_license(component: JsonObject) -> str:
     names: list[str] = []
     for item in _list(component.get("licenses")):
         if not isinstance(item, dict):
@@ -895,14 +953,14 @@ def _cdx_license(component: dict) -> str:
     return ", ".join(sorted(set(names)))
 
 
-def _cdx_components(doc: dict) -> tuple[list[dict], dict]:
+def _cdx_components(doc: JsonObject) -> tuple[list[_Component], _CdxFacts]:
     """Flatten metadata.component and the nested components tree; second value holds the SBOM level facts."""
-    metadata = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+    metadata = _dict(doc.get("metadata"))
     roots = [metadata["component"]] if isinstance(metadata.get("component"), dict) else []
-    found: list[dict] = []
-    top = doc.get("components") if isinstance(doc.get("components"), list) else []
+    found: list[_Component] = []
+    top = _list(doc.get("components"))
     stack = [(item, 0) for item in reversed(top)] + [(root, 0) for root in reversed(roots)]
-    ordered: list[dict] = []
+    ordered: list[JsonObject] = []
     while stack:
         item, depth = stack.pop()
         if not isinstance(item, dict):
@@ -933,7 +991,7 @@ def _cdx_components(doc: dict) -> tuple[list[dict], dict]:
     return found, {"author": has_author, "timestamp": _timestamp(metadata.get("timestamp")) is not None, "root": len(roots)}
 
 
-def _spdx_license(package: dict) -> str:
+def _spdx_license(package: JsonObject) -> str:
     for key in ("licenseConcluded", "licenseDeclared"):
         value = _text(package.get(key))
         if value and value not in ("NOASSERTION", "NONE"):
@@ -941,9 +999,9 @@ def _spdx_license(package: dict) -> str:
     return ""
 
 
-def _spdx_components(doc: dict) -> list[dict]:
-    found = []
-    for package in doc.get("packages") if isinstance(doc.get("packages"), list) else []:
+def _spdx_components(doc: JsonObject) -> list[_Component]:
+    found: list[_Component] = []
+    for package in _list(doc.get("packages")):
         if not isinstance(package, dict):
             continue
         refs = [r for r in _list(package.get("externalRefs")) if isinstance(r, dict)]
@@ -962,7 +1020,7 @@ def _spdx_components(doc: dict) -> list[dict]:
     return found
 
 
-def _sbom_kind(doc: dict) -> str:
+def _sbom_kind(doc: JsonObject) -> str:
     if doc.get("bomFormat") == "CycloneDX":
         return "cyclonedx"
     if isinstance(doc.get("spdxVersion"), str) and doc["spdxVersion"].startswith("SPDX-2."):
@@ -970,9 +1028,9 @@ def _sbom_kind(doc: dict) -> str:
     return ""
 
 
-def _load_sbom(text: str, field: str) -> tuple[dict | None, dict | None]:
+def _load_sbom(text: str, field: str) -> tuple[_SbomLoad | None, JsonObject | None]:
     doc, error = _load_json(text, field, "the SBOM")
-    if error:
+    if doc is None:
         return None, error
     kind = _sbom_kind(doc)
     if not kind:
@@ -980,18 +1038,19 @@ def _load_sbom(text: str, field: str) -> tuple[dict | None, dict | None]:
     return {"kind": kind, "doc": doc}, None
 
 
-def sbom_validate(payload: dict) -> dict:
+def sbom_validate(payload: JsonObject) -> JsonObject:
     """Validate a CycloneDX 1.2-1.7 or SPDX 2.2/2.3 JSON SBOM: structural integrity and the seven NTIA minimum elements of the
     2021 baseline (CISA's 2026 minimum elements replace it and add fields such as component hash and license: not checked).
     `component_count` includes the described root component/package. Author accepts a CycloneDX tool entry; supplier
     `NOASSERTION` and a missing version do not count as present."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         loaded, error = _load_sbom(payload["document"], "document")
         if error:
             return error
+        loaded = cast(_SbomLoad, loaded)  # _load_sbom returns a document whenever it returns no error
         doc, kind = loaded["doc"], loaded["kind"]
-        findings: list[dict] = []
+        findings: list[Finding] = []
         if kind == "cyclonedx":
             spec_version = _text(doc.get("specVersion"))
             if spec_version not in ("1.2", "1.3", "1.4", "1.5", "1.6", "1.7"):
@@ -1003,11 +1062,11 @@ def sbom_validate(payload: dict) -> dict:
                 if c["ref"] and c["ref"] in seen:
                     findings.append(_f("sbom.duplicate-bom-ref", "major", f"bom-ref {c['ref']!r} is used by more than one component", c["ref"]))
                 seen.add(c["ref"])
-            deps = [d for d in (doc.get("dependencies") if isinstance(doc.get("dependencies"), list) else []) if isinstance(d, dict)]
+            deps = [d for d in _list(doc.get("dependencies")) if isinstance(d, dict)]
             dangling: set[str] = set()
             linked = False
             for d in deps:
-                for ref in [d.get("ref"), *(d.get("dependsOn") if isinstance(d.get("dependsOn"), list) else [])]:
+                for ref in [d.get("ref"), *_list(d.get("dependsOn"))]:
                     if isinstance(ref, str) and ref not in known:
                         dangling.add(ref)
                 if _text(d.get("ref")) and (isinstance(d.get("dependsOn"), list) and d["dependsOn"]):
@@ -1035,7 +1094,7 @@ def sbom_validate(payload: dict) -> dict:
                 if ref in seen:
                     findings.append(_f("sbom.duplicate-spdxid", "major", f"SPDXID {ref!r} is used by more than one package", ref))
                 seen.add(ref)
-            relationships = [r for r in (doc.get("relationships") if isinstance(doc.get("relationships"), list) else []) if isinstance(r, dict)]
+            relationships = [r for r in _list(doc.get("relationships")) if isinstance(r, dict)]
             dangling = set()
             linked = False
             describes = bool(doc.get("documentDescribes"))
@@ -1050,12 +1109,12 @@ def sbom_validate(payload: dict) -> dict:
                     linked = True
             if not describes:
                 findings.append(_f("sbom.no-root", "major", "no DESCRIBES relationship or documentDescribes names the described package", "relationships"))
-            info = doc.get("creationInfo") if isinstance(doc.get("creationInfo"), dict) else {}
-            creators = [c for c in (info.get("creators") if isinstance(info.get("creators"), list) else []) if isinstance(c, str)]
+            info = _dict(doc.get("creationInfo"))
+            creators = [c for c in _list(info.get("creators")) if isinstance(c, str)]
             good = [c for c in creators if c.startswith(("Person: ", "Organization: ", "Tool: ")) and len(c.split(": ", 1)[1].strip()) > 0]
-            for c in creators:
-                if c not in good:
-                    findings.append(_f("sbom.spdx-bad-creator", "minor", f"creator {_show(c, 60)!r} is not 'Person:', 'Organization:' or 'Tool:' followed by a name", "creationInfo.creators"))
+            for creator in creators:
+                if creator not in good:
+                    findings.append(_f("sbom.spdx-bad-creator", "minor", f"creator {_show(creator, 60)!r} is not 'Person:', 'Organization:' or 'Tool:' followed by a name", "creationInfo.creators"))
             body_count = len(components)
             relationship_ok = (linked or body_count <= 1) and not dangling
             author_ok, time_ok = bool(good), _timestamp(info.get("created")) is not None
@@ -1100,7 +1159,7 @@ def sbom_validate(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 def _split_purl_version(base: str) -> tuple[str, str]:
@@ -1112,7 +1171,7 @@ def _split_purl_version(base: str) -> tuple[str, str]:
     return base, ""
 
 
-def _component_key(c: dict) -> str:
+def _component_key(c: _Component) -> str:
     """Identity of a component across versions: purl without version/qualifiers, else lowercase group/name."""
     purl = c["purl"]
     if purl.startswith("pkg:"):
@@ -1123,7 +1182,7 @@ def _component_key(c: dict) -> str:
 _SEMVER = re.compile(r"[vV]?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
 
 
-def _version_key(version: str) -> tuple | None:
+def _version_key(version: str) -> tuple[tuple[int, ...], tuple[object, ...]] | None:
     """Sort key of a semantic version (semver.org item 11), or None when the string is not one: a release outranks its pre-releases,
     numeric pre-release identifiers compare as numbers and rank below alphanumeric ones, build metadata is ignored, `1.0` equals
     `1.0.0`. Epochs, PEP 440 and distro revisions are not semver: no direction is claimed for them."""
@@ -1138,17 +1197,18 @@ def _version_key(version: str) -> tuple | None:
     return tuple(numbers), pre_key
 
 
-def sbom_diff(payload: dict) -> dict:
+def sbom_diff(payload: JsonObject) -> JsonObject:
     """Diff two SBOMs by component identity: added, removed, version changes (with downgrades) and license changes."""
 
-    def work() -> dict:
-        sides = []
+    def work() -> JsonObject:
+        sides: list[dict[str, _Group]] = []
         for field in ("before", "after"):
             loaded, error = _load_sbom(payload[field], field)
             if error:
                 return error
+            loaded = cast(_SbomLoad, loaded)  # _load_sbom returns a document whenever it returns no error
             comps = _cdx_components(loaded["doc"])[0] if loaded["kind"] == "cyclonedx" else _spdx_components(loaded["doc"])
-            grouped: dict[str, dict] = {}
+            grouped: dict[str, _Group] = {}
             for c in comps:
                 if not (c["name"] or c["purl"]):
                     continue
@@ -1157,16 +1217,20 @@ def sbom_diff(payload: dict) -> dict:
                 entry["licenses"][_clip(c["version"], 200)] = _clip(c["license"], 300)
             sides.append(grouped)
         before, after = sides
-        added, removed, changed, relicensed = [], [], [], []
-        findings: list[dict] = []
+        added: list[Finding] = []
+        removed: list[Finding] = []
+        changed: list[Finding] = []
+        relicensed: list[Finding] = []
+        findings: list[Finding] = []
         for key in sorted(set(before) | set(after)):
-            old, new = before.get(key), after.get(key)
-            if old is None:
-                added.extend({"name": new["name"], "version": v} for v in sorted(new["versions"]))
+            if key not in before:
+                added.extend({"name": after[key]["name"], "version": v} for v in sorted(after[key]["versions"]))
                 continue
-            if new is None:
+            old = before[key]
+            if key not in after:
                 removed.extend({"name": old["name"], "version": v} for v in sorted(old["versions"]))
                 continue
+            new = after[key]
             gone, fresh = sorted(old["versions"] - new["versions"]), sorted(new["versions"] - old["versions"])
             if len(gone) == 1 and len(fresh) == 1:
                 a, b = _version_key(gone[0]), _version_key(fresh[0])
@@ -1201,7 +1265,7 @@ def sbom_diff(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- in-toto statements: SLSA level and subject digest -----------------------------------------------------------------
@@ -1211,12 +1275,13 @@ _SLSA_V02 = "https://slsa.dev/provenance/v0.2"
 _STATEMENT_PREFIX = "https://in-toto.io/Statement/"
 
 
-def _load_statement(text: str, field: str) -> tuple[dict | None, dict | None]:
+def _load_statement(text: str, field: str) -> tuple[JsonObject | None, JsonObject | None]:
     """Parse an in-toto Statement from plain JSON, a DSSE envelope or a Sigstore bundle (`dsseEnvelope`)."""
     doc, error = _load_json(text, field, "the attestation")
-    if error:
+    if doc is None:
         return None, error
-    envelope = doc.get("dsseEnvelope") if isinstance(doc.get("dsseEnvelope"), dict) else doc
+    inner = doc.get("dsseEnvelope")
+    envelope = inner if isinstance(inner, dict) else doc
     if isinstance(envelope.get("payload"), str) and isinstance(envelope.get("payloadType"), str):
         raw = envelope["payload"]
         decoded = None
@@ -1229,20 +1294,20 @@ def _load_statement(text: str, field: str) -> tuple[dict | None, dict | None]:
         if decoded is None:
             return None, _invalid(field, "the DSSE payload is not base64-encoded UTF-8")
         doc, error = _load_json(decoded, field, "the DSSE payload")
-        if error:
+        if doc is None:
             return None, error
     if not isinstance(doc.get("_type"), str) or not doc["_type"].startswith(_STATEMENT_PREFIX) or not isinstance(doc.get("predicateType"), str):
         return None, _invalid(field, f"not an in-toto Statement (_type must start with {_STATEMENT_PREFIX} and predicateType must be set)")
     return doc, None
 
 
-def _subjects(statement: dict) -> list[dict]:
+def _subjects(statement: JsonObject) -> list[_Subject]:
     """[{name, digests: {alg: hex}}] with digest values lowercased; malformed subjects are kept with empty digests."""
-    out = []
-    for item in statement.get("subject") if isinstance(statement.get("subject"), list) else []:
+    out: list[_Subject] = []
+    for item in _list(statement.get("subject")):
         if not isinstance(item, dict):
             continue
-        digests = item.get("digest") if isinstance(item.get("digest"), dict) else {}
+        digests = _dict(item.get("digest"))
         out.append({"name": _text(item.get("name")), "digests": {str(k).lower(): v.lower() for k, v in digests.items() if isinstance(v, str)}})
     return out
 
@@ -1251,11 +1316,11 @@ def _usable_digest(algorithm: str, hex_part: str) -> bool:
     return _valid_digest(f"{algorithm}:{hex_part}") is not None
 
 
-def _dict(value) -> dict:
+def _dict(value: object) -> JsonObject:
     return value if isinstance(value, dict) else {}
 
 
-def slsa_level(payload: dict) -> dict:
+def slsa_level(payload: JsonObject) -> JsonObject:
     """Assess the SLSA Build level (0..3, v1.0 levels) of a provenance statement against the verification facts the caller supplies.
 
     L1: well-formed provenance exists (subject with a digest, builder id, build type, v1 external parameters).
@@ -1265,10 +1330,11 @@ def slsa_level(payload: dict) -> dict:
         SLSA's Build L3 also wants runs that cannot influence one another; the caller's isolated_build fact must cover that.
     """
 
-    def work() -> dict:
+    def work() -> JsonObject:
         statement, error = _load_statement(payload["provenance"], "provenance")
         if error:
             return error
+        statement = cast(JsonObject, statement)  # _load_statement returns a statement whenever it returns no error
         predicate_type = statement["predicateType"]
         if predicate_type not in (_SLSA_V1, _SLSA_V02):
             return _invalid("provenance", f"predicateType {predicate_type!r} is not SLSA provenance v1 or v0.2")
@@ -1326,23 +1392,24 @@ def slsa_level(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
-def provenance_match(payload: dict) -> dict:
+def provenance_match(payload: JsonObject) -> JsonObject:
     """Check that an artifact digest is one of the provenance subjects; a same-named subject with another digest is a blocker."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         statement, error = _load_statement(payload["provenance"], "provenance")
         if error:
             return error
+        statement = cast(JsonObject, statement)  # _load_statement returns a statement whenever it returns no error
         wanted = _valid_digest(payload["artifact_digest"])
         if wanted is None:
             return _invalid("artifact_digest", "artifact_digest must be sha256:<64 hex>, sha384:<96 hex> or sha512:<128 hex>")
         algorithm, hex_part = wanted
         artifact_name = payload.get("artifact_name", "")
         subjects = _subjects(statement)
-        findings: list[dict] = []
+        findings: list[Finding] = []
         if not subjects:
             findings.append(_f("provenance.no-subject", "blocker", "the statement has no subjects", "subject"))
         matching = [s for s in subjects if s["digests"].get(algorithm) == hex_part]
@@ -1369,7 +1436,7 @@ def provenance_match(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- signature policy -----------------------------------------------------------------------------------------------
@@ -1392,13 +1459,13 @@ def _glob_match(pattern: str, text: str) -> bool:
     return position <= limit
 
 
-def signature_policy(payload: dict) -> dict:
+def signature_policy(payload: JsonObject) -> JsonObject:
     """Evaluate verified signatures against required signer rules (issuer equality and an identity glob), a minimum
     number of distinct (issuer, signer) pairs and an optional transparency-log requirement. Keyless Sigstore: identity is the
     certificate SAN, issuer the OIDC issuer URL. House rules, not Sigstore semantics: any signature that did not verify is a
     blocker even when others verified, and `*` in an identity also matches `/`."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         rules = payload["rules"]
         names = [r["name"] for r in rules]
         if len(set(names)) != len(names) or any(not n.strip() for n in names):
@@ -1406,8 +1473,8 @@ def signature_policy(payload: dict) -> dict:
         if any(not r["issuer"].strip() or not r["identity"].strip() for r in rules):
             return _invalid("rules", "every rule needs a non-empty issuer and identity")
         require_log = payload["require_transparency_log"]
-        findings: list[dict] = []
-        counted: list[dict] = []
+        findings: list[Finding] = []
+        counted: list[JsonObject] = []
         unverified = 0
         for s in payload["signatures"]:
             who = _echo_value(f"{s['signer']} ({s['issuer']})")
@@ -1446,7 +1513,7 @@ def signature_policy(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- VEX ------------------------------------------------------------------------------------------------------------
@@ -1460,7 +1527,10 @@ _SEVERITY_TO_FINDING = {"critical": "blocker", "high": "major", "medium": "minor
 _VEX_PRECEDENCE = {"affected": 0, "under_investigation": 1, "fixed": 2, "not_affected": 3}
 
 
-def _purl_parts(product: str) -> tuple[str, str, frozenset]:
+_PurlParts: TypeAlias = tuple[str, str, frozenset[tuple[str, str]]]  # (identity, version, qualifiers)
+
+
+def _purl_parts(product: str) -> _PurlParts:
     """(identity, version, qualifiers) of a package URL: subpath dropped, type lowercased, qualifier keys lowercased (purl spec);
     other strings are kept as is, without version or qualifiers."""
     if not product.startswith("pkg:"):
@@ -1472,23 +1542,23 @@ def _purl_parts(product: str) -> tuple[str, str, frozenset]:
     return f"pkg:{scheme_type.lower()}{slash}{rest}", version, qualifiers
 
 
-def _product_matches(statement_parts: tuple[str, str, frozenset], product_parts: tuple[str, str, frozenset]) -> bool:
+def _product_matches(statement_parts: _PurlParts, product_parts: _PurlParts) -> bool:
     """A statement product matches when the identities are equal, its version is absent or equal and every qualifier it names
     (arch, distro ...) is also on the vulnerable product: a statement about arm64 says nothing about amd64."""
     return (statement_parts[0] == product_parts[0] and (not statement_parts[1] or statement_parts[1] == product_parts[1])
             and statement_parts[2] <= product_parts[2])
 
 
-def vex_apply(payload: dict) -> dict:
+def vex_apply(payload: JsonObject) -> JsonObject:
     """Apply OpenVEX statements to a vulnerability list. The newest valid statement per (vulnerability, product) wins
     (equal timestamps: the more conservative status, a house rule); `not_affected` needs one of the five OpenVEX justifications
     or an impact statement or the statement is ignored. Products match by package URL identity: a statement product without a
     version covers every version, and a statement product without qualifiers covers every variant (arch, distro ...), but
     qualifiers it names must be present on the vulnerable product. Product names that are not purls match exactly."""
 
-    def work() -> dict:
-        findings: list[dict] = []
-        statements: list[dict] = []
+    def work() -> JsonObject:
+        findings: list[Finding] = []
+        statements: list[JsonObject] = []
         ignored = 0
         for index, s in enumerate(payload["statements"]):
             moment = _timestamp(s["timestamp"])
@@ -1503,12 +1573,12 @@ def vex_apply(payload: dict) -> dict:
                 continue
             parts = [_purl_parts(p.strip()) for p in s["products"]]
             statements.append({**s, "moment": moment, "vulnerability": s["vulnerability"].strip().upper(), "parts": parts})
-        by_vulnerability: dict[str, list[tuple[int, dict]]] = {}
+        by_vulnerability: dict[str, list[tuple[int, JsonObject]]] = {}
         for index, s in enumerate(statements):
             by_vulnerability.setdefault(s["vulnerability"], []).append((index, s))
         seen: set[tuple[str, str]] = set()
-        exposed: list[dict] = []
-        suppressed: list[dict] = []
+        exposed: list[JsonObject] = []
+        suppressed: list[JsonObject] = []
         used: set[int] = set()
         for v in payload["vulnerabilities"]:
             shown, product = v["id"].strip(), v["product"].strip()
@@ -1547,7 +1617,7 @@ def vex_apply(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- pin audit --------------------------------------------------------------------------------------------------------
@@ -1609,7 +1679,7 @@ def _is_action_metadata(path: str) -> bool:
     return "/.github/actions/" in low and low.rsplit("/", 1)[-1] in ("action.yml", "action.yaml")
 
 
-def _docker_action_pin(value: str, at: str) -> list[dict]:
+def _docker_action_pin(value: str, at: str) -> list[Finding]:
     """A `docker://` reference (a `uses:` or action-metadata `image:`) must be pinned by digest: the same rule for both places."""
     ref = value[len("docker://"):]
     parsed, _reason = _parse_ref(ref)
@@ -1620,7 +1690,7 @@ def _docker_action_pin(value: str, at: str) -> list[dict]:
 
 
 
-def _audit_workflow(path: str, content: str) -> tuple[int, list[dict]]:
+def _audit_workflow(path: str, content: str) -> tuple[int, list[Finding]]:
     action_metadata = _is_action_metadata(path)
     refs, findings = 0, []
     for number, line in enumerate(content.split("\n"), 1):
@@ -1666,7 +1736,7 @@ def _audit_workflow(path: str, content: str) -> tuple[int, list[dict]]:
     return refs, findings
 
 
-def _audit_dockerfile(path: str, content: str) -> tuple[int, list[dict]]:
+def _audit_dockerfile(path: str, content: str) -> tuple[int, list[Finding]]:
     stages, global_args = _stages(_parse_dockerfile(content))
     refs, findings = 0, []
     for stage in stages:
@@ -1692,7 +1762,7 @@ def _audit_dockerfile(path: str, content: str) -> tuple[int, list[dict]]:
     return refs, findings
 
 
-def _audit_requirements(path: str, content: str) -> tuple[int, list[dict]]:
+def _audit_requirements(path: str, content: str) -> tuple[int, list[Finding]]:
     refs, findings, hashed = 0, [], False
     pending, start = "", 0
     logical: list[tuple[int, str]] = []
@@ -1753,7 +1823,7 @@ def _npm_pin(value: str) -> tuple[bool, str] | None:
     return (False, "major") if text.lower() in _NPM_LATEST else (False, "minor")
 
 
-def _audit_package_json(path: str, content: str, has_lockfile: bool) -> tuple[int, list[dict]]:
+def _audit_package_json(path: str, content: str, has_lockfile: bool) -> tuple[int, list[Finding]]:
     try:
         doc = json.loads(content)
     except (ValueError, RecursionError):
@@ -1762,8 +1832,8 @@ def _audit_package_json(path: str, content: str, has_lockfile: bool) -> tuple[in
         return 0, [_f("pin.unparseable", "major", "package.json must be a JSON object", path)]
     refs, findings = 0, []
     for section in _NPM_SECTIONS:
-        entries = doc.get(section)
-        for name in sorted(entries) if isinstance(entries, dict) else []:
+        entries = _dict(doc.get(section))
+        for name in sorted(entries):
             value = entries[name]
             if not isinstance(value, str):
                 continue
@@ -1778,12 +1848,12 @@ def _audit_package_json(path: str, content: str, has_lockfile: bool) -> tuple[in
     return refs, findings
 
 
-def pin_audit(payload: dict) -> dict:
+def pin_audit(payload: JsonObject) -> JsonObject:
     """Audit supplied files for unpinned dependencies: GitHub Actions (`uses:` without a full commit SHA, floating
     images), Dockerfile FROM lines, requirements*.txt (`==` pins) and package.json (exact versions or commit pins).
     Supply lockfiles (content may be empty) to let the missing-lockfile check see them."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         files = payload["files"]
         paths = [_norm_path(f["path"]) for f in files]
         if len(set(paths)) != len(paths):
@@ -1791,7 +1861,7 @@ def pin_audit(payload: dict) -> dict:
         if any(not p or p.startswith("/") or ".." in p.split("/") or "\x00" in p for p in paths):
             return _invalid("files", "paths must be non-empty, relative and free of '..'")
         lock_dirs = {p.rsplit("/", 1)[0] if "/" in p else "" for p in paths if p.rsplit("/", 1)[-1].lower() in _LOCKFILES}
-        findings: list[dict] = []
+        findings: list[Finding] = []
         by_kind: dict[str, list[int]] = {}
         skipped = 0
         for path, entry in zip(paths, files):
@@ -1829,7 +1899,7 @@ def pin_audit(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- license policy ---------------------------------------------------------------------------------------------------
@@ -1866,7 +1936,11 @@ def _license_id(text: str) -> str:
     return _LICENSE_ALIASES.get(low, low)
 
 
-def _parse_expression(expression: str):
+_LicenseLeaf: TypeAlias = tuple[str, str, str]  # ("id", license id, exception id or "")
+_LicenseTree: TypeAlias = "_LicenseLeaf | tuple[str, list[_LicenseTree]]"  # an id leaf, or ("and" | "or", operands)
+
+
+def _parse_expression(expression: str) -> _LicenseTree:
     """SPDX license expression -> nested tuples. WITH binds tighter than AND, AND tighter than OR (SPDX 2.3 Annex D).
     Operators are accepted in any case."""
     tokens = _LICENSE_TOKEN.findall(expression)
@@ -1880,7 +1954,7 @@ def _parse_expression(expression: str):
     def operator(word: str) -> bool:
         return peek().upper() == word
 
-    def parse_or(depth: int):
+    def parse_or(depth: int) -> _LicenseTree:
         nonlocal position
         if depth > _MAX_EXPRESSION_DEPTH:
             raise _ExpressionError("expression nests too deeply")
@@ -1890,7 +1964,7 @@ def _parse_expression(expression: str):
             items.append(parse_and(depth))
         return items[0] if len(items) == 1 else ("or", items)
 
-    def parse_and(depth: int):
+    def parse_and(depth: int) -> _LicenseTree:
         nonlocal position
         items = [parse_atom(depth)]
         while operator("AND"):
@@ -1898,7 +1972,7 @@ def _parse_expression(expression: str):
             items.append(parse_atom(depth))
         return items[0] if len(items) == 1 else ("and", items)
 
-    def parse_atom(depth: int):
+    def parse_atom(depth: int) -> _LicenseTree:
         nonlocal position
         token = peek()
         if token == "(":
@@ -1926,7 +2000,7 @@ def _parse_expression(expression: str):
     return tree
 
 
-def _atom_status(tree, allow: set, deny: set, deny_categories: set) -> tuple[str, list[str]]:
+def _atom_status(tree: _LicenseLeaf, allow: set[str], deny: set[str], deny_categories: set[str]) -> tuple[str, list[str]]:
     _kind, name, exception = tree
     base = _license_id(name)
     full = f"{base} with {exception.lower()}" if exception else base
@@ -1941,8 +2015,8 @@ def _atom_status(tree, allow: set, deny: set, deny_categories: set) -> tuple[str
     return "review", [label]
 
 
-def _evaluate(tree, allow: set, deny: set, deny_categories: set) -> tuple[str, list[str]]:
-    if tree[0] == "id":
+def _evaluate(tree: _LicenseTree, allow: set[str], deny: set[str], deny_categories: set[str]) -> tuple[str, list[str]]:
+    if len(tree) == 3:
         return _atom_status(tree, allow, deny, deny_categories)
     results = [_evaluate(child, allow, deny, deny_categories) for child in tree[1]]
     statuses = [r[0] for r in results]
@@ -1953,7 +2027,7 @@ def _evaluate(tree, allow: set, deny: set, deny_categories: set) -> tuple[str, l
     return status, [] if status == "allowed" else [reason for _s, rs in results for reason in rs]
 
 
-def _policy_set(entries: list, field: str) -> tuple[set | None, dict | None]:
+def _policy_set(entries: list[str], field: str) -> tuple[set[str] | None, JsonObject | None]:
     out: set[str] = set()
     for entry in entries:
         words = entry.split()
@@ -1966,25 +2040,27 @@ def _policy_set(entries: list, field: str) -> tuple[set | None, dict | None]:
     return out, None
 
 
-def license_policy(payload: dict) -> dict:
+def license_policy(payload: JsonObject) -> JsonObject:
     """Evaluate SPDX license expressions of components against allow/deny lists and denied copyleft categories.
     OR is satisfied by any allowed alternative; AND needs every operand allowed; unlisted licenses need review. Precedence is
     WITH, AND, OR (SPDX 2.3 Annex D); operators are accepted in any case although the SPDX text says to match them case-sensitively;
     identifiers match case-insensitively; `+` is resolved only for the deprecated GPL/LGPL/AGPL ids, any other `X+` needs review."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         allow, error = _policy_set(payload["allow"], "allow")
         if error:
             return error
+        allow = cast(set[str], allow)  # _policy_set returns a set whenever it returns no error
         deny, error = _policy_set(payload["deny"], "deny")
         if error:
             return error
+        deny = cast(set[str], deny)  # the same invariant holds for deny
         both = sorted(allow & deny)
         if both:
             return _invalid("deny", f"{both[0]} is both allowed and denied")
         deny_categories = set(payload["deny_categories"])
         counts = {"allowed": 0, "denied": 0, "review": 0}
-        findings: list[dict] = []
+        findings: list[Finding] = []
         for c in payload["components"]:
             expression = c["license"].strip()
             name = c["name"]
@@ -2013,7 +2089,7 @@ def license_policy(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- registry retention plan -------------------------------------------------------------------------------------------
@@ -2021,13 +2097,13 @@ def license_policy(payload: dict) -> dict:
 _KEEP_REASONS = ("in-use-digest", "protected-prefix", "recent-count", "min-age")
 
 
-def retention_plan(payload: dict) -> dict:
+def retention_plan(payload: JsonObject) -> JsonObject:
     """Plan which registry tags to keep or delete. A tag is kept when its digest is in use, it starts with a protected
     prefix, it is one of the `keep_latest` newest tags, or it is younger than `min_age_days`; the rest are deleted.
     The verdict fails when the plan would delete more than `max_delete_pct` percent of the tags (a circuit breaker).
     Plan only: A18 never deletes anything."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         as_of = _timestamp(payload["as_of"])
         if as_of is None:
             return _invalid("as_of", "as_of must be an ISO-8601 timestamp with an explicit offset")
@@ -2069,7 +2145,7 @@ def retention_plan(payload: dict) -> dict:
         delete = sorted(t["tag"] for t in tags if t["tag"] not in kept)
         surviving = {t["digest"] for t in tags if t["tag"] in kept}
         orphaned = len({t["digest"] for t in tags if t["tag"] not in kept} - surviving)
-        findings: list[dict] = []
+        findings: list[Finding] = []
         listed = {t["digest"] for t in tags}
         for digest in sorted(protected_digests - listed):
             findings.append(_f("retention.protected-digest-unlisted", "minor", f"in-use digest {digest[:19]}... has no tag in the listing; the listing may be incomplete", digest))
@@ -2095,7 +2171,7 @@ def retention_plan(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # ---- attestation bundle -----------------------------------------------------------------------------------------------
@@ -2121,11 +2197,11 @@ def _predicate_kind(predicate_type: str) -> str:
     return ""
 
 
-def attestation_bundle(payload: dict) -> dict:
+def attestation_bundle(payload: JsonObject) -> JsonObject:
     """Check that every required attestation kind (provenance, sbom, vex, vuln-scan, vsa) exists for the artifact digest
     with a verified signature. Kinds are derived from the predicateType of each attestation."""
 
-    def work() -> dict:
+    def work() -> JsonObject:
         wanted = _valid_digest(payload["artifact_digest"])
         if wanted is None:
             return _invalid("artifact_digest", "artifact_digest must be sha256:<64 hex>, sha384:<96 hex> or sha512:<128 hex>")
@@ -2140,7 +2216,7 @@ def attestation_bundle(payload: dict) -> dict:
                 return _invalid("attestations", f"attestations[{index}]: signature_verified needs signed")
             records.append({"kind": _predicate_kind(a["predicate_type"]), "digest": f"{digest[0]}:{digest[1]}",
                             "signed": a["signed"], "verified": a["signature_verified"], "type": a["predicate_type"]})
-        findings: list[dict] = []
+        findings: list[Finding] = []
         missing: list[str] = []
         for kind in required:
             of_kind = [r for r in records if r["kind"] == kind]
@@ -2170,4 +2246,4 @@ def attestation_bundle(payload: dict) -> dict:
             **_result(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)

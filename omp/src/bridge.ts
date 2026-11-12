@@ -2,9 +2,10 @@
  * The single Python bridge (TOOL-06, D-06..D-08). Every swarm tool reaches the canonical
  * `scripts/<script>.py` through `runPy`; Python stays the only authority for state and validation.
  *
- * D-06 scope note: "exactly one spawner" covers the python script children, and `runPy` is the only
- * Bun.spawn call under omp/src. The git toplevel lookup (`gitToplevel`/`swarmDir` in ./paths.ts) is a
- * read-only Bun.spawnSync of git, called only at execute time; it is not a second python spawner.
+ * D-06 scope note: "exactly one spawner" covers the python3 children, and there are two sites, both named here: the
+ * script children `runScript` (the only `Bun.spawn` under omp/src) and the /swarm startup child `runLifecycle` in
+ * ./commands.ts (node `spawn`, bounded and process-group killed there). The git toplevel lookup (`gitToplevel`/
+ * `swarmDir` in ./paths.ts) is a read-only Bun.spawnSync of git, called only at execute time; it is not a python spawner.
  *
  * Nothing here runs at import: the root and SWARM_DIR are resolved inside each call.
  */
@@ -41,6 +42,8 @@ export interface BridgeRequest {
   timeoutMs?: number;
   /** The calling session's in-flight registry (set by the extension factory); the child is swept with it. */
   inflight?: Inflight;
+  /** Timer seam for the grace, pipe and deadline waits of this run (default: the system timers). */
+  timers?: BridgeTimers;
 }
 export interface BridgeResult {
   exitCode: 0 | 1;
@@ -54,6 +57,8 @@ export type ScriptRequest = Omit<BridgeRequest, "script"> & { script: string };
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const KILL_GRACE_MS = 3_000;
+/** OSA-03: how long a child that exited 0 on its own may wait for its pipes to close before its JSON result settles. */
+const EXIT_PIPE_GRACE_MS = 500;
 const TAIL = 400;
 const SCRIPT_NAME = /^[a-z][a-z0-9_]*$/;
 const STRIPPED_ENV = ["SWARM_TASK_ID", "SWARM_CORRELATION_ID"]; // argparse defaults (swarm/script_base.py)
@@ -61,6 +66,21 @@ const STRIPPED_ENV = ["SWARM_TASK_ID", "SWARM_CORRELATION_ID"]; // argparse defa
 type StopReason = "abort" | "timeout";
 /** Stop handles of one omp session's in-flight children (WR-01): one registry per extension factory call. */
 export type Inflight = Set<(why: StopReason) => void>;
+
+/** A timer handle the bridge can cancel and `unref`. */
+export interface TimerHandle {
+  unref(): unknown;
+}
+/** The timers `runScript` schedules its waits on; a test injects fakes to fire the grace timer by hand. */
+export interface BridgeTimers {
+  setTimeout(fn: () => void, ms: number): TimerHandle;
+  clearTimeout(handle: TimerHandle | undefined): void;
+}
+const SYSTEM_TIMERS: BridgeTimers = {
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  // the handle is the Timer that the setTimeout above returned
+  clearTimeout: (handle) => clearTimeout(handle as Timer | undefined),
+};
 
 /** env SWARM_ROOT (trimmed, when it holds scripts/orch_plan.py) → realpath of the package's repo → E-DEP. */
 export function swarmRoot(): string {
@@ -81,10 +101,13 @@ function abortError(script: string, signal: AbortSignal): SwarmToolError {
   );
 }
 
-function killGroup(pid: number, sig: "SIGTERM" | "SIGKILL"): void {
+export function killGroup(pid: number, sig: "SIGTERM" | "SIGKILL"): void {
   try {
     process.kill(-pid, sig);
-  } catch {} // group already gone
+  } catch (e) {
+    if (e instanceof Error && "code" in e && e.code === "ESRCH") return; // group already gone
+    process.stderr.write(`[swarm] ${sig} to process group ${pid} failed: ${String(e)}\n`);
+  }
 }
 
 /** Group-kill one session's in-flight children (that session's `session_shutdown` handler). */
@@ -101,6 +124,23 @@ function parseObject(stdout: string): Record<string, unknown> | undefined {
   }
 }
 
+/** Accumulates a child pipe as it arrives, so a settled exit reads what has arrived instead of waiting for EOF. */
+function collect(stream: ReadableStream<Uint8Array>): { text: () => string; done: Promise<void> } {
+  const decoder = new TextDecoder();
+  let text = "";
+  const done = (async () => {
+    const reader = stream.getReader();
+    for (;;) {
+      const { done: ended, value } = await reader.read();
+      if (ended) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  })();
+  done.catch(() => {}); // a stream error still surfaces through `await done`; a settled exit need not await it
+  return { text: () => text, done };
+}
+
 /**
  * Bridge-owned input file for script flags that take a path (`--ingest`, `--per-target-findings`); the model
  * never supplies a path (T-03-08). Writes `<SWARM_DIR>/results/<kind>-<sanitised toolCallId>.json` under the
@@ -111,14 +151,16 @@ export function writeInputFile(cwd: string, kind: "ingest" | "findings", toolCal
   mkdirSync(resolve(dir, "results"), { recursive: true });
   try {
     writeFileSync(resolve(dir, ".gitignore"), "*", { flag: "wx" }); // D-11 (as swarm/paths.py): never overwrite
-  } catch {}
+  } catch (e) {
+    if (!(e instanceof Error && "code" in e && e.code === "EEXIST")) throw e;
+  }
   const path = resolve(dir, "results", `${kind}-${toolCallId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120)}.json`);
   writeFileSync(path, JSON.stringify(value, null, 2));
   return path;
 }
 
 /** Spawn `python3 <SWARM_ROOT>/scripts/<script>.py <args> --json` and map the exit contract (0/1/2) to a result or error. */
-export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT_TIMEOUT_MS, inflight }: ScriptRequest): Promise<BridgeResult> {
+export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT_TIMEOUT_MS, inflight, timers = SYSTEM_TIMERS }: ScriptRequest): Promise<BridgeResult> {
   if (signal?.aborted) throw abortError(script, signal);
   if (!SCRIPT_NAME.test(script)) throw new SwarmToolError("E-INPUT", `invalid script name ${JSON.stringify(script)}`);
   const root = swarmRoot();
@@ -147,26 +189,38 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
 
   const pid = child.pid;
   let stopped: StopReason | undefined;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let killTimer: TimerHandle | undefined;
   const stop = (why: StopReason) => {
     if (stopped) return;
     stopped = why;
     killGroup(pid, "SIGTERM");
     // escalate if SIGTERM is ignored; cleared once the child has exited, so it never hits a reused pgid (WR-02)
-    killTimer = setTimeout(() => killGroup(pid, "SIGKILL"), KILL_GRACE_MS);
+    killTimer = timers.setTimeout(() => killGroup(pid, "SIGKILL"), KILL_GRACE_MS);
     killTimer.unref();
   };
   inflight?.add(stop);
   const onAbort = () => stop("abort");
   signal?.addEventListener("abort", onAbort, { once: true });
-  const timer = setTimeout(() => stop("timeout"), timeoutMs);
+  const timer = timers.setTimeout(() => stop("timeout"), timeoutMs);
 
   try {
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited,
-    ]);
+    const out = collect(child.stdout);
+    const err = collect(child.stderr);
+    const eof = Promise.all([out.done, err.done]);
+    const code = await child.exited;
+    if (!stopped && code === 0 && !signal?.aborted) {
+      // OSA-03: a grandchild that left the process group can hold the pipes after the child exited 0 on its own.
+      // Give the pipes a bounded grace; if stdout already holds a JSON result, settle on the exit with what arrived.
+      const { promise: grace, resolve: graceElapsed } = Promise.withResolvers<void>();
+      const graceTimer = timers.setTimeout(graceElapsed, EXIT_PIPE_GRACE_MS);
+      await Promise.race([eof, grace]);
+      timers.clearTimeout(graceTimer);
+      if (!parseObject(out.text())) await eof; // not a JSON result yet: read the whole output, as before
+    } else {
+      await eof; // a stopped child keeps the full-EOF wait, so a same-group grandchild still yields E-TIMEOUT / cancel
+    }
+    const stdout = out.text();
+    const stderr = err.text();
     // D-07: never return after a cancellation — omp would record a half-applied mutation as success.
     if (signal?.aborted) throw abortError(script, signal);
     if (stopped === "timeout") throw new SwarmToolError("E-TIMEOUT", `${script} exceeded ${timeoutMs} ms and was killed`);
@@ -185,8 +239,8 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
     }
     throw new SwarmToolError("E-INTERNAL", `${script} unexpected exit ${code}: ${(stderr.trim() || stdout.trim()).slice(-TAIL)}`, json);
   } finally {
-    clearTimeout(timer);
-    clearTimeout(killTimer);
+    timers.clearTimeout(timer);
+    timers.clearTimeout(killTimer);
     signal?.removeEventListener("abort", onAbort);
     inflight?.delete(stop);
   }

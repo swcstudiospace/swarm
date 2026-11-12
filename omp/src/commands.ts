@@ -4,7 +4,7 @@
  * that turn to start and then to finish, so a `-p` run does not exit before the dispatch. The brief reaches python
  * as one argv element built by planArgs (no shell, T-04-15). Nothing is dispatched without a successful plan result.
  */
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { swarmRoot } from "./bridge.ts";
 import type { Bridge, BridgeResult } from "./bridge.ts";
@@ -124,7 +124,7 @@ function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs, assignment: Record
   return [
     `${DISPATCH_MARKER} AgentSwarm plan ${corr} is ${json.reused === true ? "reused" : "ready"}: ${count} tasks ` +
       `(pattern ${parsed.pattern}, risk ${parsed.risk_class}).`,
-    'Call the `task` tool exactly once with agent "a01-orchestrator" and this canonical signed task.assign envelope as the task text, unchanged:',
+    'Call the `task` tool exactly once in the batch shape. Set `context` to a non-empty summary of this plan (an empty context is rejected before A01 starts). In `tasks`, put one item with agent "a01-orchestrator", a one-sentence solutionSpace, and `task` set to this canonical signed task.assign envelope, unchanged:',
     JSON.stringify(assignment),
     "A01 executes the plan and reports back; do not implement the brief in this session.",
     "A01 fans out every ready lane in that same turn, including several calls to the same slug when the plan repeats it. Disjoint blast radii stay parallel. Lane agents do not review. After the join merges their branches, one Greptile review covers the merged result.",
@@ -161,6 +161,8 @@ export interface SwarmCommandOptions {
    * the run and would tear the A01 turn down mid-orchestration).
    */
   holdTimeoutMs?: number;
+  /** Stops holding the session: both waits return at once and /swarm reports the cancel (the dispatch itself is not undone). */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_START_TIMEOUT_MS = 10_000;
@@ -195,23 +197,25 @@ function userMessageText(entry: SessionEntry): string {
 /**
  * True once the dispatch turn has started (D-11 step 5, T-04-23): `ctx.isIdle()` reads false, or a user message
  * carrying DISPATCH_MARKER and `corr` was appended to the branch after `sendUserMessage` (entries from index `from`
- * on, so an earlier dispatch of the same brief never counts). False once `startTimeoutMs` elapsed without either.
+ * on, so an earlier dispatch of the same brief never counts). False once `startTimeoutMs` elapsed or `signal` aborted,
+ * without either. Deadlines run on performance.now(): a wall-clock jump is not a start timeout.
  */
 async function awaitDispatchStart(
   ctx: CommandContext,
   corr: string,
   from: number,
-  { intervalMs = 10, startTimeoutMs = DEFAULT_START_TIMEOUT_MS }: SwarmCommandOptions,
+  { intervalMs = 10, startTimeoutMs = DEFAULT_START_TIMEOUT_MS, signal }: SwarmCommandOptions,
 ): Promise<boolean> {
-  const deadline = Date.now() + startTimeoutMs;
+  const deadline = performance.now() + startTimeoutMs;
   for (;;) {
+    if (signal?.aborted) return false;
     if (!ctx.isIdle()) return true;
     const dispatched = (e: SessionEntry) => {
       const text = userMessageText(e);
       return text.includes(DISPATCH_MARKER) && text.includes(corr);
     };
     if (ctx.sessionManager.getBranch().slice(from).some(dispatched)) return true;
-    if (Date.now() >= deadline) return false;
+    if (performance.now() >= deadline) return false;
     await sleep(intervalMs);
   }
 }
@@ -220,12 +224,12 @@ async function awaitDispatchStart(
  * True once `ctx.isIdle()` reads true again, i.e. the started turn has ended. omp's `isIdle` covers the whole
  * prompt (its in-flight count is held from before the agent loop until after it), while `ctx.waitForIdle()` only
  * waits on the loop and resolves during the pre-loop window (G-04-05-1), so this poll is the hold, not waitForIdle.
- * False once `capMs` elapsed with the turn still running (never, when the cap is Infinity).
+ * False once `capMs` elapsed or `signal` aborted with the turn still running (never time out, when the cap is Infinity).
  */
-async function awaitTurnEnd(ctx: CommandContext, capMs: number, { intervalMs = 10 }: SwarmCommandOptions): Promise<boolean> {
-  const deadline = Date.now() + capMs;
+async function awaitTurnEnd(ctx: CommandContext, capMs: number, { intervalMs = 10, signal }: SwarmCommandOptions): Promise<boolean> {
+  const deadline = performance.now() + capMs;
   while (!ctx.isIdle()) {
-    if (Date.now() >= deadline) return false;
+    if (signal?.aborted || performance.now() >= deadline) return false;
     await sleep(intervalMs);
   }
   return true;
@@ -233,6 +237,79 @@ async function awaitTurnEnd(ctx: CommandContext, capMs: number, { intervalMs = 1
 
 /** Python for the /swarm startup record: argv is [root, correlation id, workspace]; no user text is spliced into this source. */
 const SWARM_LIFECYCLE_CODE = `import sys,os,json; r,corr,root=sys.argv[1:4]; sys.path.insert(0,r); from swarm.envelope import perform_signing_key_lifecycle; from swarm.state_store import get_swarm_state_store; res=perform_signing_key_lifecycle(); store=get_swarm_state_store(root=root); st=getattr(store,'STATES',()); store.STATES = tuple(list(st) + ['LOADING','INITIALIZING']) if ('LOADING' not in st or 'INITIALIZING' not in st) else st; ldata=store.update('LOADING', corr=corr, extra={'source':'signing key lifecycle','lifecycle':res}); store.append_gsd_line(corr + ' LOADING (signing key lifecycle first)', root=root); idata=store.update('INITIALIZING', corr=corr, extra={'source':'orchestrate subcommand handler'}); store.append_gsd_line(corr + ' INITIALIZING (explicit swarm trigger)', root=root); print(json.dumps({'lifecycle':res,'loading':ldata}))`;
+
+/** Bound on the lifecycle python3 child (OSA-04): the /swarm handler returns within it, whatever the child does. */
+const LIFECYCLE_TIMEOUT_MS = 4_000;
+/** Once the child has exited, how long its pipes may stay open before what arrived settles the step (bridge.ts OSA-03). */
+const LIFECYCLE_PIPE_GRACE_MS = 500;
+/** After the group SIGTERM, a lifecycle group still alive is SIGKILLed after this (bridge.ts WR-02 pattern). */
+const LIFECYCLE_KILL_GRACE_MS = 1_000;
+
+/** The spawnSync fields the lifecycle step reads. */
+interface LifecycleResult {
+  error?: Error;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}
+
+function signalGroup(pid: number, sig: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, sig);
+  } catch {} // group already gone
+}
+
+/**
+ * Runs the lifecycle python3 in its own process group and settles within LIFECYCLE_TIMEOUT_MS. spawnSync cannot give
+ * that bound: its timeout signals only the direct child, and it keeps reading the stdio pipes until they close, which
+ * a grandchild that inherited stdout holds open. Here the bound settles the step at once: the group is SIGTERMed and
+ * the pipes are destroyed, without waiting for the child's exit or EOF. A fast child settles on its close, as before.
+ */
+function runLifecycle(args: string[], { cwd, env }: { cwd: string; env: NodeJS.ProcessEnv }): Promise<LifecycleResult> {
+  const { promise, resolve } = Promise.withResolvers<LifecycleResult>();
+  const child = spawn("python3", args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const pid = child.pid;
+  let settled = false;
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const settle = (r: Pick<LifecycleResult, "error" | "status" | "signal">) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutTimer);
+    clearTimeout(graceTimer);
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    resolve({ ...r, stdout, stderr });
+  };
+  child.on("error", (error) => settle({ error, status: null, signal: null }));
+  child.on("exit", (status, signal) => {
+    clearTimeout(killTimer); // as bridge.ts: no late SIGKILL once the leader is gone (WR-02)
+    if (settled) return;
+    clearTimeout(timeoutTimer);
+    graceTimer = setTimeout(() => settle({ status, signal }), LIFECYCLE_PIPE_GRACE_MS);
+  });
+  child.on("close", (status, signal) => settle({ status, signal }));
+  timeoutTimer = setTimeout(() => {
+    if (pid !== undefined) {
+      signalGroup(pid, "SIGTERM");
+      killTimer = setTimeout(() => signalGroup(pid, "SIGKILL"), LIFECYCLE_KILL_GRACE_MS);
+      killTimer.unref();
+    }
+    const error = Object.assign(new Error(`python3 lifecycle exceeded ${LIFECYCLE_TIMEOUT_MS} ms and was killed`), { code: "ETIMEDOUT" });
+    settle({ error, status: null, signal: "SIGTERM" });
+  }, LIFECYCLE_TIMEOUT_MS);
+  return promise;
+}
 
 export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions): CommandDefinition {
   return {
@@ -247,18 +324,25 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
       // usage error writes nothing) and before planning. Paths and the correlation id travel as argv, never as source.
       try {
         const r = (process.env.SWARM_ROOT || (typeof swarmRoot === "function" ? swarmRoot() : process.cwd()));
-        const lres = spawnSync("python3", ["-c", SWARM_LIFECYCLE_CODE, r, earlyCorr, ctx.cwd], { encoding: "utf8", cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
-        if (lres.stdout) process.stderr.write(`[/swarm] state transition logged ${promptSafe(lres.stdout.trim())}\n`);
+        const lres = await runLifecycle(["-c", SWARM_LIFECYCLE_CODE, r, earlyCorr, ctx.cwd], { cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
+        if (lres.stdout) notify(ctx, `state transition logged ${lres.stdout.trim()}`, "info");
         const lerr = (lres.stderr || "").trim();
         const lout = (lres.stdout || "").trim();
-        if (lerr || lout) process.stderr.write(`[/swarm] signing key lifecycle ${promptSafe(lerr || lout)}\n`);
-        process.stderr.write(`[/swarm] swarm init state=LOADING for ${earlyCorr} (signing key lifecycle first; LOADING before INITIALIZING; reduced if no key; enterprise audit/integrity; gsd workflowz ultrathink orchestrate path; msgs shown at start)\n`);
-        process.stderr.write(`[/swarm] swarm init state=INITIALIZING for ${earlyCorr} (before gsd workflowz, state logged, messages shown; no activity from prior unit triggers)\n`);
+        if (lerr || lout) notify(ctx, `signing key lifecycle ${lerr || lout}`, "info");
+        // TS-05: a lifecycle step that did not run (no python3, a non-zero exit, a signal) is reported with its reason; the
+        // LOADING/INITIALIZING lines are not written, since they would claim a lifecycle that never happened
+        if (lres.error || lres.status !== 0) {
+          const why = lres.error ? lres.error.message : lres.signal ? `killed by ${lres.signal}` : `exit ${lres.status}`;
+          notify(ctx, `/swarm: signing key lifecycle did not complete (${why}); swarm init state not logged`, "warning");
+        } else {
+          notify(ctx, `swarm init state=LOADING for ${earlyCorr} (signing key lifecycle first; LOADING before INITIALIZING; reduced if no key; enterprise audit/integrity; gsd workflowz ultrathink orchestrate path; msgs shown at start)`, "info");
+          notify(ctx, `swarm init state=INITIALIZING for ${earlyCorr} (before gsd workflowz, state logged, messages shown; no activity from prior unit triggers)`, "info");
+        }
       } catch (e) {
-        process.stderr.write(`[/swarm] signing key lifecycle note (non-fatal): ${promptSafe(String(e))}\n`);
+        notify(ctx, `signing key lifecycle note (non-fatal): ${String(e)}`, "warning");
       }
       // explicit swarm trigger ...
-      process.stderr.write(`[/swarm] explicit swarm trigger emit swarm ID ${earlyCorr}\n`);
+      notify(ctx, `explicit swarm trigger emit swarm ID ${earlyCorr}`, "info");
       let res: BridgeResult;
       try {
         // the same brief → the same correlation id and prefix → orch_plan reuses instead of duplicating (D-11)
@@ -274,18 +358,23 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
           typeof err?.message === "string" ? err.message : typeof res.json.summary === "string" ? res.json.summary : JSON.stringify(res.json);
         return notify(ctx, `/swarm: orch_plan exit ${res.exitCode}: ${detail}`, "error");
       }
+      const corr = res.json.correlation_id;
+      if (typeof corr !== "string" || !corr) return notify(ctx, "/swarm dispatch refused: E-CONTRACT: orch_plan result carries no correlation_id", "error");
       const assignment = executionAssignment(res.json);
       if (typeof assignment === "string") return notify(ctx, `/swarm dispatch refused: ${assignment}`, "error");
-      const corr = res.json.correlation_id as string;
       const from = ctx.sessionManager.getBranch().length;
       pi.sendUserMessage(dispatchPrompt(res, parsed, assignment));
       // sendUserMessage starts the turn asynchronously: wait for it to start, then hold until it ends (G-04-05-1)
-      if (!(await awaitDispatchStart(ctx, corr, from, opts))) {
+      const started = await awaitDispatchStart(ctx, corr, from, opts);
+      if (opts.signal?.aborted) return notify(ctx, `/swarm: cancelled; stopped holding plan ${corr}`, "warning");
+      if (!started) {
         const seconds = (opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS) / 1000;
         return notify(ctx, `/swarm: dispatch did not start within ${seconds} s (plan ${corr})`, "error");
       }
       const capMs = holdTimeoutMs(ctx, opts, process.env);
-      if (!(await awaitTurnEnd(ctx, capMs, opts))) {
+      const ended = await awaitTurnEnd(ctx, capMs, opts);
+      if (opts.signal?.aborted) return notify(ctx, `/swarm: cancelled; stopped holding plan ${corr}`, "warning");
+      if (!ended) {
         // the dispatch happened; only the hold gave up (a cap the operator set, or the interactive default)
         return notify(
           ctx,

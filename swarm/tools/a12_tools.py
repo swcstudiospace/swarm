@@ -21,12 +21,13 @@ Tools:
 import math
 import re
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
 from swarm.tools.support import respond
 
 
-def canary_verdict(payload: dict) -> dict:
-    def work() -> dict:
+def canary_verdict(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         canary = payload["canary_error_rate"]
         regression = round(canary - payload["baseline_error_rate"], 6)
         if canary > payload["error_rate_max"]:
@@ -42,8 +43,8 @@ def canary_verdict(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def rollback_trigger(payload: dict) -> dict:
-    def work() -> dict:
+def rollback_trigger(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         limit = payload["slo_burn_max"]
         needed = payload["consecutive_required"]
         run = 0
@@ -63,7 +64,7 @@ def rollback_trigger(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _is_empty(value) -> bool:
+def _is_empty(value: object) -> bool:
     if value is None:
         return True
     if isinstance(value, str):
@@ -73,8 +74,8 @@ def _is_empty(value) -> bool:
     return False
 
 
-def release_record_check(payload: dict) -> dict:
-    def work() -> dict:
+def release_record_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         record = payload["record"]
         fields = list(dict.fromkeys(payload["required_fields"]))
         missing = [name for name in fields if name not in record or _is_empty(record[name])]
@@ -88,8 +89,8 @@ def release_record_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def change_failure_rate(payload: dict) -> dict:
-    def work() -> dict:
+def change_failure_rate(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         outcomes = payload["outcomes"]
         total = len(outcomes)
         failed = sum(1 for flag in outcomes if flag)
@@ -98,8 +99,8 @@ def change_failure_rate(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def deploy_frequency(payload: dict) -> dict:
-    def work() -> dict:
+def deploy_frequency(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         try:
             days = sorted(date.fromisoformat(text) for text in payload["deploy_days"])
         except ValueError as exc:
@@ -120,8 +121,8 @@ def deploy_frequency(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def lead_time_p95(payload: dict) -> dict:
-    def work() -> dict:
+def lead_time_p95(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         ordered = sorted(payload["durations_hours"])
         count = len(ordered)
         # Nearest-rank percentile: the value at rank ceil(p * n / 100), 1-based.
@@ -137,8 +138,8 @@ def lead_time_p95(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def gate_order_check(payload: dict) -> dict:
-    def work() -> dict:
+def gate_order_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         steps = payload["steps"]
         wanted = payload["required_order"]
         if len(set(wanted)) != len(wanted):
@@ -168,11 +169,11 @@ def gate_order_check(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _finite(value) -> bool:
+def _finite(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
@@ -200,10 +201,10 @@ _MAX_AGE_HOURS = 87600
 _CLOCK_SKEW = timedelta(seconds=1)
 
 
-def gate_freshness(payload: dict) -> dict:
+def gate_freshness(payload: dict[str, Any]) -> dict[str, Any]:
     """Gates whose signed verdict is older than its maximum age, waived without an approval id, or failed."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         now = _instant(payload["now"])
         if now is None:
             return _invalid("now", "now must be an ISO 8601 timestamp with a UTC offset (2026-08-29T09:41:00Z) or epoch seconds as a string")
@@ -265,10 +266,10 @@ def _is_authority(identity: str) -> bool:
     return actor == "A13" or (actor.startswith("human:") and len(actor) > len("human:"))
 
 
-def freeze_decision(payload: dict) -> dict:
+def freeze_decision(payload: dict[str, Any]) -> dict[str, Any]:
     """Freeze from incident alerts (severity 2 or worse, sev1 is worst) and judge an unfreeze request."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         release_id = payload["release_id"]
         unfreeze_by = payload.get("unfreeze_by")
         frozen_by = payload.get("frozen_by")
@@ -297,7 +298,7 @@ def freeze_decision(payload: dict) -> dict:
         elif _actor(unfreeze_by).startswith("human:"):
             allowed = True
             reasons.append("a human may lift any freeze")
-        elif _is_authority(frozen_by) and _actor(frozen_by) != _actor(unfreeze_by):
+        elif frozen_by is not None and _is_authority(frozen_by) and _actor(frozen_by) != _actor(unfreeze_by):
             reasons.append(f"the freeze was declared by {_actor(frozen_by)}; only that authority may lift it")
         else:
             allowed = True
@@ -314,10 +315,10 @@ def freeze_decision(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def resume_point(payload: dict) -> dict:
+def resume_point(payload: dict[str, Any]) -> dict[str, Any]:
     """Next action for an interrupted canary: resume, roll back, or complete."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         steps = payload["steps_pct"]
         if any(later <= earlier for earlier, later in zip(steps, steps[1:])):
             return _invalid("steps_pct", "steps must be strictly increasing")
@@ -360,10 +361,10 @@ def resume_point(payload: dict) -> dict:
 _GUARDRAIL_PAIRS = (("error_rate", "error_rate_max"), ("p95_ms", "p95_ms_max"), ("slo_burn", "slo_burn_max"))
 
 
-def guardrail_breaches(payload: dict) -> dict:
+def guardrail_breaches(payload: dict[str, Any]) -> dict[str, Any]:
     """Guardrails one canary sample breaches (strictly above its limit), and metrics the sample lacks."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         observed = payload["observed"]
         limits = payload["limits"]
         for name, value in [*observed.items(), *limits.items()]:

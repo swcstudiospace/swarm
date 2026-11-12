@@ -26,7 +26,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import stat
 import sys
 from pathlib import Path, PurePosixPath
@@ -330,6 +329,7 @@ OMP_ORCH_PREAMBLE = """<swarm_runtime>
 - Step 0 (mandatory, before reading any file, running any script or writing anything): check your tool definitions and apply the first matching rule below; only then continue with the assignment.
   - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
   - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: tools limited to the advisor review surface (`read`, `grep`, `glob`, and `advise`) are the Omp advisor's balanced-budget review, not this cap. Do not yield and do not skip a later `task` dispatch or work pool because that surface is showing. When orchestrator tools such as `bash`, `write` or `swarm_*` remain and `task` is absent: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first. That yield is the specialist spawn only. Read-only discovery is not blocked.
+  - (c) Otherwise, if the assignment text is not one JSON object with `schema` `swarm.v1.task.assign`, `type` `task.assign`, `target` `A01` and `payload.capability` `plan.execute`: call `swarm_plan` with that text as `brief` (pattern `feature` and risk_class `medium`, unless the text names another pattern or risk). When the result has `execution_assignment_verified` true, that `execution_assignment` is your plan.execute task.assign; continue with it. When it does not, yield BLOCKED with needs "execution assignment" and spawn nothing. A prose brief is not an unsigned assignment. Do not yield BLOCKED for a missing envelope before `swarm_plan`. Handover intake applies only after that plan gives you a task_id.
 - Advisor budget: an `<advisory>` note of any severity, including blocker, is review from the Omp advisor model (weigh, don't blindly obey). It is not a swarm BLOCKED. Keep the advisor model. Do not stop the session because it spoke, and do not skip creating the work pool or the `task` dispatch. If a blocker says read-only nodes were marked blocked because A01 cannot dispatch, those nodes stay open: finish them with read, grep, and glob. Do not hand off with them still blocked, and do not answer that the whole request remains blocked.
 """ + _OMP_COMMON + """- Lease: use `swarm_transition` to move each ready task through CLAIMED to IN_PROGRESS before requesting its specialist assignment. Preserve the normal approval controls and single-writer artifact zones.
 - Assignment: call only `swarm_assignment` with the leased `task_id` and its `correlation_id`. It reads the current Task Store lease and returns the canonical signed `task.assign` envelope, exact `assignment_prompt` text in `prompt`, and manifest `agent_slug`. Require `status: "ok"` and `assignment_verified: true`; unsigned, advisory, dry-run, refused or missing assignments confer no dispatch authority. Never construct or sign an assignment yourself, provide a signing payload, access signing material, use generic `eval`/`xd://run_code`, or write raw swarm state to obtain one.
@@ -740,30 +740,20 @@ def _classify_target_stat(st: os.stat_result, target: Path) -> str | None:
     return None
 
 
-def _target_refusal(target: Path) -> str | None:
-    """Why `target` must not be written right now (T-07-05): `_classify_target_stat` at it, or a
-    symlink/non-directory at its parent. Reads only; `lstat` never follows a swapped-in symlink."""
+def _target_refusal(target: Path, root: Path) -> str | None:
+    """Why `target` must not be written right now (T-07-05): a symlink, a non-directory or an unreadable component
+    from `root` down to `target.parent` (`_install_cursor.dir_refusal`), or `_classify_target_stat` at `target`.
+    Reads only; `lstat` never follows a swapped-in symlink."""
+    refusal = _install_cursor.dir_refusal(root, target.parent)
+    if refusal is not None:
+        return refusal
     try:
         st = os.lstat(target)
     except FileNotFoundError:
-        pass
-    except OSError as exc:
-        return f"{target} is unreadable ({exc.strerror})"
-    else:
-        refusal = _classify_target_stat(st, target)
-        if refusal is not None:
-            return refusal
-    try:
-        pst = os.lstat(target.parent)
-    except FileNotFoundError:
         return None
     except OSError as exc:
-        return f"{target.parent} is unreadable ({exc.strerror})"
-    if stat.S_ISLNK(pst.st_mode):
-        return f"{target.parent} is a symlink"
-    if not stat.S_ISDIR(pst.st_mode):
-        return f"{target.parent} is not a directory"
-    return None
+        return f"{target} is unreadable ({exc.strerror})"
+    return _classify_target_stat(st, target)
 
 
 def _read_target(target: Path) -> str | None:
@@ -828,7 +818,7 @@ def _safe_write_text(target: Path, content: str) -> str | None:
 
 
 def _write_or_check(target: Path, content: str, check: bool, changed: list, written: list, blocked: list) -> None:
-    if _target_refusal(target) is not None:
+    if _target_refusal(target, ROOT) is not None:
         changed.append(str(target.relative_to(ROOT)))
         blocked.append(str(target.relative_to(ROOT)))
         return
@@ -837,7 +827,7 @@ def _write_or_check(target: Path, content: str, check: bool, changed: list, writ
     changed.append(str(target.relative_to(ROOT)))
     if not check:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if _target_refusal(target) is not None:
+        if _target_refusal(target, ROOT) is not None:
             blocked.append(str(target.relative_to(ROOT)))
             return
         refusal = _safe_write_text(target, content)
@@ -945,9 +935,9 @@ def _grokbot_orphans(lane_dirs: set[str]) -> tuple[list[Path], list[Path]]:
     return sorted(removable), sorted(unsafe)
 
 
-def _copy_file(src: Path, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
+def _copy_file(src: Path, dest: Path, root: Path) -> None:
+    """Copy a generated UTF-8 text file through ``_write_text_nofollow``: a symlinked or hardlinked destination is refused."""
+    _write_text_nofollow(dest, src.read_text(encoding="utf-8"), root)
 
 
 def hook_command(script: Path) -> str:
@@ -969,10 +959,12 @@ def _load_hook_config(path: Path) -> dict:
     with {} would drop every other setting. The open is non-blocking, so a FIFO cannot stall the install. `os.read`
     may return short; the read loops until EOF or the buffer exceeds the cap (still too big)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return {}
     except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise HookConfigError(f"{path} is a symlink") from exc
         raise HookConfigError(f"{path} could not be read ({exc.strerror})") from exc
     try:
         info = os.fstat(fd)
@@ -1058,7 +1050,20 @@ def _set_a01_complete_hook(hooks: dict, complete_cmd: str, enabled: bool) -> Non
         hooks.pop("Stop", None)
 
 
-def merge_claude_settings(settings_path: Path, hook_cmd: str, with_a01_complete_hook: bool = False) -> None:
+def _write_text_nofollow(path: Path, text: str, root: Path) -> None:
+    """Write ``text`` to ``path`` through ``_safe_write_text``. Every directory from ``root`` down to ``path`` is checked
+    before anything is created, so a symlinked ancestor is refused rather than followed. A symlink, a hardlink or a
+    swapped file is refused with ``UnsafeDestination`` before anything is written (P5-04)."""
+    refusal = _target_refusal(path, root)
+    if refusal is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        refusal = _target_refusal(path, root) or _safe_write_text(path, text)
+    if refusal is not None:
+        raise _install_omp.UnsafeDestination(f"refusing to write {path} ({refusal})")
+
+
+def merge_claude_settings(workspace: Path, settings_path: Path, hook_cmd: str, with_a01_complete_hook: bool = False) -> None:
+    _install_cursor.require_real_dirs(workspace, settings_path.parent)
     data = _load_hook_config(settings_path)
     data.setdefault("enabledPlugins", data.get("enabledPlugins", {}))
     hooks = data.setdefault("hooks", {})
@@ -1068,17 +1073,16 @@ def merge_claude_settings(settings_path: Path, hook_cmd: str, with_a01_complete_
     # n3/n8: the Stop hook that fires the after-orchestrate trigger (on_a01_complete.py, which can detach an unattended
     # runner) is registered only on request; a reinstall without the flag removes an earlier registration of it.
     _set_a01_complete_hook(hooks, hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py"), with_a01_complete_hook)
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    _write_text_nofollow(settings_path, json.dumps(data, indent=2) + "\n", workspace)
 
 
-def write_grok_hooks(path: Path, hook_cmd: str, with_a01_complete_hook: bool = False) -> None:
+def write_grok_hooks(workspace: Path, path: Path, hook_cmd: str, with_a01_complete_hook: bool = False) -> None:
+    _install_cursor.require_real_dirs(workspace, path.parent)
     payload = _load_hook_config(path)
     hooks = payload.setdefault("hooks", {})
     hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": hook_cmd}]}]
     _set_a01_complete_hook(hooks, hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py"), with_a01_complete_hook)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    _write_text_nofollow(path, json.dumps(payload, indent=2) + "\n", workspace)
 
 
 def _workspace_hooks(workspace: Path) -> tuple[Path, Path]:
@@ -1127,12 +1131,11 @@ def install_workspace(workspace: Path, dry_run: bool = False, with_a01_complete_
     skills_src = ROOT / "skills"
     for src, dest in pairs:
         if src.is_relative_to(skills_src):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(src.read_text(encoding="utf-8").replace("$SWARM_ROOT", str(root)), encoding="utf-8")
+            _write_text_nofollow(dest, src.read_text(encoding="utf-8").replace("$SWARM_ROOT", str(root)), workspace)
         else:
-            _copy_file(src, dest)
-    merge_claude_settings(settings, hook_cmd, with_a01_complete_hook)
-    write_grok_hooks(grok_hook, hook_cmd, with_a01_complete_hook)
+            _copy_file(src, dest, workspace)
+    merge_claude_settings(workspace, settings, hook_cmd, with_a01_complete_hook)
+    write_grok_hooks(workspace, grok_hook, hook_cmd, with_a01_complete_hook)
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -1214,7 +1217,7 @@ def main() -> int:
             shown = link
         print(f"error: refusing to generate or prune through symlink {shown}", file=sys.stderr)
         return 1
-    manifest_raw = json.loads((ROOT / "agents.json").read_text())
+    manifest_raw = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
     # Validate the Grok Bot roster before any generated file is written. A rejected

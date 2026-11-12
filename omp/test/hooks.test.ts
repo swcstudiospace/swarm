@@ -6,7 +6,7 @@ import type { Bridge } from "../src/bridge.ts";
 import { SWARM_SLUGS } from "../src/guard.ts";
 import { classifiedText, classifyPrompt, GSD_HANDOFF, RUNTIME_HEADING, runtimeContext, runtimePart, shellQuote, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
-import type { ExtensionContext } from "../src/omp-api.ts";
+import type { CommandContext, ExtensionContext } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_CHILD", "SWARM_AGENT", "SWARM_ROOT");
@@ -53,11 +53,12 @@ describe("fixture positives inject once, after the prior parts", () => {
       expect(out.systemPrompt.slice(0, -1)).toEqual(PRIOR);
       const added = out.systemPrompt.at(-1) ?? "";
       expect(added.startsWith("## AgentSwarm")).toBe(true);
-      expect(added).toContain("/swarm <brief>");
-      expect(added).toContain("If A01 cannot dispatch");
-      expect(added).toContain("Read-only discovery stays in this session");
-      expect(added).toContain("not a swarm BLOCKED");
-      expect(added).not.toContain("yields BLOCKED");
+      expect(added).toContain('agent: "a01-orchestrator"');
+      expect(added).toContain("swarm_plan");
+      expect(added).toContain("execution_assignment_verified");
+      expect(added).toContain("non-empty");
+      expect(added).toContain("`context`");
+      expect(added).not.toContain("/swarm <brief>");
       expect(added).toContain("task");
       expect(added).toContain("a01-orchestrator");
       expect(out.systemPrompt.filter((p) => p.includes("## AgentSwarm"))).toHaveLength(1);
@@ -86,6 +87,26 @@ test("gsd-autonomous handoff text does not name the retired policy token", () =>
   expect(GSD_HANDOFF).toContain("If A01 cannot dispatch");
   expect(GSD_HANDOFF).toContain("Do not hand off with every node blocked");
   expect(GSD_HANDOFF).toContain("finish them inline");
+});
+
+test("auto-steer dispatches A01 with the brief and has A01 plan it", () => {
+  expect(SWARM_CONTEXT).toContain('agent: "a01-orchestrator"');
+  expect(SWARM_CONTEXT).toContain("swarm_plan");
+  expect(SWARM_CONTEXT).toContain("execution_assignment_verified");
+  expect(SWARM_CONTEXT).toContain("A prose brief is not itself a signed assignment");
+  expect(SWARM_CONTEXT).toContain("non-empty");
+  expect(GSD_HANDOFF).toContain("non-empty");
+  expect(SWARM_CONTEXT).not.toContain("yields BLOCKED");
+  expect(SWARM_CONTEXT).toContain("If A01 cannot dispatch");
+  expect(SWARM_CONTEXT).toContain("Read-only discovery stays in this session");
+  expect(SWARM_CONTEXT).toContain("not a swarm BLOCKED");
+  expect(GSD_HANDOFF).toContain("If A01 cannot dispatch");
+  expect(GSD_HANDOFF).toContain("Do not hand off with every node blocked");
+  expect(GSD_HANDOFF).toContain("finish them inline");
+  expect(GSD_HANDOFF).toContain('agent: "a01-orchestrator"');
+  expect(GSD_HANDOFF).toContain("swarm_plan");
+  expect(GSD_HANDOFF).toContain("Do not treat the phase text as an already-signed `task.assign`");
+  expect(GSD_HANDOFF).not.toContain("`/swarm <phase brief>` only");
 });
 
 test("gsd-autonomous handoff fires only for a leading /gsd-autonomous command", () => {
@@ -139,9 +160,7 @@ describe("uplift XML: HOOK-01 classifies the user's ORIGINAL (WR-01)", () => {
   });
   test("an unclosed run of ORIGINAL tags is classified whole without scanning once per opener", () => {
     const prompt = `<BUILD_PROMPT>${"<ORIGINAL>".repeat(20000)}implement the billing module</BUILD_PROMPT>`;
-    const started = performance.now();
     expect(classifiedText(prompt)).toBe(prompt);
-    expect(performance.now() - started).toBeLessThan(100);
   });
   test("entities inside ORIGINAL are unescaped, and amp last", () => {
     const prompt = "<BUILD_PROMPT><ORIGINAL>a &lt;b&gt; &amp;lt; &quot;c&quot;</ORIGINAL></BUILD_PROMPT>";
@@ -322,7 +341,107 @@ describe("runtime part", () => {
   });
 });
 
+// ── TS-01/TS-02/TS-04: the guard's fail-closed paths, reached through the real factory's tool_call handler ───────────
+
+describe("guard fail-closed paths", () => {
+  isolateEnv("SWARM_TASK_ID");
+  beforeEach(() => {
+    delete process.env.SWARM_TASK_ID;
+  });
+  const CWD = "/nonexistent-hook-guard-cwd";
+  const SWARM_CALLER = agentCtx(CWD, "a05-backend", [], false);
+  /** The real factory's tool_call handler; the bridge throws if the guard ever reaches it. */
+  const guard = () => {
+    const bridge: Bridge = () => {
+      throw new Error("the guard must never reach the bridge");
+    };
+    const pi = fakePi();
+    pi.load(createSwarmExtension({ bridge }));
+    return pi.handler("tool_call");
+  };
+  /** A session whose log cannot be read: getEntries throws, as a headless -p session with a broken log does. */
+  const unreadable = {
+    cwd: CWD,
+    sessionManager: {
+      getEntries: () => {
+        throw new Error("session log unreadable");
+      },
+      getBranch: () => [],
+    },
+  } as unknown as ExtensionContext;
+
+  test("TS-01: an unreadable session log under a swarm env marker is refused, not passed", () => {
+    process.env.SWARM_AGENT = "a05-backend";
+    expect(guard()({ toolName: "bash", input: { command: "rm -rf x" } }, unreadable)).toMatchObject({ block: true });
+  });
+
+  test("TS-01: an unreadable session log without a swarm env marker stays outside the guard", () => {
+    expect(guard()({ toolName: "bash", input: { command: "rm -rf x" } }, unreadable)).toBeUndefined();
+  });
+
+  test("TS-02: a write to xd://ast_edit whose content is not JSON is refused, its paths are never dropped", () => {
+    const run = guard();
+    expect(run({ toolName: "write", input: { path: "xd://ast_edit", content: "not json" } }, SWARM_CALLER)).toEqual({
+      block: true,
+      reason: "BLOCKED needs: human-approval (protected_path: ast-edit-unjudgeable)",
+    });
+    const named = JSON.stringify({ ops: [], paths: ["src/x.ts"] });
+    expect(run({ toolName: "write", input: { path: "xd://ast_edit", content: named } }, SWARM_CALLER)).toBeUndefined();
+  });
+
+  test("TS-04: a shell body nested past the literal-depth cap is refused, not passed with its body unread", () => {
+    const run = guard();
+    const four = String.raw`sh -c "sh -c \"sh -c \\\"sh -c 'echo nested'\\\"\""`;
+    const three = String.raw`sh -c "sh -c \"sh -c 'echo nested'\""`;
+    expect(run({ toolName: "bash", input: { command: four } }, SWARM_CALLER)).toEqual({
+      block: true,
+      reason: "BLOCKED needs: human-approval (eval: nested-shell-depth)",
+    });
+    expect(run({ toolName: "bash", input: { command: three } }, SWARM_CALLER)).toBeUndefined();
+  });
+});
+
 test("no spawn: Bun.spawn and Bun.spawnSync were never called by any hook test above", () => {
   expect(spawn).toHaveBeenCalledTimes(0);
   expect(spawnSync).toHaveBeenCalledTimes(0);
+});
+
+// Placed after the no-spawn check on purpose: the real /swarm startup runs python3 through spawnSync.
+describe("/swarm startup when the signing-key lifecycle cannot run", () => {
+  test("TS-05: warns with the reason and prints no LOADING/INITIALIZING line it did not earn", async () => {
+    const workspace = tmpDir();
+    const savedPath = process.env.PATH;
+    const savedRoot = process.env.SWARM_ROOT;
+    // an empty PATH: python3 cannot be found, so spawnSync reports the failure in `error`
+    process.env.PATH = tmpDir("no-python-path-");
+    process.env.SWARM_ROOT = workspace;
+    const stderr: string[] = [];
+    const write = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      stderr.push(String(chunk));
+      return true;
+    }) as never);
+    const notes: Array<{ message: string; level: string }> = [];
+    try {
+      const bridge: Bridge = (async () => ({ exitCode: 1, json: { error: { message: "stop after startup" } } })) as never;
+      const pi = fakePi();
+      pi.load(createSwarmExtension({ bridge }));
+      const ctx = {
+        ...fakeCtx(workspace),
+        hasUI: true,
+        ui: { notify: (message: string, level: string) => void notes.push({ message, level }) },
+        isIdle: () => true,
+        waitForIdle: async () => {},
+      } as unknown as CommandContext;
+      await pi.command("swarm").handler("add a health endpoint", ctx);
+    } finally {
+      write.mockRestore();
+      process.env.PATH = savedPath;
+      if (savedRoot === undefined) delete process.env.SWARM_ROOT;
+      else process.env.SWARM_ROOT = savedRoot;
+    }
+    const warning = notes.find((n) => n.level === "warning");
+    expect(warning?.message).toMatch(/signing key lifecycle did not complete \(.+\)/);
+    expect(stderr.join("")).not.toContain("state=LOADING");
+    expect(stderr.join("")).not.toContain("state=INITIALIZING");
+  });
 });

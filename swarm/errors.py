@@ -4,7 +4,7 @@ from enum import Enum
 import random
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .taskstore import TaskStore
@@ -38,12 +38,12 @@ _HANDLING = {
 class SwarmError(Exception):
     """Exception carrying a taxonomy code so scripts can report it uniformly."""
 
-    def __init__(self, code: ErrorCode | str, message: str, **details):
+    def __init__(self, code: ErrorCode | str, message: str, **details: object):
         self.code = ErrorCode(code)
         self.details = details
         super().__init__(f"{self.code.value}: {message}")
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         return {"code": self.code.value, "message": str(self), "details": self.details,
                 "handling": self.code.standard_handling}
 
@@ -65,7 +65,7 @@ def classify(exc: BaseException) -> ErrorCode:
 
 def _exp_backoff_err(attempt: int, base: float = 1.0) -> float:
     """1s base + jitter for ErrorHandler 5 att retries."""
-    sleep = min(base * (2 ** attempt), 30.0)
+    sleep = min(base * 2.0 ** attempt, 30.0)
     jitter = random.uniform(0, 0.3)
     return sleep + jitter
 
@@ -187,7 +187,7 @@ class ErrorHandler:
                 pass
             return "FAILED"
 
-    def spec(self) -> dict:
+    def spec(self) -> dict[str, Any]:
         """Static contract for this handler unit: ladder, degrade paths, version."""
         return {
             "retries": self.max_attempts,
@@ -218,10 +218,10 @@ class ErrorHandler:
             "backoff": "1s base + jitter for 5 attempts"
         }
 
-    def status(self) -> dict:
+    def status(self) -> dict[str, Any]:
         """Current runtime state of the handler unit. Surface agg info."""
         with self._lock:
-            agg_status = {}
+            agg_status: dict[str, Any] = {}
             try:
                 agg_status = self.aggregator.status() if hasattr(self.aggregator, 'status') else {}
             except Exception:
@@ -239,11 +239,11 @@ class CentralErrorAggregator:
     """Central per-ID aggregator for error details, partials, retry surfaced.
     Used by ErrorHandler, wired to obs/state for gsd perID partial on FAILED/ERROR.
     """
-    def __init__(self):
-        self._per_id: dict[str, dict] = {}
+    def __init__(self) -> None:
+        self._per_id: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def record(self, sub_id: str, error: dict | str, is_partial: bool = False, retry: bool = False, **kw) -> None:
+    def record(self, sub_id: str, error: dict[str, Any] | str, is_partial: bool = False, retry: bool = False, **kw: object) -> None:
         """Record error detail per ID, mark partial/retry for surfacing."""
         try:
             with self._lock:
@@ -260,12 +260,12 @@ class CentralErrorAggregator:
         except Exception:
             pass  # isolate
 
-    def get(self, sub_id: str) -> dict:
+    def get(self, sub_id: str) -> dict[str, Any]:
         """Get per ID agg for emit in obs/state."""
         with self._lock:
             return dict(self._per_id.get(sub_id, {"errors": [], "partials": [], "retries": 0}))
 
-    def surfaced(self, sub_id: str) -> dict:
+    def surfaced(self, sub_id: str) -> dict[str, Any]:
         """Surfaced view for gsd/obs: details + partials + retry count."""
         d = self.get(sub_id)
         return {
@@ -276,7 +276,7 @@ class CentralErrorAggregator:
             "has_errors": len(d.get("errors", [])) > 0,
         }
 
-    def status(self) -> dict:
+    def status(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "ids_tracked": len(self._per_id),

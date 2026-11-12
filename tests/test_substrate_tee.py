@@ -4,6 +4,7 @@ Only the transport tests open sockets, and only to servers they start on 127.0.0
 import ast
 import http.server
 import io
+import logging
 import importlib.util
 import sys
 import json
@@ -102,6 +103,7 @@ def _env(tmp_path, monkeypatch):
     for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
         monkeypatch.delenv(k)  # an ambient HTTP_PROXY/NO_PROXY never leaks into a transport test
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.setenv("SWARM_PURE_PYTHON", "1")  # the oracle switch survives the scrub: child scripts import the pure modules
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))  # a tmp dir is never mistaken for a checkout's subdir
     substrate_client.reset()
     tee_mod.reset()
@@ -205,6 +207,14 @@ def test_rest_post_reports_http_errors_and_swallows_the_rest(on, fake, monkeypat
     substrate_client.reset()
     monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: (_ for _ in ()).throw(TimeoutError(TOKEN)))
     assert substrate_client.rest_post("/events", {}) is None
+
+
+def test_rest_post_failure_logs_class(on, monkeypatch, caplog):
+    monkeypatch.setattr(substrate_client, "_request", lambda *a, **k: (_ for _ in ()).throw(ConnectionResetError(TOKEN)))
+    caplog.set_level(logging.DEBUG)
+    assert substrate_client.rest_post("/events", {}) is None
+    assert "ConnectionResetError" in caplog.text
+    assert TOKEN not in caplog.text  # the exception's value never reaches the log, only its class
 
 
 @pytest.mark.parametrize("sse", [False, True])
@@ -662,8 +672,10 @@ def test_surfaces_match_agents_json():
 EVENT_KINDS = {"session.start", "prompt", "claim", "tool.call", "file.edit", "shell", "commit", "pr", "handoff", "session.end",
                "note", "warning"}
 _SOURCES = [*sorted((ROOT / "swarm").glob("*.py")), *sorted((ROOT / "scripts").glob("*.py")), *sorted((ROOT / "hooks").glob("*.py"))]
-# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal
-_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py"})
+# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal.
+# scripts/orch_status.py `_emit_ingest_events` replays event types the ingest manifest already recorded; those types were classified at the writer.
+# scripts/orch_plan.py `_plan_commit` replays only `plan.updated` (`_PLAN_EVENTS`), which the script itself emits as a literal (`ctx.emit("plan.updated", ...)`).
+_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py", "scripts/orch_status.py", "scripts/orch_plan.py"})
 
 
 def _emit_type_arg(call: ast.Call) -> ast.expr | None:

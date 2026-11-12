@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from typing import Any, TypeGuard, cast
 
 from swarm.tools.support import respond
 
@@ -63,8 +64,8 @@ def _token_problem(name: str, max_depth: int, roots: list[str] | None) -> str | 
     return None
 
 
-def token_name_check(payload: dict) -> dict:
-    def work() -> dict:
+def token_name_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         names = payload["names"]
         max_depth = payload["max_depth"]
         roots = payload.get("roots")
@@ -82,11 +83,11 @@ def token_name_check(payload: dict) -> dict:
             "conforming": not invalid and not duplicates,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def target_size_check(payload: dict) -> dict:
-    def work() -> dict:
+def target_size_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         targets = payload["targets"]
         repeated = sorted(tid for tid, count in Counter(t["id"] for t in targets).items() if count > 1)
         if repeated:
@@ -108,11 +109,11 @@ def target_size_check(payload: dict) -> dict:
             "compliant": not failing,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def scale_monotonic_check(payload: dict) -> dict:
-    def work() -> dict:
+def scale_monotonic_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         steps = payload["steps"]
         luminances = []
         for step in steps:
@@ -135,11 +136,11 @@ def scale_monotonic_check(payload: dict) -> dict:
             "violations": violations,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def spacing_scale_check(payload: dict) -> dict:
-    def work() -> dict:
+def spacing_scale_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         base = payload["base_px"]
         multiples, off_scale = [], []
         for value in payload["values_px"]:
@@ -157,7 +158,7 @@ def spacing_scale_check(payload: dict) -> dict:
             "on_scale": not off_scale,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 def _norm_state(state: str) -> str:
@@ -168,8 +169,8 @@ def _covers(state: str, family: str) -> bool:
     return state == family or state.startswith(family + ".")
 
 
-def state_coverage_check(payload: dict) -> dict:
-    def work() -> dict:
+def state_coverage_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         required = list(dict.fromkeys(_norm_state(s) for s in payload["required_states"]))
         declared = [_norm_state(s) for s in payload["declared_states"]]
         if "" in required:
@@ -187,11 +188,11 @@ def state_coverage_check(payload: dict) -> dict:
             "complete": not missing,
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def focus_contrast_check(payload: dict) -> dict:
-    def work() -> dict:
+def focus_contrast_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         try:
             focus = _luminance(payload["focus_hex"])
         except ValueError as exc:
@@ -211,11 +212,11 @@ def focus_contrast_check(payload: dict) -> dict:
             "meets": all(r >= floor for r in ratios),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def motion_duration_check(payload: dict) -> dict:
-    def work() -> dict:
+def motion_duration_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         limit = payload["max_duration_ms"]
         animations = payload["animations"]
         return {
@@ -227,11 +228,11 @@ def motion_duration_check(payload: dict) -> dict:
             "compliant": all(a["duration_ms"] <= limit and a["has_reduced_motion_variant"] for a in animations),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def breakpoint_order_check(payload: dict) -> dict:
-    def work() -> dict:
+def breakpoint_order_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         breakpoints = payload["breakpoints"]
         duplicates = sorted(name for name, count in Counter(b["name"] for b in breakpoints).items() if count > 1)
         out_of_order = [
@@ -250,7 +251,7 @@ def breakpoint_order_check(payload: dict) -> dict:
             "sorted_names": [b["name"] for b in ordered],
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
 _SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
@@ -259,11 +260,11 @@ _FIDELITY = ("hifi", "lofi")
 _A11Y_TARGETS = ("WCAG-2.2-AA", "WCAG-2.2-AAA")
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _flat_map_problem(field: str, tokens: dict) -> dict | None:
+def _flat_map_problem(field: str, tokens: dict[str, Any]) -> dict[str, Any] | None:
     """INVALID_INPUT for a token map that is too large, has blank names or non-scalar values; else None."""
     if len(tokens) > _MAX_TOKENS:
         return _invalid(field, f"more than {_MAX_TOKENS} tokens")
@@ -279,8 +280,8 @@ def _token_differs(before: object, after: object) -> bool:
     return before != after or isinstance(before, bool) != isinstance(after, bool)
 
 
-def token_semver_impact(payload: dict) -> dict:
-    def work() -> dict:
+def token_semver_impact(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         old, new, aliases = payload["old"], payload["new"], payload.get("aliases") or {}
         for field, tokens in (("old", old), ("new", new)):
             problem = _flat_map_problem(field, tokens)
@@ -319,10 +320,10 @@ def token_semver_impact(payload: dict) -> dict:
             "diff_empty": not (added or removed or changed),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def _nonblank(value: object) -> bool:
+def _nonblank(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(value.strip())
 
 
@@ -330,7 +331,7 @@ def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _spec_findings(spec: dict) -> tuple[list[str], list[str], bool]:
+def _spec_findings(spec: dict[str, Any]) -> tuple[list[str], list[str], bool]:
     """(missing_fields, bad_enums, empty_acceptance_refs) for the output_format shape of one ux.spec."""
     missing: list[str] = []
     bad: list[str] = []
@@ -384,8 +385,8 @@ def _spec_findings(spec: dict) -> tuple[list[str], list[str], bool]:
     return missing, bad, empty_refs
 
 
-def spec_completeness_check(payload: dict) -> dict:
-    def work() -> dict:
+def spec_completeness_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         spec = payload["spec"]
         required = list(dict.fromkeys(_norm_state(s) for s in payload["required_states"]))
         if "" in required:
@@ -424,11 +425,11 @@ def spec_completeness_check(payload: dict) -> dict:
             "complete": not (missing or bad or missing_states or unknown or absent or empty_refs or below_floor),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict
 
 
-def ac_trace_check(payload: dict) -> dict:
-    def work() -> dict:
+def ac_trace_check(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         ids = [i.strip() for i in payload["acceptance_ids"]]
         if "" in ids:
             return _invalid("acceptance_ids", "acceptance ids must not be blank")
@@ -467,4 +468,4 @@ def ac_trace_check(payload: dict) -> dict:
             "traced": not (uncovered or unknown or without),
         }
 
-    return respond(payload, work)
+    return cast(dict[str, Any], respond(payload, work))  # respond() is untyped in support.py; work() returns a result dict

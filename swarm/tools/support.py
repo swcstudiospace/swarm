@@ -7,10 +7,16 @@ import importlib.util
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable, Iterator
+from types import ModuleType
+from typing import Any, TypeVar
+
+_Arg = TypeVar("_Arg")
+_Result = TypeVar("_Result")
 
 ROOT = Path(__file__).resolve().parents[2]
-_SCRIPTS: dict[str, Any] = {}
+_SCRIPTS: dict[str, ModuleType] = {}
+_SCRIPTS_LOCK = threading.RLock()
 _running: set[int] = set()
 _lane = threading.Condition()
 _cancel: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar("swarm_call_cancel", default=None)
@@ -23,7 +29,7 @@ def current_caller() -> str | None:
 
 
 @contextlib.contextmanager
-def caller_scope(caller: str | None):
+def caller_scope(caller: str | None) -> Iterator[None]:
     """Bind ``caller`` for the duration of the block and restore the previous value on any exit."""
     token = _caller.set(caller)
     try:
@@ -66,7 +72,7 @@ def sleep_until_cancelled(seconds: float) -> bool:
     return flag.wait(seconds)
 
 
-def invoke_bounded(fn, arg, timeout_s: float):
+def invoke_bounded(fn: Callable[[_Arg], _Result], arg: _Arg, timeout_s: float) -> _Result:
     """Run ``fn(arg)`` until ``timeout_s``.
 
     One function runs at a time. A later independent call waits for the worker
@@ -113,29 +119,34 @@ def invoke_bounded(fn, arg, timeout_s: float):
         raise StillRunning(f"exceeded {timeout_s}s")
     if "error" in outcome:
         raise outcome["error"]
-    return outcome["value"]
+    value: _Result = outcome["value"]  # outcome is written only by target(), which stores the fn result under "value"
+    return value
 
 
-def script(stem: str) -> Any:
+def script(stem: str) -> ModuleType:
     """Load scripts/<stem>.py once. Scripts are not a package and only run main under __main__.
 
-    The return is Any because each stem is a loose script, not a typed module.
-    Callers reach functions that exist on that file; a static checker cannot see them.
+    The return is ModuleType: each stem is a loose script loaded from its file. Attribute access on a module is Any,
+    so callers reach functions that exist on that file; a static checker cannot see their signatures.
     """
     cached = _SCRIPTS.get(stem)
     if cached is not None:
         return cached
-    path = ROOT / "scripts" / f"{stem}.py"
-    spec = importlib.util.spec_from_file_location(f"_swarm_lane_{stem}", path)
-    if spec is None or spec.loader is None:
-        raise OSError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _SCRIPTS[stem] = module
-    return module
+    with _SCRIPTS_LOCK:
+        cached = _SCRIPTS.get(stem)
+        if cached is not None:
+            return cached
+        path = ROOT / "scripts" / f"{stem}.py"
+        spec = importlib.util.spec_from_file_location(f"_swarm_lane_{stem}", path)
+        if spec is None or spec.loader is None:
+            raise OSError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCRIPTS[stem] = module
+        return module
 
 
-def respond(payload: dict, work):
+def respond(payload: dict[str, Any], work: Callable[[], _Result]) -> dict[str, Any] | _Result:
     """Contract-test probe, then the real call. Probe values never reach the lane function."""
     probe = payload.get("probe")
     if probe == "sleep":

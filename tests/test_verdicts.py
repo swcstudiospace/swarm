@@ -504,3 +504,30 @@ def test_empty_id_env_means_unset_but_empty_flag_is_rejected(swarm_dir):
     for flag in ("--correlation-id=", "--task-id="):
         r = run_script("orch_status.py", flag, "--json")
         assert r.returncode == 2 and json.loads(r.stdout)["error"]["code"] == "E-INPUT", r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------- P1-19: severities and verdicts are closed sets
+def test_make_verdict_rejects_unknown_severity(monkeypatch):
+    from swarm.errors import SwarmError
+    from swarm.gates import make_verdict
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k")
+    bogus = {"id": "F-1", "severity": "catastrophic", "kind": "functional", "summary": "x", "evidence": "", "ac_ref": None,
+             "owner_suggestion": None, "location": None}
+    with pytest.raises(SwarmError) as e:
+        make_verdict(gate="review", task_id="T-1", agent_id="A09", findings=[bogus], audit=False)
+    assert e.value.code.value == "E-CONTRACT"
+
+
+@pytest.mark.xfail(strict=True, reason="BLOCKED-PIN P1-19 validate half: verdict membership lives in the pinned Rust mirror crates/gsd-route/src/gate_facts.rs parse_envelope")
+def test_validate_verdict_rejects_unknown_verdict(monkeypatch):
+    from swarm.envelope import build_envelope, sign_envelope
+    from swarm.errors import SwarmError
+    from swarm.gates import validate_verdict
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k")
+    payload = {"gate": "review", "task_id": "T-1", "verdict": "maybe", "findings": [], "runs": {}, "expires_s": 86400,
+               "issued_at": 1000.0}
+    env = sign_envelope(build_envelope(source="A09", target="A01", msg_type="gate.verdict", payload=payload,
+                                       correlation_id="C-1", priority="P1"), audit=False)
+    with pytest.raises(SwarmError) as e:
+        validate_verdict(env)
+    assert e.value.code.value == "E-CONTRACT"
