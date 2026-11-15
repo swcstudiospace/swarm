@@ -16,7 +16,6 @@ projection, lifecycle or approval logic, never writes to the task store, and rea
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import selectors
@@ -25,17 +24,19 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 ORCH_STATUS = ROOT / "scripts" / "orch_status.py"
+sys.path.insert(0, str(ROOT))
+os.environ.setdefault("SWARM_PURE_PYTHON", "1")  # importing swarm.* must not load the native extension in this stdlib server
+from swarm.mcp_projection import PAGE_SIZE, Page, empty_page, parse_page, project_page, success_result  # noqa: E402
 
 STRUCTURED_REVISION = "2025-06-18"
 PROTOCOL_VERSIONS = (STRUCTURED_REVISION, "2024-11-05")  # newest first; an unknown request is answered with the first
 SERVER_INFO = {"name": "agent-swarm", "version": "0.1.0"}
 
 TOOL_NAME = "swarm_status"
-PAGE_SIZE = 50  # the default `limit` and its largest accepted value
 MAX_LINE_BYTES = 65536  # content of one request line, not counting its newline
 MAX_JSON_DEPTH = 32
 BACKEND_TIMEOUT_S = 10.0
@@ -180,74 +181,15 @@ def _read_payload(correlation_id: str) -> dict[str, Any] | str:
     return payload
 
 
-def _encode_cursor(correlation_id: str, offset: int) -> str:
-    body = json.dumps({"c": correlation_id, "o": offset}, separators=(",", ":")).encode("ascii")
-    return base64.urlsafe_b64encode(body).decode("ascii")
-
-
-def _decode_cursor(cursor: str, correlation_id: str) -> int | None:
-    """The offset a cursor names for this correlation, or None when it is malformed or was issued for another correlation."""
-    try:
-        body = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
-    except ValueError:  # binascii, unicode and JSON decode errors are all ValueError
-        return None
-    if not isinstance(body, dict) or body.get("c") != correlation_id:
-        return None
-    offset = body.get("o")
-    return offset if type(offset) is int and offset >= 0 else None
-
-
-class _Page(NamedTuple):
-    correlation_id: str
-    limit: int
-    offset: int
-
-
-def _parse_page(arguments: object) -> _Page | str:
-    """The validated arguments of a swarm_status call, or the reason they are invalid."""
-    if not isinstance(arguments, dict):
-        return "arguments must be an object"
-    if set(arguments) - {"correlation_id", "limit", "cursor"}:
-        return "arguments accept only correlation_id, limit and cursor"
-    if "correlation_id" not in arguments:
-        return "correlation_id is required"
-    correlation_id = arguments["correlation_id"]
-    if not isinstance(correlation_id, str) or "\x00" in correlation_id:
-        return "correlation_id must be a string without NUL characters"
-    limit = arguments.get("limit", PAGE_SIZE)
-    if type(limit) is not int or not 1 <= limit <= PAGE_SIZE:
-        return f"limit must be an integer from 1 to {PAGE_SIZE}"
-    cursor = arguments.get("cursor")
-    if cursor is None:
-        return _Page(correlation_id, limit, 0)
-    if not isinstance(cursor, str):
-        return "cursor must be a string"
-    offset = _decode_cursor(cursor, correlation_id)
-    if offset is None:
-        return "cursor was not issued for this correlation"
-    return _Page(correlation_id, limit, offset)
-
-
-def _swarm_status(page: _Page) -> dict[str, Any] | str:
+def _swarm_status(page: Page) -> dict[str, Any] | str:
     """One page of task rows as structuredContent, or the reason the read failed. An empty correlation is answered without the
     backend, so it can never reach another correlation."""
     if page.correlation_id == "":
-        return {"correlation_id": "", "tasks": [], "next_cursor": None, "swarm_dir": None, "db": None}
+        return empty_page()
     payload = _read_payload(page.correlation_id)
     if isinstance(payload, str):
         return payload
-    rows = payload["tasks"]
-    end = page.offset + page.limit
-    next_cursor = _encode_cursor(page.correlation_id, end) if end < len(rows) else None
-    return {"correlation_id": page.correlation_id, "tasks": rows[page.offset:end], "next_cursor": next_cursor,
-            "swarm_dir": payload.get("swarm_dir"), "db": payload.get("db")}
-
-
-def _success_result(session: Session, structured: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {"content": [{"type": "text", "text": json.dumps(structured, sort_keys=True)}], "isError": False}
-    if session.protocol_version == STRUCTURED_REVISION:
-        result["structuredContent"] = structured
-    return result
+    return project_page(page, payload)
 
 
 def _error_result(text: str) -> dict[str, Any]:
@@ -259,13 +201,13 @@ def _tools_call(session: Session, rid: Any, params: object) -> dict[str, Any]:
         return _error(rid, INVALID_PARAMS, "tools/call requires a string name")
     if params["name"] != TOOL_NAME:
         return _error(rid, INVALID_PARAMS, "unknown tool")
-    page = _parse_page(params.get("arguments", {}))
+    page = parse_page(params.get("arguments", {}))
     if isinstance(page, str):
         return _error(rid, INVALID_PARAMS, page)
     answer = _swarm_status(page)
     if isinstance(answer, str):
         return _result(rid, _error_result(answer))  # an authority or backend failure is a tool result, not a protocol error
-    return _result(rid, _success_result(session, answer))
+    return _result(rid, success_result(answer, session.protocol_version == STRUCTURED_REVISION))
 
 
 def _request(session: Session, rid: Any, method: str, params: object) -> dict[str, Any]:
