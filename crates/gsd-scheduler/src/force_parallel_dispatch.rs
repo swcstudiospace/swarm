@@ -158,24 +158,27 @@ pub enum Priority {
 }
 
 impl Priority {
-    /// Parses a priority label exactly as Python stores it (`P0`..`P3`). Any other string is `E-INPUT`.
-    pub fn parse(label: &str) -> Result<Self, FailureError> {
+    /// Parses a priority label as Python's `PRIORITY_RANK.get(label, PRIORITY_RANK["P2"])` does: `P0`..`P3`
+    /// map to their rank. Any other label (including another case or surrounding whitespace) is `P2`.
+    pub fn parse(label: &str) -> Self {
         match label {
-            "P0" => Ok(Self::P0),
-            "P1" => Ok(Self::P1),
-            "P2" => Ok(Self::P2),
-            "P3" => Ok(Self::P3),
-            other => Err(FailureError::new(
-                ErrorCode::Input,
-                format!("priority must be one of P0, P1, P2, P3, got {other:?}"),
-            )),
+            "P0" => Self::P0,
+            "P1" => Self::P1,
+            "P3" => Self::P3,
+            // `P2`, and every label Python does not know, falls back to `P2`.
+            _ => Self::P2,
         }
     }
 
-    /// Reads a task's proto priority, which carries the rank: `0` is `P0` through `3` is `P3`.
-    /// Any other rank is `E-INPUT`.
-    pub fn from_wire(rank: i32) -> Result<Self, FailureError> {
-        Self::parse(&format!("P{rank}"))
+    /// Reads a task's proto priority rank: `0` is `P0` through `3` is `P3`. Any other rank is `P2`, the same
+    /// fallback as an unknown label.
+    pub fn from_wire(rank: i32) -> Self {
+        match rank {
+            0 => Self::P0,
+            1 => Self::P1,
+            3 => Self::P3,
+            _ => Self::P2,
+        }
     }
 }
 
@@ -186,13 +189,13 @@ impl From<FailureError> for SchedulerError {
 }
 
 /// Sorts `tasks` into dispatch order: priority (`P0` first), DAG depth (shallower first), then creation
-/// order (original position). Stable for full ties. A task whose priority is outside `P0`..`P3` fails the
-/// sort with `E-INPUT` and leaves `tasks` unchanged.
-pub fn sort_dispatch_order(tasks: &mut Vec<Task>) -> SchedulerResult<()> {
-    let priorities = tasks
+/// order (original position). Stable for full ties. An unknown priority sorts as `P2`, as Python's
+/// `order_ready` does.
+pub fn sort_dispatch_order(tasks: &mut Vec<Task>) {
+    let priorities: Vec<Priority> = tasks
         .iter()
         .map(|task| Priority::from_wire(task.priority))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
     let depths = dag_depths(tasks);
     let owned = std::mem::take(tasks);
     let mut keyed: Vec<(Priority, usize, usize, Task)> = owned
@@ -202,7 +205,6 @@ pub fn sort_dispatch_order(tasks: &mut Vec<Task>) -> SchedulerResult<()> {
         .collect();
     keyed.sort_by_key(|(priority, depth, index, _)| (*priority, *depth, *index));
     *tasks = keyed.into_iter().map(|(_, _, _, task)| task).collect();
-    Ok(())
 }
 
 /// Longest dependency chain below each task: roots are 0, a dependent is its deepest dependency + 1.
@@ -446,7 +448,7 @@ where
     let cap = effective_global_cap(config.requested_parallel);
     let limiter =
         AimdLimiter::new(cap, 1, config.cooldown)?.with_streak_threshold(config.fail_streak);
-    sort_dispatch_order(&mut built.tasks)?;
+    sort_dispatch_order(&mut built.tasks);
     let mut run = Run {
         built,
         worker: Arc::new(worker),
@@ -544,7 +546,7 @@ mod tests {
             task("C", 0, "w", &[]),
             task("D", 0, "w", &["A"]),
         ];
-        sort_dispatch_order(&mut tasks).expect("sort");
+        sort_dispatch_order(&mut tasks);
         assert_eq!(ids(&tasks), vec!["A", "C", "D", "B"]);
     }
 
@@ -556,7 +558,7 @@ mod tests {
             task("mid", 0, "w", &["root"]),
             task("root", 0, "w", &[]),
         ];
-        sort_dispatch_order(&mut tasks).expect("sort");
+        sort_dispatch_order(&mut tasks);
         assert_eq!(ids(&tasks), vec!["root", "mid", "deep"]);
     }
 
@@ -831,54 +833,77 @@ mod tests {
     }
 
     #[test]
-    fn priority_parses_p0_to_p3_and_rejects_anything_else() {
-        assert_eq!(Priority::parse("P0").ok(), Some(Priority::P0));
-        assert_eq!(Priority::parse("P3").ok(), Some(Priority::P3));
-        for bad in ["p0", "P4", "", "high", " P1"] {
-            assert_eq!(
-                Priority::parse(bad).expect_err("bad priority").code(),
-                ErrorCode::Input
-            );
+    fn priority_parses_p0_to_p3_and_maps_anything_else_to_p2() {
+        assert_eq!(Priority::parse("P0"), Priority::P0);
+        assert_eq!(Priority::parse("P1"), Priority::P1);
+        assert_eq!(Priority::parse("P2"), Priority::P2);
+        assert_eq!(Priority::parse("P3"), Priority::P3);
+        for unknown in ["p0", "P4", "", "high", " P1"] {
+            assert_eq!(Priority::parse(unknown), Priority::P2, "label {unknown:?}");
         }
     }
 
     #[test]
-    fn wire_rank_maps_zero_to_p0_and_rejects_out_of_range() {
-        assert_eq!(Priority::from_wire(0).ok(), Some(Priority::P0));
-        assert_eq!(Priority::from_wire(3).ok(), Some(Priority::P3));
-        assert_eq!(
-            Priority::from_wire(4).expect_err("rank 4").code(),
-            ErrorCode::Input
-        );
-        assert_eq!(
-            Priority::from_wire(-1).expect_err("rank -1").code(),
-            ErrorCode::Input
-        );
+    fn wire_rank_maps_zero_to_p0_and_unknown_rank_to_p2() {
+        assert_eq!(Priority::from_wire(0), Priority::P0);
+        assert_eq!(Priority::from_wire(2), Priority::P2);
+        assert_eq!(Priority::from_wire(3), Priority::P3);
+        for unknown in [4, -1, i32::MIN, i32::MAX] {
+            assert_eq!(Priority::from_wire(unknown), Priority::P2, "rank {unknown}");
+        }
     }
 
     #[test]
     fn p0_sorts_before_p3() {
         assert!(Priority::P0 < Priority::P3);
         let mut tasks = vec![task("low", 3, "w", &[]), task("high", 0, "w", &[])];
-        sort_dispatch_order(&mut tasks).expect("sort");
+        sort_dispatch_order(&mut tasks);
         assert_eq!(ids(&tasks), vec!["high", "low"]);
     }
 
     #[test]
-    fn bad_priority_is_rejected_and_leaves_tasks_unsorted() {
-        let mut tasks = vec![task("a", 0, "w", &[]), task("b", 7, "w", &[])];
-        let err = sort_dispatch_order(&mut tasks).expect_err("bad priority");
-        assert!(err.to_string().contains("E-INPUT"));
-        assert_eq!(ids(&tasks), vec!["a", "b"]);
+    fn unknown_priority_sorts_as_p2_then_depth_then_creation() {
+        // Wire ranks 7 and -1 are unknown and sort with P2: after P1, before P3; ties keep creation order.
+        let mut tasks = vec![
+            task("p3", 3, "w", &[]),
+            task("unknown-high", 7, "w", &[]),
+            task("p2", 2, "w", &[]),
+            task("p1", 1, "w", &[]),
+            task("unknown-low", -1, "w", &[]),
+            task("unknown-dep", 9, "w", &["p1"]),
+        ];
+        sort_dispatch_order(&mut tasks);
+        assert_eq!(
+            ids(&tasks),
+            vec![
+                "p1",
+                "unknown-high",
+                "p2",
+                "unknown-low",
+                "unknown-dep",
+                "p3"
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn run_rejects_bad_priority_before_dispatching() {
-        let tasks = vec![task("a", -1, "w", &[])];
-        let err = run_force_parallel(built(tasks), serial(1), |_t: Task| async { Ok(()) })
+    async fn run_dispatches_unknown_priority_as_p2() {
+        // One slot: unknown ranks dispatch as P2, after P1 and before P3, in creation order.
+        let tasks = vec![
+            task("p3", 3, "w", &[]),
+            task("unknown-high", 7, "w", &[]),
+            task("p1", 1, "w", &[]),
+            task("unknown-low", -1, "w", &[]),
+            task("p2", 2, "w", &[]),
+        ];
+        let report = run_force_parallel(built(tasks), serial(1), |_t: Task| async { Ok(()) })
             .await
-            .expect_err("bad priority");
-        assert!(err.to_string().contains("E-INPUT"));
+            .expect("dispatch");
+        assert_eq!(
+            report.dispatch_order,
+            vec!["p1", "unknown-high", "unknown-low", "p2", "p3"]
+        );
+        assert!(report.undispatched.is_empty());
     }
 
     #[test]
