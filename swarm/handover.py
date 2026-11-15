@@ -39,6 +39,7 @@ from .manifest import AGENTS_FILE
 from .paths import swarm_dir
 from .redact import redact, redact_text
 from .schema import load_schema, validate
+from .taskstore import connect_readonly
 
 log = logging.getLogger(__name__)
 
@@ -492,9 +493,8 @@ class StoreReader:
         path = swarm_dir(root) / "tasks.db"
         self.conn: sqlite3.Connection | None = None
         if path.is_file():
-            self.conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
+            self.conn = connect_readonly(path, timeout=5)
             self.conn.row_factory = sqlite3.Row
-            self.conn.execute("PRAGMA query_only=ON")
 
     def __enter__(self) -> StoreReader:
         return self

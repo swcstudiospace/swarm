@@ -139,6 +139,13 @@ def _snapshot(paths: list[Path]) -> dict[str, tuple]:
 def _changes(before: dict[str, tuple], after: dict[str, tuple]) -> list[str]:
     out: list[str] = []
     for key in sorted(before.keys() | after.keys()):
+        # AC-14.7-06, narrowed by user decisions: a read route may create the run-log directory `.swarm/`, its
+        # `.gitignore`, and append `.swarm/events.jsonl` (existing tests pin the run-log record). Store, key, and SQLite
+        # sidecar creation stays forbidden.
+        if Path(key).name == ".swarm" and after.get(key) == ("dir",):
+            continue
+        if Path(key).parent.name == ".swarm" and Path(key).name in {"events.jsonl", ".gitignore"}:
+            continue
         if key not in before:
             out.append(f"created {key}")
         elif key not in after:

@@ -110,8 +110,51 @@ def _gates_of(task: TaskRow) -> list[str]:
     return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
 
 
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _is_wal_database(path: Path) -> bool:
+    """True when `path` is a SQLite file whose header marks it as WAL (file format bytes 18 and 19 are both 2)."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(100)
+    except OSError:
+        return False
+    return len(head) == 100 and head.startswith(_SQLITE_HEADER) and head[18] == 2 and head[19] == 2
+
+
+def connect_readonly(path: str | Path, *, timeout: float = 30) -> sqlite3.Connection:
+    """A read-only connection to the existing Task Store file at `path`, which creates nothing beside it (no -journal,
+    -wal or -shm). Only a WAL database makes SQLite create a sidecar on a read-only open, so the open depends on what is
+    there: with a -wal file, the existing -shm is used read-only (`readonly_shm`), and a missing -shm is an explicit error;
+    with no -wal, every commit is in the main file, and `immutable` reads it without locks or sidecars. A writer that
+    starts after that check can make the read stale or fail, never create a file. A rollback-journal database needs no
+    sidecar to read. Raises sqlite3.Error when the file is absent, is not a database or cannot be read."""
+    db = Path(os.path.abspath(path))
+    if Path(f"{db}-wal").exists():
+        params = "mode=ro&readonly_shm=1"
+    elif _is_wal_database(db):
+        params = "mode=ro&immutable=1"
+    else:
+        params = "mode=ro"
+    conn = sqlite3.connect(f"{db.as_uri()}?{params}", uri=True, timeout=timeout)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    return conn
+
+
 class TaskStore:
-    def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
+    def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None, read_only: bool = False):
+        if read_only:  # a read route: an existing store, opened without creating anything; no schema, no migration
+            self.path = Path(path) if path else swarm_dir(root) / "tasks.db"
+            self.conn = connect_readonly(self.path)
+            self.conn.row_factory = sqlite3.Row
+            self._tx_depth = 0
+            self._live_dirty = False
+            return
         self.path = Path(path) if path else swarm_dir(root, create=True) / "tasks.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=30)  # contenders wait for the write lock, not "database is locked"

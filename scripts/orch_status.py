@@ -86,18 +86,36 @@ def finish_transition(store: TaskStore, ctx: Ctx, tid: str, *, before: str, reas
 
 
 def run(args, ctx) -> dict:
-    store = TaskStore(root=ctx.root)
-    corr = ctx.correlation_id or latest_correlation(ctx.root)
-
     if args.history:
-        try:
-            store.get(args.history)
-        except SwarmError as exc:
-            # Named without the id, as the Rust wire answers (review F17): the caller has the id.
-            raise SwarmError(ErrorCode.E_INPUT, "unknown task for history.task_id") from exc
-        return {"status": "ok", "task_id": args.history, "history": store.history(args.history),
-                "verdicts": store.latest_verdicts(args.history),
-                "missing_gate_reasons": store.missing_gate_reasons(args.history), "summary": f"history for {args.history}"}
+        return _history(args.history, ctx)
+    if args.transition or args.ingest:
+        return _write(args, ctx)
+    return _status(ctx)
+
+
+def _open_read_store(root: str | Path | None) -> TaskStore | None:
+    """The Task Store of a read route, opened read-only, or None when there is no Task Store file yet. A read route creates
+    nothing (no store, no .gitignore, no sidecar); a path that is there but is not a usable store fails explicitly."""
+    path = swarm_dir(root) / "tasks.db"
+    return TaskStore(path, read_only=True) if path.exists() else None
+
+
+def _history(task_id: str, ctx) -> dict:
+    store = _open_read_store(ctx.root)
+    if store is None:
+        raise SwarmError(ErrorCode.E_INPUT, "unknown task for history.task_id")
+    try:
+        store.get(task_id)
+    except SwarmError as exc:
+        # Named without the id, as the Rust wire answers (review F17): the caller has the id.
+        raise SwarmError(ErrorCode.E_INPUT, "unknown task for history.task_id") from exc
+    return {"status": "ok", "task_id": task_id, "history": store.history(task_id),
+            "verdicts": store.latest_verdicts(task_id),
+            "missing_gate_reasons": store.missing_gate_reasons(task_id), "summary": f"history for {task_id}"}
+
+
+def _write(args, ctx) -> dict:
+    store = TaskStore(root=ctx.root)
 
     if args.transition:
         tid, state = args.transition
@@ -110,12 +128,16 @@ def run(args, ctx) -> dict:
                               events=lambda row: [("task.transition", {"task_id": tid, "state": row["state"], "reason": args.reason}, None)])
         return {"status": "ok", "task": t, "summary": f"{tid} → {t['state']}"}
 
-    if args.ingest:
-        return ingest(store, Path(args.ingest), ctx, approve=not args.advisory)
+    return ingest(store, Path(args.ingest), ctx, approve=not args.advisory)
 
-    tasks = store.list(correlation_id=corr)
-    where = {"db": str(store.path), "swarm_dir": str(store.path.parent)}  # D-04: absolute, cwd-independent
-    if not tasks:
+
+def _status(ctx) -> dict:
+    corr = ctx.correlation_id or latest_correlation(ctx.root)
+    db = swarm_dir(ctx.root) / "tasks.db"
+    store = _open_read_store(ctx.root)
+    tasks = store.list(correlation_id=corr) if store is not None else []
+    where = {"db": str(db), "swarm_dir": str(db.parent)}  # D-04: absolute, cwd-independent
+    if not tasks or store is None:  # no Task Store file yet (none is created), or no task for this correlation
         return {"status": "ok", "correlation_id": corr, "tasks": [], **where, "summary": "no tasks (run orch_plan.py first)"}
     ready = {t["task_id"] for t in store.ready(corr)}
     rows, counts = [], {}
