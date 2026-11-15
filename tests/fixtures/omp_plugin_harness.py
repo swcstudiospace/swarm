@@ -131,9 +131,29 @@ def _guard_omp_argv(args: list[str], scratch: Path | None) -> None:
         raise GuardViolation(f"install source is neither the repo package nor matrix scratch: {args[2]}")
     if args[:3] == ["--mode", "rpc", "--no-session"]:
         rest = args[3:]
-        if rest == [] or rest == ["-e", str(PKG_ENTRY)]:
+        if rest == [] or rest == ["-e", str(PKG_DIR)]:
             return
     raise GuardViolation(f"omp argv outside the matrix allowlist: {args!r}")
+
+
+# Scratch-only model config for each case's isolated agent dir. It names the model id and holds no
+# credential: `auth: none` reads no key, and the closed-port baseUrl means no request can succeed.
+# Without it a fresh start has no default model and exits before answering RPC.
+SCRATCH_MODELS_YML = (
+    "providers:\n"
+    "  scratch:\n"
+    "    baseUrl: http://127.0.0.1:9/v1\n"
+    "    api: anthropic-messages\n"
+    "    auth: none\n"
+    "    models:\n"
+    "      - id: claude-haiku-5-5\n"
+)
+
+
+def _write_scratch_models(home: Path) -> None:
+    agent_dir = home / ".omp" / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "models.yml").write_text(SCRATCH_MODELS_YML, encoding="utf-8")
 
 
 def _isolated_env(home: Path) -> dict[str, str]:
@@ -413,7 +433,7 @@ def _rpc_exchange(argv: list[str], cwd: Path, env: dict[str, str], timeout_s: fl
 
 def _fresh_start(ctx: _Ctx, label: str, *, explicit_entry: bool = False) -> dict[str, Any]:
     """Fresh `omp --mode rpc --no-session` in ctx.workspace. No `-e` unless explicit_entry."""
-    args = ["--mode", "rpc", "--no-session"] + (["-e", str(PKG_ENTRY)] if explicit_entry else [])
+    args = ["--mode", "rpc", "--no-session"] + (["-e", str(PKG_DIR)] if explicit_entry else [])
     _guard_omp_argv(args, ctx.scratch)
     run = _rpc_exchange([ctx.omp, *args], ctx.workspace, ctx.env, _timeout_s())
     rec = _record(ctx, label, args, run.exit_code, run.stdout, run.stderr, run.timed_out, kind="fresh_start", inline=False)
@@ -457,7 +477,7 @@ def _case_configured_only(ctx: _Ctx) -> dict[str, Any]:
 def _case_explicit_source(ctx: _Ctx) -> dict[str, Any]:
     identity = _plugin_list(ctx, "list-no-install")
     _fresh_start(ctx, "fresh-start-explicit-e", explicit_entry=True)
-    return {"notes": {"identity": identity, "explicit_entry": _s(ctx, PKG_ENTRY)}}
+    return {"notes": {"identity": identity, "explicit_entry": _s(ctx, PKG_DIR)}}
 
 
 def _case_duplicate_alias(ctx: _Ctx) -> dict[str, Any]:
@@ -570,6 +590,7 @@ def run_case(name: str, out_dir: str | Path, omp_bin: str | None = None) -> dict
         workspace = scratch / "ws"
         home.mkdir()
         workspace.mkdir()
+        _write_scratch_models(home)
         ctx = _Ctx(
             case=name,
             out=out,
