@@ -13,6 +13,7 @@ import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRAT
 import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionContext, ExtensionFactory } from "./omp-api.ts";
 import { type BarEvent, createSwarmBar, type SwarmBarOptions } from "./swarm_bar.ts";
+import { swarmStatusCommand } from "./swarm_status.ts";
 import { buildTools } from "./tools.ts";
 
 function taskResult(event: unknown): { toolCallId: string | undefined; isError: boolean } | undefined {
@@ -40,6 +41,8 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
     for (const tool of buildTools(scoped)) pi.registerTool(tool);
     // ORCH-03 (D-11): the same scoped bridge, so session_shutdown also sweeps the command's python child
     pi.registerCommand("swarm", swarmCommand(pi, scoped, {}));
+    // swarm-status: a read-only view of one correlation through orch_status (no writes, no model turn)
+    pi.registerCommand("swarm-status", swarmStatusCommand(scoped));
     // The bar is display-only: nothing it does may change a decision or throw into the host.
     const display = (fn: () => void): void => {
       try {
