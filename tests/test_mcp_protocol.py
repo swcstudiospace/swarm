@@ -49,7 +49,6 @@ JSONRPC_INVALID_PARAMS = -32602
 # arbitrary file, shell, script or registry access.
 FORBIDDEN_TOOL_TOKENS = frozenset({"transition", "ingest", "sign", "signer", "key", "waive", "waiver", "record", "approve",
                                    "approval", "file", "exec", "shell", "script", "registry"})
-SERVER_NOT_BUILT = pytest.mark.xfail(strict=True, reason="14.7 W1 server not built")
 
 
 def _pairs(rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -161,7 +160,6 @@ def test_unknown_method_returns_method_not_found_with_the_request_id(mcp):
     assert response["error"]["code"] == JSONRPC_METHOD_NOT_FOUND, response
 
 
-@SERVER_NOT_BUILT
 def test_unknown_tool_name_is_an_invalid_params_protocol_error(mcp):
     """Under the 2025-06-18 revision an unknown tool is a protocol error (-32602), not a tool result."""
     initialize_session(mcp, PROTO_STRUCTURED)
@@ -215,7 +213,6 @@ def test_cancel_of_initialize_does_not_drop_its_response(mcp):
     assert response["result"]["protocolVersion"] == PROTO_STRUCTURED
 
 
-@SERVER_NOT_BUILT
 def test_cancelled_tool_call_gets_exactly_one_result_reply(mcp, seeded_tasks):
     initialize_session(mcp, PROTO_STRUCTURED)
     mcp.send({"jsonrpc": "2.0", "id": 77, "method": "tools/call",
@@ -228,7 +225,6 @@ def test_cancelled_tool_call_gets_exactly_one_result_reply(mcp, seeded_tasks):
     assert "result" in replies_to_77[0], replies_to_77
 
 
-@SERVER_NOT_BUILT
 def test_tools_list_names_tools_with_object_input_schemas(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     tools = mcp.request("tools/list")["result"]["tools"]
@@ -242,7 +238,6 @@ def test_tools_list_names_tools_with_object_input_schemas(mcp):
         assert tool["inputSchema"]["type"] == "object", tool
 
 
-@SERVER_NOT_BUILT
 def test_tools_list_exposes_no_raw_control_surface(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     names = [tool["name"] for tool in mcp.request("tools/list")["result"]["tools"]]
@@ -251,7 +246,6 @@ def test_tools_list_exposes_no_raw_control_surface(mcp):
         assert not tokens & FORBIDDEN_TOOL_TOKENS, f"{name!r} exposes a forbidden control surface"
 
 
-@SERVER_NOT_BUILT
 def test_tools_call_crosses_into_taskstore_and_returns_structured_rows(mcp, seeded_tasks):
     initialize_session(mcp, PROTO_STRUCTURED)
     result = _tool_result(call_tool(mcp, TOOL, {"correlation_id": CORR}, id=20))
@@ -263,7 +257,6 @@ def test_tools_call_crosses_into_taskstore_and_returns_structured_rows(mcp, seed
         assert task_id in text, text
 
 
-@SERVER_NOT_BUILT
 def test_text_only_revision_returns_text_without_structured_content(mcp, seeded_tasks):
     initialize = initialize_session(mcp, PROTO_TEXT_ONLY)
     assert initialize["result"]["protocolVersion"] == PROTO_TEXT_ONLY, initialize
@@ -276,7 +269,6 @@ def test_text_only_revision_returns_text_without_structured_content(mcp, seeded_
         assert task_id in text, text
 
 
-@SERVER_NOT_BUILT
 def test_tools_call_for_a_correlation_with_no_tasks_is_an_explicit_empty_result(mcp, seeded_tasks):
     """An unknown correlation is an empty answer, not an error, and not a silent fallback to the latest correlation."""
     initialize_session(mcp, PROTO_STRUCTURED)
@@ -285,7 +277,6 @@ def test_tools_call_for_a_correlation_with_no_tasks_is_an_explicit_empty_result(
     assert result["structuredContent"]["tasks"] == [], result
 
 
-@SERVER_NOT_BUILT
 def test_authority_failure_is_a_tool_error_result_not_a_protocol_error(mcp, swarm_dir):
     """A directory where tasks.db should be makes the real TaskStore fail to open. The failure is a tool result with isError."""
     swarm_dir.mkdir(parents=True, exist_ok=True)

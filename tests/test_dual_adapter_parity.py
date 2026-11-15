@@ -85,8 +85,6 @@ LABEL_CURRENT = "current"
 CORE_KEYS = ("task_id", "agent", "state", "attempt", "rework", "depth")
 CANONICAL_KEYS = CORE_KEYS + ("ready", "gates_required", "verdicts", "missing_gates")
 
-SERVER_NOT_BUILT = pytest.mark.xfail(strict=True, reason="14.7 W1 server not built")
-
 
 def _project(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
     return [{key: row[key] for key in keys} for row in rows]
@@ -277,7 +275,6 @@ def test_interrupted_state_omp_surface_reports_the_retry_attempt(server_env, par
 # ---- MCP client against the W1 server: strict xfail ------------------------------------------------------------------
 
 
-@SERVER_NOT_BUILT
 def test_mcp_and_omp_report_identical_canonical_outcomes(server_env, mcp, parity_root):
     initialize_session(mcp, PROTO)
     omp = _omp_payload(server_env, CORR)
@@ -287,7 +284,6 @@ def test_mcp_and_omp_report_identical_canonical_outcomes(server_env, mcp, parity
     assert page["swarm_dir"] == omp["swarm_dir"], "both surfaces must name the same store"
 
 
-@SERVER_NOT_BUILT
 def test_mcp_pages_have_the_same_boundaries_as_the_omp_answer(server_env, mcp, parity_root):
     initialize_session(mcp, PROTO)
     expected = _pages([row["task_id"] for row in _omp_rows(server_env, CORR)], PAGE_SIZE)
@@ -305,25 +301,21 @@ def test_mcp_pages_have_the_same_boundaries_as_the_omp_answer(server_env, mcp, p
     assert first_again == expected[0], "the first page must not move between reads"
 
 
-@SERVER_NOT_BUILT
 def test_empty_state_mcp_reports_explicit_empty_like_omp(server_env, mcp, parity_root):
     initialize_session(mcp, PROTO)
     _assert_label_parity(server_env, mcp, CORR_EMPTY, LABEL_EMPTY)
 
 
-@SERVER_NOT_BUILT
 def test_partial_state_mcp_reports_the_same_label_as_omp(server_env, mcp, parity_root):
     initialize_session(mcp, PROTO)
     _assert_label_parity(server_env, mcp, CORR_PARTIAL, LABEL_PARTIAL)
 
 
-@SERVER_NOT_BUILT
 def test_stale_state_mcp_reports_the_same_label_as_omp(server_env, mcp, parity_root):
     initialize_session(mcp, PROTO)
     _assert_label_parity(server_env, mcp, CORR_STALE, LABEL_STALE)
 
 
-@SERVER_NOT_BUILT
 def test_interrupted_state_mcp_reports_the_same_label_as_omp(server_env, mcp, parity_root):
     initialize_session(mcp, PROTO)
     _assert_label_parity(server_env, mcp, CORR_INTERRUPTED, LABEL_INTERRUPTED)
