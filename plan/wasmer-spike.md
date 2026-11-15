@@ -573,6 +573,8 @@ Found during the spike or the policy review. Recorded, not fixed. Each is a bloc
 
 ### 10.2 Decisions needed
 
+*Historical (2026-11-12).* The A03 and A11 items below are superseded. D-P3-1 (wasip1) is replaced by D-P3-5 and D-P5-13, and the exact "Update to 50.0.1" answer governs the pin. They are not requested again. The live checkpoints are CP-AUTH, CP-EVIDENCE and CP-PINS in section 14.8.
+
 - **A03:** approve D-P3-1 (wasip1 target, WASI 0.1) and record the WASI version (Q-8). Approve D1 to D4 (`P-sizing` section 4).
 - **A11:** approve the target pin change (D-P3-1) in its own commit; add the CI digest step (`P-dist` step 8); D3 link-time import list enforcement.
   Update 2026-10-28: approved by the user 2026-10-26 (chat); record in `.planning/phases/10-wasmer-sandbox-and-omp-validation/10-VERIFICATION.md`, section "Sign-off record", which states the state of these three conditions and the two accepted exceptions (the pin is not in its own commit; `ci.yml` has no guest-digest step).
@@ -611,6 +613,21 @@ Second review (a general reviewer, same phase): also CONDITIONAL, with these rul
 - S-13: the default leeway is 60 s, so the gate sets leeway 0 for per-call tokens.
 - Before C3, 21 conditions apply, including: the T-01 to T-04 fixes; the revocation check on the gate (N-4); F-07 fixed or its type deleted; the secret kept out of Debug (N-2); invalid PII regexes refused (N-1); denial records fsynced or the tamper-evidence claim removed (N-3); enable_sandbox wired or deleted (N-5); and a test for every S-item needed for C3, because gsd-security has no tests (N-7).
 - New findings N-1 to N-7 are recorded in the second review. Round-trip success is implied by exit 0, since the host prints no separate line for it.
+
+**Verbatim check (2026-11-12, read-only).** Everything above is a paraphrase and stays labelled as one. The raw reviewer outputs survive outside this repository, as artifacts of session `01a16040-4a41-717d-953b-dc7ceea5743a` under `/root/.omp/agent/sessions/-src-repos-agent-swarm/`:
+
+- `A10SpikeReview-2.md`: task-result `A10SpikeReview-2`, agent `a10-security`, 6,313 characters, 73 lines, sha256 `b3ccbeca8e9add4fee5b8a076363ec3dfe4207231b25f416bd51a924622dc6e9`, file mtime 2026-10-22 17:36:31 UTC. The parent session records this `outputPath` and an `outputMeta` with `charCount` 6313. Its first line reads: "**Overall verdict: CONDITIONAL.** The fault-injection scope and the wasip1 direction are acceptable. Sign-off is conditional on the T-01 to T-04 fixes (F-01, F-02, F-05, F-06) landing before C3, and on the Q-1 and Q-4 measurements. Nothing here accepts risk; the human owner decides."
+- `A10SpikeReview.md`: task-result `A10SpikeReview`, 17,303 bytes, sha256 `ed1e26d63f752b0c47c7c9a4241b98f1efb9d1a8c5b4e3e112e8525aa7370b4f`, file mtime 2026-10-22 17:41:32 UTC. The parent session shows it was spawned without an `agent` field, so the recorded identity is the generic `task` agent, although the artifact calls itself an "A10 security gate review". Its section 1 reads: "## 1. Overall verdict: CONDITIONAL". This is the second review that b06293e records.
+
+Differences the paraphrase above does not carry. Use the artifacts for per-item text.
+
+1. Condition 6 of the a10-security artifact is omitted here: "The `wasip2` pin change is its own commit and needs A11 approval, not a hand edit in this spike." Current pin evidence is CP-PINS.
+2. S-10: the a10-security artifact accepts it (unknown `error.code` maps to E-CONTRACT). The second review rejects it as written (E-INTERNAL, Python truth). The accept list above includes S-10 without showing that conflict.
+3. S-22: the a10-security artifact rejects it until F-07 is cleared. The second review accepts the expected outcome, rejects the F-07 block as written, and rules that F-07 blocks admission use, not S-22.
+4. Per-item differences exist between the two artifacts. For example S-02, S-06, S-07, S-09 and S-11 are "accept" in one and "with condition" in the other.
+5. The second review's "50 ms slices" wording in S-20 and Q-4 is superseded by D-P5-15 (500 ms slices inside a 3 s bound).
+6. The second review rules Q-5 as drop-with-count (S-24). That is advisory and is not adopted. Q-5 stays unruled (section 14.5).
+7. F-07's owner differs: the a10-security artifact routes it to A05 with A10 as verifier; the second review says runtime and security.
 
 ---
 
@@ -670,7 +687,7 @@ The user chose: keep the `wasm32-wasip2` target and change the runtime. Sections
 
 Dated 2026-11-08. This section is the current governing contract for the Phase 8 report. Sections 1 to 13 stay as history. Amendment commit `1b77658` is part of the D-P3-5 record. Nothing here is a phase pass, an A03 approval, an A10 verdict, or an A11 pin sign-off.
 
-Read on the working tree at `8cde6dd4723efa13221c44c8b8388c31765b698b` (branch `feat/v2.4-rust-wasm-core`, dirty). No cargo test, Wasmer run, or Wasmtime run was executed for this addendum. Source and test names below are structural evidence only.
+Read on the working tree at `8cde6dd4723efa13221c44c8b8388c31765b698b` (branch `feat/v2.4-rust-wasm-core`, dirty). No cargo test, Wasmer run, or Wasmtime run was executed for this addendum. Source and test names below are structural evidence only. Re-read 2026-11-12 at HEAD `98e93b31d682085d885118cc2c4fa30452d82b1f`: `plan/wasmer-spike.md` and `plan/decompose.md` match HEAD. The `.planning/` files are git-excluded and were read from disk. The 2026-11-12 re-check used read-only git, grep, find and file reads only.
 
 ### 14.1 Precedence
 
@@ -678,7 +695,7 @@ Read on the working tree at `8cde6dd4723efa13221c44c8b8388c31765b698b` (branch `
 2. D-P3-5 (user, 2026-10-22) supersedes D-P3-1 and the section 8 O2: Wasmtime plus a component canonical ABI carrying JSON `list<u8>`. The 2026-10-22 text names wasmtime 50.0.0 and keeps `wasm32-wasip2` (section 13). Commit `1b77658`.
 3. D-P5-10 and D-P5-13 supersede the guest target and refine the WIT. D-P5-13 (user, 2026-10-23) builds the guest for `wasm32-unknown-unknown` and wraps it as a component with wit-component 0.247.0. It overrides the guest-target part of D-P5-1 only. No WASI interface version is imported. D-P5-14, D-P5-17 and D-P5-20: unresolved import is E-DEP, no stubs, empty production linker for this guest.
 4. The exact dependency answer "Update to 50.0.1" governs the crate pin now. `Cargo.toml` records `wasmtime = { version = "=50.0.1", features = ["component-model"] }`, metadata `wasmtime = "50.0.1"`, and `wasm_target = "wasm32-unknown-unknown"`. That record does not approve the runtime or pin review gate.
-5. AMB-4 (user, 2026-11-06, option (a), `.planning/STATE.md`): the listed gaps are accepted with reasons. Full-core sandboxing, the read-route and sandbox defaults, and the write-route flips move to a follow-on milestone. Original full-core compile, stub, budget, and size claims stay unmeasured.
+5. AMB-4 (user, 2026-11-06, option (a), `.planning/STATE.md`): the listed gaps are accepted with reasons. Full-core sandboxing, the read-route and sandbox defaults, and the write-route flips move to a follow-on milestone. Original full-core compile, stub, budget, and size claims stay unmeasured. The separate DEC-02 scheduler-scope decision (user, 2026-11-06, option (c), same STATE run) defers only the Phase 14.4 scheduler scope and keeps the held scheduler code held. It does not reopen full-core sandboxing or the non-scheduler deferrals above.
 6. Python stays the default engine. No default flips here.
 
 ### 14.2 Runtime, target, and boundary
@@ -699,6 +716,8 @@ Current component digests on disk, read 2026-11-08, one line each:
 
 - `crates/gsd-sandbox/guest-module.sha256` = `732857c13367ad18eb84571cbc11174a098d176c65aab2ae13763b2318d69a9e`
 - `crates/gsd-sandbox/guest-module-write.sha256` = `4626c3b14d7c29b5b5fd3ff907d45be6c17884d32e803b8c453812d0cef739f9`
+
+Re-read 2026-11-12: both values are unchanged, and `Cargo.toml` still reads `=50.0.1` (lines 165, 169 and 171).
 
 Fresh A10 and A11 records bound to 50.0.1 and these digests are outstanding (CP-PINS). The 2026-10-26 user acceptance covered wasmtime `=50.0.0` (commit `80f0e19`) and digest `ffa7b28a7879da7ea99a20c83999d0b79e757bd084878909dcce0054fe66cade` (commit `eb7a2b9`). The recording agent in `10-VERIFICATION.md` Sign-off record states that it does not sign as A10 or A11. Later records for `91b0970e` and `50b06310` do not sign today's pins. The 2026-11-07 A10 session produced no verdict. The 2026-11-07 A11 session returned FAIL.
 
@@ -728,16 +747,18 @@ Labels stay distinct. NOT MEASURED, NOT RE-OBSERVED, SUPERSEDED, and ACCEPTED DE
 | C3 | PARTIAL. Section 4: gsd-proto PASS, gsd-serde PASS; gsd-failure, gsd-nexus, gsd-runtime, gsd-governor, gsd-pool, gsd-observability, gsd-security, gsd-scheduler FAIL. Eight stub cells say "not measured". Wasip1 per member not measured. | Nov 6 AMB-4 accepts the full-core deferral. | Retain all ten member rows and eight failed-member stub statuses as historical unmeasured data. | Section 4 [RUN] on wasm32-wasip2. Not re-run. | No new compile. A route guest's no-import boundary does not establish a per-member feature-split plan. | NOT MEASURED for stubs and wasip1. ACCEPTED DEFERRAL for the full-core split. |
 | C8 | PARTIAL. Section 8.2 and section 13.1 were both live O2 texts. | D-P3-5, then D-P5-10 and D-P5-13. | Sections 1, 8.2, 8.4, and 13 marked historical. Per-route ABI restated in 14.3. | Contract text plus `Cargo.toml` and D-P5-10. Serde share unmeasured. | Full-route guest coverage is not claimed. | SUPERSEDED as the live conflict. PARTIAL remains on unmeasured serde share. |
 | C10 | PARTIAL. Section 5 has payload bounds. U5.3 numeric budgets and full-core size are pending. | Separate first-route evidence and configured limits from missing whole-core budgets. Nov 6 AMB-4 defers the full-core portion. | No new numeric budget. | 10-CONTEXT loaded-host note of 2026-10-23 (compile 108 ms, request 140,721 bytes, caps, n=300 warm invoke). Historical, host load 3.9 to 4.2, not quiet qualification. Host marshal timings are not an isolated serde or guest-execution ratio. | Whole-core fuel, memory, serde, and size budgets. | NOT MEASURED for those budgets. ACCEPTED DEFERRAL for the full-core portion. |
-| C14 | PARTIAL. Section 11 is a paraphrase: reviewer named a10-security, overall CONDITIONAL, fault-injection scope and wasip1 direction called acceptable, plus a second review. | Recover the original raw output, or leave the evidence open. | Searched the tree for that verdict sentence. The only hit is section 11 of this file. No separate artifact. | Section 11, commit history named by `08-VERIFICATION.md` (`b06293e`). Absence recorded 2026-11-08. | CP-EVIDENCE. A fresh review cannot become the old raw review. The paraphrase stays labelled as a paraphrase. | NOT RE-OBSERVED as a verbatim verdict. |
+| C14 | PARTIAL → LOCATED. Section 11 is a labelled paraphrase of two retained reviews: reviewer named a10-security, overall CONDITIONAL, fault-injection scope and wasip1 direction called acceptable, plus a second review. | Recover the original raw output, or leave the evidence open. | Located 2026-11-12 as session artifacts `A10SpikeReview-2.md` (a10-security) and `A10SpikeReview.md` (second review), outside the repo. The 2026-11-08 tree search was correct but incomplete. | Session artifacts with sha256 in section 11; `b06293e` commit history. Paraphrase differences listed in section 11. | None for the record's existence. A fresh review cannot become the old raw review, and the paraphrase's differences stay labelled. | Verbatim raw output located. Paraphrase retained and labelled. Not a current A10 approval. |
 | C15 | PARTIAL. Section 11 fault-scope text is conditional and is a paraphrase. Section 13.3 left the runtime review pending, then a 2026-10-28 update points at user acceptance. | Map each fault-scope condition to its decision. A current scoped A10 record is still required. | Cited D-P5-12, D-P5-14, D-P5-18, D-P5-19 as later decisions. | `10-VERIFICATION.md` Sign-off record: user, 2026-10-26 chat, recorded 2026-10-28; agent does not sign as A10. Runtime then `=50.0.0`. Nov 7 A10: no verdict (`.planning/STATE.md`). | CP-AUTH for a current A10 fault-scope ruling. CP-PINS is separate. | User acceptance is not an A10 verdict. Current ruling BLOCKED. |
-| C16 | NOT MET. E-01 through E-16 listed; section 11 does not approve them. | Non-use on this guest is not approval. D-P21's two exceptions are the pin commit shape and the missing `ci.yml` guest-digest step. | Section 14.6 keeps one row per exception. | Empty-linker statements in `build.rs` and D-P5-17/20. Structural only. | CP-AUTH per item. | DENIED/NOT ENABLED is not PASS. |
+| C16 | NOT MET. E-01 through E-16 listed; section 11 does not approve them. | Non-use on this guest is not approval. D-P21's two exceptions are the pin commit shape and the missing `ci.yml` guest-digest step. | Section 14.6 keeps one row per exception, with the 2026-10-22 advisory rulings. | Empty-linker statements in `build.rs` and D-P5-17/20. Structural only. The a10-security artifact rejects every E-item except E-01 and E-03, which it conditions; none is approved. | CP-AUTH per item. | DENIED/NOT ENABLED is not PASS. |
 | C17 | PARTIAL. Q-3 was answered in section 11 while U5.3 still said E-CAPACITY. | Q-1 through Q-8 in section 14.5. F-03 text corrected in `plan/decompose.md` U5.3. | U5.3 line now names E-INTERNAL, E-TIMEOUT, and E-CAPACITY by cause. | `classify` source, dated 2026-11-08 read. Not a test run. | Imported-log overflow (Q-5) stays unruled. | F-03 text SUPERSEDED. Q-5 remains open for an imported log. |
 | C18 | NOT MET. Scope sentence said the spike was for the full core. Section 1 and section 12 say the guest is not the full core. | Nov 6 AMB-4. | Scope sentence in section 1 stays, qualified here: the measured guest is the spike guest (gsd-proto path in section 12), not the full core. | Section 12 reproduction. AMB-4 in `.planning/STATE.md` 2026-11-06. | No new full-core run. Scheduler reopening does not change this row. | ACCEPTED DEFERRAL. The original criterion was not literally met. |
 | C21 | PARTIAL. Summary omitted D-P3-5. Report sections still described Wasmer as if section 13 were the only later contract. | `1b77658` / D-P3-5, then D-P5-13, then 50.0.1. | Navigation note, historical markers, this section, and `08-SUMMARY.md`. | `Cargo.toml` pin read 2026-11-08. Old numbers kept with their units and sample counts. | CP-PINS. | Text drift corrected. Pin sign-off still open. |
 | C24 | NOT MET. No A03 approval of D-P3-1. | Successor facts are recorded. D-P3-1 approval is not requested again. | Quoted the A03 record. | `10-CONTEXT.md` heading "A03 record (A10 condition 5)": "It is not an approval, and no agent gives one here." User decisions D-P3-5 and D-P5-13. | CP-AUTH: A03 approval of the successor architecture and WASI applicability. | Facts recorded. Approval BLOCKED. |
-| C25 | NOT RUN. Verifier found `/tmp/gsd-wasmer-spike` absent. | Inspect retained evidence only. Do not rerun Wasmer. A new Wasmtime run cannot restore the old logs. | Commands and claimed values copied into 14.7. `ls` of `/tmp/gsd-wasmer-spike` on 2026-11-08: no such directory. | Sections 12 and 13.4. A missing cargo registry directory is not evidence of zero component matches. | CP-EVIDENCE until a real locator appears or authority accepts the limitation. | NOT RE-OBSERVED. |
+| C25 | NOT RUN → TRANSCRIPT-TRACED. Verifier found `/tmp/gsd-wasmer-spike` absent. | Inspect retained evidence only. Do not rerun Wasmer. A new Wasmtime run cannot restore the old logs. | Commands and claimed values in 14.7. `ls` of `/tmp/gsd-wasmer-spike` on 2026-11-08 and 2026-11-12: no such directory. Stdout of the Wasmer and Wasmtime runs survives as transcript tool results (14.7); the `run-*.txt` files do not. A 2026-11-12 `find` under `/tmp`, `/var/tmp` and `/root` (depth 4; `*wasmer*`, `run-wasip*.txt`, `run-wasmtime*`) found no run log. `/tmp/rs05-ws` and `/tmp/gguest-src-144a8d3` hold report copies only. `~/.cargo/registry/src/` holds only `index.crates.io-1949cf8c6b5b557f/`, with no `wasmer-7.5.0`. | Sections 12 and 13.4. An absent registry tree is not evidence of zero component matches. | CP-EVIDENCE for a human disposition that accepts the transcript records as retained evidence, or for supplying the `run-*.txt` files. | NOT RE-OBSERVED. Values traceable to transcript records, not re-observed. |
 
 ### 14.5 Question dispositions
+
+Owner: the Phase 8 gap documentation pass. Each row cites its source decision and its authority limit. Evidence providers are as in section 14.4.
 
 | Question | Reconciliation | Evidence and authority limit | Disposition |
 |---|---|---|---|
@@ -753,6 +774,10 @@ Labels stay distinct. NOT MEASURED, NOT RE-OBSERVED, SUPERSEDED, and ACCEPTED DE
 ### 14.6 Exception dispositions
 
 Current effective behavior for every row is DENIED/NOT ENABLED on this guest. That observation is not a grant. No all-E waiver is offered. D-P21's accepted exceptions (combined pin commit `eb7a2b9`; no guest-digest step in `ci.yml`) do not approve any row below.
+
+Owner of these rows: the Phase 8 gap documentation pass. Evidence providers are A03 (architectural authority), A10 (scoped security) and A11 (fresh pin evidence), as in section 14.4.
+
+The 2026-10-22 advisory rulings in the retained a10-security artifact (`A10SpikeReview-2.md`, lines 56 to 67; section 11 verbatim check) are: E-01 conditional, approvable only if `storage.read` cannot serve input files and the preopen is read-only; E-02 reject; E-03 conditional, read-only and only if `storage` cannot serve TaskStore reads; E-04 reject until Q-6 is ruled; E-05 reject; E-06 reject for now; E-07, E-08 and E-10 to E-14 reject; E-09 reject from A10 alone, since A03 or the planner is also needed; E-15 reject until F-06 is fixed; E-16 reject. The second review (`A10SpikeReview.md`, section 5) records E-01 as "not approved now", rejects E-02 and E-04 to E-16, and rejects E-03 where the first artifact conditions it. Those rulings predate D-P5-5 to D-P5-20 and the empty linker. None approves an item, and a conditional ruling is not a grant.
 
 | ID | Scope | Evidence of non-use | Authority still required | Allowed scope of a future grant | Why a decision is still open |
 |---|---|---|---|---|---|
@@ -777,6 +802,14 @@ Current effective behavior for every row is DENIED/NOT ENABLED on this guest. Th
 
 Inspected 2026-11-08. `/tmp/gsd-wasmer-spike` is absent. These commands and values are the report's claims. They were not re-run. A missing `~/.cargo/registry/src/*/wasmer-7.5.0` tree would not prove zero component matches; that tree was not treated as a new observation.
 
+Retained tool-result records, located 2026-11-12. These are stdout records of bash tool calls in session `01a16040-4a41-717d-953b-dc7ceea5743a` (`/root/.omp/agent/sessions/-src-repos-agent-swarm/2026-10-21T20-56-28-481Z_01a16040-4a41-717d-953b-dc7ceea5743a.jsonl`). The `/tmp` files they were tee'd into are absent.
+
+- Wasmer 7.5.0, wasip1 core with deny-by-default shims: line 2182, toolCallId `toolu_01BNy4uKkgAvrjRYrhyABJX6`, 2026-10-22T17:29:17.251Z. Records `metric=compile_ms value=205.584`, `instantiate_ms 0.055`, `invoke_warm_p50_us 0.990`, `invoke_warm_p95_us 7.111`, `linear_memory_pages 23`, `module_bytes 62979`, `wasmer_version=7.5.0`, `module_kind=core`, `exit=0`.
+- Wasmer 7.5.0, wasip1 before shims, and the wasip2 component: line 2154, toolCallId `toolu_01SeF5uy3Sg7ygdNs9eNd46p`, 2026-10-22T17:23:49.839Z. Records `unknown import` for `wasi_snapshot_preview1.environ_get` and, for the wasip2 component, `Validation error: unknown binary version and encoding combination: 0xd and 0x1`.
+- Wasmtime 50.0.0, wasip2 component: line 2367, toolCallId `toolu_01H7T4uGtXf47Cmkq1bwM1ni`, 2026-10-22T18:28:45.565Z. Records `compile_ms 205.358`, `instantiate_ms 0.423`, `invoke_warm_p50_us 1.350`, `invoke_warm_p95_us 1.480`, `module_bytes 80066`, `wasmtime_version=50.0.0`, `module_kind=component`, `wasi_policy=deny-by-default`, `exit=0`.
+
+These records hold the summary lines only. The 200 individual samples, the hardware fingerprint and the dealloc detail are not in them. No value here is a 2026-11-12 observation.
+
 Wasmer era, section 12, rustc and cargo 1.98.1, host `x86_64-unknown-linux-gnu`:
 
 - `rustup target add wasm32-wasip2`, `wasm32-wasip1`, and `wasm32-unknown-unknown`.
@@ -799,6 +832,6 @@ Tasks 1 and 2 of `08-GAP-01` stop here. A general continue does not close these 
 
 **CP-AUTH.** Still open: A03 approval of the successor architecture and WASI applicability (C24); a current A10 fault-scope ruling (C15); per-exception authority (C16, including E-01 through E-16, with E-09 requiring A03 or the planner and A10). Q-5 stays unruled for an imported log.
 
-**CP-EVIDENCE.** Still open: original A10 raw output (C14); original run logs (C25). Parent-owned commands, if a later execution is separately authorized, and only for current mapping and import policy: `cargo test -p gsd-sandbox wasmtime_limits --locked`; `cargo test -p gsd-sandbox --test guest_imports --locked`; `cargo test -p gsd-sandbox --features write-routes --test guest_imports --locked`. They do not restore historical Wasmer metrics or the old review text.
+**CP-EVIDENCE.** Narrowed on 2026-11-12. C14 is no longer a checkpoint row: the raw A10 outputs were located as session artifacts (section 11, verbatim check), and the paraphrase's differences from them are listed there. Still open: C25 log files. The transcript tool results in section 14.7 preserve the stdout values, but the `/tmp/gsd-wasmer-spike/run-*.txt` files and sources are absent. A human disposition must accept the transcript records as the retained evidence, or the files must be supplied. Parent-owned commands, if a later execution is separately authorized, and only for current mapping and import policy: `cargo test -p gsd-sandbox wasmtime_limits --locked`; `cargo test -p gsd-sandbox --test guest_imports --locked`; `cargo test -p gsd-sandbox --features write-routes --test guest_imports --locked`. They do not restore historical Wasmer metrics, and they do not reproduce the old review text.
 
 **CP-PINS.** Still open: fresh independent A10 and A11 records bound to wasmtime 50.0.1 and the digests in section 14.2, plus the accepted CI boundaries. No push until those records exist. This addendum does not start those roles and does not edit CI or pins.
