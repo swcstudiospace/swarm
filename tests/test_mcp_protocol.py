@@ -105,7 +105,6 @@ def test_authority_cli_projection_matches_taskstore_fixture(seeded_tasks, server
     assert _pairs(payload["tasks"]) == seeded_tasks
 
 
-@SERVER_NOT_BUILT
 @pytest.mark.parametrize(("method", "params"), [
     ("tools/list", {}),
     ("tools/call", {"name": TOOL, "arguments": {"correlation_id": CORR}}),
@@ -117,7 +116,6 @@ def test_request_before_initialize_is_rejected_without_a_result(mcp, seeded_task
     assert isinstance(response["error"].get("code"), int), response
 
 
-@SERVER_NOT_BUILT
 def test_initialize_echoes_a_supported_version_and_advertises_tools(mcp):
     response = mcp.request("initialize", initialize_params(PROTO_STRUCTURED))
     assert "result" in response, response
@@ -128,7 +126,6 @@ def test_initialize_echoes_a_supported_version_and_advertises_tools(mcp):
     assert isinstance(result["serverInfo"]["version"], str)
 
 
-@SERVER_NOT_BUILT
 def test_initialize_with_unknown_version_answers_with_a_revision_the_server_speaks(mcp):
     response = mcp.request("initialize", initialize_params(PROTO_UNKNOWN))
     assert "result" in response, response
@@ -137,7 +134,6 @@ def test_initialize_with_unknown_version_answers_with_a_revision_the_server_spea
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", offered), offered
 
 
-@SERVER_NOT_BUILT
 def test_initialized_notification_gets_no_reply(mcp):
     initialize = mcp.request("initialize", initialize_params(PROTO_STRUCTURED))
     assert "result" in initialize, initialize
@@ -148,7 +144,6 @@ def test_initialized_notification_gets_no_reply(mcp):
     assert not mcp.stray, mcp.stray
 
 
-@SERVER_NOT_BUILT
 def test_notification_with_unknown_method_gets_no_reply(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     mcp.notify("notifications/w0-no-such-notification", {"detail": "w0"})
@@ -158,7 +153,6 @@ def test_notification_with_unknown_method_gets_no_reply(mcp):
     assert not mcp.stray, mcp.stray
 
 
-@SERVER_NOT_BUILT
 def test_unknown_method_returns_method_not_found_with_the_request_id(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     response = mcp.request("w0/no-such-method", {}, id=7)
@@ -177,7 +171,6 @@ def test_unknown_tool_name_is_an_invalid_params_protocol_error(mcp):
     assert response["error"]["code"] == JSONRPC_INVALID_PARAMS, response
 
 
-@SERVER_NOT_BUILT
 def test_malformed_json_line_gets_parse_error_and_session_continues(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     mcp.send_raw(b'{"jsonrpc":"2.0","id":9,\n')
@@ -188,7 +181,6 @@ def test_malformed_json_line_gets_parse_error_and_session_continues(mcp):
     assert "result" in pong, pong
 
 
-@SERVER_NOT_BUILT
 @pytest.mark.parametrize("rid", ["req-w0-str", 4242])
 def test_request_id_type_is_preserved_in_the_response(mcp, rid):
     initialize_session(mcp, PROTO_STRUCTURED)
@@ -197,7 +189,6 @@ def test_request_id_type_is_preserved_in_the_response(mcp, rid):
     assert response["id"] == rid and type(response["id"]) is type(rid), response
 
 
-@SERVER_NOT_BUILT
 def test_each_request_is_answered_once(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     first = mcp.request("ping", id=11)
@@ -206,7 +197,6 @@ def test_each_request_is_answered_once(mcp):
     assert not mcp.stray, mcp.stray
 
 
-@SERVER_NOT_BUILT
 def test_cancel_for_unknown_request_id_gets_no_reply(mcp):
     initialize_session(mcp, PROTO_STRUCTURED)
     mcp.notify("notifications/cancelled", {"requestId": 987654, "reason": "w0 contract: nothing in flight"})
@@ -216,7 +206,6 @@ def test_cancel_for_unknown_request_id_gets_no_reply(mcp):
     assert not mcp.stray, mcp.stray
 
 
-@SERVER_NOT_BUILT
 def test_cancel_of_initialize_does_not_drop_its_response(mcp):
     """The initialize request must not be cancelled. A cancel that arrives for it must not erase the negotiated result."""
     mcp.send({"jsonrpc": "2.0", "id": 13, "method": "initialize", "params": initialize_params(PROTO_STRUCTURED)})
@@ -227,7 +216,7 @@ def test_cancel_of_initialize_does_not_drop_its_response(mcp):
 
 
 @SERVER_NOT_BUILT
-def test_cancelled_tool_call_gets_at_most_one_reply(mcp, seeded_tasks):
+def test_cancelled_tool_call_gets_exactly_one_result_reply(mcp, seeded_tasks):
     initialize_session(mcp, PROTO_STRUCTURED)
     mcp.send({"jsonrpc": "2.0", "id": 77, "method": "tools/call",
               "params": {"name": TOOL, "arguments": {"correlation_id": CORR}}})
@@ -235,7 +224,8 @@ def test_cancelled_tool_call_gets_at_most_one_reply(mcp, seeded_tasks):
     pong = mcp.request("ping", id=78)
     assert "result" in pong, pong
     replies_to_77 = [message for message in mcp.stray if message.get("id") == 77]
-    assert len(replies_to_77) <= 1, replies_to_77
+    assert len(replies_to_77) == 1, replies_to_77
+    assert "result" in replies_to_77[0], replies_to_77
 
 
 @SERVER_NOT_BUILT
@@ -310,7 +300,6 @@ def test_authority_failure_is_a_tool_error_result_not_a_protocol_error(mcp, swar
     assert "Traceback" not in text, text
 
 
-@SERVER_NOT_BUILT
 def test_stdout_carries_only_jsonrpc_and_server_exits_zero_on_stdin_eof(mcp):
     """Every stdout line parses as a JSON-RPC 2.0 object (the client enforces it), and closing stdin ends the server cleanly."""
     initialize_session(mcp, PROTO_STRUCTURED)
