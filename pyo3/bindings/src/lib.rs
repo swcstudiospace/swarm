@@ -201,8 +201,8 @@ struct PyThreadPool {
 #[pymethods]
 impl PyThreadPool {
     #[staticmethod]
-    fn create_pool(config: &PyConcurrencyConfig) -> PyResult<Self> {
-        let p = ThreadPool::new(config.inner.clone()).map_err(task_error_to_py)?;
+    fn create_pool(config: &Bound<'_, PyConcurrencyConfig>) -> PyResult<Self> {
+        let p = ThreadPool::new(config.borrow().inner.clone()).map_err(task_error_to_py)?;
         Ok(Self { inner: p })
     }
 
@@ -210,7 +210,7 @@ impl PyThreadPool {
     /// The callables are the bidirectional work executed by rust workers.
     fn submit_tasks(
         &self,
-        tasks: Vec<PyRef<PySubTask>>,
+        tasks: Vec<Bound<'_, PySubTask>>,
         works: Vec<Py<PyAny>>,
     ) -> PyResult<Vec<PySubTicket>> {
         if tasks.len() != works.len() {
@@ -219,9 +219,9 @@ impl PyThreadPool {
         let mut out = Vec::with_capacity(tasks.len());
         for (pt, work_obj) in tasks.into_iter().zip(works.into_iter()) {
             let st = SubTask {
-                id: pt.id.clone(),
-                timeout: pt.timeout_ms.map(Duration::from_millis),
-                max_retries: pt.max_retries,
+                id: pt.borrow().id.clone(),
+                timeout: pt.borrow().timeout_ms.map(Duration::from_millis),
+                max_retries: pt.borrow().max_retries,
             };
             let slot: Arc<std::sync::Mutex<Option<SubResult<String>>>> =
                 Arc::new(std::sync::Mutex::new(None));
@@ -232,8 +232,8 @@ impl PyThreadPool {
             let work = move || -> Result<String, TaskError> {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     Python::attach(|py| {
-                        match py_callable.call0(py) {
-                            Ok(v) => v.extract::<String>(py).map_err(|e| TaskError::Other(e.to_string())),
+                        match py_callable.bind(py).call0() {
+                            Ok(v) => v.extract::<String>().map_err(|e| TaskError::Other(e.to_string())),
                             Err(e) => Err(TaskError::Other(e.to_string())),
                         }
                     })
@@ -252,7 +252,7 @@ impl PyThreadPool {
             let _ticket = self.inner.submit(st, work).map_err(task_error_to_py)?;
             // use our known id (slot side-effect now guaranteed)
             let pyt = PySubTicket {
-                id: pt.id.clone(),
+                id: pt.borrow().id.clone(),
                 result_slot: slot,
             };
             out.push(pyt);
@@ -302,7 +302,7 @@ fn swarm_pyo3_pool(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     #[pyfn(m)]
     #[pyo3(name = "create_pool")]
-    fn py_create_pool(cfg: &PyConcurrencyConfig) -> PyResult<PyThreadPool> {
+    fn py_create_pool(cfg: &Bound<'_, PyConcurrencyConfig>) -> PyResult<PyThreadPool> {
         PyThreadPool::create_pool(cfg)
     }
 
@@ -310,7 +310,7 @@ fn swarm_pyo3_pool(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[pyo3(name = "submit_tasks")]
     fn py_submit_tasks(
         pool: &PyThreadPool,
-        tasks: Vec<PyRef<PySubTask>>,
+        tasks: Vec<Bound<'_, PySubTask>>,
         works: Vec<Py<PyAny>>,
     ) -> PyResult<Vec<PySubTicket>> {
         pool.submit_tasks(tasks, works)
