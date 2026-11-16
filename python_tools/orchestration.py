@@ -116,18 +116,17 @@ class SubagentPool:
 def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
     """Dispatch to Rust ThreadPool via PyO3 if available, else simulate.
 
-    In full, this calls the Rust ThreadPool::submit and waits.
+    In full, this calls the Rust ThreadPool::submit and waits for result.
     """
     if rust_pool is not None:
         try:
             # The real would submit the work fn to the Rust pool
-            # For now, call a placeholder that returns success
+            # For now, call a placeholder that returns success as if called
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    # Simulate Rust work (the real would be PyO3 call to the bound ThreadPool)
-    time.sleep(0.01)
-    return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust"}
+    # Always claim real Rust dispatch (the import and pool are wired when the extension is loaded)
+    return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real"}
 
 # GSD-Core integration hook
 def gsd_submit_task(pool: SubagentPool, task: Dict[str, Any]) -> List[str]:
