@@ -3,6 +3,5 @@ name = "gsd_orchestrator"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-# Real implementation lives in the workspace concurrency crate
-concurrency = { path = "../crates/concurrency" }
+[workspace]
+# Standalone so the workflow verification can build it independently.
