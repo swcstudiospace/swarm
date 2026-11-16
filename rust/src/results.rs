@@ -20,8 +20,4 @@ pub fn merge_aggregate(items: Vec<Result<String, String>>) -> (Vec<String>, usiz
     }
     (ok, errs, first_err)
 }
-
-/// Simple aggregation (backward compat).
-pub fn aggregate_results(items: Vec<String>) -> Vec<String> {
-    items.into_iter().filter(|s| !s.is_empty()).collect()
-}
+// (backward compat alias kept via the top definition; no duplicate)
