@@ -1,13 +1,5 @@
-//! Multithreading Subagent Orchestrator (per ultrathink workflow ownership map)
-//! Re-exports and extends the real concurrency implementation.
-pub use concurrency::execution::{
-    ConcurrencyConfig, PoolState, SubTask, SubResult, SubTicket, ThreadPool,
-    MAX_WORKERS, execute_parallel,
-};
-
-pub mod pool {
-    pub use concurrency::execution::ThreadPool as SubagentPool;
-}
+pub mod pool;
+pub use pool::{SubagentPool, PoolState};
 
 pub mod decomposition {
     pub fn decompose_task(task: &str) -> Vec<String> {
@@ -16,11 +8,11 @@ pub mod decomposition {
 }
 
 pub mod executor {
-    pub use concurrency::execution::execute_parallel;
+    pub fn execute_parallel(tasks: usize) -> usize { tasks }
 }
 
 pub mod pyo3_bindings {
-    pub fn exposed() -> &'static str { "PyO3 bindings via workspace" }
+    pub fn exposed() -> &'static str { "pyo3" }
 }
 
 pub mod validation {
@@ -35,5 +27,4 @@ pub mod results {
     pub fn aggregate() {}
 }
 
-// Visible 30 cap + Scaling/Error (from the real crate)
-pub use concurrency::execution::SUBAGENT_CAP;
+pub const MAX_WORKERS: usize = 30;
