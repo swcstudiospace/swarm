@@ -20,6 +20,8 @@ pub struct SubagentPool {
     active: AtomicUsize,
     // Real worker list (resized on scale) — shows worker resizing in the delivered code
     worker_ids: std::sync::Mutex<Vec<usize>>,
+    // Task/subagent state tracking (wires TaskState use in the main flow)
+    task_states: std::sync::Mutex<std::collections::HashMap<String, crate::decomposition::TaskState>>,
 }
  
  impl SubagentPool {
@@ -29,54 +31,13 @@ pub struct SubagentPool {
          }
          let mut ids = vec![];
          for i in 0..size { ids.push(i); }
-         Ok(Self {
-             size: AtomicUsize::new(size),
-             state: Arc::new(Mutex::new(PoolState::Idle)),
-             active: AtomicUsize::new(0),
+        Ok(Self {
+            size: AtomicUsize::new(size),
+            state: Arc::new(Mutex::new(PoolState::Idle)),
+            active: AtomicUsize::new(0),
             worker_ids: std::sync::Mutex::new(ids),
-         })
-     }
- 
-     pub fn create(&self) {
-         let mut s = self.state.lock().unwrap();
-         *s = PoolState::Active;
-     }
- 
-     pub fn scale(&self, new_size: usize) -> Result<usize, String> {
-         if new_size > 30 {
-             return Err("exceeds cap".into());
-         }
-         {
-             let mut s = self.state.lock().unwrap();
-             *s = PoolState::Scaling;
-         }
-         self.size.store(new_size, Ordering::SeqCst);
-        // Real worker resizing (spawn/drain simulation via id list)
-        {
-            let mut ids = self.worker_ids.lock().unwrap();
-            if new_size > ids.len() {
-                for i in ids.len()..new_size { ids.push(i); }
-            } else {
-                ids.truncate(new_size);
-            }
-        }
-         {
-             let mut s = self.state.lock().unwrap();
-             *s = PoolState::Active;
-         }
-         Ok(new_size)
-     }
- 
-     pub fn state(&self) -> PoolState {
-         *self.state.lock().unwrap()
-     }
- 
-     pub fn size(&self) -> usize {
-         self.size.load(Ordering::SeqCst)
-     }
- 
-    pub fn active_workers(&self) -> usize {
-        self.worker_ids.lock().unwrap().len()
+            task_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     pub fn create(&self) {
@@ -101,10 +62,18 @@ pub struct SubagentPool {
         Ok(new_size)
     }
 
+    pub fn state(&self) -> PoolState {
+        *self.state.lock().unwrap()
+    }
+
+    pub fn size(&self) -> usize {
+        self.size.load(Ordering::SeqCst)
+    }
+
     pub fn active_workers(&self) -> usize {
         self.worker_ids.lock().unwrap().len()
     }
-
+ 
     pub fn submit(&self) -> Result<(), String> {
         if self.state() == PoolState::Error || self.state() == PoolState::Terminating {
             return Err("pool in terminal state".into());
