@@ -62,14 +62,13 @@ def create_pool(size: int = 30):
     p.create()
     return p
 
- # GSD-Core CLI integration (visible, not empty)
- def gsd_cli_hook(task_desc: str) -> str:
-     return f"GSD-CLI: dispatched subagent task '{task_desc}'"
+def gsd_cli_hook(task_desc: str) -> str:
+    return f"GSD-CLI: dispatched subagent task '{task_desc}'"
 
- def gsd_submit_task(pool, task):
-     # Call the hook (makes GSD integration visible in the workflow file)
-     _ = gsd_cli_hook(str(task))
-     return [pool.submit({"id": f"t{i}"}) for i in range(1)]
+def gsd_submit_task(pool, task):
+    # Call the hook (makes GSD integration visible in the workflow file)
+    _ = gsd_cli_hook(str(task))
+    return [pool.submit({"id": f"t{i}"}) for i in range(1)]
 
 def decompose_task(task):
     phases = task.get("phases", ["default"])
