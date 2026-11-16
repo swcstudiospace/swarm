@@ -67,7 +67,7 @@ class SubagentPool:
                 continue
 
     def _check_futures(self) -> None:
-        """Check completed futures and collect results."""
+        """Check completed futures and collect results. Called always."""
         with self.lock:
             done = []
             for task_id, fut in self._futures:
@@ -92,13 +92,12 @@ class SubagentPool:
             return self.results.copy()
 
     def drain(self) -> None:
-        """Drain the pool."""
+        """Drain the pool. Do not hold lock during join."""
+        self._running = False
+        self._executor.shutdown(wait=True)
+        if hasattr(self, '_worker_thread') and self._worker_thread:
+            self._worker_thread.join(timeout=5)
         with self.lock:
-            self.state = PoolState.Draining
-            self._running = False
-            self._executor.shutdown(wait=True)
-            if hasattr(self, '_worker_thread') and self._worker_thread:
-                self._worker_thread.join(timeout=5)
             self.state = PoolState.Idle
 
 def rust_dispatch(subtask: Dict[str, Any]) -> Any:
