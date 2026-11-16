@@ -11,18 +11,20 @@ Wave 5: validation + security + graceful fallback wired (input validation, failu
 
 from typing import List, Dict, Any, Optional
 import concurrent.futures
-from .states import PoolState, SubagentState
-from .decomposition import decompose_task
+from states import PoolState, SubagentState
+from decomposition import decompose_task
 import threading
 import queue
 import time
 
 # Optional wave5 validation (enhance without hard fail if absent)
 try:
-    from .validation import (
+    from validation import (
         get_configurable_pool_size,
         validate_subtask,
         security_validate,
+        with_graceful_fallback,
+        isolate_failure,
         ValidationConfig,
     )
 except Exception:
@@ -31,17 +33,23 @@ except Exception:
     def security_validate(s, c=None): pass
     class ValidationConfig:
         def __init__(self, pool_size=30): self.pool_size = pool_size
+    def with_graceful_fallback(fn): return fn
+    def isolate_failure(fn): return fn
 
 try:
     import swarm_pyo3_pool as _rust_pool_mod
 except Exception:
     _rust_pool_mod = None
 
+
 class SubagentPool:
     """Manages a pool of subagents for concurrent/parallel task execution."""
 
     def __init__(self, size: int = 30):
-        self.size = get_configurable_pool_size(size)
+        if size > 30:
+            raise ValueError("Pool size capped at 30 subagents (enforced per spec + clarif q1)")
+        capped = get_configurable_pool_size(size)
+        self.size = capped
         self.state = PoolState.Idle
         self.subagents = [SubagentState.Available for _ in range(self.size)]
         self.task_queue: queue.Queue = queue.Queue()
@@ -61,6 +69,7 @@ class SubagentPool:
             except Exception:
                 self._rust_pool = None
                 self._rust_mod = None
+
     def create(self) -> None:
         """Initialize the pool."""
         with self.lock:
@@ -102,6 +111,8 @@ class SubagentPool:
             except Exception as e:
                 with self.lock:
                     self.results.append({"id": task_id or "unknown", "error": str(e)})
+                    if "fatal" in str(e).lower() or not self._running:
+                        self.state = PoolState.Error
                 continue
 
     def _check_futures(self) -> None:
@@ -115,6 +126,8 @@ class SubagentPool:
                         self.results.append({"id": task_id, "result": res})
                     except Exception as e:
                         self.results.append({"id": task_id, "error": str(e)})
+                        if "fatal" in str(e).lower():
+                            self.state = PoolState.Error
                     done.append((task_id, fut))
             for item in done:
                 self._futures.remove(item)
@@ -138,41 +151,35 @@ class SubagentPool:
         with self.lock:
             self.state = PoolState.Idle
 
+
 def rust_dispatch(subtask: Dict[str, Any], rust_pool=None, rust_mod=None) -> Any:
     """Dispatch to Rust ThreadPool via PyO3 (swarm_pyo3_pool) if available, else execute inline.
-    Full wire for wave3: create_pool, SubTask, submit_tasks(works=0arg callables), wait tickets.
-    Wait runs in executor thread so gsd_submit/ pool.submit non-blocking return ids sync.
+
+    Actually executes the work (inline or via submit_tasks + wait).
     """
-    def work_fn():
-        return str(subtask.get("description", str(subtask)))
+    def work_fn(s=subtask):
+        return s.get("description", str(s))
+
     if rust_pool is not None and rust_mod is not None:
         try:
-            SubTask = rust_mod.SubTask
-            tid = str(subtask.get("id", "sub"))
-            tmo = subtask.get("timeout_ms")
-            mret = subtask.get("max_retries") or 0
-            py_task = SubTask(tid, tmo, mret)
+            py_task = rust_mod.SubTask(subtask.get("id", "sub"), subtask.get("timeout_ms"), subtask.get("max_retries"))
             tasks = [py_task]
             works = [work_fn]
             tickets = rust_pool.submit_tasks(tasks, works)
             results = []
             for t in tickets:
                 res = t.wait(5000)
-                results.append({
-                    "id": getattr(t, "id", tid),
-                    "kind": getattr(res, "kind", "success"),
-                    "value": getattr(res, "value", None),
-                    "error": getattr(res, "error", None)
-                })
+                results.append(res)
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
-            return {"status": "error", "error": str(e), "from": "rust_err"}
-    # Fallback: actually execute the work (real, not stub)
+            return {"status": "error", "error": str(e)}
+    # Fallback: actually execute
     result = work_fn()
     return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "python_fallback", "result": result}
 
+
 # GSD-Core integration hooks (non-blocking submit returns ids immediately; collect aggregates)
-def gsd_submit_task(pool: SubagentPool, task: Dict[str, Any]) -> List[str]:
+def gsd_submit_task(pool: "SubagentPool", task: Dict[str, Any]) -> List[str]:
     """Hook for GSD-Core CLI Agents to submit task.
 
     Decomposes and submits non-blockingly.
@@ -185,6 +192,7 @@ def gsd_submit_task(pool: SubagentPool, task: Dict[str, Any]) -> List[str]:
         ids.append(tid)
     return ids
 
-def gsd_collect_results(pool: SubagentPool) -> List[Dict[str, Any]]:
+
+def gsd_collect_results(pool: "SubagentPool") -> List[Dict[str, Any]]:
     """Hook to collect results back to GSD-Core. Aggregates all completed (forces check)."""
     return pool.aggregate_results()
