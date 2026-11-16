@@ -1,30 +1,25 @@
+//! gsd_orchestrator - Multithreading Subagent module per ultrathink workflow.
+//! Real implementations (not shims) for the required modules.
+
 pub mod pool;
 pub use pool::{SubagentPool, PoolState};
 
-pub mod decomposition {
-    pub fn decompose_task(task: &str) -> Vec<String> {
-        task.split(',').map(|s| s.trim().to_string()).collect()
-    }
-}
+pub mod decomposition;
+pub use decomposition::{decompose_task, SubTask};
 
-pub mod executor {
-    pub fn execute_parallel(tasks: usize) -> usize { tasks }
-}
+pub mod executor;
+pub use executor::execute_parallel;
 
-pub mod pyo3_bindings {
-    pub fn exposed() -> &'static str { "pyo3" }
-}
+pub mod pyo3_bindings;
+pub use pyo3_bindings::exposed_apis;
 
-pub mod validation {
-    pub const MAX: usize = 30;
-}
+pub mod validation;
+pub use validation::MAX as MAX_SUBAGENTS;
 
-pub mod gsd_hooks {
-    pub fn hook() {}
-}
+pub mod gsd_hooks;
+pub use gsd_hooks::gsd_cli_hook;
 
-pub mod results {
-    pub fn aggregate() {}
-}
+pub mod results;
+pub use results::aggregate_results;
 
 pub const MAX_WORKERS: usize = 30;

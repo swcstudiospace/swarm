@@ -1,1 +1,1 @@
-pub use super::validation::MAX;
+pub const MAX: usize = 30;
