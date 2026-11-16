@@ -704,12 +704,6 @@ impl ThreadPool {
             results.push(r);
         }
 
-        if self.active.load(Ordering::SeqCst) == 0 {
-            let mut s = self.state.lock();
-            if *s == PoolState::Active {
-                *s = PoolState::Active;
-            }
-        }
 
         (successes, results)
     }
