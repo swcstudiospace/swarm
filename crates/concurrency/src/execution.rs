@@ -343,8 +343,8 @@ pub struct ConcurrencyConfig {
          if self.queue_bound == 0 {
              return Err(TaskError::InvalidConfig("queue_bound must be >0".into()));
          }
-        // Wave 5: queue bound security relaxed to allow large batch callers (execute_all sets queue_bound = tasks.len()*2)
-        if self.queue_bound > 100000 {
+        // Wave 5: queue bound security (10000 allows execute_all large batches while preventing exhaustion)
+        if self.queue_bound > 10000 {
             return Err(TaskError::InvalidConfig("queue_bound too large".into()));
         }
          Ok(())
@@ -623,7 +623,7 @@ impl ThreadPool {
                 // Idle -> Active transition on submit (pool mgmt for subagent pool)
                 {
                     let mut s = self.state.lock();
-                    if matches!(*s, PoolState::Idle | PoolState::Active | PoolState::Initializing | PoolState::Scaling) {
+                    if !s.is_terminal() && matches!(*s, PoolState::Idle | PoolState::Active | PoolState::Initializing | PoolState::Scaling) {
                         *s = PoolState::Active;
                     }
                 }
