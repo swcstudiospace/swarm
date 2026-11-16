@@ -1,4 +1,11 @@
-// Path to real PyO3 implementation is in pyo3/bindings/src/lib.rs
-pub fn exposed_apis() -> &'static str {
-    "create_pool, submit_tasks, status, dispatch, scale (see pyo3/bindings)"
+// Visibility into the real PyO3 implementation (pyo3/bindings/src/lib.rs).
+// Exposes the surface the Python side (orchestration.py) calls.
+pub fn exposed_apis() -> &'static [ &'static str ] {
+    &[
+        "create_pool / SubagentPool::new",
+        "submit_tasks + wait (tickets)",
+        "status / metrics",
+        "scale (dynamic within cap)",
+        "force_error / Error state",
+    ]
 }

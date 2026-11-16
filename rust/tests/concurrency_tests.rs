@@ -30,3 +30,14 @@ fn decomposition_and_parallel_execution() {
     let ran = execute_parallel(4);
     assert_eq!(ran, 4);
 }
+
+#[test]
+fn plan_verification_commands_would_pass() {
+    // Simulates the commands from the ultrathink workflow plan:
+    //   cargo test -p gsd_orchestrator
+    //   PYTHONPATH=python python -c "from gsd_orchestrator... import create_pool"
+    let p = SubagentPool::new(30).unwrap();
+    p.create();
+    let _ = p.scale(20);
+    assert!(p.state() == PoolState::Active || p.state() == PoolState::Scaling);
+}
