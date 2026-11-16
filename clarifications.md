@@ -97,4 +97,4 @@ These resolutions recorded from direct code reads/greps (no invention). Update p
  - force_error() and submit() path enter Error.
 
  Recorded as settled from delivered implementation. The clarification answers the asked question with the behavior that was built.
-(end append for q2)
+ (end append for q2)
