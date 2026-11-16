@@ -23,12 +23,15 @@ fn workflow_30_subagent_and_scaling() {
 
     p.force_error();
     assert_eq!(p.state(), PoolState::Error);
+
+    p.recover_from_error();
+    assert_eq!(p.state(), PoolState::Idle, "pool-level recovery from Error must be possible");
 }
 
-#[test]
-fn cap_enforced() {
-    assert!(SubagentPool::new(31).is_err());
-}
+ #[test]
+ fn cap_enforced() {
+     assert!(SubagentPool::new(31).is_err());
+ }
 
 #[test]
 fn decomposition_and_parallel_execution() {
