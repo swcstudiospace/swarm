@@ -23,9 +23,9 @@ use thiserror::Error;
 
 /// SOTA production constants (boring, correct, low-overhead):
 /// - WORKER_POLL: idle recv poll for shutdown/coop cancel; 100ms balances latency/CPU.
-/// - JOIN_WAIT: collection timeout in join (task inner timeouts are enforced in worker).
+/// - JOIN_WAIT: collection timeout in join (30s; task inner timeouts enforce per-task; hung worker may block join up to this - callers can use try_recv for non-blocking if needed).
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const JOIN_WAIT: Duration = Duration::from_secs(300);
+const JOIN_WAIT: Duration = Duration::from_secs(30);
 /// Pool lifecycle states per spec (state machine).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PoolState {
