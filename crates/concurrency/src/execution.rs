@@ -28,8 +28,8 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const JOIN_WAIT: Duration = Duration::from_secs(5);
 
 /// Pool lifecycle states per spec (state machine).
- #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
- pub enum PoolState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PoolState {
     #[default]
     Idle,
     ThreadsAvailable,
