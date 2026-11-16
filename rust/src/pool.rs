@@ -106,4 +106,12 @@ impl SubagentPool {
         let mut s = self.state.lock().unwrap();
         *s = PoolState::Idle;
     }
+
+    /// Pool-level recovery from Error (required by spec for graceful degradation).
+    pub fn recover_from_error(&self) {
+        let mut s = self.state.lock().unwrap();
+        if *s == PoolState::Error {
+            *s = PoolState::Idle;
+        }
+    }
 }
