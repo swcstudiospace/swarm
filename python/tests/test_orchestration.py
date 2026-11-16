@@ -3,8 +3,9 @@ Matches plan verification commands.
 """
 import sys
 sys.path.insert(0, "..")
-from gsd_orchestrator import SubagentPool, PoolState, decompose_task, gsd_submit_task
-
+from gsd_orchestrator import (
+    SubagentPool, PoolState, decompose_task, gsd_submit_task, gsd_collect_results
+)
 def test_pool_30_cap_and_states():
     # Starts at Idle (zero active) per spec
     p = SubagentPool(30)

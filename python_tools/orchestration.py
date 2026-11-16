@@ -42,13 +42,20 @@ except Exception:
     _rust_pool_mod = None
 
 
+MAX_POOL_SIZE = 30
+
 class SubagentPool:
-    """Manages a pool of subagents for concurrent/parallel task execution."""
+    """Manages a pool of subagents for concurrent/parallel task execution.
+    Cap at 30 is hard-enforced. Scaling state used for dynamic adjustment (within cap).
+    Error state used on unrecoverable failures.
+    """
 
     def __init__(self, size: int = 30):
-        if size > 30:
-            raise ValueError("Pool size capped at 30 subagents (enforced per spec + clarif q1)")
+        if size > MAX_POOL_SIZE:
+            raise ValueError(f"Pool size capped at {MAX_POOL_SIZE} subagents (enforced)")
         capped = get_configurable_pool_size(size)
+        if capped > MAX_POOL_SIZE:
+            capped = MAX_POOL_SIZE
         self.size = capped
         self.state = PoolState.Idle
         self.subagents = [SubagentState.Available for _ in range(self.size)]
@@ -70,8 +77,23 @@ class SubagentPool:
                 self._rust_pool = None
                 self._rust_mod = None
 
+    def scale(self, new_size: int):
+        """Dynamic adjustment (Scaling state) within the 30 cap. No runtime growth beyond cap (q2 resolved as fixed-at-creation + internal scaling only)."""
+        if new_size > MAX_POOL_SIZE:
+            new_size = MAX_POOL_SIZE
+        with self.lock:
+            self.state = PoolState.Scaling
+            self.size = new_size
+            # adjust executor if possible (best effort)
+            try:
+                self._executor._max_workers = new_size
+            except Exception:
+                pass
+            self.state = PoolState.Active
+        return self.size
+
     def create(self) -> None:
-        """Initialize the pool."""
+        """Initialize the pool (Idle -> Active)."""
         with self.lock:
             self.state = PoolState.Initializing
             self._running = True
