@@ -394,7 +394,7 @@ impl ThreadPool {
                     Ok(Ok(val)) => {
                         result_to_send = SubResult::Success(val);
                         last_err = None;
-                        // fall to post-work dl check below (no early break)
+                        // fall to post-work dl check (no early break)
                     }
                     Ok(Err(e)) => {
                         last_err = Some(e.clone());
@@ -449,7 +449,7 @@ impl ThreadPool {
                 if let SubResult::Success(_) = &result_to_send {
                     break;
                 }
-
+            }
             if matches!(&result_to_send, SubResult::Failure(TaskError::Other(msg)) if msg == "uninit") {
                 result_to_send = SubResult::Failure(
                     last_err.unwrap_or_else(|| TaskError::Other("unknown worker error".into())),
