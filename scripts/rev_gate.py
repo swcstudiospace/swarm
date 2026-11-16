@@ -10,6 +10,9 @@ strings, invisible/bidi control characters), merges optional LLM findings from
 --findings-file (every target) and --per-target-findings (each gate target only its
 own), and writes a signed `gate.verdict` (gate=review) envelope to
 .swarm/verdicts/<task_id>.review.json (recorded in the Task Store when the task exists).
+Optional repeatable --path (relative to --root) limits the diff to those paths.
+With no --path the change set is unchanged. A --path outside --root or that does
+not exist is E-INPUT and records no verdict.
 """
 from __future__ import annotations
 import json
@@ -53,8 +56,64 @@ def resolve_base(root: Path, requested: str | None) -> str | None:
     return None
 
 
-def collect_changes(root: Path, base: str | None) -> dict[str, dict]:
-    """rel_path -> {added, deleted, lines: [(lineno, text)] for added lines}."""
+def resolve_subject_paths(root: Path, raw_paths: list[str] | None) -> list[Path] | None:
+    """None means the whole tree. Otherwise existing paths under root.
+
+    A path that leaves root or does not exist raises E-INPUT before any verdict is recorded.
+    """
+    if not raw_paths:
+        return None
+    root_resolved = root.resolve()
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for raw in raw_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            raise SwarmError(ErrorCode.E_INPUT, "--path requires a non-empty path relative to --root")
+        candidate = Path(raw)
+        try:
+            target = (candidate if candidate.is_absolute() else root_resolved / candidate).resolve()
+        except OSError as exc:
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {raw!r} could not be resolved") from exc
+        try:
+            inside = target == root_resolved or target.is_relative_to(root_resolved)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {raw!r} leaves the repository root")
+        if not target.exists():
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {raw!r} does not exist under {root_resolved}")
+        if target not in seen:
+            seen.add(target)
+            resolved.append(target)
+    return resolved
+
+
+def _rel_in_scopes(rel: str, scopes: list[str]) -> bool:
+    rel_path = Path(rel)
+    for scope in scopes:
+        if scope in ("", "."):
+            return True
+        scope_path = Path(scope)
+        if rel_path == scope_path or scope_path in rel_path.parents:
+            return True
+    return False
+
+
+def _subject_rels(root: Path, scopes: list[Path]) -> list[str]:
+    root_resolved = root.resolve()
+    rels = []
+    for scope in scopes:
+        rel = scope.relative_to(root_resolved).as_posix()
+        rels.append("." if rel == "" else rel)
+    return rels
+
+
+def collect_changes(root: Path, base: str | None, scopes: list[str] | None = None) -> dict[str, dict]:
+    """rel_path -> {added, deleted, lines: [(lineno, text)] for added lines}.
+
+    scopes is None for the whole tree (the historical change set). Otherwise only those
+    repo-relative paths, including untracked files under them.
+    """
     changes: dict[str, dict] = {}
 
     def whole(p: Path, rel: str):
@@ -68,9 +127,21 @@ def collect_changes(root: Path, base: str | None) -> dict[str, dict]:
 
     if base is None:
         for p in iter_files(root):
-            whole(p, p.relative_to(root).as_posix())
+            rel = p.relative_to(root).as_posix()
+            if scopes is not None and not _rel_in_scopes(rel, scopes):
+                continue
+            whole(p, rel)
+        # An explicit file inside a directory the whole-tree walk skips is still in scope.
+        if scopes is not None:
+            for rel in scopes:
+                if rel in ("", ".") or rel in changes:
+                    continue
+                target = root / rel
+                if target.is_file():
+                    whole(target, rel)
         return changes
-    diff = sh(["git", "diff", "-U0", "--no-color", base, "--", "."], cwd=root).stdout
+    end = ["--", "."] if scopes is None else ["--", *(f":(literal){rel}" for rel in scopes)]
+    diff = sh(["git", "diff", "-U0", "--no-color", base, *end], cwd=root).stdout
     cur, new_no = None, 0
     for line in diff.splitlines():
         if line.startswith("+++ "):
@@ -89,11 +160,18 @@ def collect_changes(root: Path, base: str | None) -> dict[str, dict]:
             cur["binary"] = True
     skip = {".swarm", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
     # `-z`: names come back as raw bytes, not quoted octal; decoded with the filesystem encoding so the real path is read.
-    listed = subprocess.run(["git", "ls-files", "-z", "--others", "--exclude-standard", "."], cwd=root, capture_output=True, timeout=600).stdout
+    if scopes is None:
+        listed = subprocess.run(["git", "ls-files", "-z", "--others", "--exclude-standard", "."], cwd=root, capture_output=True, timeout=600).stdout
+    else:
+        listed = subprocess.run(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard", "--", *(f":(literal){rel}" for rel in scopes)],
+            cwd=root, capture_output=True, timeout=600).stdout
     for raw in listed.split(b"\0"):
         rel = os.fsdecode(raw)
-        if rel and not skip & set(Path(rel).parts):
+        if rel and not skip & set(Path(rel).parts) and (scopes is None or _rel_in_scopes(rel, scopes)):
             whole(root / rel, rel)
+    if scopes is not None:
+        changes = {rel: ch for rel, ch in changes.items() if _rel_in_scopes(rel, scopes)}
     return changes
 
 
@@ -153,6 +231,8 @@ def load_extra(path: str | None, offset: int) -> list[dict]:
 
 
 def run(args, ctx) -> dict:
+    scopes = resolve_subject_paths(ctx.root, args.path)
+    scope_rels = _subject_rels(ctx.root, scopes) if scopes else None
     if ctx.dry_run:
         stats = {"files": 1, "added": 12, "deleted": 3, "per_file": [{"file": "src/example.py", "added": 12, "deleted": 3}]}
         env, recorded = issue_gate(ctx, gate="review", agent_id="A09@dry", findings=[], expires_s=172800,
@@ -162,7 +242,7 @@ def run(args, ctx) -> dict:
                 "recorded": sorted(recorded),
                 "summary": "dry-run: canned pass verdict"}
     base = resolve_base(ctx.root, args.diff_base)
-    changes = collect_changes(ctx.root, base)
+    changes = collect_changes(ctx.root, base, scope_rels)
     per_file = [{"file": f, "added": c["added"], "deleted": c["deleted"]} for f, c in sorted(changes.items())]
     stats = {"files": len(changes), "added": sum(c["added"] for c in changes.values()),
              "deleted": sum(c["deleted"] for c in changes.values()), "per_file": per_file}
@@ -191,6 +271,8 @@ def run(args, ctx) -> dict:
 
 
 def add_args(p):
+    p.add_argument("--path", action="append", default=None,
+                   help="limit the diff to this path under --root (repeatable; omitted: whole tree or --diff-base)")
     p.add_argument("--diff-base", help="git ref to diff against (default: HEAD~1, then origin/main, else whole tree)")
     p.add_argument("--findings-file", help="JSON list of additional (LLM semantic) findings to merge into every target's verdict")
     p.add_argument("--per-target-findings",

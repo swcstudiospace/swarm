@@ -342,6 +342,8 @@ class TaskStore:
                                      "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
                 if not real_key_configured() and insecure_dev_key() is None:
                     raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured", task_id=task_id)
+                # missing_gates includes a gate task's verified fail on an owned target (including itself)
+                # even when notes.gates is []; a non-gate task with gates [] and no fail is unchanged.
                 missing = self.missing_gates(task_id)
                 if missing:
                     raise SwarmError(ErrorCode.E_POLICY,
@@ -468,8 +470,47 @@ class TaskStore:
             return "fail"
         return "ok"
 
+    def _owned_target_fail(self, task: TaskRow, now: float) -> str | None:
+        """Gate name when a verified current fail sits on a target this gate task owns.
+
+        Ownership is notes.gate_for, which the plan may set to the gate task itself. A fail on another
+        owned target counts only when this task issued it (signed gate_task). A fail recorded on the
+        gate task itself counts either way: notes.gates [] must not hide it. None for a non-gate task,
+        so an empty notes.gates override there still means no required gates.
+        """
+        notes = task.get("notes_json") or {}
+        gate = notes.get("gate")
+        targets = notes.get("gate_for")
+        if not isinstance(gate, str) or not gate or not isinstance(targets, list):
+            return None
+        tid = task["task_id"]
+        for target_id in targets:
+            if not isinstance(target_id, str) or not target_id:
+                continue
+            try:
+                target = task if target_id == tid else self.get(target_id)
+            except SwarmError:
+                continue
+            row = self._latest_rows(target).get(gate)
+            if row is None or self._check_row(target, gate, row, now) != "fail":
+                continue
+            if target_id == tid:
+                return gate
+            try:
+                issuer = validate_verdict(json.loads(row["envelope_json"])).get("gate_task")
+            except Exception:  # noqa: BLE001 - an unreadable envelope is not a fail this task recorded
+                continue
+            if issuer == tid:
+                return gate
+        return None
+
     def missing_gate_reasons(self, task_id: str) -> dict[str, str]:
-        """Required gates lacking a verified, current, unexpired pass/waive verdict → reason, in required order."""
+        """Required gates lacking a verified, current, unexpired pass/waive verdict → reason, in required order.
+
+        A gate task that recorded a verified current fail on a target it owns (notes.gate_for, including
+        itself) is missing that gate with reason "fail", even when notes.gates is empty. A non-gate task
+        with notes.gates [] is unchanged.
+        """
         task = self.get(task_id)
         latest = self._latest_rows(task)
         now = time.time()
@@ -478,6 +519,9 @@ class TaskStore:
             reason = self._check_row(task, g, latest.get(g), now)
             if reason != "ok":
                 out[g] = reason
+        owned = self._owned_target_fail(task, now)
+        if owned is not None and owned not in out:
+            out[owned] = "fail"
         return out
 
     def missing_gates(self, task_id: str) -> builtins.list[str]:

@@ -9,6 +9,9 @@ greps (eval/exec, shell=True + f-string, pickle, yaml.load, innerHTML, SQL strin
 building), (4) IaC checks on *.tf / *.yaml (0.0.0.0/0 ingress, privileged, hostNetwork).
 Finding ids are stable hashes so --allow-list can suppress them with a justification.
 Writes a signed `gate.verdict` (gate=security) to .swarm/verdicts/<task_id>.security.json.
+Optional repeatable --path (relative to --root) limits the file scan to those paths.
+With no --path the whole tree is scanned. A --path outside --root or that does not
+exist is E-INPUT and records no verdict.
 """
 from __future__ import annotations
 import codecs
@@ -83,7 +86,67 @@ def _binary_prefix(path: Path) -> bool:
     return False
 
 
-def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
+def resolve_subject_paths(root: Path, raw_paths: list[str] | None) -> list[Path] | None:
+    """None means the whole tree. Otherwise existing paths under root.
+
+    A path that leaves root or does not exist raises E-INPUT before any verdict is recorded.
+    """
+    if not raw_paths:
+        return None
+    root_resolved = root.resolve()
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for raw in raw_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            raise SwarmError(ErrorCode.E_INPUT, "--path requires a non-empty path relative to --root")
+        candidate = Path(raw)
+        try:
+            target = (candidate if candidate.is_absolute() else root_resolved / candidate).resolve()
+        except OSError as exc:
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {raw!r} could not be resolved") from exc
+        try:
+            inside = target == root_resolved or target.is_relative_to(root_resolved)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {raw!r} leaves the repository root")
+        if not target.exists():
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {raw!r} does not exist under {root_resolved}")
+        if target not in seen:
+            seen.add(target)
+            resolved.append(target)
+    return resolved
+
+
+def _path_in_scopes(path: Path, scopes: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for scope in scopes:
+        if resolved == scope or (scope.is_dir() and resolved.is_relative_to(scope)):
+            return True
+    return False
+
+
+def _iter_scoped(root: Path, scopes: list[Path]):
+    """Files the whole-tree walk would yield under scopes, plus an explicit file the walk skips."""
+    seen: set[Path] = set()
+    for scope in scopes:
+        candidates = [scope] if scope.is_file() else iter_files(scope)
+        for path in candidates:
+            try:
+                key = path.resolve()
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            yield path
+
+
+
+def scan_files(root: Path, self_path: Path, scopes: list[Path] | None = None) -> tuple[list[dict], dict]:
     findings, seen = [], {"secrets": 0, "sast": 0, "iac": 0}
 
     def add(rule, sev, kind, summary, loc, evidence="", cwe=None):
@@ -91,7 +154,8 @@ def scan_files(root: Path, self_path: Path) -> tuple[list[dict], dict]:
         findings.append(make_finding(fid(kind, rule, loc), sev, kind, f"{rule}: {summary}", evidence=evidence,
                                      location=loc, ac_ref=cwe, owner_suggestion="A05"))
 
-    for p in iter_files(root):
+    files = iter_files(root) if scopes is None else _iter_scoped(root, scopes)
+    for p in files:
         if p.resolve() == self_path:
             continue
         if _binary_prefix(p):
@@ -147,10 +211,13 @@ def _audit_env() -> dict[str, str]:
             if key in BINARY_ENV_NAMES or key == "XDG_CONFIG_HOME" or key.startswith("LC_")}
 
 
-def dep_audit(root: Path, timeout: int) -> tuple[list[dict], dict]:
+def dep_audit(root: Path, timeout: int, scopes: list[Path] | None = None) -> tuple[list[dict], dict]:
     findings, runs = [], {}
     for name, globs, binary, cmd in AUDITS:
-        if not any(list(root.glob(g)) for g in globs):
+        if scopes is None:
+            if not any(list(root.glob(g)) for g in globs):
+                continue
+        elif not any(_path_in_scopes(p, scopes) for g in globs for p in root.glob(g)):
             continue
         if not which(binary):
             runs[name] = "skipped:tool-missing"
@@ -221,6 +288,7 @@ def apply_allow_list(findings: list[dict], path: str | None) -> tuple[list[dict]
 
 
 def run(args, ctx) -> dict:
+    scopes = resolve_subject_paths(ctx.root, args.path)
     if ctx.dry_run:
         runs = {"secrets": "pass", "sast": "pass", "iac": "skipped:no-iac", "pip-audit": "skipped:dry-run"}
         env, recorded = issue_gate(ctx, gate="security", agent_id="A10@dry", findings=[], runs=runs, simulate=True,
@@ -228,8 +296,8 @@ def run(args, ctx) -> dict:
         return {"status": "ok", "verdict": "pass", "findings": [], "runs": runs, "dry_run": True, "envelope": env,
                 "recorded": sorted(recorded),
                 "summary": "dry-run: canned pass verdict"}
-    findings, counts = scan_files(ctx.root, Path(__file__).resolve())
-    dep_findings, runs = dep_audit(ctx.root, args.timeout)
+    findings, counts = scan_files(ctx.root, Path(__file__).resolve(), scopes)
+    dep_findings, runs = dep_audit(ctx.root, args.timeout, scopes)
     findings += dep_findings
     if args.strict:
         for name, state in runs.items():
@@ -256,6 +324,8 @@ def run(args, ctx) -> dict:
 
 
 def add_args(p):
+    p.add_argument("--path", action="append", default=None,
+                   help="limit the file scan to this path under --root (repeatable; omitted: whole tree)")
     p.add_argument("--allow-list", help="JSON file: [{id, justification, expires?}] of finding ids to suppress")
     p.add_argument("--strict", action="store_true", help="fail-closed: missing dependency-audit tools become major findings")
     p.add_argument("--timeout", type=int, default=600, help="per-audit-tool timeout in seconds")

@@ -302,6 +302,41 @@ def test_absent_and_no_required_gates(swarm_dir):
     assert ts.missing_gate_reasons("N-2") == {}
 
 
+def test_gate_task_own_fail_with_empty_gates_is_refused_approved(swarm_dir):
+    """A gate task that recorded a fail for itself is refused APPROVED with E-POLICY even when
+    notes.gates is empty. A non-gate task with notes.gates [] and no fail still approves.
+
+    Fails on the pre-fix store: missing_gates() ignored the self fail because notes.gates was [].
+    """
+    from swarm.errors import ErrorCode, SwarmError
+    from swarm.gates import make_verdict
+    from swarm.taskstore import TaskStore
+
+    ts = TaskStore()
+    gate_id = "G-own"
+    ts.create(task_id=gate_id, correlation_id="c", capability="gate.review", risk_class="medium",
+              notes={"gate": "review", "gate_for": [gate_id], "gates": []})
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        ts.transition(gate_id, state)
+    ts.record_verdict(gate_id, make_verdict(
+        gate="review", task_id=gate_id, agent_id="A09", verdict="fail", correlation_id="c",
+        extra={"gate_task": gate_id}))
+    assert ts.missing_gate_reasons(gate_id) == {"review": "fail"}
+    assert ts.missing_gates(gate_id) == ["review"]
+    with pytest.raises(SwarmError, match="lacks passing gates") as ei:
+        ts.transition(gate_id, "APPROVED")
+    assert ei.value.code is ErrorCode.E_POLICY
+    assert ts.get(gate_id)["state"] == "IN_REVIEW"
+
+    plain = "N-empty"
+    ts.create(task_id=plain, correlation_id="c", capability="code.backend", risk_class="medium",
+              notes={"gates": []})
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        ts.transition(plain, state)
+    assert ts.missing_gates(plain) == []
+    assert ts.transition(plain, "APPROVED")["state"] == "APPROVED"
+
+
 def test_forged_fail_does_not_force_rework(swarm_dir):
     from swarm.taskstore import TaskStore
     from swarm.results import reconcile

@@ -206,3 +206,120 @@ def test_gate_block_calls_the_shared_gate_helper(name, route, tmp_path, monkeypa
         runpy.run_path(str(ROOT / "scripts" / f"{name}.py"), run_name="__main__")
     assert exit_info.value.code == 0
     assert served == [(name, (), ["--json"], route)]
+
+
+def _gate_json(script, root, swarm, *args):
+    r = run_script(script, "--root", str(root), "--json", *args, env={"SWARM_DIR": str(swarm)})
+    body = json.loads(r.stdout) if r.stdout.strip() else {}
+    return r, body
+
+
+def _changed_files(out):
+    return {row["file"] for row in out["stats"]["per_file"]}
+
+
+def _verdict_records(swarm: Path):
+    import sqlite3
+    db = swarm / "tasks.db"
+    rows = []
+    if db.exists():
+        con = sqlite3.connect(db)
+        try:
+            rows = list(con.execute("SELECT id FROM verdicts"))
+        except sqlite3.OperationalError:
+            rows = []
+        con.close()
+    files = list((swarm / "verdicts").glob("*")) if (swarm / "verdicts").is_dir() else []
+    return rows, files
+
+
+def test_subject_path_scope_limits_rev_diff_and_sec_scan(tmp_path):
+    """--path limits rev_gate's diff and sec_gate's scan; omitting it still scans the whole tree."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "keep").mkdir()
+    (repo / "other").mkdir()
+    (repo / "keep" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "other" / "leak.py").write_text("y = 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "first")
+    (repo / "keep" / "ok.py").write_text("x = 1\n# TODO subject scope\n", encoding="utf-8")
+    (repo / "other" / "leak.py").write_text('password = "Abcd0123456789efghIJKL"\n', encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "second")
+    (repo / "keep" / "new.py").write_text("z = 1\n# TODO new\n", encoding="utf-8")
+    (repo / "other" / "extra.py").write_text("w = 1\n", encoding="utf-8")
+    swarm = tmp_path / ".swarm"
+
+    r, out = _gate_json("rev_gate.py", repo, swarm, "--path", "keep")
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    files = _changed_files(out)
+    assert files == {"keep/ok.py", "keep/new.py"}, files
+    assert not any((f.get("location") or "").startswith("other/") for f in out["findings"]), out["findings"]
+
+    r, out = _gate_json("rev_gate.py", repo, swarm, "--path", "keep/ok.py")
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert _changed_files(out) == {"keep/ok.py"}, out["stats"]
+
+    r, out = _gate_json("rev_gate.py", repo, swarm, "--path", "keep/ok.py", "--path", "other/leak.py")
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert _changed_files(out) == {"keep/ok.py", "other/leak.py"}, out["stats"]
+
+    r, out = _gate_json("rev_gate.py", repo, swarm)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    files = _changed_files(out)
+    assert {"keep/ok.py", "keep/new.py", "other/leak.py", "other/extra.py"} <= files, files
+
+    r, out = _gate_json("sec_gate.py", repo, swarm, "--path", "keep")
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert not any((f.get("location") or "").startswith("other/") for f in out["findings"]), out["findings"]
+
+    r, out = _gate_json("sec_gate.py", repo, swarm, "--path", "keep", "--path", "other")
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert any((f.get("location") or "").startswith("other/leak.py") for f in out["findings"]), out["findings"]
+
+    r, out = _gate_json("sec_gate.py", repo, swarm)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert any((f.get("location") or "").startswith("other/leak.py") for f in out["findings"]), out["findings"]
+
+    plain = tmp_path / "plain"
+    (plain / "keep").mkdir(parents=True)
+    (plain / "other").mkdir()
+    (plain / "keep" / "ok.py").write_text("x = 1\n# TODO subject scope\n", encoding="utf-8")
+    (plain / "other" / "leak.py").write_text('password = "Abcd0123456789efghIJKL"\n', encoding="utf-8")
+    plain_swarm = tmp_path / ".swarm-plain"
+    r, out = _gate_json("rev_gate.py", plain, plain_swarm, "--path", "keep")
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert _changed_files(out) == {"keep/ok.py"}, out["stats"]
+    r, out = _gate_json("rev_gate.py", plain, plain_swarm)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert {"keep/ok.py", "other/leak.py"} <= _changed_files(out), out["stats"]
+
+
+def test_subject_path_outside_root_or_missing_is_e_input_and_records_nothing(tmp_path):
+    """A --path outside --root or that does not exist is E-INPUT and writes no verdict."""
+    repo = tmp_path / "repo"
+    (repo / "keep").mkdir(parents=True)
+    (repo / "keep" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("nope\n", encoding="utf-8")
+    (repo / "escape").symlink_to(outside)
+    swarm = tmp_path / ".swarm"
+    bad = ("missing.py", "../outside.txt", str(outside), "escape", "")
+    for script in ("rev_gate.py", "sec_gate.py"):
+        for raw in bad:
+            r = run_script(script, "--root", str(repo), "--json", "--task-id", "T-scope", "--path", raw,
+                           env={"SWARM_DIR": str(swarm)})
+            assert r.returncode == 2, (script, raw, r.returncode, r.stdout, r.stderr)
+            body = json.loads(r.stdout)
+            assert body["status"] == "error" and body["error"]["code"] == "E-INPUT", (script, raw, body)
+            rows, files = _verdict_records(swarm)
+            assert rows == [] and files == [], (script, raw, rows, files)
+        r = run_script(script, "--root", str(repo), "--json", "--dry-run", "--task-id", "T-scope",
+                       "--path", "keep/ok.py", "--path", "missing.py", env={"SWARM_DIR": str(swarm)})
+        assert r.returncode == 2, (script, r.stdout, r.stderr)
+        body = json.loads(r.stdout)
+        assert body["error"]["code"] == "E-INPUT", body
+        rows, files = _verdict_records(swarm)
+        assert rows == [] and files == [], (script, rows, files)
