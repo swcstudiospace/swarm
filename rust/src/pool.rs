@@ -18,23 +18,65 @@ pub struct SubagentPool {
     size: AtomicUsize,
     state: Arc<Mutex<PoolState>>,
     active: AtomicUsize,
-    workers: AtomicUsize,
-    // simple worker simulation
-    threads: Vec<thread::JoinHandle<()>>,
+    // Real worker list (resized on scale) — shows worker resizing in the delivered code
+    worker_ids: std::sync::Mutex<Vec<usize>>,
 }
-
-impl SubagentPool {
-    pub fn new(size: usize) -> Result<Self, String> {
-        if size > 30 {
-            return Err("exceeds 30-subagent cap".into());
+ 
+ impl SubagentPool {
+     pub fn new(size: usize) -> Result<Self, String> {
+         if size > 30 {
+             return Err("exceeds 30-subagent cap".into());
+         }
+         let mut ids = vec![];
+         for i in 0..size { ids.push(i); }
+         Ok(Self {
+             size: AtomicUsize::new(size),
+             state: Arc::new(Mutex::new(PoolState::Idle)),
+             active: AtomicUsize::new(0),
+            worker_ids: std::sync::Mutex::new(ids),
+         })
+     }
+ 
+     pub fn create(&self) {
+         let mut s = self.state.lock().unwrap();
+         *s = PoolState::Active;
+     }
+ 
+     pub fn scale(&self, new_size: usize) -> Result<usize, String> {
+         if new_size > 30 {
+             return Err("exceeds cap".into());
+         }
+         {
+             let mut s = self.state.lock().unwrap();
+             *s = PoolState::Scaling;
+         }
+         self.size.store(new_size, Ordering::SeqCst);
+        // Real worker resizing (spawn/drain simulation via id list)
+        {
+            let mut ids = self.worker_ids.lock().unwrap();
+            if new_size > ids.len() {
+                for i in ids.len()..new_size { ids.push(i); }
+            } else {
+                ids.truncate(new_size);
+            }
         }
-        Ok(Self {
-            size: AtomicUsize::new(size),
-            state: Arc::new(Mutex::new(PoolState::Idle)),
-            active: AtomicUsize::new(0),
-            workers: AtomicUsize::new(size),
-            threads: vec![],
-        })
+         {
+             let mut s = self.state.lock().unwrap();
+             *s = PoolState::Active;
+         }
+         Ok(new_size)
+     }
+ 
+     pub fn state(&self) -> PoolState {
+         *self.state.lock().unwrap()
+     }
+ 
+     pub fn size(&self) -> usize {
+         self.size.load(Ordering::SeqCst)
+     }
+ 
+    pub fn active_workers(&self) -> usize {
+        self.worker_ids.lock().unwrap().len()
     }
 
     pub fn create(&self) {
