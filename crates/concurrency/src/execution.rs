@@ -394,7 +394,7 @@ impl ThreadPool {
                     Ok(Ok(val)) => {
                         result_to_send = SubResult::Success(val);
                         last_err = None;
-                        break;
+                        // fall to post-work dl check below (no early break)
                     }
                     Ok(Err(e)) => {
                         last_err = Some(e.clone());
@@ -428,7 +428,27 @@ impl ThreadPool {
                         thread::sleep(Duration::from_millis(backoff));
                     }
                 }
-            }
+                // Post-work deadline enforcement (SOTA fix for timeout gap):
+                // work() may take longer than dl; classify late completion as timeout
+                // with partial value if it was a success. Pre-start check alone is insufficient.
+                if let Some(dl) = task_deadline {
+                    if Instant::now() > dl {
+                        let partial = match &result_to_send {
+                            SubResult::Success(v) => Some(v.clone()),
+                            SubResult::Partial { partial, .. } => partial.clone(),
+                            _ => None,
+                        };
+                        result_to_send = SubResult::Partial {
+                            partial,
+                            error: TaskError::Timeout(job.task.timeout.unwrap_or_default()),
+                        };
+                        break;
+                    }
+                }
+                // for success we must not retry: break here if not already timed out above
+                if let SubResult::Success(_) = &result_to_send {
+                    break;
+                }
 
             if matches!(&result_to_send, SubResult::Failure(TaskError::Other(msg)) if msg == "uninit") {
                 result_to_send = SubResult::Failure(
@@ -554,7 +574,7 @@ impl ThreadPool {
         let mut successes = 0usize;
 
         for t in tickets {
-            let to = Duration::from_secs(5);
+            let to = JOIN_WAIT;
             let r = t.wait(to);
             if r.is_success() {
                 successes += 1;
