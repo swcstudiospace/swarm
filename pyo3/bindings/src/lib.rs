@@ -150,12 +150,12 @@ fn subresult_to_py(r: SubResult<String>) -> PySubResult {
         SubResult::Failure(e) => PySubResult {
             kind: "failure".into(),
             value: None,
-            error: Some(format!("{:?}", e)),
+            error: Some(e.to_string()),
         },
         SubResult::Partial { partial, error } => PySubResult {
             kind: "partial".into(),
             value: partial,
-            error: Some(format!("{:?}", error)),
+            error: Some(error.to_string()),
         },
     }
 }
@@ -300,7 +300,8 @@ impl PyThreadPool {
 
     fn shutdown(&self, grace_ms: u64) -> PyResult<PyMetrics> {
         let m = self.inner.shutdown(Duration::from_millis(grace_ms));
-        Ok(metrics_to_py(m, m.state))
+        let st = m.state;
+        Ok(metrics_to_py(m, st))
     }
 }
 
@@ -398,7 +399,7 @@ mod tests {
         let p = PyThreadPool {
             inner: ThreadPool::new(cfg.inner.clone()).expect("cfg valid"),
         };
-        let st = p.status(unsafe { Python::assume_gil_acquired() });
+        let st = Python::with_gil(|py| p.status(py));
         assert!(st.is_ok());
         let _m = p.cancel().unwrap();
         let _ = p.shutdown(1);
