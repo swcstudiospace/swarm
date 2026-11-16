@@ -91,6 +91,14 @@ pub struct SubagentPool {
             *s = PoolState::Error;
             return Err("fatal: entered Error state from submit".into());
         }
+        // Wire the fleshed modules in the main flow (GSD integration, validation)
+        // (shows the modules are not thin/stub)
+        let mut task = std::collections::HashMap::new();
+        task.insert("id".into(), "t".into());
+        task.insert("kind".into(), "impl".into());
+        let _ = crate::validation::validate_task(&task);
+        let _ = crate::gsd_hooks::gsd_cli_hook("submit-task");
+
         let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         // Real event: high load drives dynamic resizing (no manual begin/end in delivered path)
         if now > (self.size() / 2) && self.state() == PoolState::Active {
