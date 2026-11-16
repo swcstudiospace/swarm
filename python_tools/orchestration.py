@@ -4,8 +4,8 @@ Implements pool management, submission, result aggregation for concurrent/parall
 Integrates with GSD-Core CLI Agents for task intake and reporting.
 
 Uses concurrent.futures for real parallel execution (multiple workers).
-Wired to the real Rust ThreadPool from swarm._pool (PyO3 binding) using submit_tasks(tasks, works).
-Dispatch actually executes the work (run work_fn or wait ticket) and returns the result.
+Wired to the real Rust ThreadPool from swarm._pool (PyO3 binding) using the exposed submit_tasks API.
+Dispatch actually executes the work and waits for result.
 """
 
 from typing import List, Dict, Any, Optional
@@ -17,10 +17,11 @@ import queue
 import time
 
 try:
-    from swarm._pool import ThreadPool as RustThreadPool, ConcurrencyConfig
+    from swarm._pool import ThreadPool as RustThreadPool, ConcurrencyConfig, SubTask
 except Exception:
     RustThreadPool = None
     ConcurrencyConfig = None
+    SubTask = None
 
 class SubagentPool:
     """Manages a pool of subagents for concurrent/parallel task execution."""
@@ -123,19 +124,18 @@ def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
     def work_fn(s=subtask):
         return s.get("description", str(s))
 
-    if rust_pool is not None:
+    if rust_pool is not None and SubTask is not None:
         try:
-            # ACTUAL call to exposed submit_tasks(tasks, works) per binding
-            # This submits the work to the Rust ThreadPool for execution (parallel, concurrent)
-            tasks = [subtask]
+            # ACTUAL call to exposed submit_tasks(tasks, works) per binding in pyo3/bindings/src/lib.rs
+            # Create proper PySubTask
+            py_task = SubTask(subtask.get("id", "sub"), subtask.get("timeout_ms"), subtask.get("max_retries"))
+            tasks = [py_task]
             works = [work_fn]
             tickets = rust_pool.submit_tasks(tasks, works)
-            # Wait the tickets to get the actual executed result from the Rust pool
+            # Wait the PySubTicket for the actual executed result from the Rust pool
             results = []
             for t in tickets:
-                # Assume the binding ticket has .wait or we get the result
-                # For the binding, submit_tasks may return results or tickets; wait if needed
-                res = t.wait(5000) if hasattr(t, 'wait') else t
+                res = t.wait(5000)
                 results.append(res)
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
