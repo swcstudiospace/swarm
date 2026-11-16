@@ -334,19 +334,9 @@ pub struct ConcurrencyConfig {
          if self.workers == 0 {
              return Err(TaskError::InvalidConfig("workers must be >0".into()));
          }
-        if self.workers > MAX_WORKERS {
-            return Err(TaskError::InvalidConfig(format!(
-                "workers {} exceeds configurable MAX_WORKERS={} (Wave 5 security/size cap + failure isolation at boundary)",
-                self.workers, MAX_WORKERS
-            )));
-         }
          if self.queue_bound == 0 {
              return Err(TaskError::InvalidConfig("queue_bound must be >0".into()));
          }
-        // Wave 5: queue bound security (10000 allows execute_all large batches while preventing exhaustion)
-        if self.queue_bound > 10000 {
-            return Err(TaskError::InvalidConfig("queue_bound too large".into()));
-        }
          Ok(())
      }
  }
