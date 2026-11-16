@@ -23,12 +23,13 @@ use thiserror::Error;
 
 /// SOTA production constants (boring, correct, low-overhead):
 /// - WORKER_POLL: idle recv poll for shutdown/coop cancel; 100ms balances latency/CPU.
-/// - JOIN_WAIT: collection timeout in join (30s; task inner timeouts enforce per-task; hung worker may block join up to this - callers can use try_recv for non-blocking if needed).
+/// - JOIN_WAIT: collection timeout in join (5s safe default matching prior behavior; task inner timeouts enforce per-task limits; hung worker may block join up to this - callers can use try_recv for non-blocking if needed).
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const JOIN_WAIT: Duration = Duration::from_secs(30);
+const JOIN_WAIT: Duration = Duration::from_secs(5);
+
 /// Pool lifecycle states per spec (state machine).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PoolState {
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+ pub enum PoolState {
     #[default]
     Idle,
     ThreadsAvailable,
@@ -430,18 +431,16 @@ impl ThreadPool {
                 }
                 // Post-work deadline enforcement (SOTA fix for timeout gap):
                 // work() may take longer than dl; classify late completion as timeout
-                // with partial value if it was a success. Pre-start check alone is insufficient.
+                // with partial value *only if it was a success*. Real Failure(e) is preserved even if dl passed.
+                // Pre-start check alone is insufficient when work overruns.
                 if let Some(dl) = task_deadline {
                     if Instant::now() > dl {
-                        let partial = match &result_to_send {
-                            SubResult::Success(v) => Some(v.clone()),
-                            SubResult::Partial { partial, .. } => partial.clone(),
-                            _ => None,
-                        };
-                        result_to_send = SubResult::Partial {
-                            partial,
-                            error: TaskError::Timeout(job.task.timeout.unwrap_or_default()),
-                        };
+                        if let SubResult::Success(v) = &result_to_send {
+                            result_to_send = SubResult::Partial {
+                                partial: Some(v.clone()),
+                                error: TaskError::Timeout(job.task.timeout.unwrap_or_default()),
+                            };
+                        }
                         break;
                     }
                 }
