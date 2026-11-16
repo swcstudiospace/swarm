@@ -1032,6 +1032,12 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
     script = ROOT / "scripts" / f"{GATE_SCRIPTS[gate]}.py"
     cmd = [sys.executable, str(script), *(["--dry-run"] if dry_run else []), "--task-id", task["task_id"],
            "--correlation-id", task["correlation_id"], "--root", str(repo), "--json"]
+    for path in task["notes_json"].get("subject_paths") or []:
+        if gate not in ("review", "security"):
+            raise SwarmError(ErrorCode.E_CONTRACT, "subject_paths only apply to review and security",
+                             task_id=task["task_id"])
+        cmd += ["--path", path]
+
     if per_target_findings is not None:
         cmd += ["--per-target-findings", str(per_target_findings)]
     # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record

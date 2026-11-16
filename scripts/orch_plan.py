@@ -51,6 +51,18 @@ _LOG = logging.getLogger("swarm.orch_plan")
 # (suffix, capability, agent, title, depends_on suffixes, gate spec), or the 8-field row
 # (..., gate spec, risk_class, acceptance) when a row pins its own risk class.
 # gate spec: None = derive from risk class; [] = no gates; {"gate": "quality", "for": [...]} = this IS a gate task
+
+def _subject_paths(gates: dict) -> list[str]:
+    """Optional repo-relative paths a review or security gate must scan. Absent means the whole tree."""
+    paths = gates.get("paths", [])
+    if paths is None:
+        return []
+    if not isinstance(paths, list) or not all(isinstance(p, str) and p and not p.startswith("/") and ".." not in p.split("/") for p in paths):
+        raise SwarmError(ErrorCode.E_INPUT, "gates.paths must be a list of repo-relative paths")
+    if paths and gates.get("gate") not in ("review", "security"):
+        raise SwarmError(ErrorCode.E_INPUT, "gates.paths is only valid on a review or security gate")
+    return paths
+
 PATTERNS: dict[str, list[tuple]] = {
     "feature": [
         ("req", "req.spec", "A02", "Requirements spec + acceptance criteria", [], []),
@@ -452,6 +464,9 @@ def run(args, ctx) -> dict:
                         notes["gate"] = gates["gate"]
                         notes["gate_for"] = [f"{prefix}-{s}" for s in gates["for"]]
                         notes["gates"] = []
+                        paths = _subject_paths(gates)
+                        if paths:
+                            notes["subject_paths"] = paths
                     elif gates is not None:
                         notes["gates"] = gates
                     if lane:
