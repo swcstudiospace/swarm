@@ -456,18 +456,20 @@ impl ThreadPool {
             }
 
             let _ = job.result_tx.send(result_to_send);
+
+            active.fetch_sub(1, Ordering::SeqCst);
+            progress.notify_all();
+
+            {
+                let mut st = state.lock();
+                if *st == PoolState::ExecutingBatch && active.load(Ordering::SeqCst) == 0 {
+                    *st = PoolState::ThreadsAvailable;
+                }
+            }
         }
 
         progress.notify_all();
     }
-
-    pub fn state(&self) -> PoolState {
-        *self.state.lock()
-    }
-
-    pub fn metrics(&self) -> Metrics {
-        let qd = self.work_tx.len();
-        Metrics {
             active_threads: self.active.load(Ordering::SeqCst),
             queue_depth: qd,
             state: self.state(),
