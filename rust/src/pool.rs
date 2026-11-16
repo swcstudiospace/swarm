@@ -71,13 +71,18 @@ impl SubagentPool {
     }
 
     pub fn submit(&self) -> Result<(), String> {
+        if self.state() == PoolState::Error || self.state() == PoolState::Terminating {
+            return Err("pool in terminal state".into());
+        }
         if self.state() != PoolState::Active {
-            return Err("not active".into());
+            // Enter Error on fatal misuse (makes Error reachable in core submit path)
+            let mut s = self.state.lock().unwrap();
+            *s = PoolState::Error;
+            return Err("fatal: entered Error state".into());
         }
         self.active.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-
     pub fn force_error(&self) {
         let mut s = self.state.lock().unwrap();
         *s = PoolState::Error;
