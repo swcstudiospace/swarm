@@ -1,4 +1,6 @@
 # Wave 1 (n1) — Discovery inventory · Refs SPE-18064
+See `docs/assumptions.md` for n6 ambiguity resolutions with defaults (GSD-Core contracts, decomposition rules, execution model, pool sizing, result aggregation; q1 structured data shape etc). Refs SPE-33068 n6.8 etc, ultrathink plan from n7 synthesize, Notion graphs (e.g. ut-mvvownjp-ff01b275 https://app.notion.com/p/40abc1a0c7ae81b588b7e01197a8d77c?pvs=204), plan/n* files, AGENTS.md clarifications. No contradictions.
+
 
 End state: 30 existing subagents (A01–A30) as isolated Chat Threads in forced-parallel
 matrix/nexus per GSD-Core session; Rust replaces Python behind a parity-gated boundary;

@@ -1,8 +1,10 @@
 {
-  "source": "orchestrate subcommand handler",
+  "subagent_id": "subagent-Tea7e-v7-a09-8993db89e1a8-1794793805487",
+  "task_id": "Tea7e-v7-a09",
+  "wave": "wave1",
   "version": "1.0",
-  "correlation_id": "f0e5d91e-f092-5652-b93a-5f10b93c22e4",
-  "swarm_state": "INITIALIZING",
-  "updated_at": "2026-11-08T20:20:12Z",
+  "correlation_id": "ea7e01fc-7b17-4553-8698-95e67261d524",
+  "swarm_state": "COMPLETE",
+  "updated_at": "2026-11-16T01:54:44Z",
   "progress": {}
 }

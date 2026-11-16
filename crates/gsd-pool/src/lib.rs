@@ -2,10 +2,12 @@
 //!
 //! Manages lifecycle, pooling, reuse, and isolation for chat-thread subagents.
 //!
+//! See docs/assumptions.md for n6 ambiguity resolutions with defaults (pool sizing=30 enforced configurable maximum; execution model=Rust thread pools for parallel; result aggregation=flat). Refs SPE-33068 n6.8 etc, ultrathink n7 synthesize for Multithreading Subagent, plan files, Notion graph.
+//!
 //! The public surface is the chat facade in [`chat`], its data types, the thread state machine,
 //! and [`PoolError`], [`PoolConfig`] and [`PoolResult`]. The pool machinery (`ThreadPool`, the warm
 //! pool and the handle registry) is crate-private.
-
+:
 use std::time::{Duration, Instant};
 
 use dashmap::mapref::entry::Entry;
@@ -16,7 +18,6 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::handle_registry::ChatThreadHandle;
-use crate::warm_reuse::WarmPool;
 
 mod cancel;
 pub mod chat;
@@ -26,6 +27,8 @@ mod handle_registry;
 pub mod thread_state_machine;
 pub mod thread_state_transition_table;
 mod warm_reuse;
+use crate::warm_reuse::WarmPool;
+
 
 pub use cancel::{CancelOutcome, CancelReport};
 pub use chat::{

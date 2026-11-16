@@ -1,4 +1,6 @@
 # N7 — Ordered wave execution plan · Refs SPE-18070
+See `docs/assumptions.md` (n6 ambiguity resolutions with defaults for GSD-Core contracts/decomposition/execution/pool sizing/result aggregation; q1 data shape structured (id,desc,phase?,priority?,deps); q2 flat per-subtask; q3 inline only; Rust thread pools; pool 30 enforced max; generic keyword decomp). Refs SPE-33068 n6.8 etc, ultrathink n7 synthesize, SPE-18070, Notion graphs from .planning.
+
 
 Source inputs (read first — authoritative): `plan/inventory.md` (n1 facts),
 `plan/decompose.md` (n2 units U1–U6 + file-ownership table), `plan/scheduler-options.md`

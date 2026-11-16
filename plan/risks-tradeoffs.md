@@ -1,4 +1,6 @@
 # Risks & tradeoffs: scheduler × Rust/Wasmer/omp · Refs SPE-18069
+See `docs/assumptions.md` for n6 ambiguity resolutions with defaults (GSD-Core contracts, decomposition rules, execution model = Rust thread pools for parallel, pool sizing=30 enforced configurable max, result aggregation=flat list per-subtask + inline goal artifact). Refs SPE-33068 n6.8 etc, n7 synthesize, execution-waves N7, decompose N2, inventory, Notion from graph.
+
 
 Source inputs (Wave 2, read first — authoritative): `plan/inventory.md` (n1 facts),
 `plan/decompose.md` (n2 units U1–U6 + ownership table), `plan/scheduler-options.md`

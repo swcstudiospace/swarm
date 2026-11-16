@@ -1,4 +1,6 @@
 # N2 — Decomposition: AI-multithreading upgrade · Refs SPE-18068
+See `docs/assumptions.md` for n6 ambiguity resolutions with defaults (GSD-Core contracts, decomposition rules [generic keyword based for independent/ordered], execution model [Rust thread pools], pool sizing [30 enforced max], result aggregation [flat; q2 flat per-subtask; q3 inline only no separate doc]). Refs SPE-33068 n6.8, n7 synthesize, SPE-18068, inventory n1, execution-waves n7, Notion from graph.
+
 
 Source facts: plan/inventory.md (n1, authoritative). Python truth: scripts/swarm_run.py:38-56
 (force-parallel reconcile+dispatchable+select_batch policy), swarm/errors.py:13-20 (7 codes).
