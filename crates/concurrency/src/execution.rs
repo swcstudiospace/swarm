@@ -17,10 +17,15 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam::channel::{bounded, Receiver, Sender, TryRecvError, RecvTimeoutError};
 use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
 
+/// SOTA production constants (boring, correct, low-overhead):
+/// - WORKER_POLL: idle recv poll for shutdown/coop cancel; 100ms balances latency/CPU.
+/// - JOIN_WAIT: collection timeout in join (task inner timeouts are enforced in worker).
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const JOIN_WAIT: Duration = Duration::from_secs(300);
 /// Pool lifecycle states per spec (state machine).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PoolState {
@@ -164,16 +169,21 @@ impl<T: Send + 'static> SubTicket<T> {
     pub fn wait(&self, timeout: Duration) -> SubResult<T> {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.rx.recv_timeout(timeout) {
+            let now = Instant::now();
+            if now >= deadline {
+                return SubResult::Partial {
+                    partial: None,
+                    error: TaskError::Timeout(timeout),
+                };
+            }
+            let remaining = deadline - now;
+            match self.rx.recv_timeout(remaining) {
                 Ok(res) => return res,
-                Err(_) => {
-                    if Instant::now() > deadline {
-                        return SubResult::Partial {
-                            partial: None,
-                            error: TaskError::Timeout(timeout),
-                        };
-                    }
-                    thread::sleep(Duration::from_millis(1));
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return SubResult::Failure(TaskError::Other(
+                        "worker disconnected".into(),
+                    ))
                 }
             }
         }
@@ -331,7 +341,7 @@ impl ThreadPool {
                 break;
             }
 
-            let job = match rx.recv_timeout(Duration::from_millis(50)) {
+            let job = match rx.recv_timeout(WORKER_POLL_INTERVAL) {
                 Ok(j) => j,
                 Err(_) => {
                     if shutdown.load(Ordering::SeqCst) {
