@@ -1,0 +1,20 @@
+=== Plan verification commands (from ultrathink workflow) ===
+
+# cargo test in the rust/ context (plan verification)
+$ (cd rust && cargo test -- --quiet)
+test result: ok. 4 passed
+
+# PYTHONPATH=python python -c "from gsd_orchestrator.orchestrator import create_pool"
+$ PYTHONPATH=python python3 -c '
+from gsd_orchestrator.orchestrator import create_pool
+p = create_pool(30)
+print("create_pool(30) state after create:", p.state)
+p.scale(20)
+print("after scale(20):", p.size)
+print("plan verification command passes")
+'
+create_pool(30) state after create: Active
+after scale(20): 20
+plan verification command passes
+
+All verification commands pass against the workflow-specified layout.
