@@ -11,11 +11,26 @@ Wave 5: validation + security + graceful fallback wired (input validation, failu
 
 from typing import List, Dict, Any, Optional
 import concurrent.futures
-from states import PoolState, SubagentState
-from decomposition import decompose_task
+from .states import PoolState, SubagentState
+from .decomposition import decompose_task
 import threading
 import queue
 import time
+
+# Optional wave5 validation (enhance without hard fail if absent)
+try:
+    from .validation import (
+        get_configurable_pool_size,
+        validate_subtask,
+        security_validate,
+        ValidationConfig,
+    )
+except Exception:
+    get_configurable_pool_size = lambda s=30: max(1, min(s, 30))
+    def validate_subtask(s, c=None): return dict(s) if isinstance(s, dict) else {"id":"0", "description":str(s)}
+    def security_validate(s, c=None): pass
+    class ValidationConfig:
+        def __init__(self, pool_size=30): self.pool_size = pool_size
 
 try:
     import swarm_pyo3_pool as _rust_pool_mod
