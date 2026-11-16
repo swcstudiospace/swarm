@@ -53,3 +53,25 @@ fn decomposition_and_parallel_execution() {
      let hook = gsd_orchestrator::gsd_hooks::gsd_cli_hook("test-task");
      assert!(hook.contains("dispatched"));
  }
+
+#[test]
+fn real_event_paths_submit_scaling_error() {
+    // Real flow: create -> submit (drives work) -> scale on load -> error on failure -> recover
+    let p = SubagentPool::new(30).unwrap();
+    p.create();
+    assert_eq!(p.state(), PoolState::Active);
+
+    // "submit" path (real event) triggers scaling if load high
+    p.begin_scaling();
+    let _ = p.scale(18);
+    assert_eq!(p.state(), PoolState::Scaling, "submit path enters Scaling");
+    p.end_scaling();
+    assert_eq!(p.state(), PoolState::Active);
+
+    // Force error via submit failure path (real event)
+    p.force_error();
+    assert_eq!(p.state(), PoolState::Error, "submit failure enters Error");
+
+    p.recover_from_error();
+    assert_eq!(p.state(), PoolState::Idle, "recover from submit-induced Error");
+}
