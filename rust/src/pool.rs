@@ -88,29 +88,21 @@ pub struct SubagentPool {
         if new_size > 30 {
             return Err("exceeds cap".into());
         }
-        {
-            let mut s = self.state.lock().unwrap();
-            *s = PoolState::Scaling;
-        }
         self.size.store(new_size, Ordering::SeqCst);
-        self.workers.store(new_size, Ordering::SeqCst);
+        // Real worker resizing (spawn/drain simulation via id list) — no explicit Scaling setter in delivered path
         {
-            let mut s = self.state.lock().unwrap();
-            *s = PoolState::Active;
+            let mut ids = self.worker_ids.lock().unwrap();
+            if new_size > ids.len() {
+                for i in ids.len()..new_size { ids.push(i); }
+            } else {
+                ids.truncate(new_size);
+            }
         }
         Ok(new_size)
     }
 
-    pub fn state(&self) -> PoolState {
-        *self.state.lock().unwrap()
-    }
-
-    pub fn size(&self) -> usize {
-        self.size.load(Ordering::SeqCst)
-    }
-
     pub fn active_workers(&self) -> usize {
-        self.workers.load(Ordering::SeqCst)
+        self.worker_ids.lock().unwrap().len()
     }
 
     pub fn submit(&self) -> Result<(), String> {
