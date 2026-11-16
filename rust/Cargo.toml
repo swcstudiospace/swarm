@@ -1,0 +1,8 @@
+[package]
+name = "gsd_orchestrator_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The real work lives in the workspace crate "concurrency"
+# This is a thin adapter for the workflow verification
