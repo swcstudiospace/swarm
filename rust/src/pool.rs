@@ -123,12 +123,10 @@ pub struct SubagentPool {
             return Err("fatal: entered Error state from submit".into());
         }
         let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        // Real event: high load drives Scaling (dynamic within cap)
+        // Real event: high load drives dynamic resizing (no manual begin/end in delivered path)
         if now > (self.size() / 2) && self.state() == PoolState::Active {
-            self.begin_scaling();
-            // keep active within cap by adjusting
-            let _ = self.scale(self.size().saturating_sub(2).max(1));
-            self.end_scaling();
+            let target = self.size().saturating_sub(2).max(1);
+            let _ = self.scale(target);
         }
         Ok(())
     }
