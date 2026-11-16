@@ -236,6 +236,11 @@ pub struct TaskFacts {
     pub dry_run: bool,
     /// `_gates_of`: `notes.gates` when present, else `GATES_BY_RISK[risk_class]`, in this order.
     pub required_gates: Vec<String>,
+    /// `notes.gate` when it is a non-empty string. Absent, empty, or not a string is `None` (not a gate task).
+    pub gate: Option<String>,
+    /// `notes.gate_for` when it is a list. Non-string and empty ids are dropped. Absent or not a list is `None`,
+    /// which is not ownership (an empty list is a list and owns nothing).
+    pub gate_for: Option<Vec<String>>,
 }
 
 /// The state of one task, for the issuer rule of [`unaccepted_gates`].
@@ -289,6 +294,22 @@ impl TaskFacts {
             verdicts_since: verdicts_since(obj_get(&notes, "verdicts_since"))?,
             dry_run: obj_get(&notes, "dry_run").is_some_and(py_truthy),
             required_gates,
+            gate: match obj_get(&notes, "gate") {
+                Some(Json::Str(gate)) if !gate.is_empty() => Some(gate.clone()),
+                _ => None,
+            },
+            gate_for: match obj_get(&notes, "gate_for") {
+                Some(Json::Arr(items)) => Some(
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Json::Str(id) if !id.is_empty() => Some(id.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            },
         })
     }
 }
@@ -595,6 +616,13 @@ fn row_of<'a>(latest: &[(&str, &'a VerdictFacts)], gate: &str) -> Option<&'a Ver
 
 /// `missing_gate_reasons`: the required gates that lack a verified, current, unexpired `pass` or `waive` verdict, with the reason,
 /// in required order (a repeated gate appears once, at its first position).
+///
+/// A gate task that recorded a verified current fail on a target it owns (`notes.gate_for`, including itself) is also missing
+/// that gate with reason `fail`, even when `notes.gates` is empty. A non-gate task (`notes.gate` absent or `notes.gate_for` not a
+/// list) is unchanged, so an empty `notes.gates` override there still means no required gates. The fail counts only when
+/// [`check_row`] is `fail` (the host's `sig_ok` plus the envelope checks). Another owned target is not checked here: this
+/// function has that target's rows only when the caller included them, and not the target's `correlation_id`, `verdicts_since`
+/// or `dry_run`, which [`check_row`] needs. Guessing those fields would not match Python.
 pub fn missing_gate_reasons(
     task: &TaskFacts,
     rows: &[VerdictFacts],
@@ -608,7 +636,34 @@ pub fn missing_gate_reasons(
             out.push((gate.clone(), outcome));
         }
     }
+    if let Some(gate) = owned_target_fail(task, rows, now)? {
+        if !out.iter().any(|(seen, _)| seen == &gate) {
+            out.push((gate, CheckOutcome::Fail));
+        }
+    }
     Ok(out)
+}
+
+/// Gate name when a verified current fail sits on this gate task itself (`notes.gate_for` contains `task_id`).
+///
+/// Python's `_owned_target_fail` also accepts a fail on another owned target when this task issued it. That needs the
+/// target's facts, which are not an argument here, so only the self target is evaluated.
+fn owned_target_fail(
+    task: &TaskFacts,
+    rows: &[VerdictFacts],
+    now: f64,
+) -> Result<Option<String>, Unsupported> {
+    let (Some(gate), Some(targets)) = (&task.gate, &task.gate_for) else {
+        return Ok(None);
+    };
+    if !targets.iter().any(|target_id| target_id == &task.task_id) {
+        return Ok(None);
+    }
+    let latest = latest_rows(task, rows, false);
+    if check_row(task, gate, row_of(&latest, gate), now)? == CheckOutcome::Fail {
+        return Ok(Some(gate.clone()));
+    }
+    Ok(None)
 }
 
 /// `latest_verdicts(verified_only=True)`: [`latest_rows`] without the rows whose [`check_row`] is not verified (`ok`, `fail`, `expired`).
@@ -1266,5 +1321,40 @@ mod tests {
             parse_envelope(&envelope_text("1.0", "5", "")),
             EnvelopeState::Valid(_)
         ));
+    }
+
+    #[test]
+    fn gate_task_own_fail_with_empty_gates_is_missing_and_non_gate_empty_gates_is_not() {
+        let notes = r#"{"gate":"review","gate_for":["G"],"gates":[]}"#;
+        let gate_task = TaskFacts::from_row("G", "c", Some("medium"), Some(notes))
+            .expect("gate task notes are inside the provable subset");
+        let envelope = r#"{"msg_id":"m","correlation_id":"c","trace_id":"t","source":"s","target":"A01","type":"gate.verdict","schema":"swarm.v1.gate.verdict","ts":"x","ttl_s":300,"priority":"P1","risk_class":"low","sig":"hmac:AA==","payload":{"gate":"review","task_id":"G","verdict":"fail","findings":[],"expires_s":86400,"issued_at":1000.0,"gate_task":"G"}}"#;
+        let row = VerdictRow {
+            id: 1,
+            task_id: "G".to_string(),
+            gate: "review".to_string(),
+            verdict: Some("fail".to_string()),
+            envelope_json: Some(envelope.to_string()),
+            ts: 10.0,
+        };
+        let verified = VerdictFacts::new(row.clone(), true);
+        assert_eq!(
+            missing_gate_reasons(&gate_task, std::slice::from_ref(&verified), 1001.0),
+            Ok(vec![("review".to_string(), CheckOutcome::Fail)]),
+            "a verified self-fail on a gate task is missing even when notes.gates is empty"
+        );
+        let unverified = VerdictFacts::new(row, false);
+        assert_eq!(
+            missing_gate_reasons(&gate_task, std::slice::from_ref(&unverified), 1001.0),
+            Ok(Vec::new()),
+            "a fail counts only when the envelope verifies"
+        );
+        let plain = TaskFacts::from_row("N", "c", Some("medium"), Some(r#"{"gates":[]}"#))
+            .expect("empty gates override");
+        assert_eq!(
+            missing_gate_reasons(&plain, &[], 1001.0),
+            Ok(Vec::new()),
+            "a non-gate task with notes.gates [] has no missing gates"
+        );
     }
 }

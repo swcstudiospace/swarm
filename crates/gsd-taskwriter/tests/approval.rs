@@ -493,6 +493,19 @@ async fn a_failing_gate_is_a_policy_refusal() {
 }
 
 #[tokio::test]
+async fn a_gate_task_own_fail_with_empty_gates_is_a_policy_refusal() {
+    refused_with(
+        r#"{"verdicts": [["review", "fail"]], "notes": {"gate": "review", "gate_for": ["T-1"], "gates": []}}"#,
+        "hmac",
+        "hmac",
+        "lacks passing gates ['review']",
+        &["review"],
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn a_missing_gate_is_a_policy_refusal() {
     refused_with(
         r#"{"verdicts": [["review", "pass"]]}"#,

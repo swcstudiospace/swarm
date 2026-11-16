@@ -367,28 +367,34 @@ pub(crate) async fn gather(
         .into_iter()
         .map(|row| VerdictFacts::new(row, false))
         .collect();
-    // Only the rows `_check_row` can reach are verified: the highest id of each required gate.
-    let current: Vec<i64> = {
-        let latest = latest_rows(&target, &rows, false);
-        target
-            .required_gates
-            .iter()
-            .filter_map(|gate| {
-                latest
-                    .iter()
-                    .find(|(name, _)| name == gate)
-                    .map(|(_, facts)| facts.row.id)
-            })
-            .collect()
-    };
+    // Verify the highest-id row of each required gate, and, when this gate task owns itself, the
+    // highest-id row of notes.gate whose stored verdict is fail. notes.gates [] would otherwise leave
+    // that row sig_ok false, so missing_gate_reasons could not see a verified fail. No other row is verified.
+    let latest = latest_rows(&target, &rows, false);
+    let mut verify: Vec<i64> = target
+        .required_gates
+        .iter()
+        .filter_map(|gate| {
+            latest
+                .iter()
+                .find(|(name, _)| name == gate)
+                .map(|(_, facts)| facts.row.id)
+        })
+        .collect();
+    if let (Some(gate), Some(owned)) = (&target.gate, &target.gate_for) {
+        if owned.iter().any(|id| id == task_id) {
+            if let Some((_, facts)) = latest.iter().find(|(name, _)| *name == gate.as_str()) {
+                if facts.row.verdict.as_deref() == Some("fail") && !verify.contains(&facts.row.id) {
+                    verify.push(facts.row.id);
+                }
+            }
+        }
+    }
     for entry in rows
         .iter_mut()
-        .filter(|entry| current.contains(&entry.row.id))
+        .filter(|entry| verify.contains(&entry.row.id))
     {
-        entry.sig_ok = match (&entry.envelope, entry.row.envelope_json.as_deref()) {
-            (EnvelopeState::Invalid, _) | (_, None | Some("")) => false,
-            (_, Some(text)) => keys.verify_text(text).map_err(declined)?,
-        };
+        entry.sig_ok = keys.row_sig_ok(entry)?;
     }
 
     let now = source.clock(requested_now);
