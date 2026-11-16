@@ -3,10 +3,12 @@
 Implements pool management, submission, result aggregation for concurrent/parallel execution.
 Integrates with GSD-Core CLI Agents for task intake and reporting.
 
-From the plan: tasks submit non-blockingly and results aggregate to GSD-Core.
+Uses concurrent.futures for real parallel execution (multiple workers).
+Wired placeholder for Rust dispatch via PyO3.
 """
 
 from typing import List, Dict, Any, Optional
+import concurrent.futures
 from .states import PoolState, SubagentState
 from .decomposition import decompose_task
 import threading
@@ -24,7 +26,8 @@ class SubagentPool:
         self.results: List[Dict[str, Any]] = []
         self.lock = threading.Lock()
         self._running = False
-        self._worker_thread: Optional[threading.Thread] = None
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=size)
+        self._futures: List = []
 
     def create(self) -> None:
         """Initialize the pool."""
@@ -45,48 +48,44 @@ class SubagentPool:
             return task_id
 
     def _worker_loop(self) -> None:
-        """Worker loop for executing subtasks concurrently."""
+        """Worker loop for submitting to parallel executor."""
         while self._running:
             task_id = None
             try:
                 task_id, subtask = self.task_queue.get(timeout=1)
-                # Find available subagent
+                # Submit to executor for parallel (real concurrent/parallel)
+                future = self._executor.submit(self._execute_subtask, subtask)
                 with self.lock:
-                    for i, status in enumerate(self.subagents):
-                        if status == SubagentState.Available:
-                            self.subagents[i] = SubagentState.Busy
-                            break
-                    else:
-                        # No available, requeue
-                        self.task_queue.put((task_id, subtask))
-                        time.sleep(0.1)
-                        continue
-
-                # Simulate execution (in real, dispatch to Rust via PyO3)
-                result = self._execute_subtask(subtask)
-                with self.lock:
-                    self.results.append({"id": task_id, "result": result})
-                    for i, status in enumerate(self.subagents):
-                        if status == SubagentState.Busy:
-                            self.subagents[i] = SubagentState.Available
-                            break
-
+                    self._futures.append((task_id, future))
                 self.task_queue.task_done()
             except queue.Empty:
+                self._check_futures()
                 continue
             except Exception as e:
                 with self.lock:
                     self.results.append({"id": task_id or "unknown", "error": str(e)})
-                    # Mark subagent failed or available
-                    for i, status in enumerate(self.subagents):
-                        if status == SubagentState.Busy:
-                            self.subagents[i] = SubagentState.Failed
-                            break
+                continue
+
+    def _check_futures(self) -> None:
+        """Check completed futures and collect results."""
+        with self.lock:
+            done = []
+            for task_id, fut in self._futures:
+                if fut.done():
+                    try:
+                        res = fut.result()
+                        self.results.append({"id": task_id, "result": res})
+                    except Exception as e:
+                        self.results.append({"id": task_id, "error": str(e)})
+                    done.append((task_id, fut))
+            for item in done:
+                self._futures.remove(item)
 
     def _execute_subtask(self, subtask: Dict[str, Any]) -> Any:
-        """Execute subtask (placeholder for Rust dispatch)."""
-        # In full impl, use PyO3 to call Rust execution
-        time.sleep(0.01)  # Simulate work
+        """Execute subtask. Placeholder for Rust via PyO3."""
+        # TODO: dispatch to actual Rust ThreadPool via PyO3 binding for true parallel
+        # For now, simulate work in the executor thread (parallel)
+        time.sleep(0.01)
         return {"status": "success", "subtask": subtask.get("description", str(subtask))}
 
     def aggregate_results(self) -> List[Dict[str, Any]]:
@@ -99,7 +98,8 @@ class SubagentPool:
         with self.lock:
             self.state = PoolState.Draining
             self._running = False
-            if self._worker_thread:
+            self._executor.shutdown(wait=True)
+            if hasattr(self, '_worker_thread') and self._worker_thread:
                 self._worker_thread.join(timeout=5)
             self.state = PoolState.Idle
 
