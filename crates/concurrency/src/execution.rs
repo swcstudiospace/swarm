@@ -27,32 +27,116 @@ use thiserror::Error;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const JOIN_WAIT: Duration = Duration::from_secs(5);
 
-/// Pool lifecycle states per spec (state machine).
+/// Pool lifecycle states per BUILD_PROMPT spec (state machine for multithreading subagent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PoolState {
     #[default]
+    /// Initial idle state before initialization.
     Idle,
-    ThreadsAvailable,
-    Saturated,
-    ExecutingBatch,
-    Cancelling,
-    Shutdown,
+    /// Pool is initializing (e.g. spawning workers).
+    Initializing,
+    /// Pool is active and ready for dispatch.
+    Active,
+    /// Pool is scaling (add/remove workers).
+    Scaling,
+    /// Pool is draining work (no new submits, finishing current).
+    Draining,
+    /// Pool is terminating (shutdown in progress).
+    Terminating,
+    /// Pool in error state (unrecoverable).
+    Error,
 }
 
 impl PoolState {
     pub fn as_str(&self) -> &'static str {
         match self {
             PoolState::Idle => "IDLE",
-            PoolState::ThreadsAvailable => "THREADS_AVAILABLE",
-            PoolState::Saturated => "SATURATED",
-            PoolState::ExecutingBatch => "EXECUTING_BATCH",
-            PoolState::Cancelling => "CANCELLING",
-            PoolState::Shutdown => "SHUTDOWN",
+            PoolState::Initializing => "INITIALIZING",
+            PoolState::Active => "ACTIVE",
+            PoolState::Scaling => "SCALING",
+            PoolState::Draining => "DRAINING",
+            PoolState::Terminating => "TERMINATING",
+            PoolState::Error => "ERROR",
         }
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, PoolState::Shutdown)
+        matches!(self, PoolState::Terminating | PoolState::Error)
+    }
+}
+
+/// Task lifecycle states per BUILD_PROMPT spec (for decomposition/dispatch/agg in subagent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskState {
+    #[default]
+    /// Task received by pool/orchestrator.
+    Received,
+    /// Task decomposed into subtasks (via decompose).
+    Decomposed,
+    /// Subtasks queued for dispatch.
+    Queued,
+    /// Assigned to a subagent/worker.
+    Assigned,
+    /// Executing on subagent.
+    Executing,
+    /// Aggregating partial results.
+    Aggregating,
+    /// Completed successfully.
+    Completed,
+    /// Failed (after retries).
+    Failed,
+    /// Cancelled (cooperative or explicit).
+    Cancelled,
+}
+
+impl TaskState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskState::Received => "RECEIVED",
+            TaskState::Decomposed => "DECOMPOSED",
+            TaskState::Queued => "QUEUED",
+            TaskState::Assigned => "ASSIGNED",
+            TaskState::Executing => "EXECUTING",
+            TaskState::Aggregating => "AGGREGATING",
+            TaskState::Completed => "COMPLETED",
+            TaskState::Failed => "FAILED",
+            TaskState::Cancelled => "CANCELLED",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+        )
+    }
+}
+
+/// Subagent lifecycle states per BUILD_PROMPT spec (for pool of 30 subagents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentState {
+    /// Subagent available for work.
+    Available,
+    /// Subagent busy executing a subtask.
+    Busy,
+    /// Subagent failed (error state, may recycle).
+    Failed,
+    /// Subagent terminated (drained or explicit).
+    Terminated,
+}
+
+impl SubagentState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubagentState::Available => "AVAILABLE",
+            SubagentState::Busy => "BUSY",
+            SubagentState::Failed => "FAILED",
+            SubagentState::Terminated => "TERMINATED",
+        }
+    }
+
+    pub fn is_usable(&self) -> bool {
+        matches!(self, SubagentState::Available | SubagentState::Busy)
     }
 }
 
@@ -279,7 +363,7 @@ impl ThreadPool {
     pub fn new(config: ConcurrencyConfig) -> Result<Self, TaskError> {
         config.validate()?;
         let (work_tx, work_rx) = bounded(config.queue_bound);
-        let state = Arc::new(Mutex::new(PoolState::Idle));
+        let state = Arc::new(Mutex::new(PoolState::Initializing));
         let active = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let batch_inflight = Arc::new(AtomicUsize::new(0));
@@ -320,7 +404,7 @@ impl ThreadPool {
             }
         }
 
-        *pool.state.lock() = PoolState::ThreadsAvailable;
+        *pool.state.lock() = PoolState::Active;
         Ok(pool)
     }
 
@@ -356,10 +440,12 @@ impl ThreadPool {
 
             {
                 let mut st = state.lock();
-                if *st == PoolState::ThreadsAvailable {
-                    *st = PoolState::ExecutingBatch;
+                if *st == PoolState::Active {
+                    *st = PoolState::Active;
+                } else if *st == PoolState::Initializing {
+                    *st = PoolState::Active;
                 } else if *st == PoolState::Idle {
-                    *st = PoolState::ExecutingBatch;
+                    *st = PoolState::Active;
                 }
             }
 
