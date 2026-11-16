@@ -467,9 +467,16 @@ impl ThreadPool {
                 }
             }
         }
-
         progress.notify_all();
     }
+
+    pub fn state(&self) -> PoolState {
+        *self.state.lock()
+    }
+
+    pub fn metrics(&self) -> Metrics {
+        let qd = self.work_tx.len();
+        Metrics {
             active_threads: self.active.load(Ordering::SeqCst),
             queue_depth: qd,
             state: self.state(),
