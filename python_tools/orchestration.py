@@ -120,14 +120,9 @@ def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
     """
     if rust_pool is not None:
         try:
-            # Actually call the Rust pool submit with a work fn
-            def work_fn():
-                return subtask.get("description", str(subtask))
-            # The binding submit takes the task and the work
-            ticket = rust_pool.submit({"id": subtask.get("id", "sub")}, work_fn)
-            # Wait the ticket to get the actual result from the Rust pool
-            result = ticket.wait(5000)  # 5s timeout
-            return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "result": result}
+            # Use the exposed submit_tasks from the binding
+            results = rust_pool.submit_tasks([subtask])
+            return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
             return {"status": "error", "error": str(e)}
     # Always claim real Rust dispatch (the import and pool are wired when the extension is loaded)
