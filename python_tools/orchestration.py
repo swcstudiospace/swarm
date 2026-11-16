@@ -125,9 +125,9 @@ def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
                 return subtask.get("description", str(subtask))
             # The binding submit takes the task and the work
             ticket = rust_pool.submit({"id": subtask.get("id", "sub")}, work_fn)
-            # In real, we would wait the ticket
-            # For now, return success as if the call happened
-            return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "ticket": str(ticket)}
+            # Wait the ticket to get the actual result from the Rust pool
+            result = ticket.wait(5000)  # 5s timeout
+            return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "result": result}
         except Exception as e:
             return {"status": "error", "error": str(e)}
     # Always claim real Rust dispatch (the import and pool are wired when the extension is loaded)
