@@ -80,7 +80,14 @@ impl SubagentPool {
             *s = PoolState::Error;
             return Err("fatal: entered Error state from submit".into());
         }
-        self.active.fetch_add(1, Ordering::SeqCst);
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        // Real event: high load drives Scaling (dynamic within cap)
+        if now > (self.size() / 2) && self.state() == PoolState::Active {
+            self.begin_scaling();
+            // keep active within cap by adjusting
+            let _ = self.scale(self.size().saturating_sub(2).max(1));
+            self.end_scaling();
+        }
         Ok(())
     }
 
