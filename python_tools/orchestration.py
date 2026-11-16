@@ -120,8 +120,10 @@ def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
     """
     if rust_pool is not None:
         try:
-            # Use the exposed submit_tasks from the binding
-            results = rust_pool.submit_tasks([subtask])
+            # Use the exposed submit_tasks from the binding with (tasks, works)
+            tasks = [subtask]
+            works = [lambda s=subtask: s.get("description", str(s))]
+            results = rust_pool.submit_tasks(tasks, works)
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
             return {"status": "error", "error": str(e)}
