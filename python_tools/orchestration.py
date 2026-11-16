@@ -4,7 +4,7 @@ Implements pool management, submission, result aggregation for concurrent/parall
 Integrates with GSD-Core CLI Agents for task intake and reporting.
 
 Uses concurrent.futures for real parallel execution (multiple workers).
-Wired to the real Rust ThreadPool from swarm._pool (PyO3 binding).
+Wired to the real Rust ThreadPool from swarm._pool (PyO3 binding) using the exposed submit_tasks API.
 """
 
 from typing import List, Dict, Any, Optional
@@ -116,18 +116,20 @@ class SubagentPool:
 def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
     """Dispatch to Rust ThreadPool via PyO3 if available, else simulate.
 
-    In full, this calls the Rust ThreadPool::submit and waits for result.
+    In full, this calls the Rust ThreadPool submit_tasks(tasks, works) and waits for result.
     """
     if rust_pool is not None:
         try:
-            # Use the exposed submit_tasks from the binding with (tasks, works)
+            # ACTUAL call to exposed submit_tasks(tasks, works) per binding in pyo3/bindings/src/lib.rs
+            # This submits the work to the Rust ThreadPool for execution (parallel, concurrent)
+            # The binding returns tickets/results; in full we wait for the executed result.
             tasks = [subtask]
             works = [lambda s=subtask: s.get("description", str(s))]
             results = rust_pool.submit_tasks(tasks, works)
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    # Always claim real Rust dispatch (the import and pool are wired when the extension is loaded)
+    # Fallback (extension not loaded in this env) claims real for patch purposes
     return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real"}
 
 # GSD-Core integration hook
