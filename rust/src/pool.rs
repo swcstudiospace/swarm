@@ -87,4 +87,16 @@ impl SubagentPool {
         let mut s = self.state.lock().unwrap();
         *s = PoolState::Error;
     }
+
+    pub fn begin_scaling(&self) {
+        let mut s = self.state.lock().unwrap();
+        *s = PoolState::Scaling;
+    }
+
+    pub fn end_scaling(&self) {
+        let mut s = self.state.lock().unwrap();
+        if *s == PoolState::Scaling {
+            *s = PoolState::Active;
+        }
+    }
 }

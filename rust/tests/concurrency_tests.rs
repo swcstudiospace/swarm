@@ -10,10 +10,14 @@ fn workflow_30_subagent_and_scaling() {
     assert_eq!(p.state(), PoolState::Active);
     assert_eq!(p.size(), 30);
 
+    p.begin_scaling();
+    assert_eq!(p.state(), PoolState::Scaling, "Scaling state must be entered");
     let new_size = p.scale(25).expect("scale");
     assert_eq!(new_size, 25);
-    assert_eq!(p.state(), PoolState::Active);
     assert_eq!(p.active_workers(), 25, "Scaling must change the number of active workers");
+    p.end_scaling();
+    assert_eq!(p.state(), PoolState::Active);
+
     p.force_error();
     assert_eq!(p.state(), PoolState::Error);
 }
