@@ -86,3 +86,17 @@ Evidence quotes:
 
 These resolutions recorded from direct code reads/greps (no invention). Update plan defaults if needed. Paths listed above.
  (end append)
+
+## q2 Pool Resize (from blocking clarifications in ultrathink spec)
+Recommended: Fixed at creation
+Rationale from repo evidence: Pool size (workers) is set at ThreadPool::new(ConcurrencyConfig) and PoolConfig; no resize method or runtime capacity change API exists. Scaling state is internal (for batch/queue), not pool worker count change. Matches swarm max_parallel at start, gsd-pool warm_pool_size fixed in config.
+Evidence quotes:
+- crates/concurrency/src/execution.rs:363: `pub fn new(config: ConcurrencyConfig) -> Result<Self, TaskError> { ... workers: Mutex::new(Vec::with_capacity(config.workers)) ... }`
+- crates/concurrency/src/execution.rs:318: `pub workers: usize` in ConcurrencyConfig (no resize)
+- crates/gsd-pool/src/lib.rs:106: `pub warm_pool_size: usize` (fixed in config)
+- swarm/_native.pyi:193: `workers: int = 4` (param at creation)
+- No resize, scale, or set_workers in execution.rs, lib.rs, gsd-pool, or pyo3 bindings.
+Pool size fixed at creation time (configurable at init, up to 30 cap). Scaling is for internal state, not dynamic worker resize.
+
+Recorded as settled. No invention; derived from repo code.
+(end append for q2)
