@@ -434,15 +434,12 @@ impl ThreadPool {
                 // with partial value if it was a success. Pre-start check alone is insufficient.
                 if let Some(dl) = task_deadline {
                     if Instant::now() > dl {
-                        let partial = match &result_to_send {
-                            SubResult::Success(v) => Some(v.clone()),
-                            SubResult::Partial { partial, .. } => partial.clone(),
-                            _ => None,
-                        };
-                        result_to_send = SubResult::Partial {
-                            partial,
-                            error: TaskError::Timeout(job.task.timeout.unwrap_or_default()),
-                        };
+                        if let SubResult::Success(v) = &result_to_send {
+                            result_to_send = SubResult::Partial {
+                                partial: Some(v.clone()),
+                                error: TaskError::Timeout(job.task.timeout.unwrap_or_default()),
+                            };
+                        }
                         break;
                     }
                 }
@@ -452,17 +449,13 @@ impl ThreadPool {
                 }
             }
 
-            let _ = job.result_tx.send(result_to_send);
-
-            active.fetch_sub(1, Ordering::SeqCst);
-            progress.notify_all();
-
-            {
-                let mut st = state.lock();
-                if *st == PoolState::ExecutingBatch && active.load(Ordering::SeqCst) == 0 {
-                    *st = PoolState::ThreadsAvailable;
-                }
+            if matches!(&result_to_send, SubResult::Failure(TaskError::Other(msg)) if msg == "uninit") {
+                result_to_send = SubResult::Failure(
+                    last_err.unwrap_or_else(|| TaskError::Other("unknown worker error".into())),
+                );
             }
+
+            let _ = job.result_tx.send(result_to_send);
         }
 
         progress.notify_all();
