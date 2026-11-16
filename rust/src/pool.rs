@@ -100,4 +100,10 @@ impl SubagentPool {
             *s = PoolState::Active;
         }
     }
+
+    pub fn return_to_idle(&self) {
+        self.active.store(0, Ordering::SeqCst);
+        let mut s = self.state.lock().unwrap();
+        *s = PoolState::Idle;
+    }
 }

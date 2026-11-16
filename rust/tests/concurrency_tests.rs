@@ -18,6 +18,9 @@ fn workflow_30_subagent_and_scaling() {
     p.end_scaling();
     assert_eq!(p.state(), PoolState::Active);
 
+    p.return_to_idle();
+    assert_eq!(p.state(), PoolState::Idle, "Idle must be reachable after use");
+
     p.force_error();
     assert_eq!(p.state(), PoolState::Error);
 }
