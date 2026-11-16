@@ -429,21 +429,7 @@ impl ThreadPool {
                         thread::sleep(Duration::from_millis(backoff));
                     }
                 }
-                // Post-work deadline enforcement (SOTA fix for timeout gap):
-                // work() may take longer than dl; classify late completion as timeout
-                // with partial value *only if it was a success*. Real Failure(e) is preserved even if dl passed.
-                // Pre-start check alone is insufficient when work overruns.
-                if let Some(dl) = task_deadline {
-                    if Instant::now() > dl {
-                        if let SubResult::Success(v) = &result_to_send {
-                            result_to_send = SubResult::Partial {
-                                partial: Some(v.clone()),
-                                error: TaskError::Timeout(job.task.timeout.unwrap_or_default()),
-                            };
-                        }
-                        break;
-                    }
-                }
+                // Pre-start deadline check only (post-work rewrite of Success removed to preserve contract).
                 // for success we must not retry: break here if not already timed out above
                 if let SubResult::Success(_) = &result_to_send {
                     break;
