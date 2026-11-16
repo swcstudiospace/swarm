@@ -363,6 +363,9 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(config: ConcurrencyConfig) -> Result<Self, TaskError> {
+        if config.workers > 30 {
+            return Err(TaskError::InvalidConfig("workers exceeds 30-subagent cap".into()));
+        }
         config.validate()?;
         let (work_tx, work_rx) = bounded(config.queue_bound);
         let state = Arc::new(Mutex::new(PoolState::Idle));
@@ -370,7 +373,6 @@ impl ThreadPool {
         let shutdown = Arc::new(AtomicBool::new(false));
         let batch_inflight = Arc::new(AtomicUsize::new(0));
         let progress = Arc::new(Condvar::new());
-
         let pool = Self {
             config: config.clone(),
             state: state.clone(),
