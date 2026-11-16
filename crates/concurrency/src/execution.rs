@@ -320,7 +320,7 @@ pub struct ConcurrencyConfig {
  impl Default for ConcurrencyConfig {
      fn default() -> Self {
          Self {
-            workers: MAX_WORKERS,  // Wave 5: 30 default (configurable max, security cap; matches python_tools/validation + clarifs)
+             workers: 4,  // keep existing default; cap at MAX_WORKERS=30 (configurable max per clarifs q1)
              queue_bound: 128,
              default_timeout: Duration::from_secs(10),
              backoff_base_ms: 10,
@@ -343,9 +343,9 @@ pub struct ConcurrencyConfig {
          if self.queue_bound == 0 {
              return Err(TaskError::InvalidConfig("queue_bound must be >0".into()));
          }
-        // Wave 5: queue bound security for graceful (prevents exhaustion, isolates bad batches)
-        if self.queue_bound > MAX_WORKERS * 16 {
-            return Err(TaskError::InvalidConfig("queue_bound exceeds isolation limit".into()));
+        // Wave 5: queue bound security relaxed to allow large batch callers (execute_all sets queue_bound = tasks.len()*2)
+        if self.queue_bound > 100000 {
+            return Err(TaskError::InvalidConfig("queue_bound too large".into()));
         }
          Ok(())
      }
