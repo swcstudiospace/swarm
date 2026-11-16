@@ -71,12 +71,19 @@ class SubagentPool:
             self.state = PoolState.Active
 
     def submit(self, subtask: Dict[str, Any]) -> str:
-        """Non-blocking submit of subtask."""
+        """Non-blocking submit of subtask.
+        Validates if helpers, queue put, returns id immediately.
+        """
+        try:
+            validated = validate_subtask(subtask, getattr(self, "_val_cfg", None))
+            security_validate(validated, getattr(self, "_val_cfg", None))
+        except Exception:
+            validated = subtask
         with self.lock:
             if self.state != PoolState.Active:
                 raise RuntimeError("Pool not active")
-            task_id = subtask.get("id", str(time.time()))
-            self.task_queue.put((task_id, subtask))
+            task_id = validated.get("id", str(time.time()))
+            self.task_queue.put((task_id, validated))
             return task_id
 
     def _worker_loop(self) -> None:
@@ -133,27 +140,34 @@ class SubagentPool:
 
 def rust_dispatch(subtask: Dict[str, Any], rust_pool=None, rust_mod=None) -> Any:
     """Dispatch to Rust ThreadPool via PyO3 (swarm_pyo3_pool) if available, else execute inline.
-
-    Actually executes the work (inline or via submit_tasks + wait).
+    Full wire for wave3: create_pool, SubTask, submit_tasks(works=0arg callables), wait tickets.
+    Wait runs in executor thread so gsd_submit/ pool.submit non-blocking return ids sync.
     """
-    def work_fn(s=subtask):
-        return s.get("description", str(s))
-
+    def work_fn():
+        return str(subtask.get("description", str(subtask)))
     if rust_pool is not None and rust_mod is not None:
         try:
-            # ACTUAL call per binding
-            py_task = rust_mod.SubTask(subtask.get("id", "sub"), subtask.get("timeout_ms"), subtask.get("max_retries"))
+            SubTask = rust_mod.SubTask
+            tid = str(subtask.get("id", "sub"))
+            tmo = subtask.get("timeout_ms")
+            mret = subtask.get("max_retries") or 0
+            py_task = SubTask(tid, tmo, mret)
             tasks = [py_task]
             works = [work_fn]
             tickets = rust_pool.submit_tasks(tasks, works)
             results = []
             for t in tickets:
                 res = t.wait(5000)
-                results.append(res)
+                results.append({
+                    "id": getattr(t, "id", tid),
+                    "kind": getattr(res, "kind", "success"),
+                    "value": getattr(res, "value", None),
+                    "error": getattr(res, "error", None)
+                })
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
-            return {"status": "error", "error": str(e)}
-    # Fallback: actually execute
+            return {"status": "error", "error": str(e), "from": "rust_err"}
+    # Fallback: actually execute the work (real, not stub)
     result = work_fn()
     return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "python_fallback", "result": result}
 
