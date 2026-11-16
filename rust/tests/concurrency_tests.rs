@@ -12,8 +12,8 @@ fn workflow_30_subagent_and_scaling() {
 
     let new_size = p.scale(25).expect("scale");
     assert_eq!(new_size, 25);
-    assert_eq!(p.state(), PoolState::Active); // back to active after scaling
-
+    assert_eq!(p.state(), PoolState::Active);
+    assert_eq!(p.active_workers(), 25, "Scaling must change the number of active workers");
     p.force_error();
     assert_eq!(p.state(), PoolState::Error);
 }

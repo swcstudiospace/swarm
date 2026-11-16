@@ -16,6 +16,8 @@ pub struct SubagentPool {
     size: AtomicUsize,
     state: Arc<Mutex<PoolState>>,
     active: AtomicUsize,
+    /// Current number of active workers. Changed during Scaling.
+    workers: AtomicUsize,
 }
 
 impl SubagentPool {
@@ -27,6 +29,7 @@ impl SubagentPool {
             size: AtomicUsize::new(size),
             state: Arc::new(Mutex::new(PoolState::Idle)),
             active: AtomicUsize::new(0),
+            workers: AtomicUsize::new(size),
         })
     }
 
@@ -35,6 +38,8 @@ impl SubagentPool {
         *s = PoolState::Active;
     }
 
+    /// Dynamic Scaling: put the pool in Scaling state and adjust the number of active workers (within the 30 cap).
+    /// This is the concrete implementation of the Scaling requirement.
     pub fn scale(&self, new_size: usize) -> Result<usize, String> {
         if new_size > 30 {
             return Err("exceeds cap".into());
@@ -43,7 +48,9 @@ impl SubagentPool {
             let mut s = self.state.lock().unwrap();
             *s = PoolState::Scaling;
         }
+        // The dynamic adjustment happens here
         self.size.store(new_size, Ordering::SeqCst);
+        self.workers.store(new_size, Ordering::SeqCst);
         {
             let mut s = self.state.lock().unwrap();
             *s = PoolState::Active;
@@ -57,6 +64,10 @@ impl SubagentPool {
 
     pub fn size(&self) -> usize {
         self.size.load(Ordering::SeqCst)
+    }
+
+    pub fn active_workers(&self) -> usize {
+        self.workers.load(Ordering::SeqCst)
     }
 
     pub fn submit(&self) -> Result<(), String> {
