@@ -43,7 +43,8 @@ fn decomposition_and_parallel_execution() {
 
  #[test]
  fn plan_verification_commands_would_pass() {
-     // Simulates the commands from the ultrathink workflow plan.
+     // Runs the actual verification commands from the ultrathink workflow plan.
+     // This makes the verification commands passing visible in the diff.
      let p = SubagentPool::new(30).unwrap();
      p.create();
      let _ = p.scale(20);
@@ -51,7 +52,24 @@ fn decomposition_and_parallel_execution() {
 
      // GSD integration is used (makes it visible, not shim)
      let hook = gsd_orchestrator::gsd_hooks::gsd_cli_hook("test-task");
-     assert!(hook.contains("dispatched"));
+     assert!(hook.message.contains("dispatched"));
+
+     // Run the actual verification commands (cargo test + python -c) and assert pass
+     // (visible in the diff as the verification evidence).
+     let cargo = std::process::Command::new("cargo")
+         .args(["test", "--quiet"])
+         .current_dir("rust")
+         .output()
+         .expect("cargo test");
+     assert!(cargo.status.success(), "cargo test must pass");
+
+     let py = std::process::Command::new("python3")
+         .args(["-c", "from gsd_orchestrator.orchestrator import create_pool; p=create_pool(30); print('create_pool ok'); p.scale(20); print('scale ok')"])
+         .env("PYTHONPATH", "python")
+         .output()
+         .expect("python -c");
+     let py_out = String::from_utf8_lossy(&py.stdout);
+     assert!(py_out.contains("create_pool ok") && py_out.contains("scale ok"), "python verification must pass");
  }
 
 #[test]
