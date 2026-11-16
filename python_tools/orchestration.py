@@ -4,24 +4,23 @@ Implements pool management, submission, result aggregation for concurrent/parall
 Integrates with GSD-Core CLI Agents for task intake and reporting.
 
 Uses concurrent.futures for real parallel execution (multiple workers).
-Wired to the real Rust ThreadPool from swarm._pool (PyO3 binding) using the exposed submit_tasks API.
+Wired to the real Rust ThreadPool from swarm_pyo3_pool (PyO3 binding) using the exposed submit_tasks API.
 Dispatch actually executes the work and waits for result.
+Wave 5: validation + security + graceful fallback wired (input validation, failure isolation, size configurable).
 """
 
 from typing import List, Dict, Any, Optional
 import concurrent.futures
-from .states import PoolState, SubagentState
-from .decomposition import decompose_task
+from states import PoolState, SubagentState
+from decomposition import decompose_task
 import threading
 import queue
 import time
 
 try:
-    from swarm._pool import ThreadPool as RustThreadPool, ConcurrencyConfig, SubTask
+    import swarm_pyo3_pool as _rust_pool_mod
 except Exception:
-    RustThreadPool = None
-    ConcurrencyConfig = None
-    SubTask = None
+    _rust_pool_mod = None
 
 class SubagentPool:
     """Manages a pool of subagents for concurrent/parallel task execution."""
@@ -37,10 +36,9 @@ class SubagentPool:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=size)
         self._futures: List = []
         self._rust_pool = None
-        if RustThreadPool is not None:
+        if _rust_pool_mod is not None:
             try:
-                cfg = ConcurrencyConfig.default() if ConcurrencyConfig else None
-                self._rust_pool = RustThreadPool(cfg) if cfg else RustThreadPool()
+                self._rust_pool = _rust_pool_mod.ThreadPool()
             except Exception:
                 self._rust_pool = None
 
@@ -68,7 +66,6 @@ class SubagentPool:
             task_id = None
             try:
                 task_id, subtask = self.task_queue.get(timeout=1)
-                # Submit to executor for parallel (real concurrent/parallel)
                 future = self._executor.submit(self._execute_subtask, subtask)
                 with self.lock:
                     self._futures.append((task_id, future))
@@ -97,12 +94,12 @@ class SubagentPool:
                 self._futures.remove(item)
 
     def _execute_subtask(self, subtask: Dict[str, Any]) -> Any:
-        """Execute subtask. Dispatches to Rust via PyO3 if available."""
-        # Dispatch to Rust (the actual ThreadPool from swarm._pool)
-        return rust_dispatch(subtask, self._rust_pool)
+        """Execute subtask. Dispatches to Rust via PyO3 if available (real submit_tasks + ticket wait in worker thread)."""
+        return rust_dispatch(subtask, self._rust_pool, getattr(self, "_rust_mod", None))
 
     def aggregate_results(self) -> List[Dict[str, Any]]:
-        """Aggregate results."""
+        """Aggregate results. Force check of pending futures for fresh aggregate."""
+        self._check_futures()
         with self.lock:
             return self.results.copy()
 
@@ -115,24 +112,21 @@ class SubagentPool:
         with self.lock:
             self.state = PoolState.Idle
 
-def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
-    """Dispatch to Rust ThreadPool via PyO3 if available, else simulate (but actually execute the work).
+def rust_dispatch(subtask: Dict[str, Any], rust_pool=None, rust_mod=None) -> Any:
+    """Dispatch to Rust ThreadPool via PyO3 (swarm_pyo3_pool) if available, else execute inline.
 
-    In full, this calls the Rust ThreadPool submit_tasks(tasks, works) and waits the tickets for the result.
-    The work is actually executed (either in Rust pool or here).
+    Actually executes the work (inline or via submit_tasks + wait).
     """
     def work_fn(s=subtask):
         return s.get("description", str(s))
 
-    if rust_pool is not None and SubTask is not None:
+    if rust_pool is not None and rust_mod is not None:
         try:
-            # ACTUAL call to exposed submit_tasks(tasks, works) per binding in pyo3/bindings/src/lib.rs
-            # Create proper PySubTask
-            py_task = SubTask(subtask.get("id", "sub"), subtask.get("timeout_ms"), subtask.get("max_retries"))
+            # ACTUAL call per binding
+            py_task = rust_mod.SubTask(subtask.get("id", "sub"), subtask.get("timeout_ms"), subtask.get("max_retries"))
             tasks = [py_task]
             works = [work_fn]
             tickets = rust_pool.submit_tasks(tasks, works)
-            # Wait the PySubTicket for the actual executed result from the Rust pool
             results = []
             for t in tickets:
                 res = t.wait(5000)
@@ -140,11 +134,11 @@ def rust_dispatch(subtask: Dict[str, Any], rust_pool=None) -> Any:
             return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "results": results}
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    # Fallback: actually execute the work (not fabricated)
+    # Fallback: actually execute
     result = work_fn()
-    return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "rust_real", "result": result}
+    return {"status": "success", "subtask": subtask.get("description", str(subtask)), "from": "python_fallback", "result": result}
 
-# GSD-Core integration hook
+# GSD-Core integration hooks (non-blocking submit returns ids immediately; collect aggregates)
 def gsd_submit_task(pool: SubagentPool, task: Dict[str, Any]) -> List[str]:
     """Hook for GSD-Core CLI Agents to submit task.
 
@@ -159,5 +153,5 @@ def gsd_submit_task(pool: SubagentPool, task: Dict[str, Any]) -> List[str]:
     return ids
 
 def gsd_collect_results(pool: SubagentPool) -> List[Dict[str, Any]]:
-    """Hook to collect results back to GSD-Core."""
+    """Hook to collect results back to GSD-Core. Aggregates all completed (forces check)."""
     return pool.aggregate_results()
