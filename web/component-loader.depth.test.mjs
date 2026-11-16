@@ -1,6 +1,6 @@
 // The loader's wire depth limit: a request nested to depth 32 is accepted and depth 33 is refused
-// with code "input" before the guest is called. Today MAX_DEPTH is 128, so depth 33 is accepted
-// and the depth 33 refusal tests fail; the depth 1 and depth 32 tests pass today and must stay green.
+// with code "input" before the guest is called. MAX_DEPTH is 32.
+// The depth 1 and depth 32 tests must stay green.
 //
 // Each request is valid for the wire schema at its depth (crates/gsd-route/src/orch_status_wire.rs):
 // list mode with no tasks, and the nesting under `history`, which list mode ignores. A refusal can
@@ -88,4 +88,17 @@ test("request_nested_to_depth_33_is_refused_with_input_code", () => {
 
 test("request_nested_to_depth_33_is_refused_by_invoke_before_the_guest", () => {
   assert.throws(() => invoke(bytesOf(requestWithDepth(33))), isInputRefusal);
+});
+
+test("tool_input_of_100000_bytes_is_accepted", () => {
+  const request = requestWithDepth(1);
+  request.tasks = [{ input: "x".repeat(100000) }];
+  assert.doesNotThrow(() => requestFromBytes(bytesOf(request)));
+});
+
+test("tool_input_of_100001_bytes_is_refused_before_the_guest", () => {
+  const request = requestWithDepth(1);
+  request.tasks = [{ input: "x".repeat(100001) }];
+  assert.throws(() => requestFromBytes(bytesOf(request)), isInputRefusal);
+  assert.throws(() => invoke(bytesOf(request)), isInputRefusal);
 });

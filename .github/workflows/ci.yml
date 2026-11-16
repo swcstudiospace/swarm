@@ -110,6 +110,21 @@ jobs:
             "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
             VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
           fi
+      # Phase 11 U2 gate 3 (11-VERIFICATION.md row 19): catalog and a dry-run slice must finish
+      # with the extension importable. This step does not set SWARM_PURE_PYTHON. A temp SWARM_DIR
+      # keeps the slice off the checkout. orch_plan only seeds that directory so the dry-run has a plan.
+      - name: phase 11 U2 multithreading smoke
+        run: |
+          unset SWARM_PURE_PYTHON
+          python3 -c 'import swarm._native'
+          export SWARM_DIR="$RUNNER_TEMP/u2-smoke-swarm"
+          mkdir -p "$SWARM_DIR"
+          if [ -z "${SWARM_ED25519_KEY:-}${SWARM_ED25519_KEY_FILE:-}${SWARM_SIGNING_KEY:-}" ]; then
+            export SWARM_ALLOW_INSECURE_DEV_KEY=1
+          fi
+          python3 scripts/orch_plan.py --brief-text "phase 11 U2 smoke" --pattern feature --risk-class medium --json >/dev/null
+          python3 scripts/swarm_tool.py catalog --caller A05
+          python3 scripts/swarm_run.py --dry-run --json
       # The default build: the sandbox write legs check the named E-DEP refusal and report "not covered", never a pass.
       - name: key tests (default build)
         env:
