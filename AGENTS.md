@@ -160,6 +160,8 @@ Working assumptions (explicit from repo evidence):
 - q2: Requires prior 'on' (ultrathink classification).
 - q3: Brief plus free text (for /swarm).
 - q4: OMP sessions logic + diagnostics reference assumptions for syntax (ultrathink via unescaped <ORIGINAL>), key, limits (depth/hold/recursion).
+- See `docs/assumptions.md` for n6 ambiguity resolutions with defaults (GSD-Core contracts, decomposition rules [generic keyword based independent/ordered], execution model [Rust thread pools parallel], pool sizing [30 enforced configurable max], result aggregation [flat per-subtask list; q3 goal inline only no sep doc]; q1 data shape structured (id, description, phase?, priority?, deps list)). Refs SPE-33068 n6.8 etc, n7 synthesize ultrathink, plans (inventory n1/decompose n2/execution-waves n7/risks n6), Notion graph links.
+
 
 Current bypass (classifier/hooks/gsd autonomous evidence confirmed): / commands and gsd own agents bypass to non-sdlc (startswith("/") or "<system-reminder" or NEGATIVE/DISPATCH_MARKER or SWARM_CHILD=1 or non-empty SWARM_AGENT; swarm/signal_detector.py:25, omp/src/hooks.ts:35, hooks/autonomous_run.py:43 (updated), hooks/user_prompt_submit.py:60, AGENTS.md:83; gsd-auton now uses OMP cmd path not CHILD=1 spawn. Exact `/gsd-autonomous workflowz ultrathink orchestrate` classified sdlc for concurrent launch (hook_trigger.py updated to OMP, autonomous_run.py classify updated). Other bypass preserved. SPE-13819 n3.6-7.
 

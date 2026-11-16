@@ -388,6 +388,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "concurrency"
+version = "0.1.0"
+dependencies = [
+ "crossbeam",
+ "parking_lot",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3025,6 +3035,15 @@ dependencies = [
  "pyo3-build-config",
  "pyo3-ffi",
  "pyo3-macros",
+]
+
+[[package]]
+name = "pyo3-bindings"
+version = "0.1.0"
+dependencies = [
+ "concurrency",
+ "parking_lot",
+ "pyo3",
 ]
 
 [[package]]

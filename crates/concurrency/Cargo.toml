@@ -1,0 +1,25 @@
+[package]
+name = "concurrency"
+version = "0.1.0"
+edition = "2021"
+description = "Concurrency primitives for GSD-Core Multithreading Subagent: thread pool, bounded work queue, channels, states, retries, timeouts, partial results, metrics. SOTA thread-safe implementation."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["concurrency", "development-tools", "thread-pool"]
+keywords = ["thread-pool", "concurrency", "subtask", "retry", "partial-results", "multithreading"]
+
+[dependencies]
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+# for tests only
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

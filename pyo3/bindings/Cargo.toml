@@ -1,0 +1,23 @@
+[package]
+name = "pyo3-bindings"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 binding layer for concurrency ThreadPool (n7 wave 3): create_pool, submit_tasks, status, cancel; PyClass conversions, error translation, validation, memory safety (GIL release), tests. SOTA per SPE-33072 n5.8"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+
+[lib]
+name = "swarm_pyo3_pool"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Enabled by maturin for the wheel. Off by default so `cargo test` links against libpython.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["abi3-py312"] }
+concurrency = { path = "../../crates/concurrency" }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+pyo3 = { workspace = true, features = ["auto-initialize"] }
