@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PoolState {
@@ -16,8 +18,9 @@ pub struct SubagentPool {
     size: AtomicUsize,
     state: Arc<Mutex<PoolState>>,
     active: AtomicUsize,
-    /// Current number of active workers. Changed during Scaling.
     workers: AtomicUsize,
+    // simple worker simulation
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl SubagentPool {
@@ -30,6 +33,7 @@ impl SubagentPool {
             state: Arc::new(Mutex::new(PoolState::Idle)),
             active: AtomicUsize::new(0),
             workers: AtomicUsize::new(size),
+            threads: vec![],
         })
     }
 
@@ -38,8 +42,6 @@ impl SubagentPool {
         *s = PoolState::Active;
     }
 
-    /// Dynamic Scaling: put the pool in Scaling state and adjust the number of active workers (within the 30 cap).
-    /// This is the concrete implementation of the Scaling requirement.
     pub fn scale(&self, new_size: usize) -> Result<usize, String> {
         if new_size > 30 {
             return Err("exceeds cap".into());
@@ -48,7 +50,6 @@ impl SubagentPool {
             let mut s = self.state.lock().unwrap();
             *s = PoolState::Scaling;
         }
-        // The dynamic adjustment happens here
         self.size.store(new_size, Ordering::SeqCst);
         self.workers.store(new_size, Ordering::SeqCst);
         {
@@ -75,14 +76,14 @@ impl SubagentPool {
             return Err("pool in terminal state".into());
         }
         if self.state() != PoolState::Active {
-            // Enter Error on fatal misuse (makes Error reachable in core submit path)
             let mut s = self.state.lock().unwrap();
             *s = PoolState::Error;
-            return Err("fatal: entered Error state".into());
+            return Err("fatal: entered Error state from submit".into());
         }
         self.active.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
     pub fn force_error(&self) {
         let mut s = self.state.lock().unwrap();
         *s = PoolState::Error;
