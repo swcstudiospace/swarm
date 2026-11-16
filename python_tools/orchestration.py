@@ -41,22 +41,26 @@ class SubagentPool:
     """Manages a pool of subagents for concurrent/parallel task execution."""
 
     def __init__(self, size: int = 30):
-        self.size = size
+        self.size = get_configurable_pool_size(size)
         self.state = PoolState.Idle
-        self.subagents = [SubagentState.Available for _ in range(size)]
+        self.subagents = [SubagentState.Available for _ in range(self.size)]
         self.task_queue: queue.Queue = queue.Queue()
         self.results: List[Dict[str, Any]] = []
         self.lock = threading.Lock()
         self._running = False
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=size)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.size)
         self._futures: List = []
         self._rust_pool = None
+        self._rust_mod = None
+        self._val_cfg = ValidationConfig(pool_size=self.size)
         if _rust_pool_mod is not None:
             try:
-                self._rust_pool = _rust_pool_mod.ThreadPool()
+                cfg = _rust_pool_mod.ConcurrencyConfig.default()
+                self._rust_pool = _rust_pool_mod.ThreadPool.create_pool(cfg)
+                self._rust_mod = _rust_pool_mod
             except Exception:
                 self._rust_pool = None
-
+                self._rust_mod = None
     def create(self) -> None:
         """Initialize the pool."""
         with self.lock:
