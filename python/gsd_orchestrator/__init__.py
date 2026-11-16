@@ -13,7 +13,7 @@ from .orchestrator import (
     PoolState,
     create_pool,
     gsd_submit_task,
-    gsd_collect_results,
+    gsd_cli_hook,
     decompose_task,
     MAX_POOL_SIZE,
 )
@@ -23,7 +23,7 @@ __all__ = [
     "PoolState",
     "create_pool",
     "gsd_submit_task",
-    "gsd_collect_results",
+    "gsd_cli_hook",
     "decompose_task",
     "MAX_POOL_SIZE",
 ]
