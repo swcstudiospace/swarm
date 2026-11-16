@@ -1,0 +1,26 @@
+[package]
+name = "gsd-taskwriter"
+version = "0.1.0"
+edition = "2021"
+description = "Host-only Task Store writer for the GSD-Core Rust engine: BEGIN IMMEDIATE transactions, conditional state updates and append-only audit rows over the Python-owned tasks.db schema"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["development-tools", "database"]
+keywords = ["sqlite", "task-store", "writer", "migration"]
+
+[features]
+# Named pause points inside a write transaction, for fault tests. Never enabled by default and never in the shipped binary.
+fault-injection = []
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
+# The host side of signing: verifying a verdict row for APPROVED and signing a gate's verdict. Only gsd-taskwriter and gsd-adapter may
+# reach it; gsd-route, gsd-guest and gsd-sandbox must not (tests/keys_never_in_guest.rs and tests/test_keys_never_in_guest.py).
+gsd-envelope = { path = "../gsd-envelope" }
+gsd-route = { path = "../gsd-route" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from swarm.skill_registry import Skill, load_skills, skills_for_owner, validate_skills  # noqa: E402
-AGENTS = json.loads((ROOT / "agents.json").read_text())["agents"]
+AGENTS = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))["agents"]
 
 DONT = {
     "A01": "Do not implement domain artifacts (code/docs/IaC).",
@@ -57,6 +57,16 @@ def agent_skill(a: dict) -> str:
 6. For each ready task, lease it (`orch_status.py --repo <app> --transition <id> CLAIMED`, then `IN_PROGRESS`), then spawn `subagent_type` = slug (Claude Agent tool or Grok `spawn_subagent`). Do not implement domain work.
 7. Ingest child JSON with `orch_status.py --repo <app> --ingest`. Apply fail-closed gates (max 2 rework loops); gate scripts, not you, record verdicts.
 """
+    assign_prereq = (
+        "A project brief, or a signed `task.assign` with task_id and correlation_id. A brief is planned with orch_plan before any BLOCKED yield."
+        if a["id"] == "A01"
+        else "Signed `task.assign` with task_id and correlation_id."
+    )
+    assign_step = (
+        "If the message is a signed task.assign, echo task_id and correlation_id. If it is a project brief, run orch_plan on it first; do not reject it as unsigned."
+        if a["id"] == "A01"
+        else "Validate the signed task.assign. Echo task_id and correlation_id."
+    )
     return f"""---
 name: {a['slug']}
 description: >
@@ -82,7 +92,7 @@ Don't use for: {DONT[a['id']]}
 - Swarm root with `agents.json`, `scripts/`, `swarm/`.
 - `SWARM_DIR` (default `<git toplevel>/.swarm`, made absolute).
 - `python3` and/or `bun` on PATH.
-- Signed `task.assign` with task_id and correlation_id.
+- {assign_prereq}
 
 ## How to Run
 
@@ -90,7 +100,7 @@ Don't use for: {DONT[a['id']]}
 
 ## Procedure
 
-1. Validate the signed task.assign. Echo task_id and correlation_id.
+1. {assign_step}
 2. Read upstream artifacts in consumes: {', '.join(a['consumes'][:8])}.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only {', '.join(a['produces'][:6])}.
@@ -174,15 +184,17 @@ disable-model-invocation: false
 ## When to Use
 - You are a01-orchestrator and a wave is ready, or the user explicitly asked for the full SDLC through the swarm.
 - You were given a plan whose tasks carry `agent` fields.
+- You were given a project brief and no correlation yet: call `swarm_plan` first (step 0). A missing signed envelope is not a reason to stop before that call.
 
 Never use from a specialist session.
 
 ## Prerequisites
 - Tools: swarm_plan, swarm_status, swarm_transition, swarm_assignment, swarm_ingest, task (plus read tools). You do **not** have `swarm_gate`: the gate agents (a08-qa, a09-reviewer, a10-security, a12-release) run it themselves.
-- A correlation from swarm_plan or /swarm.
+- A correlation from swarm_plan or /swarm. Create it in step 0 when the assignment text is a brief.
 
 ## Procedure
 
+0. No correlation yet, and the assignment text is not a signed `swarm.v1.task.assign` envelope aimed at A01 with capability `plan.execute`: call `swarm_plan` with that text as the brief (pattern and risk from the text, otherwise `feature` / `medium`). Continue only when the result is a persisted plan. If `execution_assignment_verified` is not true, yield BLOCKED with needs `execution assignment` and spawn nothing. Do not yield BLOCKED for a missing envelope before this call.
 1. `swarm_status` for the correlation → the ready tasks, each with its `agent` and gate notes (`gate`, `gate_for`).
 2. Lease every task of the ready wave with `swarm_transition`: PLANNED → CLAIMED, then CLAIMED → IN_PROGRESS. Lease gate tasks before their gate agent runs: `swarm_gate` refuses a gate task that is not IN_PROGRESS.
    Obtain each leased task's canonical prompt with `swarm_assignment({task_id, correlation_id})`; require `assignment_verified: true`. Do not construct signatures or use generic code-execution devices.
@@ -265,6 +277,22 @@ def omp_skill(a: dict, skills: list[Skill] | None = None) -> str:
         f"{a['id']} {a['code']} {a['name']} — {a['description']} "
         f"Use when the swarm assigns capability {', '.join(a['capabilities'][:3])}."
     )
+    if a["id"] == "A01":
+        procedure = (
+            "1. If the message is one signed `task.assign` envelope (`schema` `swarm.v1.task.assign`, "
+            "`target` `A01`, `payload.capability` `plan.execute`), continue with it. If it is a project brief, "
+            "call `swarm_plan` with that text before any BLOCKED yield. A prose brief is not an unsigned assignment. "
+            "When `execution_assignment_verified` is not true, yield BLOCKED with needs `execution assignment` and spawn nothing.\n"
+            "2. Finish by calling `yield` with a `task.result` object.\n"
+            f"3. Don't use it for: {DONT[a['id']]}\n"
+        )
+    else:
+        procedure = (
+            f"1. Dispatch via the omp `task` tool with `agent: {a['slug']}` "
+            f"(definition: `omp/agents/{a['slug']}.md`), passing the signed `task.assign` payload.\n"
+            "2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.\n"
+            f"3. Don't use it for: {DONT[a['id']]}\n"
+        )
     return f"""---
 name: {yaml_str(a['slug'])}
 description: {desc}
@@ -281,10 +309,7 @@ Don't use for: {DONT[a['id']]}
 
 ## Procedure
 
-1. Dispatch via the omp `task` tool with `agent: {a['slug']}` (definition: `omp/agents/{a['slug']}.md`), passing the signed `task.assign` payload.
-2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.
-3. Don't use it for: {DONT[a['id']]}
-{_index_sections(a, skills)}"""
+{procedure}{_index_sections(a, skills)}"""
 
 
 def source_skill(s: Skill) -> str:

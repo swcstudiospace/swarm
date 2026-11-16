@@ -13,6 +13,7 @@ import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRAT
 import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionContext, ExtensionFactory } from "./omp-api.ts";
 import { type BarEvent, createSwarmBar, type SwarmBarOptions } from "./swarm_bar.ts";
+import { swarmStatusCommand } from "./swarm_status.ts";
 import { buildTools } from "./tools.ts";
 
 function taskResult(event: unknown): { toolCallId: string | undefined; isError: boolean } | undefined {
@@ -29,6 +30,9 @@ export interface SwarmExtensionOptions {
 
 export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtensionOptions): ExtensionFactory {
   return (pi) => {
+    // Kill switch: SWARM_DISABLED=1 registers nothing (no tools, /swarm, hooks, guard or bar), so a stuck or
+    // misconfigured swarm can never block the operator's own session. Read per call, so `SWARM_DISABLED=1 omp` works.
+    if (process.env.SWARM_DISABLED === "1") return;
     // WR-01: this session's children only — a sibling session's shutdown never reaches them
     const inflight: Inflight = new Set();
     // the third bar is per session, like inflight: a sibling session never paints this session's rows
@@ -37,6 +41,8 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
     for (const tool of buildTools(scoped)) pi.registerTool(tool);
     // ORCH-03 (D-11): the same scoped bridge, so session_shutdown also sweeps the command's python child
     pi.registerCommand("swarm", swarmCommand(pi, scoped, {}));
+    // swarm-status: a read-only view of one correlation through orch_status (no writes, no model turn)
+    pi.registerCommand("swarm-status", swarmStatusCommand(scoped));
     // The bar is display-only: nothing it does may change a decision or throw into the host.
     const display = (fn: () => void): void => {
       try {
@@ -81,9 +87,12 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
     pi.on("tool_call", (event, ctx) => {
       const env = process.env;
       let known: Pick<GuardFacts, "agent" | "topLevel"> = { agent: undefined, topLevel: false };
+      // TS-01: until the session log is read the caller is unknown; an unreadable log then falls back to the swarm env marker
+      let unreadable = true;
       try {
         const { restricted, topLevel } = sessionAgent(ctx);
         known = { agent: callingAgent(ctx), topLevel };
+        unreadable = false;
         // getActiveTools only for A01: the depth-cap check is the only reader (D-06).
         // The same list distinguishes a real cap from the advisor review surface.
         const activeTools = known.agent === ORCHESTRATOR ? pi.getActiveTools() : undefined;
@@ -98,7 +107,7 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
         if (!decision?.block && event.toolName === "task") display(() => bar.taskSpawn(ctx, event.input, event.toolCallId));
         return decision;
       } catch (err) {
-        if (!inSwarm({ ...known, env })) return undefined;
+        if (!inSwarm({ agent: known.agent, topLevel: known.topLevel || unreadable, env })) return undefined;
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };
       }
     });

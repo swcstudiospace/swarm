@@ -1,0 +1,13 @@
+CASE                          ROUTE                       RESULT  CHECKS
+happy_path                    orch_status + swarm_tool    pass    3/3
+transition_legal_illegal      orch_status                 pass    2/2
+gate_pass_fail_major          orch_status                 pass    2/2
+boundary_100kb                swarm_tool                  pass    3/3
+validation_error              orch_status + swarm_tool    pass    3/3
+empty                         orch_status + swarm_tool    pass    2/2
+large                         orch_status + swarm_tool    pass    2/2
+malformed                     swarm_tool                  pass    3/3
+timeout                       swarm_tool                  pass    1/1
+policy                        orch_status + swarm_tool    pass    2/2
+classifier_quadruple_mirror   errors + retry + omp bridge pass    19/19
+11/11 cases pass

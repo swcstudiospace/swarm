@@ -39,8 +39,10 @@ import math
 import posixpath
 import re
 from collections import Counter
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any, TypeGuard, TypedDict
 
 from swarm.tools.support import respond
 
@@ -75,34 +77,34 @@ RESOURCES_FINALIZER = "resources-finalizer.argocd.argoproj.io"
 FLUX_PRUNE_KEY = "kustomize.toolkit.fluxcd.io/prune"
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, str]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _is_int(value) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _is_number(value) -> bool:
+def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, str]:
     """Every finding passes through _scrub, so no handler can quote a credential-shaped input value by accident."""
     return {"id": _scrub(fid), "severity": severity, "summary": _scrub(summary)}
 
 
-def _counts(findings: list[dict]) -> dict:
+def _counts(findings: list[dict[str, str]]) -> dict[str, int]:
     return {name: sum(1 for f in findings if f["severity"] == name) for name in SEVERITIES}
 
 
-def _report(findings: list[dict]) -> dict:
+def _report(findings: list[dict[str, str]]) -> dict[str, Any]:
     """verdict, severity_counts and the worst MAX_FINDINGS findings (worst first, then by id) of a lint-style result."""
     ordered = sorted(findings, key=lambda f: (_SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
     counts = _counts(ordered)
@@ -110,7 +112,7 @@ def _report(findings: list[dict]) -> dict:
     return {"verdict": verdict, "severity_counts": counts, "findings": ordered[:MAX_FINDINGS]}
 
 
-def _dig(value, *keys):
+def _dig(value: object, *keys: str) -> Any:
     for key in keys:
         if not isinstance(value, dict):
             return None
@@ -118,16 +120,26 @@ def _dig(value, *keys):
     return value
 
 
-def _str(value) -> str:
+def _str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _list(value) -> list:
+def _list(value: object) -> list[Any]:
     """The value when it is a list, else an empty list: free-form manifests may hold any JSON type under any key."""
     return value if isinstance(value, list) else []
 
 
-def _tree_problem(*values) -> str | None:
+def _dict(value: object) -> dict[str, Any]:
+    """The value when it is a JSON object, else an empty object."""
+    return value if isinstance(value, dict) else {}
+
+
+def _dict_or_none(value: object) -> dict[str, Any] | None:
+    """The value when it is a JSON object, else None."""
+    return value if isinstance(value, dict) else None
+
+
+def _tree_problem(*values: object) -> str | None:
     """Reason a free-form input is too large or deep to analyse (bounded work), else None."""
     stack = [(value, 1) for value in values]
     nodes = 0
@@ -147,22 +159,23 @@ def _tree_problem(*values) -> str | None:
     return None
 
 
-def _bounded(field: str, *values) -> dict | None:
+def _bounded(field: str, *values: object) -> dict[str, str] | None:
     problem = _tree_problem(*values)
     return _invalid(field, f"{field}: {problem}") if problem else None
 
 
-def _name_of(manifest) -> str:
+def _name_of(manifest: object) -> str:
     """The object's name: metadata.name, or metadata.generateName when only that is set (the API server creates the name on apply); "" when neither."""
     metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
     if isinstance(metadata, dict):
         for key in ("name", "generateName"):
-            if isinstance(metadata.get(key), str) and metadata[key]:
-                return metadata[key]
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
     return ""
 
 
-def _manifest_problem(items: list, field: str) -> dict | None:
+def _manifest_problem(items: list[Any], field: str) -> dict[str, str] | None:
     """INVALID_INPUT unless every item is a Kubernetes object with string apiVersion, kind and metadata.name or generateName."""
     for index, item in enumerate(items):
         if not (isinstance(item, dict) and isinstance(item.get("apiVersion"), str) and item["apiVersion"]
@@ -179,17 +192,17 @@ def _version(api_version: str) -> str:
     return api_version.split("/", 1)[1] if "/" in api_version else api_version
 
 
-def _namespace(manifest: dict) -> str:
+def _namespace(manifest: dict[str, Any]) -> str:
     return _str(_dig(manifest, "metadata", "namespace"))
 
 
-def _label(manifest: dict) -> str:
+def _label(manifest: dict[str, Any]) -> str:
     """Kind/namespace/name of a manifest, namespace omitted when absent."""
     ns = _namespace(manifest)
     return f"{manifest['kind']}/{ns}/{_name_of(manifest)}" if ns else f"{manifest['kind']}/{_name_of(manifest)}"
 
 
-def _annotations(manifest: dict) -> dict:
+def _annotations(manifest: dict[str, Any]) -> dict[str, str]:
     raw = _dig(manifest, "metadata", "annotations")
     return {k: v for k, v in raw.items() if isinstance(v, str)} if isinstance(raw, dict) else {}
 
@@ -223,7 +236,7 @@ def _duration_seconds(text: str) -> Decimal | None:
     return total
 
 
-def _templated(value) -> bool:
+def _templated(value: object) -> bool:
     return isinstance(value, str) and "{{" in value
 
 
@@ -239,7 +252,7 @@ _DEPRECATED_KUSTOMIZE_FIELDS = {
 _REGEX_META = frozenset("[](){}|?\\^$*+")
 
 
-def _name_tokens(pattern: str):
+def _name_tokens(pattern: str) -> list[tuple[str, str]] | None:
     """Tokens of the literal / `.` / `.*` / `.+` subset of a Kustomize target regex; None for any other construct."""
     body = pattern[1:] if pattern.startswith("^") else pattern
     body = body[:-1] if body.endswith("$") else body
@@ -262,7 +275,7 @@ def _name_tokens(pattern: str):
     return tokens
 
 
-def _tokens_match(tokens: list, text: str) -> bool:
+def _tokens_match(tokens: list[tuple[str, str]], text: str) -> bool:
     states = {0}
     for kind, char in tokens:
         following: set[int] = set()
@@ -279,7 +292,7 @@ def _tokens_match(tokens: list, text: str) -> bool:
     return len(text) in states
 
 
-def _selector_matches(pattern, value: str) -> bool | None:
+def _selector_matches(pattern: object, value: str) -> bool | None:
     """Whole-value match of a Kustomize target field (a regex); None when the pattern is outside the evaluated subset."""
     if pattern in (None, ""):
         return True
@@ -291,7 +304,7 @@ def _selector_matches(pattern, value: str) -> bool | None:
     return None if tokens is None else _tokens_match(tokens, value)
 
 
-def _target_hit(target: dict, literal: bool, manifest: dict) -> bool | None:
+def _target_hit(target: dict[str, Any], literal: bool, manifest: dict[str, Any]) -> bool | None:
     """Whether a patch target selects a manifest: True, False, or None when only an unevaluated regular expression is undecided.
     A target derived from a strategic merge patch must equal the resource id exactly: group, version, kind, name and namespace,
     an absent namespace meaning none (a patch without a namespace does not select a namespaced object, a patch without
@@ -314,9 +327,9 @@ def _target_hit(target: dict, literal: bool, manifest: dict) -> bool | None:
     return None if undecided else True
 
 
-def _kustomize_patches(kust: dict, findings: list[dict]) -> list[dict]:
+def _kustomize_patches(kust: dict[str, Any], findings: list[dict[str, str]]) -> list[dict[str, Any]]:
     """Every patch of a kustomization as {label, target, literal, unresolved}; structural problems become findings."""
-    patches: list[dict] = []
+    patches: list[dict[str, Any]] = []
     sources = (("patches", kust.get("patches")), ("patchesStrategicMerge", kust.get("patchesStrategicMerge")),
                ("patchesJson6902", kust.get("patchesJson6902")))
     for field, entries in sources:
@@ -357,7 +370,7 @@ def _kustomize_patches(kust: dict, findings: list[dict]) -> list[dict]:
     return patches
 
 
-def _json_patch_op_problem(op) -> str | None:
+def _json_patch_op_problem(op: object) -> str | None:
     if not isinstance(op, dict) or not isinstance(op.get("op"), str) or op["op"] not in _JSON_PATCH_OPS:
         return "op must be one of add, copy, move, remove, replace, test"
     if not isinstance(op.get("path"), str) or (op["path"] and not op["path"].startswith("/")):
@@ -369,7 +382,7 @@ def _json_patch_op_problem(op) -> str | None:
     return None
 
 
-def kustomize_check(payload: dict) -> dict:
+def kustomize_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Overlay integrity: duplicate ids, namespace collisions after the `namespace:` transformer, patch targets that
     match nothing, JSON 6902 operations and deprecated kustomization fields.
 
@@ -378,24 +391,24 @@ def kustomize_check(payload: dict) -> dict:
     builds, but the cluster sees one object, so it is reported as a conflict (major). The `namespace:` transformer sets the
     namespace of every namespaced object and renames every v1 Namespace object to it (two Namespaces then collide)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         kust, resources = payload["kustomization"], payload["resources"]
         extra = set(payload.get("extra_cluster_scoped_kinds", []))
         problem = _bounded("kustomization", kust) or _bounded("resources", resources) or _manifest_problem(resources, "resources")
         if problem:
             return problem
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         override = kust.get("namespace") if isinstance(kust.get("namespace"), str) else ""
         scoped = CLUSTER_SCOPED_KINDS | extra
 
-        def identity(manifest: dict, namespace: str, name: str) -> str:
+        def identity(manifest: dict[str, Any], namespace: str, name: str) -> str:
             group = _group(manifest["apiVersion"])
             return f"{group + '/' if group else ''}{manifest['kind']}/{namespace + '/' if namespace else ''}{name}"
 
-        before_full: Counter = Counter()  # (version, id) -> objects
-        before_plain: Counter = Counter()  # id -> objects
-        after_full: Counter = Counter()
-        after_plain: Counter = Counter()
+        before_full: Counter[tuple[str, str]] = Counter()  # (version, id) -> objects
+        before_plain: Counter[str] = Counter()  # id -> objects
+        after_full: Counter[tuple[str, str]] = Counter()
+        after_plain: Counter[str] = Counter()
         moved: dict[tuple[str, str], int] = {}
         renamed: list[str] = []
         for manifest in resources:
@@ -476,7 +489,8 @@ def kustomize_check(payload: dict) -> dict:
             "unresolved_patch_count": sum(1 for p in patches if p["unresolved"]), **_report(findings),
         }
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_helm_values_drift ----------------------------------------------------------------------------------------
@@ -493,11 +507,11 @@ def _segment(key: str) -> str:
     return key.replace("\\", "\\\\").replace(".", "\\.")
 
 
-def _flatten(values) -> dict:
+def _flatten(values: object) -> dict[str, object]:
     """Dotted-path leaves of a values tree; scalars, lists and empty maps are leaves. Keys are escaped by _segment, so every leaf
     has its own path and no leaf is dropped."""
-    flat: dict = {}
-    stack: list = [(None, values)]
+    flat: dict[str, object] = {}
+    stack: list[tuple[str | None, object]] = [(None, values)]
     while stack:
         prefix, node = stack.pop()
         if isinstance(node, dict) and node:
@@ -509,7 +523,7 @@ def _flatten(values) -> dict:
     return flat
 
 
-def _value_type(value) -> str:
+def _value_type(value: object) -> str:
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -521,7 +535,7 @@ def _value_type(value) -> str:
     return "array" if isinstance(value, list) else "object"
 
 
-def _same_value(left, right) -> bool:
+def _same_value(left: object, right: object) -> bool:
     if _value_type(left) != _value_type(right):
         return False
     if _value_type(left) == "number":
@@ -538,13 +552,13 @@ def _preview(keys: list[str], limit: int = 8) -> str:
     return shown + (f" (+{len(keys) - limit} more)" if len(keys) > limit else "")
 
 
-def helm_values_drift(payload: dict) -> dict:
+def helm_values_drift(payload: dict[str, Any]) -> dict[str, Any]:
     """Compare Helm values across environments: `required_keys` must exist and be non-empty (null and "" count as empty,
     because Helm treats a null override as an unset key), `invariant_keys` must be identical everywhere, and every
     environment is diffed against `reference` (default: the first) for missing keys, extra keys and type changes.
     A key matches a leaf exactly or as a prefix of leaves (`resources` covers `resources.limits.cpu`); a dot that belongs to one key is written with a backslash in front."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         envs, required, invariant = payload["environments"], payload["required_keys"], payload["invariant_keys"]
         problem = _bounded("environments", envs)
         if problem:
@@ -563,7 +577,7 @@ def helm_values_drift(payload: dict) -> dict:
             return _invalid("reference", f"reference {reference!r} is not one of the environments")
 
         flat = {env["name"]: _flatten(env["values"]) for env in envs}
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
 
         def covered(env: str, key: str) -> list[str]:
             return sorted(k for k in flat[env] if k == key or k.startswith(key + "."))
@@ -579,7 +593,7 @@ def helm_values_drift(payload: dict) -> dict:
         for key in sorted(set(invariant)):
             leaves = sorted({leaf for env in names for leaf in covered(env, key)})
             for leaf in leaves:
-                groups: list[tuple] = []  # (value, environments holding it), in order of first appearance
+                groups: list[tuple[object, list[str]]] = []  # (value, environments holding it), in order of first appearance
                 for env in names:
                     value = flat[env].get(leaf, missing)
                     for entry in groups:
@@ -619,7 +633,8 @@ def helm_values_drift(payload: dict) -> dict:
             "reference": reference, "diverging_value_count": diverging, **_report(findings),
         }
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- shared Argo CD / Flux application checks -------------------------------------------------------------------------
@@ -635,7 +650,7 @@ _ARGO_ENUM_SYNC_OPTIONS = {"PrunePropagationPolicy": frozenset({"background", "f
                            "Prune": frozenset({"true", "false", "confirm"}), "Delete": frozenset({"true", "false", "confirm"})}
 
 
-def _revision_class(revision, chart: bool) -> str:
+def _revision_class(revision: object, chart: bool) -> str:
     """pinned (commit sha, exact chart version), tag, branch, range (chart wildcard or constraint), templated or floating
     (empty or HEAD, which follows the default branch)."""
     if not isinstance(revision, str) or not revision.strip():
@@ -654,7 +669,7 @@ def _revision_class(revision, chart: bool) -> str:
     return "tag" if _VERSION_TAG.match(text) else "branch"
 
 
-def _revision_findings(add, label: str, klass: str, prod: bool) -> None:
+def _revision_findings(add: Callable[[str, str, str], None], label: str, klass: str, prod: bool) -> None:
     if klass in ("floating", "range"):
         add(f"floating-revision:{label}", "major" if prod else "info",
             f"{label} is {klass}: the deployed content changes without a Git change to this application")
@@ -662,14 +677,15 @@ def _revision_findings(add, label: str, klass: str, prod: bool) -> None:
         add(f"branch-revision:{label}", "minor", f"{label} tracks a branch; a production rollout follows every merge to it")
 
 
-def _argo_app_findings(spec: dict, metadata: dict, prod: bool, prefix: str = "") -> tuple[list[dict], dict]:
+def _argo_app_findings(spec: dict[str, Any], metadata: dict[str, Any], prod: bool, prefix: str = "") -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Findings for the spec of an Argo CD Application (or an ApplicationSet template); also {auto_sync, prune, revision_class}."""
-    findings: list[dict] = []
+    findings: list[dict[str, str]] = []
 
     def add(rule: str, severity: str, message: str) -> None:
         findings.append(_finding(prefix + rule, severity, message))
 
-    sources = spec.get("sources") if isinstance(spec.get("sources"), list) else (
+    sources_field = spec.get("sources")
+    sources = sources_field if isinstance(sources_field, list) else (
         [spec["source"]] if isinstance(spec.get("source"), dict) else [])
     if not sources:
         add("no-source", "blocker", "spec has neither source nor sources")
@@ -700,8 +716,8 @@ def _argo_app_findings(spec: dict, metadata: dict, prod: bool, prefix: str = "")
     elif project == "default" and prod:
         add("default-project", "minor", "a production application in the default project is not restricted by an AppProject")
 
-    policy = spec.get("syncPolicy") if isinstance(spec.get("syncPolicy"), dict) else {}
-    automated = policy.get("automated") if isinstance(policy.get("automated"), dict) else None
+    policy = _dict(spec.get("syncPolicy"))
+    automated = _dict_or_none(policy.get("automated"))
     if automated is not None and automated.get("enabled") is False:
         automated = None  # `enabled: false` turns automated sync off whatever prune, selfHeal and allowEmpty say (Argo CD automated sync docs)
     prune = bool(automated and automated.get("prune") is True)
@@ -716,7 +732,7 @@ def _argo_app_findings(spec: dict, metadata: dict, prod: bool, prefix: str = "")
                 "allowEmpty with prune lets an empty render delete every resource of the application")
         if not isinstance(policy.get("retry"), dict):
             add("no-retry", "minor", "automated sync without a retry policy stops after the first failed attempt")
-    options = policy.get("syncOptions") if isinstance(policy.get("syncOptions"), list) else []
+    options = _list(policy.get("syncOptions"))
     for option in options:
         if not isinstance(option, str) or "=" not in option:
             add(f"sync-option-malformed:{_redact(str(option))}", "minor", f"sync option {_echo(option)} is not Key=value")
@@ -737,13 +753,13 @@ def _argo_app_findings(spec: dict, metadata: dict, prod: bool, prefix: str = "")
                 add("sync-option:Validate", "minor", "Validate=false skips kubectl schema validation")
         else:
             add(f"sync-option-unknown:{_redact(key)}", "info", f"sync option {_redact(key)} is not one of the documented options")
-    ignores = spec.get("ignoreDifferences") if isinstance(spec.get("ignoreDifferences"), list) else []
+    ignores = _list(spec.get("ignoreDifferences"))
     for index, entry in enumerate(ignores):
-        pointers = entry.get("jsonPointers") if isinstance(entry, dict) and isinstance(entry.get("jsonPointers"), list) else []
-        queries = entry.get("jqPathExpressions") if isinstance(entry, dict) and isinstance(entry.get("jqPathExpressions"), list) else []
+        pointers = _list(entry.get("jsonPointers")) if isinstance(entry, dict) else []
+        queries = _list(entry.get("jqPathExpressions")) if isinstance(entry, dict) else []
         if any(p in ("", "/") for p in pointers) or any(q.strip() == "." for q in queries if isinstance(q, str)):
             add(f"ignore-everything:{index}", "minor", f"ignoreDifferences[{index}] ignores the whole object, so drift can never be seen")
-    finalizers = metadata.get("finalizers") if isinstance(metadata.get("finalizers"), list) else []
+    finalizers = _list(metadata.get("finalizers"))
     if any(isinstance(f, str) and f.startswith(RESOURCES_FINALIZER) for f in finalizers):
         add("cascade-delete", "info", "the resources finalizer makes deleting the application delete its workloads")
     return findings, {"auto_sync": automated is not None, "prune": prune, "revision_class": first_class}
@@ -758,13 +774,13 @@ _FLUX_DEPRECATED_API = {
 MIN_FLUX_INTERVAL_SECONDS = 60  # policy of this check (sub-minute polling hammers the source), not an API limit
 
 
-def _flux_findings(manifest: dict, prod: bool) -> tuple[list[dict], dict]:
-    findings: list[dict] = []
+def _flux_findings(manifest: dict[str, Any], prod: bool) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    findings: list[dict[str, str]] = []
 
     def add(rule: str, severity: str, message: str) -> None:
         findings.append(_finding(rule, severity, message))
 
-    kind, spec = manifest["kind"], manifest.get("spec") if isinstance(manifest.get("spec"), dict) else {}
+    kind, spec = manifest["kind"], _dict(manifest.get("spec"))
     group, version = _group(manifest["apiVersion"]), _version(manifest["apiVersion"])
     if (group, version) in _FLUX_DEPRECATED_API:
         add("deprecated-api-version", "minor", f"{manifest['apiVersion']} is deprecated; Flux 2 serves {group}/{'v1' if kind == 'Kustomization' else 'v2'}")
@@ -819,11 +835,11 @@ def _flux_findings(manifest: dict, prod: bool) -> tuple[list[dict], dict]:
     return findings, {"auto_sync": not suspended, "prune": prune, "revision_class": klass}
 
 
-def app_sync_policy(payload: dict) -> dict:
+def app_sync_policy(payload: dict[str, Any]) -> dict[str, Any]:
     """Sync-policy lint of one Argo CD Application, Flux Kustomization or Flux HelmRelease: production auto-sync and
     prune (L3 / L4 for this agent), revision pinning, destination, sync options, retry, intervals and deprecated Flux API versions."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         resource, prod = payload["resource"], payload["environment"] == "prod"
         if not isinstance(resource, dict):
             return _invalid("resource", "resource must be an object")
@@ -845,7 +861,8 @@ def app_sync_policy(payload: dict) -> dict:
         return {"state": "SUCCESS", "engine": engine, "kind": kind, "auto_sync": info["auto_sync"], "prune_enabled": info["prune"],
                 "revision_class": info["revision_class"], **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_appset_check ---------------------------------------------------------------------------------------------
@@ -853,7 +870,7 @@ def app_sync_policy(payload: dict) -> dict:
 _GENERATOR_TYPES = ("list", "clusters", "git", "scmProvider", "clusterDecisionResource", "pullRequest", "matrix", "merge", "plugin")
 
 
-def _go_actions(text: str):
+def _go_actions(text: str) -> Iterator[str]:
     """The text of every {{ ... }} action in a Go template string (linear; a regex with a lazy `.*?` rescans on every unclosed `{{`)."""
     position = 0
     while True:
@@ -874,7 +891,7 @@ _MAX_GENERATOR_DEPTH = 4
 _MAX_ELEMENT_DEPTH = 6
 
 
-def _nested_keys(element: dict, prefix: str = "", depth: int = 1) -> set[str]:
+def _nested_keys(element: dict[str, Any], prefix: str = "", depth: int = 1) -> set[str]:
     """Parameter names a list element offers: its keys and, for a nested object, the dotted keys inside it (`{{ .cluster.name }}`)."""
     keys: set[str] = set()
     for key, value in element.items():
@@ -885,7 +902,7 @@ def _nested_keys(element: dict, prefix: str = "", depth: int = 1) -> set[str]:
     return keys
 
 
-def _selector_hit(selector: dict, labels: dict) -> bool:
+def _selector_hit(selector: dict[str, Any], labels: dict[str, Any]) -> bool:
     """Kubernetes label-selector semantics: matchLabels all equal, every matchExpression satisfied."""
     for key, value in (selector.get("matchLabels") or {}).items():
         if labels.get(key) != value:
@@ -907,7 +924,7 @@ def _selector_hit(selector: dict, labels: dict) -> bool:
     return True
 
 
-def _appset_generator(gen, ctx: dict, path: str, depth: int):
+def _appset_generator(gen: object, ctx: dict[str, Any], path: str, depth: int) -> tuple[set[str], bool, int | None]:
     """(parameter keys, keys-are-open, upper bound on elements or None) for one generator; problems go to ctx findings."""
     findings, go = ctx["findings"], ctx["go"]
     ctx["count"] += 1
@@ -997,7 +1014,7 @@ def _appset_generator(gen, ctx: dict, path: str, depth: int):
         open_ = any(r[1] for r in results)
         if kind == "matrix":
             bounds = [r[2] for r in results]
-            bound = math.prod(bounds) if bounds and all(b is not None for b in bounds) else None
+            bound = math.prod(b for b in bounds if b is not None) if bounds and all(b is not None for b in bounds) else None
             return keys, open_, bound
         merge_keys = body.get("mergeKeys")
         if not isinstance(merge_keys, list) or not merge_keys or not all(isinstance(k, str) for k in merge_keys):
@@ -1012,7 +1029,7 @@ def _appset_generator(gen, ctx: dict, path: str, depth: int):
     return set(), True, None  # scmProvider, pullRequest, clusterDecisionResource, plugin: parameters come from the remote system
 
 
-def _template_refs(template, go: bool) -> list[str]:
+def _template_refs(template: object, go: bool) -> list[str]:
     refs: set[str] = set()
     stack = [template]
     while stack:
@@ -1030,7 +1047,7 @@ def _template_refs(template, go: bool) -> list[str]:
     return sorted(refs)
 
 
-def _known_ref(ref: str, keys: set, prefixes: set, open_: bool, go: bool) -> bool:
+def _known_ref(ref: str, keys: set[str], prefixes: set[str], open_: bool, go: bool) -> bool:
     if open_ or ref in keys or ref in prefixes:
         return True
     if ref in ("metadata", "metadata.labels", "metadata.annotations", "values") or ref.startswith("metadata.annotations."):
@@ -1038,13 +1055,13 @@ def _known_ref(ref: str, keys: set, prefixes: set, open_: bool, go: bool) -> boo
     return not go and bool(_PATH_INDEX.match(ref))
 
 
-def appset_check(payload: dict) -> dict:
+def appset_check(payload: dict[str, Any]) -> dict[str, Any]:
     """ApplicationSet lint: generator shape (exactly one type; matrix has 2 children; merge keys), cluster selection
     against the registered clusters (empty selector = every cluster, no match = Applications deleted), template keys that
     the generators actually produce (fasttemplate `{{key}}` or Go template `{{ .key }}`), a unique templated Application
     name and destination per element, RollingSync steps, plus every Application-spec rule of gitops_app_sync_policy."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         appset, clusters, prod = payload["applicationset"], payload["clusters"], payload["environment"] == "prod"
         problem = _bounded("applicationset", appset) or _bounded("clusters", clusters)
         if problem:
@@ -1060,15 +1077,16 @@ def appset_check(payload: dict) -> dict:
                 return _invalid("clusters", f"cluster {cluster['name']}: labels must be an object of strings")
         spec = appset["spec"]
         go = spec.get("goTemplate") is True
-        findings: list[dict] = []
-        ctx = {"findings": findings, "go": go, "clusters": [{"name": c["name"], "labels": c.get("labels", {})} for c in clusters],
+        findings: list[dict[str, str]] = []
+        ctx: dict[str, Any] = {"findings": findings, "go": go, "clusters": [{"name": c["name"], "labels": c.get("labels", {})} for c in clusters],
                "matched": set(), "matched_labels": [], "count": 0, "cluster_unknown": False, "cluster_generators": 0}
         generators = spec.get("generators")
         if not isinstance(generators, list) or not generators:
             findings.append(_finding("no-generators", "blocker", "spec.generators must list at least one generator"))
             generators = []
         keys: set[str] = set()
-        open_, bound = False, 0
+        open_: bool = False
+        bound: int | None = 0
         for index, gen in enumerate(generators):
             gen_keys, gen_open, gen_bound = _appset_generator(gen, ctx, f"generators[{index}]", 1)
             keys |= gen_keys
@@ -1087,15 +1105,15 @@ def appset_check(payload: dict) -> dict:
         if not isinstance(template, dict):
             findings.append(_finding("no-template", "blocker", "spec.template is required"))
         else:
-            metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
-            app_spec = template.get("spec") if isinstance(template.get("spec"), dict) else {}
+            metadata = _dict(template.get("metadata"))
+            app_spec = _dict(template.get("spec"))
             name = metadata.get("name")
             if not isinstance(name, str) or not name:
                 findings.append(_finding("template-no-name", "blocker", "template.metadata.name is required"))
             elif "{{" not in name and many:
                 findings.append(_finding("template-name-static", "blocker",
                                          f"template name {name!r} has no template key, so every generated element produces the same Application"))
-            destination = app_spec.get("destination") if isinstance(app_spec.get("destination"), dict) else {}
+            destination = _dict(app_spec.get("destination"))
             if any_cluster_generator and matched_count > 1 and destination and not any(_templated(destination.get(k)) for k in ("server", "name")):
                 findings.append(_finding("destination-static", "major",
                                          f"{matched_count} clusters are selected but the destination is not templated: every Application targets the same cluster"))
@@ -1112,7 +1130,7 @@ def appset_check(payload: dict) -> dict:
                                                  f"{lacking} selected cluster(s) lack label {label} used by the template"))
             strategy = spec.get("strategy")
             kind = strategy.get("type") if isinstance(strategy, dict) else None
-            sync_policy = app_spec.get("syncPolicy") if isinstance(app_spec.get("syncPolicy"), dict) else {}
+            sync_policy = _dict(app_spec.get("syncPolicy"))
             if kind == "RollingSync" and isinstance(sync_policy.get("automated"), dict):
                 findings.append(_finding("template-auto-sync-ignored-by-rolling-sync", "minor",
                                          "RollingSync forces automated sync off on every generated Application (the controller logs a warning), so the template's "
@@ -1120,7 +1138,7 @@ def appset_check(payload: dict) -> dict:
                 app_spec = {**app_spec, "syncPolicy": {k: v for k, v in sync_policy.items() if k != "automated"}}
             app_findings, _ = _argo_app_findings(app_spec, metadata, prod, "template-")
             findings.extend(app_findings)
-            labels_in_template = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
+            labels_in_template = _dict(metadata.get("labels"))
             if kind not in (None, "AllAtOnce", "RollingSync"):
                 findings.append(_finding("strategy-type", "blocker", f"strategy.type {_echo(kind)} must be AllAtOnce or RollingSync"))
             if kind == "RollingSync":
@@ -1137,7 +1155,7 @@ def appset_check(payload: dict) -> dict:
             elif prod and many and (matched_count != 1):
                 findings.append(_finding("no-progressive-sync", "minor",
                                          "a production ApplicationSet that can generate several Applications syncs them all at once; consider strategy RollingSync"))
-            sync = spec.get("syncPolicy") if isinstance(spec.get("syncPolicy"), dict) else {}
+            sync = _dict(spec.get("syncPolicy"))
             if sync.get("applicationsSync") not in (None, "create-only", "create-update", "create-delete", "sync"):
                 findings.append(_finding("applications-sync", "major", f"syncPolicy.applicationsSync {_echo(sync.get('applicationsSync'))} is not a valid policy"))
             cascades = any(isinstance(f, str) and f.startswith(RESOURCES_FINALIZER) for f in _list(metadata.get("finalizers")))
@@ -1147,7 +1165,8 @@ def appset_check(payload: dict) -> dict:
                                          "preserveResourcesOnDeletion is not set"))
         return {"state": "SUCCESS", "generator_count": ctx["count"], "matched_cluster_count": matched_count, **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_sync_wave_check ------------------------------------------------------------------------------------------
@@ -1160,7 +1179,7 @@ _WAVE_VALUE = re.compile(r"^[+-]?[0-9]+$")
 _INT64_DIGITS = 19  # an int64 has at most 19 significant digits: longer runs are refused before int() can convert them
 
 
-def _wave_number(raw) -> int | None:
+def _wave_number(raw: object) -> int | None:
     """The int64 that a sync-wave annotation written as a string holds, None when it holds none. Leading zeros are not significant
     (Argo CD parses the value as an integer), so only the digits after them are converted, and only when there are at most 19."""
     if not isinstance(raw, str) or not _WAVE_VALUE.fullmatch(raw):
@@ -1175,7 +1194,7 @@ def _wave_number(raw) -> int | None:
 _POD_OWNERS = frozenset(WORKLOAD_KINDS | {"CronJob", "Pod", "Rollout"})
 
 
-def _pod_spec(manifest: dict) -> dict | None:
+def _pod_spec(manifest: dict[str, Any]) -> dict[str, Any] | None:
     kind, spec = manifest["kind"], manifest.get("spec")
     if kind not in _POD_OWNERS or not isinstance(spec, dict):
         return None
@@ -1183,11 +1202,11 @@ def _pod_spec(manifest: dict) -> dict | None:
     return pod if isinstance(pod, dict) else None
 
 
-def _pod_refs(pod: dict) -> set[tuple[str, str]]:
+def _pod_refs(pod: dict[str, Any]) -> set[tuple[str, str]]:
     """(kind, name) of the ConfigMaps, Secrets, ServiceAccount and PVCs a pod spec needs to start (optional references excluded)."""
     refs: set[tuple[str, str]] = set()
 
-    def add(kind: str, holder, name_key: str = "name") -> None:
+    def add(kind: str, holder: object, name_key: str = "name") -> None:
         if isinstance(holder, dict) and isinstance(holder.get(name_key), str) and holder[name_key] and holder.get("optional") is not True:
             refs.add((kind, holder[name_key]))
 
@@ -1222,20 +1241,20 @@ def _pod_refs(pod: dict) -> set[tuple[str, str]]:
     return refs
 
 
-def sync_wave_check(payload: dict) -> dict:
+def sync_wave_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Argo CD sync ordering (sync-waves guide): resources run by phase (PreSync, Sync, PostSync), then ascending
     `argocd.argoproj.io/sync-wave` (default 0, negative allowed), then Namespaces, other built-in kinds and custom
     resources, then name. Flags unparsable waves (Argo CD silently uses 0), invalid hook types and delete policies,
     Namespaces after their contents, custom resources before or in the wave of their CRD, and workloads that run before
     the ConfigMap, Secret, ServiceAccount or PVC they need (the wave never turns healthy, so the sync stalls)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         manifests = payload["manifests"]
         problem = _bounded("manifests", manifests) or _manifest_problem(manifests, "manifests")
         if problem:
             return problem
-        findings: list[dict] = []
-        entries = []
+        findings: list[dict[str, str]] = []
+        entries: list[dict[str, Any]] = []
         skipped_keys: set[tuple[str, str, str]] = set()  # objects with hook Skip: never applied, so nothing can depend on them
         skipped_namespaces: set[str] = set()
         for manifest in manifests:
@@ -1273,7 +1292,7 @@ def sync_wave_check(payload: dict) -> dict:
                             "position": (_PHASE_ORDER[phases[0]], wave)})
 
         namespaces = {_name_of(e["manifest"]): e for e in entries if e["manifest"]["kind"] == "Namespace"}
-        crds: dict[tuple[str, str], dict] = {}
+        crds: dict[tuple[str, str], dict[str, Any]] = {}
         for entry in entries:
             spec = entry["manifest"].get("spec")
             if entry["manifest"]["kind"] == "CustomResourceDefinition" and isinstance(spec, dict):
@@ -1322,7 +1341,8 @@ def sync_wave_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "resource_count": len(entries), "wave_count": len({(k[1], k[2]) for k in groups}),
                 "plan": plan, **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_prune_risk -----------------------------------------------------------------------------------------------
@@ -1334,7 +1354,7 @@ _GUARDRAIL_KINDS = frozenset({
 _CROSSPLANE_CONFIG_GROUPS = frozenset({"apiextensions.crossplane.io", "pkg.crossplane.io"})
 
 
-def prune_risk(payload: dict) -> dict:
+def prune_risk(payload: dict[str, Any]) -> dict[str, Any]:
     """What a prune would delete. `pruned` are the live objects that are no longer in Git. Namespaces and CRDs cascade
     to everything inside them (blocker); PVCs lose data (blocker in production), StatefulSets whose
     persistentVolumeClaimRetentionPolicy.whenDeleted is Delete take their PVCs along; Secrets, access-control objects,
@@ -1345,12 +1365,12 @@ def prune_risk(payload: dict) -> dict:
     Autonomy: non-production L2, production sync L3, production prune L4 (any unprotected object). An empty desired state with
     allowEmpty wipes the application."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         pruned, prod, automated = payload["pruned"], payload["environment"] == "prod", payload["automated"]
         problem = _bounded("pruned", pruned) or _manifest_problem(pruned, "pruned")
         if problem:
             return problem
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         protected = 0
 
         def severity(production: str, other: str) -> str:
@@ -1369,7 +1389,7 @@ def prune_risk(payload: dict) -> dict:
                                          f"{label} is " + ("skipped by prune (Prune=false)" if "Prune=false" in options
                                                            else "pruned only after manual confirmation (Prune=confirm)")))
                 continue
-            group, spec = _group(manifest["apiVersion"]), manifest.get("spec") if isinstance(manifest.get("spec"), dict) else {}
+            group, spec = _group(manifest["apiVersion"]), _dict(manifest.get("spec"))
             if kind == "Namespace":
                 findings.append(_finding(f"prune-namespace:{label}", "blocker", f"pruning Namespace {label} deletes every object inside it"))
             elif kind == "CustomResourceDefinition":
@@ -1429,7 +1449,8 @@ def prune_risk(payload: dict) -> dict:
         return {"state": "SUCCESS", "pruned_count": len(pruned), "protected_count": protected, "unprotected_count": unprotected,
                 "autonomy_required": autonomy, "human_approval_required": autonomy != "L2", **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_rollout_check --------------------------------------------------------------------------------------------
@@ -1442,7 +1463,7 @@ _PERCENT = re.compile(r"\d{1,6}%")
 _DIGITS = re.compile(r"\d{1,9}")
 
 
-def _int_or_percent(value):
+def _int_or_percent(value: object) -> tuple[str, int] | None:
     """("int", n) or ("pct", n) for a Kubernetes IntOrString of a non-negative integer or a percentage; None when invalid."""
     if _is_int(value):
         return ("int", value) if value >= 0 else None
@@ -1451,7 +1472,7 @@ def _int_or_percent(value):
     return None
 
 
-def _analysis_names(block, label: str, known: set, findings: list[dict]) -> int:
+def _analysis_names(block: object, label: str, known: set[str], findings: list[dict[str, str]]) -> int:
     """Check the AnalysisTemplate references of one analysis block; returns how many templates it references."""
     templates = block.get("templates") if isinstance(block, dict) else None
     if not isinstance(templates, list) or not templates:
@@ -1467,7 +1488,7 @@ def _analysis_names(block, label: str, known: set, findings: list[dict]) -> int:
     return len(templates)
 
 
-def _surge_pods(replicas: int, value) -> int:
+def _surge_pods(replicas: int, value: object) -> int:
     """maxSurge as a pod count the way Argo Rollouts resolves it: an integer as is, a percentage of the replicas rounded up, 25% when
     unset; an invalid value resolves to 0 there (the validation error is ignored by the replica math)."""
     parsed = ("pct", 25) if value is None else _int_or_percent(value)
@@ -1507,7 +1528,7 @@ def _basic_canary_weight(replicas: int, weight: int, surge: int) -> int:
     return (canary * 200 + total) // (2 * total)
 
 
-def rollout_check(payload: dict) -> dict:
+def rollout_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Argo Rollouts validation. Exactly one of canary / blueGreen; canary steps (one action each, setWeight 0-100 and not
     decreasing, pause durations, analysis templates that exist, background analysis), maxSurge / maxUnavailable (both
     zero is invalid; maxUnavailable above 100% is invalid; defaults are 25%), traffic routing services, and a blast
@@ -1517,7 +1538,7 @@ def rollout_check(payload: dict) -> dict:
     also a house threshold). With traffic routing the weight is the traffic weight. blueGreen needs distinct active and
     preview services and a prePromotionAnalysis when promotion is automatic."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         rollout, known = payload["rollout"], set(payload["analysis_templates"])
         max_first = payload.get("max_first_step_weight", DEFAULT_MAX_FIRST_STEP_WEIGHT)
         problem = _bounded("rollout", rollout)
@@ -1537,7 +1558,7 @@ def rollout_check(payload: dict) -> dict:
         deadline = spec.get("progressDeadlineSeconds")
         if deadline is not None and (not _is_int(deadline) or deadline <= 0):
             findings.append(_finding("progress-deadline", "blocker", "progressDeadlineSeconds must be a positive integer"))
-        strategy = spec.get("strategy") if isinstance(spec.get("strategy"), dict) else {}
+        strategy = _dict(spec.get("strategy"))
         canary, blue_green = strategy.get("canary"), strategy.get("blueGreen")
         effective: list[int] = []
         gates = pause_total = analyses = steps_count = 0
@@ -1551,7 +1572,7 @@ def rollout_check(payload: dict) -> dict:
             if not isinstance(canary, dict):
                 findings.append(_finding("canary-invalid", "blocker", "strategy.canary must be an object"))
                 canary = {}
-            routing = canary.get("trafficRouting") if isinstance(canary.get("trafficRouting"), dict) else {}
+            routing = _dict(canary.get("trafficRouting"))
             routed = bool(routing)
             if routed and not _dig(routing, "istio", "destinationRule") and not (canary.get("stableService") and canary.get("canaryService")):
                 findings.append(_finding("traffic-routing-services", "blocker", "trafficRouting needs stableService and canaryService (or an Istio destinationRule with subsets)"))
@@ -1599,7 +1620,7 @@ def rollout_check(payload: dict) -> dict:
                                                  f"step {index} asks for {weight}% but {replicas} replica(s) without traffic routing expose {real}% "
                                                  f"(whole pods, maxSurge {surge_pods} pod(s))"))
                 elif action == "pause":
-                    pause = step["pause"] if isinstance(step["pause"], dict) else {}
+                    pause = _dict(step["pause"])
                     duration = pause.get("duration")
                     if duration is None:
                         gates += 1
@@ -1607,8 +1628,8 @@ def rollout_check(payload: dict) -> dict:
                         pause_total += duration
                     elif isinstance(duration, str) and _DIGITS.fullmatch(duration):
                         pause_total += int(duration)
-                    elif isinstance(duration, str) and _duration_seconds(duration) is not None:
-                        pause_total += int(_duration_seconds(duration))
+                    elif isinstance(duration, str) and (seconds := _duration_seconds(duration)) is not None:
+                        pause_total += int(seconds)
                     else:
                         findings.append(_finding(f"pause-invalid:{index}", "blocker", f"step {index} pause duration {_echo(duration)} is not seconds or a duration such as 30s, 5m, 1h"))
                 elif action == "analysis":
@@ -1629,14 +1650,15 @@ def rollout_check(payload: dict) -> dict:
             if not analyses:
                 findings.append(_finding("no-analysis", "major", "no analysis step or background analysis: nothing verifies the canary before it is promoted"))
             surge, unavailable = canary.get("maxSurge"), canary.get("maxUnavailable")
-            parsed = {}
+            parsed: dict[str, tuple[str, int] | None] = {}
             for label, value in (("maxSurge", surge), ("maxUnavailable", unavailable)):
                 if value is None:
                     continue
                 parsed[label] = _int_or_percent(value)
                 if parsed[label] is None:
                     findings.append(_finding(f"{label}-invalid", "blocker", f"{label} {_echo(value)} must be a non-negative integer or a percentage such as 25%"))
-            if parsed.get("maxUnavailable") and parsed["maxUnavailable"][0] == "pct" and parsed["maxUnavailable"][1] > 100:
+            unavailable_parsed = parsed.get("maxUnavailable")
+            if unavailable_parsed and unavailable_parsed[0] == "pct" and unavailable_parsed[1] > 100:
                 findings.append(_finding("maxUnavailable-over-100", "major",
                                          "maxUnavailable above 100% lets more pods be unavailable than exist; Deployments reject it, Argo Rollouts does not validate it"))
             if "maxSurge" in parsed and "maxUnavailable" in parsed and all(p is not None and p[1] == 0 for p in (parsed["maxSurge"], parsed["maxUnavailable"])):
@@ -1671,7 +1693,8 @@ def rollout_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "strategy": name, "step_count": steps_count, "effective_weights": effective,
                 "manual_gate_count": gates, "total_pause_seconds": pause_total, "analysis_count": analyses, **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_canary_verdict -------------------------------------------------------------------------------------------
@@ -1698,7 +1721,7 @@ def _significant(value: Decimal) -> float:
     return round(number, 6) if abs(number) >= 1 else float(f"{number:.6g}")
 
 
-def canary_verdict(payload: dict) -> dict:
+def canary_verdict(payload: dict[str, Any]) -> dict[str, Any]:
     """AnalysisRun-style verdict. Per metric the canary samples are aggregated and compared with a limit: the absolute
     `threshold`, the baseline aggregate widened by `max_regression_pct` (of its magnitude, in the worse direction: up for
     lower-is-better, down for higher-is-better, so a negative baseline of -10 with 10% allows -9 and -11 respectively), or the
@@ -1708,7 +1731,7 @@ def canary_verdict(payload: dict) -> dict:
     `min_samples` samples, is Inconclusive unless it already failed. Any failed metric makes the run Failed (abort), else any
     inconclusive one makes it Inconclusive (pause), else Successful (promote). Non-finite numbers are refused."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         metrics, min_samples = payload["metrics"], payload["min_samples"]
         names = [m["name"] for m in metrics]
         if len(set(names)) != len(names):
@@ -1717,7 +1740,8 @@ def canary_verdict(payload: dict) -> dict:
             numbers = [metric.get("threshold"), metric.get("max_regression_pct"), *metric["canary_samples"], *metric.get("baseline_samples", [])]
             if not all(value is None or _is_number(value) for value in numbers):
                 return _invalid("metrics", f"metric {metric['name']}: thresholds, percentages and samples must be finite numbers")
-        results, counts = [], {"Failed": 0, "Inconclusive": 0, "Successful": 0}
+        results: list[dict[str, Any]] = []
+        counts = {"Failed": 0, "Inconclusive": 0, "Successful": 0}
         for metric in metrics:
             name = metric["name"]
             threshold, pct = metric.get("threshold"), metric.get("max_regression_pct")
@@ -1729,7 +1753,7 @@ def canary_verdict(payload: dict) -> dict:
             lower = metric["direction"] == "lower-is-better"
             if pct is not None and not lower and pct > 100:
                 return _invalid("metrics", f"metric {name}: a higher-is-better metric cannot regress by more than 100%")
-            limits = []
+            limits: list[Decimal] = []
             if threshold is not None:
                 limits.append(_dec(threshold))
             if pct is not None:
@@ -1756,7 +1780,8 @@ def canary_verdict(payload: dict) -> dict:
         return {"state": "SUCCESS", "verdict": verdict, "action": action, "failed_count": counts["Failed"],
                 "inconclusive_count": counts["Inconclusive"], "passed_count": counts["Successful"], "metrics": results}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_promotion_gate -------------------------------------------------------------------------------------------
@@ -1770,7 +1795,7 @@ def _same_commit(left: str, right: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-def promotion_gate(payload: dict) -> dict:
+def promotion_gate(payload: dict[str, Any]) -> dict[str, Any]:
     """Preconditions of a promotion PR from `source_env` to `target_env`: the target must be the next stage of `env_order`,
     required checks must pass (neutral and skipped count as passing, like GitHub required checks; a required check that
     never reported is waiting), the source must have soaked for `min_soak_minutes` (elapsed >= required passes), enough
@@ -1778,7 +1803,7 @@ def promotion_gate(payload: dict) -> dict:
     cannot approve; a later changes_requested blocks) and no change freeze (start inclusive, end exclusive). blocked > waiting
     > ready. Production promotion is L3 and needs at least one approval. This tool decides readiness; it never merges."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             now = _timestamp(payload["now"], "now")
             deployed = _timestamp(payload["deployed_at"], "deployed_at")
@@ -1799,14 +1824,14 @@ def promotion_gate(payload: dict) -> dict:
         if (freeze_start is None) != (freeze_end is None):
             return _invalid("freeze_start", "freeze_start and freeze_end must be given together")
         freeze = None
-        if freeze_start is not None:
+        if freeze_start is not None and freeze_end is not None:
             try:
                 freeze = (_timestamp(freeze_start, "freeze_start"), _timestamp(freeze_end, "freeze_end"))
             except ValueError as exc:
                 return _invalid("freeze_start" if "freeze_start" in str(exc) else "freeze_end", str(exc))
             if freeze[0] >= freeze[1]:
                 return _invalid("freeze_end", "freeze_end must be after freeze_start")
-        latest: dict[str, tuple] = {}
+        latest: dict[str, tuple[tuple[datetime, int], Any]] = {}
         for index, review in enumerate(payload["approvals"]):
             try:
                 when = _timestamp(review["at"], f"approvals[{index}].at")
@@ -1818,7 +1843,7 @@ def promotion_gate(payload: dict) -> dict:
             if user not in latest or (when, index) >= latest[user][0]:
                 latest[user] = ((when, index), review)
 
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         if gap > 1:
             findings.append(_finding("stage-skipped", "blocker", f"{target} is not the next stage after {source}; {order[order.index(source) + 1]} comes first"))
         statuses: dict[str, int] = {}
@@ -1868,7 +1893,8 @@ def promotion_gate(payload: dict) -> dict:
                 "autonomy_level": "L3" if production else "L2", "severity_counts": ordered["severity_counts"],
                 "findings": ordered["findings"]}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_drift_classify -------------------------------------------------------------------------------------------
@@ -1907,7 +1933,7 @@ def _path_under(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(prefix + ".") or path.startswith(prefix + "[")
 
 
-def _classify_diff(diff: dict, ignored: list[str]) -> tuple[str, str]:
+def _classify_diff(diff: dict[str, Any], ignored: list[str]) -> tuple[str, str]:
     kind, path, change, manager = diff["kind"], _normal_path(diff["path"]), diff["change"], diff.get("field_manager", "")
     if any(_path_under(path, prefix) for prefix in ignored):
         return "benign", "covered by ignore_differences"
@@ -1935,7 +1961,7 @@ def _classify_diff(diff: dict, ignored: list[str]) -> tuple[str, str]:
     return "drift", "field differs from Git"
 
 
-def drift_classify(payload: dict) -> dict:
+def drift_classify(payload: dict[str, Any]) -> dict[str, Any]:
     """Classify field-level differences between live objects and Git (path in dotted form, `[n]` or `[name=x]` for list
     items; `$` or empty for a whole object). benign: server-populated fields (resourceVersion, uid, generation,
     managedFields, status, last-applied annotation), the HPA-written replica count (field manager kube-controller-manager),
@@ -1943,9 +1969,10 @@ def drift_classify(payload: dict) -> dict:
     Secret data, Service exposure, security contexts, host namespaces and mounts, service accounts and images. drift:
     everything else. clean -> ignore; drifted -> self-heal to Git; dangerous -> investigate before any sync."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         diffs, ignored = payload["diffs"], [_normal_path(p) for p in payload["ignore_differences"]]
-        classified, counts = [], {"benign": 0, "drift": 0, "dangerous": 0}
+        classified: list[dict[str, str]] = []
+        counts: dict[str, int] = {"benign": 0, "drift": 0, "dangerous": 0}
         for diff in diffs:
             klass, reason = _classify_diff(diff, ignored)
             counts[klass] += 1
@@ -1958,7 +1985,8 @@ def drift_classify(payload: dict) -> dict:
                 "dangerous_count": counts["dangerous"], "verdict": verdict, "recommended_action": action,
                 "classified": sorted(classified, key=lambda c: ({"dangerous": 0, "drift": 1, "benign": 2}[c["class"]], c["resource"], c["path"]))}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_image_policy ---------------------------------------------------------------------------------------------
@@ -2006,7 +2034,7 @@ def _parse_image(ref: str) -> tuple[str, str, str]:
     return name, tag, digest
 
 
-def _version_key(version: tuple) -> tuple:
+def _version_key(version: tuple[int, int, int, str]) -> tuple[object, ...]:
     """Semver 2.0 precedence key of (major, minor, patch, prerelease or ""); build metadata never takes part. A numeric
     identifier sorts below an alphanumeric one; a digits-only identifier above uint64 counts as text, as in Masterminds."""
     major, minor, patch, pre = version
@@ -2014,12 +2042,12 @@ def _version_key(version: tuple) -> tuple:
     return (major, minor, patch, 0 if pre else 1, identifiers)
 
 
-def _compare(left: tuple, right: tuple) -> int:
+def _compare(left: tuple[int, int, int, str], right: tuple[int, int, int, str]) -> int:
     a, b = _version_key(left), _version_key(right)
     return (a > b) - (a < b)
 
 
-def _semver_parse(text: str):
+def _semver_parse(text: str) -> tuple[int, int, int, str] | None:
     """(major, minor, patch, prerelease or "") of a version as Masterminds NewVersion reads it (optional v, missing minor and
     patch are 0, leading zeros allowed in the numbers); None when it is not a version."""
     if len(text) > _SEMVER_MAX_VERSION:
@@ -2033,10 +2061,11 @@ def _semver_parse(text: str):
         return None
     if any(part.isdigit() and len(part) > 1 and part[0] == "0" for part in pre.split(".")) if pre else False:
         return None
-    return (*numbers, pre)
+    major, minor, patch = numbers
+    return major, minor, patch, pre
 
 
-def _release_version(tag: str):
+def _release_version(tag: str) -> tuple[int, int, int, str] | None:
     """(major, minor, patch, prerelease or "") of a version tag (v1.2, 1.2.3-rc.1); None for anything else, wildcards included."""
     return _semver_parse(tag)
 
@@ -2045,7 +2074,15 @@ def _is_x(text: str) -> bool:
     return text in ("x", "X", "*")
 
 
-def _parse_comparator(token: str) -> dict:
+class _Comparator(TypedDict):
+    op: str
+    con: tuple[int, int, int, str]
+    dirty: bool
+    minor_dirty: bool
+    patch_dirty: bool
+
+
+def _parse_comparator(token: str) -> _Comparator:
     match = _CONSTRAINT.fullmatch(token)
     if not match:
         raise ValueError("improper constraint")
@@ -2063,7 +2100,7 @@ def _parse_comparator(token: str) -> dict:
     return {"op": operator, "con": parsed, "dirty": dirty, "minor_dirty": minor_dirty, "patch_dirty": patch_dirty}
 
 
-def _tilde(v: tuple, c: dict) -> bool:
+def _tilde(v: tuple[int, int, int, str], c: _Comparator) -> bool:
     con = c["con"]
     if _compare(v, con) < 0:
         return False
@@ -2074,7 +2111,7 @@ def _tilde(v: tuple, c: dict) -> bool:
     return v[1] == con[1] or c["minor_dirty"]
 
 
-def _caret(v: tuple, c: dict) -> bool:
+def _caret(v: tuple[int, int, int, str], c: _Comparator) -> bool:
     con = c["con"]
     if _compare(v, con) < 0:
         return False
@@ -2089,7 +2126,7 @@ def _caret(v: tuple, c: dict) -> bool:
     return v[2] == con[2]
 
 
-def _not_equal(v: tuple, c: dict) -> bool:
+def _not_equal(v: tuple[int, int, int, str], c: _Comparator) -> bool:
     con = c["con"]
     if c["dirty"]:
         if con[0] != v[0]:
@@ -2105,7 +2142,7 @@ def _not_equal(v: tuple, c: dict) -> bool:
     return _compare(v, con) != 0
 
 
-def _greater_than(v: tuple, c: dict) -> bool:
+def _greater_than(v: tuple[int, int, int, str], c: _Comparator) -> bool:
     con = c["con"]
     if not c["dirty"]:
         return _compare(v, con) > 0
@@ -2118,7 +2155,7 @@ def _greater_than(v: tuple, c: dict) -> bool:
     return _compare(v, con) > 0
 
 
-def _less_equal(v: tuple, c: dict) -> bool:
+def _less_equal(v: tuple[int, int, int, str], c: _Comparator) -> bool:
     con = c["con"]
     if not c["dirty"]:
         return _compare(v, con) <= 0
@@ -2127,7 +2164,7 @@ def _less_equal(v: tuple, c: dict) -> bool:
     return not (v[0] == con[0] and v[1] > con[1] and not c["minor_dirty"])
 
 
-def _check_comparator(c: dict, v: tuple, include_pre: bool) -> bool:
+def _check_comparator(c: _Comparator, v: tuple[int, int, int, str], include_pre: bool) -> bool:
     if v[3] != "" and not include_pre:
         return False
     operator, con = c["op"], c["con"]
@@ -2148,7 +2185,7 @@ def _check_comparator(c: dict, v: tuple, include_pre: bool) -> bool:
     return _caret(v, c)
 
 
-def _parse_constraint(text: str):
+def _parse_constraint(text: str) -> Callable[[tuple[int, int, int, str]], bool]:
     """Predicate for a Masterminds semver constraint (=, !=, >, >=, <, <=, ~, ~>, ^, x wildcards, `A - B` ranges, `||`, comma or
     space AND); ValueError when Masterminds rejects it."""
     if len(text) > _SEMVER_MAX_CONSTRAINT:
@@ -2157,7 +2194,7 @@ def _parse_constraint(text: str):
     segments = text.split("||")
     if len(segments) > _SEMVER_MAX_GROUPS:
         raise ValueError("too many constraint groups (max 32)")
-    groups = []
+    groups: list[tuple[list[_Comparator], bool]] = []
     for segment in segments:
         if not _VALID_GROUP.fullmatch(segment):
             raise ValueError("improper constraint")
@@ -2166,7 +2203,7 @@ def _parse_constraint(text: str):
     return lambda v: any(all(_check_comparator(c, v, include_pre) for c in comparators) for comparators, include_pre in groups)
 
 
-def image_policy(payload: dict) -> dict:
+def image_policy(payload: dict[str, Any]) -> dict[str, Any]:
     """Image reference hygiene plus a Flux ImagePolicy-style selection. The reference is pinned only by a digest; no tag
     or one of MUTABLE_TAGS (latest, main, ...: a convention, not a registry fact) is floating. Policies: semver (a port of
     Masterminds/semver v3.5.0, the library Flux uses: =, !=, >, >=, <, <=, ~, ^, x wildcards, `A - B` ranges, `||` and comma
@@ -2175,7 +2212,7 @@ def image_policy(payload: dict) -> dict:
     greatest, desc the smallest). Flux rejects the whole candidate list when a numerical tag is not a number, so filter the
     tags first; here such tags are ignored. Anything credential-shaped in the reference is redacted in every output."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         try:
             repository, tag, digest = _parse_image(payload["image"])
         except ValueError as exc:
@@ -2184,7 +2221,7 @@ def image_policy(payload: dict) -> dict:
         for index, item in enumerate(candidates):
             if not _TAG.fullmatch(item):
                 return _invalid("candidate_tags", f"candidate_tags[{index}] is not a valid OCI tag")
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         pinned = bool(digest)
         floating = not pinned and (not tag or tag in MUTABLE_TAGS)
         shown, shown_tag = _redact(payload["image"]), _redact(tag)
@@ -2204,7 +2241,7 @@ def image_policy(payload: dict) -> dict:
                     allows = _parse_constraint(policy.get("range", "*"))
                 except ValueError as exc:
                     return _invalid("policy", f"policy.range: {exc}")
-                versions = {}
+                versions: dict[str, tuple[int, int, int, str]] = {}
                 for item in candidates:
                     version = _release_version(item)
                     if version is not None and allows(version):
@@ -2240,7 +2277,8 @@ def image_policy(payload: dict) -> dict:
                 "selected_tag": _redact(selected), "update_available": bool(selected) and selected != tag, "eligible_count": eligible,
                 **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_secret_scan ----------------------------------------------------------------------------------------------
@@ -2270,7 +2308,7 @@ _MNEMONIC = re.compile(r"\b(?:[a-z]{3,8} ){11,23}[a-z]{3,8}\b")
 _MAX_ECHO = 120
 
 
-def _userinfo_spans(text: str):
+def _userinfo_spans(text: str) -> Iterator[tuple[int, int]]:
     """(start, end) of the `user[:password]` part of every `scheme://user[:password]@host` in text (end is the index of the @)."""
     position = 0
     while True:
@@ -2291,7 +2329,7 @@ def _bare_token(userinfo: str) -> bool:
     return ":" not in userinfo and len(userinfo) >= 16 and any(c.isdigit() for c in userinfo) and any(c.isalpha() for c in userinfo)
 
 
-def _url_passwords(text: str):
+def _url_passwords(text: str) -> Iterator[str]:
     """The password of every `scheme://user[:password]@host` in text, or the whole userinfo when it is a bare token."""
     for start, end in _userinfo_spans(text):
         userinfo = text[start:end]
@@ -2302,14 +2340,15 @@ def _url_passwords(text: str):
             yield userinfo
 
 
-def _blank_token_run(match) -> str:
+def _blank_token_run(match: re.Match[str]) -> str:
     run = match.group(0)
     return _REDACTED if any(char.isdigit() for char in run) and any(char.isalpha() for char in run) else run
 
 
 def _scrub(text: str) -> str:
     """text with every credential-shaped part replaced by <redacted> (no length cap)."""
-    pieces, last = [], 0
+    pieces: list[str] = []
+    last = 0
     for start, end in _userinfo_spans(text):
         pieces += [text[last:start], _REDACTED]
         last = end
@@ -2326,7 +2365,7 @@ def _redact(text: str) -> str:
     return out if len(out) <= _MAX_ECHO else out[:_MAX_ECHO] + "..."
 
 
-def _echo(value) -> str:
+def _echo(value: object) -> str:
     """repr of a caller-supplied value for a finding, with credential-shaped parts redacted."""
     if isinstance(value, str):
         return repr(_redact(value))
@@ -2350,7 +2389,8 @@ _TEMPLATE_TOKENS = (("${", "}"), ("$(", ")"), ("{{", "}}"))
 
 def _strip_templates(text: str) -> str:
     """text without its ${...}, $(...), {{...}} and <...> tokens; linear (a closer that is not found is remembered as absent)."""
-    out, index, size, absent = [], 0, len(text), set()
+    out: list[str] = []
+    index, size, absent = 0, len(text), set[str]()
     while index < size:
         for opener, closer in _TEMPLATE_TOKENS:
             if closer not in absent and text.startswith(opener, index):
@@ -2373,7 +2413,7 @@ def _strip_templates(text: str) -> str:
     return "".join(out)
 
 
-def _real_value(value) -> bool:
+def _real_value(value: object) -> bool:
     """A string that is a literal value. Empty text and values made *entirely* of template or placeholder tokens (<token>, ${TOKEN},
     $(TOKEN), {{ .Values.t }}, CHANGEME) are not: `hunter2${x}` and `Bearer ${T}` still hold literal text."""
     if not isinstance(value, str) or _PLACEHOLDER_WORD.match(value):
@@ -2381,7 +2421,7 @@ def _real_value(value) -> bool:
     return any(char.isalnum() for char in _strip_templates(value))
 
 
-def _leaves(node, path: str = ""):
+def _leaves(node: object, path: str = "") -> Iterator[tuple[str, str]]:
     """(path, value) of every scalar string leaf, depth first with dict keys sorted."""
     stack = [(path, node)]
     while stack:
@@ -2394,7 +2434,7 @@ def _leaves(node, path: str = ""):
             yield current, item
 
 
-def _expand_lists(manifests: list) -> list:
+def _expand_lists(manifests: list[Any]) -> list[Any]:
     """The manifests with every `kind: List` (or *List) replaced by its items, nested lists included; kubectl get -o yaml emits those
     and their own metadata has no name."""
     out, pending = [], list(reversed(manifests))
@@ -2407,7 +2447,7 @@ def _expand_lists(manifests: list) -> list:
     return out
 
 
-def secret_scan(payload: dict) -> dict:
+def secret_scan(payload: dict[str, Any]) -> dict[str, Any]:
     """Plaintext secrets in manifests versus secret references. A v1 Secret with data or stringData is plaintext (base64 is
     an encoding) unless it is SOPS-encrypted (top-level `sops` key and every value ENC[...]); a SealedSecret
     (bitnami.com), ExternalSecret (external-secrets.io) or SecretProviderClass is a reference. Also flagged: env vars and
@@ -2417,19 +2457,19 @@ def secret_scan(payload: dict) -> dict:
     {{...}}, CHANGEME) are ignored. A finding names the object, the key or path and the kind of credential, never a value
     (key names and paths pass through the same redaction as every quoted field)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         manifests = _expand_lists(payload["manifests"])
         problem = _bounded("manifests", manifests) or _manifest_problem(manifests, "manifests")
         if problem:
             return problem
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         exposures = references = 0
         for manifest in manifests:
             label, kind, api = _label(manifest), manifest["kind"], manifest["apiVersion"]
             group = _group(api)
             skip_patterns = False
             if kind == "Secret" and api == "v1":
-                values = {}
+                values: dict[str, object] = {}
                 for section in ("data", "stringData"):
                     block = manifest.get(section)
                     values.update({f"{section}.{k}": v for k, v in (block.items() if isinstance(block, dict) else [])})
@@ -2498,7 +2538,8 @@ def secret_scan(payload: dict) -> dict:
                         findings.append(_finding(f"credentials-in-url:{label}:{_redact(path)}", "blocker", f"{label} {_redact(path)} embeds user:password in a URL (value not shown)"))
         return {"state": "SUCCESS", "manifest_count": len(manifests), "exposure_count": exposures, "reference_count": references, **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # --- gitops_repo_layout ----------------------------------------------------------------------------------------------
@@ -2515,7 +2556,7 @@ _MAX_DOUBLE_STAR = 2
 MAX_LISTED = 200  # environments and cluster directories listed in the result; keeps it far below the 256 KiB output limit
 
 
-def _codeowners_pattern(pattern: str):
+def _codeowners_pattern(pattern: str) -> tuple[bool, tuple[str, ...], str] | None:
     """(anchored, segments, mode) of a CODEOWNERS pattern (gitignore-like; no negation, no character classes), or None when
     unsupported. mode is `dir` (trailing slash: needs something inside), `open` (a plain name: the path itself or anything under
     it) or `exact` (a wildcard in the last segment: that depth only)."""
@@ -2554,7 +2595,7 @@ def _glob(pattern: str, text: str) -> bool:
     return p == len(pattern)
 
 
-def _pattern_matches(rule: tuple, path_segments: list[str]) -> bool:
+def _pattern_matches(rule: tuple[bool, tuple[str, ...], str], path_segments: list[str]) -> bool:
     anchored, segments, mode = rule
     size, last = len(path_segments), len(segments) - 1
     memo: dict[tuple[int, int], bool] = {}
@@ -2576,8 +2617,8 @@ def _pattern_matches(rule: tuple, path_segments: list[str]) -> bool:
     return any(walk(0, start) for start in ([0] if anchored else range(size)))
 
 
-def _codeowners_rules(text: str, findings: list[dict]) -> list[tuple]:
-    rules = []
+def _codeowners_rules(text: str, findings: list[dict[str, str]]) -> list[tuple[tuple[bool, tuple[str, ...], str], list[str]]]:
+    rules: list[tuple[tuple[bool, tuple[str, ...], str], list[str]]] = []
     for number, raw in enumerate(text.splitlines(), 1):
         line = raw.split(" #", 1)[0].strip()
         if not line or line.startswith("#") or line.startswith(("[", "^[")):
@@ -2598,7 +2639,7 @@ def _codeowners_rules(text: str, findings: list[dict]) -> list[tuple]:
     return rules
 
 
-def _owners_of(rules: list[tuple], path: str) -> list[str]:
+def _owners_of(rules: list[tuple[tuple[bool, tuple[str, ...], str], list[str]]], path: str) -> list[str]:
     """Owners of the last pattern that matches the path (the last matching pattern wins), none when no pattern matches."""
     segments = path.split("/")
     for rule, rule_owners in reversed(rules):
@@ -2607,7 +2648,7 @@ def _owners_of(rules: list[tuple], path: str) -> list[str]:
     return []
 
 
-def repo_layout(payload: dict) -> dict:
+def repo_layout(payload: dict[str, Any]) -> dict[str, Any]:
     """GitOps repository layout from a file list. An environment exists when a path runs through overlays/<env>/,
     environments/<env>/, envs/<env>/, env/<env>/ or is values-<env>.y(a)ml or values/<env>.y(a)ml. Checks: expected
     environments present, overlays with a kustomization file and a sibling base/, every application having every expected
@@ -2615,7 +2656,7 @@ def repo_layout(payload: dict) -> dict:
     unregistered cluster directories, private-key-looking files, and CODEOWNERS: present at a location GitHub or GitLab
     reads and, when its text is supplied, owning every production environment (last matching pattern wins)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         paths = payload["paths"]
         expected, production = payload["expected_envs"], payload["production_envs"]
         for index, path in enumerate(paths):
@@ -2625,7 +2666,7 @@ def repo_layout(payload: dict) -> dict:
             return _invalid("expected_envs", "environment and cluster names must be non-empty and contain no /")
         if not set(production) <= set(expected):
             return _invalid("production_envs", "production_envs must be a subset of expected_envs")
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         files = set(paths)
         env_paths: dict[str, list[str]] = {}
         overlay_dirs: dict[str, set[str]] = {}  # application prefix -> envs with an overlay dir
@@ -2686,7 +2727,7 @@ def repo_layout(payload: dict) -> dict:
         if not file_present and text is None:
             findings.append(_finding("codeowners-missing", "major", "no CODEOWNERS file at .github/, the root, docs/ or .gitlab/"))
         evaluated = text is not None
-        if evaluated:
+        if text is not None:
             rules = _codeowners_rules(text, findings)
             for env in production:
                 env_files = sorted(set(env_paths.get(env, [])))
@@ -2707,4 +2748,5 @@ def repo_layout(payload: dict) -> dict:
         return {"state": "SUCCESS", "path_count": len(files), "envs_found": listed_envs, "missing_envs": [_scrub(e) for e in sorted(missing)],
                 "cluster_dirs": listed_clusters, "codeowners_evaluated": evaluated, **_report(findings)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result

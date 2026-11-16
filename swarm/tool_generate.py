@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 from swarm.tool_registry import ERROR_STATES, ROOT, iter_entries, load_document, tool_tier, validate_registry
 
@@ -43,10 +44,10 @@ def _registry_ok(path: Path | None) -> bool:
     return True
 
 
-def render_docs(data: dict) -> dict[str, str]:
+def render_docs(data: dict[str, Any]) -> dict[str, str]:
     agents = [a for a in data.get("agents") or [] if isinstance(a, dict)]
-    lane: dict[str, list[dict]] = {a["id"]: [] for a in agents}
-    shared: list[dict] = []
+    lane: dict[str, list[dict[str, Any]]] = {a["id"]: [] for a in agents}
+    shared: list[dict[str, Any]] = []
     for container, tool in iter_entries(data):
         if not isinstance(tool, dict):
             continue
@@ -65,7 +66,7 @@ def render_docs(data: dict) -> dict[str, str]:
     return pages
 
 
-def _allowed_states(tool: dict) -> list[str]:
+def _allowed_states(tool: dict[str, Any]) -> list[str]:
     """States a tool's success example may return, taken from its output_schema.state."""
     state = ((tool.get("output_schema") or {}).get("properties") or {}).get("state") or {}
     if "const" in state:
@@ -81,7 +82,7 @@ def _state_assertion(states: list[str]) -> str:
     return f'    assert result["state"] in {tuple(states)!r}'
 
 
-def render_contract_tests(data: dict) -> str:
+def render_contract_tests(data: dict[str, Any]) -> str:
     tools = [tool for _container, tool in iter_entries(data) if isinstance(tool, dict) and tool.get("name")]
     tools.sort(key=lambda tool: tool["name"])
     lines = [
@@ -155,7 +156,7 @@ def _emit(files: dict[str, str], root: Path, check: bool, label: str) -> int:
     return 0
 
 
-def _agent_page(agent: dict, lane_tools: list[dict], shared_used: list[dict]) -> str:
+def _agent_page(agent: dict[str, Any], lane_tools: list[dict[str, Any]], shared_used: list[dict[str, Any]]) -> str:
     caps = ", ".join(f"`{item}`" for item in agent["capabilities"])
     consumes = ", ".join(f"`{item}`" for item in agent["consumes"])
     produces = ", ".join(f"`{item}`" for item in agent["produces"])
@@ -206,7 +207,7 @@ def _agent_page(agent: dict, lane_tools: list[dict], shared_used: list[dict]) ->
     return "\n".join(lines)
 
 
-def _catalog(agents: list[dict], lane: dict[str, list[dict]], shared: list[dict]) -> str:
+def _catalog(agents: list[dict[str, Any]], lane: dict[str, list[dict[str, Any]]], shared: list[dict[str, Any]]) -> str:
     rows = []
     for agent in agents:
         for tool in sorted(lane[agent["id"]], key=lambda item: item.get("name") or ""):
@@ -256,13 +257,13 @@ def _catalog(agents: list[dict], lane: dict[str, list[dict]], shared: list[dict]
     return "\n".join(lines)
 
 
-def _name_list(tools: list[dict], empty: str) -> list[str]:
+def _name_list(tools: list[dict[str, Any]], empty: str) -> list[str]:
     if not tools:
         return [empty]
     return [f"- `{tool['name']}` ({tool.get('owner')})" for tool in tools]
 
 
-def _tool_table(tools: list[dict], empty: str) -> str:
+def _tool_table(tools: list[dict[str, Any]], empty: str) -> str:
     if not tools:
         return empty
     lines = [
@@ -291,7 +292,7 @@ def _tool_table(tools: list[dict], empty: str) -> str:
     return "\n".join(lines)
 
 
-def _io_summary(schema: dict) -> str:
+def _io_summary(schema: dict[str, Any]) -> str:
     props = schema.get("properties") or {}
     required = set(schema.get("required") or [])
     if not isinstance(props, dict) or not props:

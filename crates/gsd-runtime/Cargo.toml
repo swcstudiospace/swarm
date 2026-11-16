@@ -1,0 +1,58 @@
+[package]
+name = "gsd-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Core runtime primitives for GSD-Core: deterministic clock, async primitives, I/O utilities"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["asynchronous", "concurrency", "development-tools::profiling"]
+keywords = ["tokio", "deterministic", "replay", "runtime"]
+
+[dependencies]
+tokio = { workspace = true, features = ["full", "rt-multi-thread", "macros", "io-util", "net", "time", "sync", "fs", "process", "signal"] }
+tokio-uring = { workspace = true }
+bytes = { workspace = true }
+bytesize = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+smallvec = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+once_cell = { workspace = true }
+atomic-waker = { workspace = true }
+event-listener = { workspace = true }
+portable-atomic = { workspace = true }
+crossbeam = { workspace = true }
+lock_api = { workspace = true }
+spin = { workspace = true }
+scopeguard = { workspace = true }
+pin-project = { workspace = true }
+pin-project-lite = { workspace = true }
+nix = { workspace = true }
+mio = { workspace = true }
+socket2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+memmap2 = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+default = ["std"]
+std = ["tokio/rt-multi-thread"]
+sim = []  # simulation mode for deterministic replay

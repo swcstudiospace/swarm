@@ -302,6 +302,41 @@ def test_absent_and_no_required_gates(swarm_dir):
     assert ts.missing_gate_reasons("N-2") == {}
 
 
+def test_gate_task_own_fail_with_empty_gates_is_refused_approved(swarm_dir):
+    """A gate task that recorded a fail for itself is refused APPROVED with E-POLICY even when
+    notes.gates is empty. A non-gate task with notes.gates [] and no fail still approves.
+
+    Fails on the pre-fix store: missing_gates() ignored the self fail because notes.gates was [].
+    """
+    from swarm.errors import ErrorCode, SwarmError
+    from swarm.gates import make_verdict
+    from swarm.taskstore import TaskStore
+
+    ts = TaskStore()
+    gate_id = "G-own"
+    ts.create(task_id=gate_id, correlation_id="c", capability="gate.review", risk_class="medium",
+              notes={"gate": "review", "gate_for": [gate_id], "gates": []})
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        ts.transition(gate_id, state)
+    ts.record_verdict(gate_id, make_verdict(
+        gate="review", task_id=gate_id, agent_id="A09", verdict="fail", correlation_id="c",
+        extra={"gate_task": gate_id}))
+    assert ts.missing_gate_reasons(gate_id) == {"review": "fail"}
+    assert ts.missing_gates(gate_id) == ["review"]
+    with pytest.raises(SwarmError, match="lacks passing gates") as ei:
+        ts.transition(gate_id, "APPROVED")
+    assert ei.value.code is ErrorCode.E_POLICY
+    assert ts.get(gate_id)["state"] == "IN_REVIEW"
+
+    plain = "N-empty"
+    ts.create(task_id=plain, correlation_id="c", capability="code.backend", risk_class="medium",
+              notes={"gates": []})
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        ts.transition(plain, state)
+    assert ts.missing_gates(plain) == []
+    assert ts.transition(plain, "APPROVED")["state"] == "APPROVED"
+
+
 def test_forged_fail_does_not_force_rework(swarm_dir):
     from swarm.taskstore import TaskStore
     from swarm.results import reconcile
@@ -504,3 +539,30 @@ def test_empty_id_env_means_unset_but_empty_flag_is_rejected(swarm_dir):
     for flag in ("--correlation-id=", "--task-id="):
         r = run_script("orch_status.py", flag, "--json")
         assert r.returncode == 2 and json.loads(r.stdout)["error"]["code"] == "E-INPUT", r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------- P1-19: severities and verdicts are closed sets
+def test_make_verdict_rejects_unknown_severity(monkeypatch):
+    from swarm.errors import SwarmError
+    from swarm.gates import make_verdict
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k")
+    bogus = {"id": "F-1", "severity": "catastrophic", "kind": "functional", "summary": "x", "evidence": "", "ac_ref": None,
+             "owner_suggestion": None, "location": None}
+    with pytest.raises(SwarmError) as e:
+        make_verdict(gate="review", task_id="T-1", agent_id="A09", findings=[bogus], audit=False)
+    assert e.value.code.value == "E-CONTRACT"
+
+
+@pytest.mark.xfail(strict=True, reason="BLOCKED-PIN P1-19 validate half: verdict membership lives in the pinned Rust mirror crates/gsd-route/src/gate_facts.rs parse_envelope")
+def test_validate_verdict_rejects_unknown_verdict(monkeypatch):
+    from swarm.envelope import build_envelope, sign_envelope
+    from swarm.errors import SwarmError
+    from swarm.gates import validate_verdict
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k")
+    payload = {"gate": "review", "task_id": "T-1", "verdict": "maybe", "findings": [], "runs": {}, "expires_s": 86400,
+               "issued_at": 1000.0}
+    env = sign_envelope(build_envelope(source="A09", target="A01", msg_type="gate.verdict", payload=payload,
+                                       correlation_id="C-1", priority="P1"), audit=False)
+    with pytest.raises(SwarmError) as e:
+        validate_verdict(env)
+    assert e.value.code.value == "E-CONTRACT"

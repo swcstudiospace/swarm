@@ -1,0 +1,764 @@
+syntax = "proto3";
+
+package gsd.v1;
+
+option go_package = "github.com/swcstudiospace/agent-swarm/crates/gsd-proto/gen/go;gsd";
+option java_package = "com.swcstudio.gsd.v1";
+option java_multiple_files = true;
+option csharp_namespace = "Gsd.V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+// ============================================================================
+// Core Identity Types
+// ============================================================================
+
+message ChatThreadId {
+  string value = 1;
+}
+
+message SessionId {
+  string value = 1;
+}
+
+message TaskId {
+  string value = 1;
+}
+
+message SubagentType {
+  string value = 1;
+}
+
+// ============================================================================
+// Capability Manifest (n7)
+// ============================================================================
+
+message CapabilityManifest {
+  SubagentType subagent_type = 1;
+  repeated ToolPermission tools = 2;
+  ModelConfig model_config = 3;
+  int64 context_window_tokens = 4;
+  int64 max_tokens_per_turn = 5;
+  Permissions permissions = 6;
+  Statefulness statefulness = 7;
+  repeated string affinity_hints = 8;
+}
+
+message ToolPermission {
+  string name = 1;
+  repeated string args_schema = 2;
+}
+
+message ModelConfig {
+  string provider = 1;
+  string model = 2;
+  map<string, string> params = 3;
+}
+
+message Permissions {
+  repeated string fs_read = 1;
+  repeated string fs_write = 2;
+  repeated string net_egress = 3;
+  repeated string secrets = 4;
+}
+
+enum Statefulness {
+  STATELESS = 0;
+  CHECKPOINTABLE = 1;
+  PERSISTENT = 2;
+}
+
+// ============================================================================
+// Task and Workflow
+// ============================================================================
+
+message Task {
+  TaskId id = 1;
+  SubagentType subagent_type = 2;
+  google.protobuf.Any input_payload = 3;
+  repeated TaskId dependencies = 4;
+  int32 priority = 5;
+  RetryPolicy retry_policy = 6;
+  google.protobuf.Duration timeout = 7;
+  map<string, string> metadata = 8;
+}
+
+message RetryPolicy {
+  int32 max_attempts = 1;
+  google.protobuf.Duration base_delay = 2;
+  double backoff_multiplier = 3;
+  double jitter = 4;
+  repeated string retryable_error_codes = 5;
+}
+
+message WorkflowDef {
+  string name = 1;
+  string version = 2;
+  repeated Task tasks = 3;
+  repeated Edge edges = 4;
+  SchedulingPolicy policy = 5;
+  Budget budgets = 6;
+  map<string, string> metadata = 7;
+}
+
+message Edge {
+  TaskId from = 1;
+  TaskId to = 2;
+  string condition = 3;  // CEL expression for conditional edges
+}
+
+enum SchedulingPolicy {
+  CRITICAL_PATH_THROUGHPUT_HYBRID = 0;
+  CRITICAL_PATH = 1;
+  MAX_THROUGHPUT = 2;
+  COST_AWARE = 3;
+  LATENCY_OPTIMIZED = 4;
+  FAIR_SHARE = 5;
+}
+
+message Budget {
+  int64 max_tokens = 1;
+  int64 max_wall_time_ms = 2;
+  int32 max_tool_calls = 3;
+  double max_cost_usd = 4;
+}
+
+// ============================================================================
+// Thread State
+// ============================================================================
+
+enum ThreadStateKind {
+  IDLE = 0;
+  INITIALIZING = 1;
+  RUNNING = 2;
+  WAITING_DEPENDENCY = 3;
+  SUSPENDED = 4;
+  COMPLETED = 5;
+  FAILED = 6;
+  TERMINATED = 7;
+}
+
+message ThreadState {
+  ChatThreadId id = 1;
+  SubagentType subagent_type = 2;
+  ThreadStateKind state = 3;
+  CapabilityManifest capability_manifest = 4;
+  repeated google.protobuf.Any messages = 11;
+  map<string, google.protobuf.Any> context_window = 5;
+  map<string, Artifact> artifacts = 6;
+  repeated Checkpoint checkpoints = 7;
+  map<string, string> metadata = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message Checkpoint {
+  string id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  bytes thread_state_snapshot = 3;  // bincode-serialized ThreadState
+  string description = 4;
+}
+
+// ============================================================================
+// Artifacts
+// ============================================================================
+
+message Artifact {
+  string id = 1;
+  string type = 2;
+  bytes content_ref = 5;  // bincode-serialized content or reference
+  map<string, string> metadata = 3;
+  repeated string lineage = 4;
+}
+
+// ============================================================================
+// Budget and Resource Governance
+// ============================================================================
+
+message BudgetRequest {
+  SessionId session_id = 1;
+  ChatThreadId thread_id = 2;
+  int64 tokens = 4;
+  int64 wall_time_ms = 5;
+  int32 tool_calls = 3;
+  double cost_usd = 6;
+}
+
+message BudgetGrant {
+  bool granted = 1;
+  int64 tokens_granted = 2;
+  int64 wall_time_ms_granted = 3;
+  int32 tool_calls_granted = 5;
+  double cost_usd_granted = 6;
+  google.protobuf.Duration valid_for = 4;
+}
+
+message BudgetSnapshot {
+  int64 tokens_used = 1;
+  int64 wall_time_ms_used = 2;
+  int32 tool_calls_used = 3;
+  double cost_usd_used = 5;
+  int64 tokens_remaining = 4;
+  int64 wall_time_ms_remaining = 6;
+  int32 tool_calls_remaining = 7;
+  double cost_usd_remaining = 8;
+}
+
+message BudgetLegacy {
+  int64 max_tokens = 1;
+  int64 max_wall_time_ms = 2;
+  int32 max_tool_calls = 3;
+  double max_cost_usd = 4;
+}
+
+// ============================================================================
+// Session State
+// ============================================================================
+
+message SessionState {
+  string version = 1;
+  SessionId session_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 9;
+  map<string, ThreadState> threads = 4;
+  map<string, Branch> branches = 5;
+  repeated Checkpoint checkpoints = 10;
+  WorkflowDef workflow = 6;
+  BudgetSnapshot budget_snapshot = 7;
+  map<string, string> metadata = 8;
+}
+
+message Branch {
+  string name = 1;
+  string parent_branch = 2;
+  string base_checkpoint_id = 3;
+  google.protobuf.Timestamp created_at = 4;
+  map<string, string> metadata = 5;
+}
+
+// ============================================================================
+// Nexus Communication
+// ============================================================================
+
+message Topic {
+  string name = 1;
+  string schema_type = 2;  // type URL for payload
+}
+
+message NexusMessage {
+  string id = 1;
+  Topic topic = 2;
+  google.protobuf.Any payload = 3;
+  map<string, string> headers = 5;
+  google.protobuf.Timestamp timestamp = 4;
+  ChatThreadId sender = 6;
+}
+
+message Subscription {
+  string id = 1;
+  Topic topic = 2;
+  ChatThreadId subscriber = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message NexusMessageEnvelope {
+  NexusMessage message = 1;
+  repeated ChatThreadId recipients = 2;  // empty = broadcast
+}
+
+// ============================================================================
+// State Store Events
+// ============================================================================
+
+enum StateEventType {
+  THREAD_CREATED = 0;
+  THREAD_STATE_CHANGED = 1;
+  THREAD_CHECKPOINTED = 2;
+  THREAD_COMPLETED = 3;
+  THREAD_FAILED = 4;
+  ARTIFACT_CREATED = 5;
+  ARTIFACT_UPDATED = 6;
+  SESSION_BRANCHED = 7;
+  SESSION_MERGED = 8;
+  BUDGET_GRANTED = 9;
+  BUDGET_EXHAUSTED = 10;
+  NEXUS_MESSAGE_PUBLISHED = 11;
+  NEXUS_MESSAGE_DELIVERED = 12;
+  CIRCUIT_BREAKER_OPENED = 13;
+  CIRCUIT_BREAKER_CLOSED = 14;
+  DEAD_LETTER_ENQUEUED = 15;
+}
+
+message StateEvent {
+  string id = 1;
+  SessionId session_id = 2;
+  StateEventType type = 3;
+  google.protobuf.Timestamp timestamp = 6;
+  google.protobuf.Any payload = 4;
+  ChatThreadId thread_id = 7;
+  map<string, string> metadata = 5;
+}
+
+// ============================================================================
+// Failure and Retry
+// ============================================================================
+
+enum CircuitBreakerState {
+  CLOSED = 0;
+  OPEN = 1;
+  HALF_OPEN = 2;
+}
+
+message CircuitBreakerConfig {
+  int32 failure_threshold = 1;
+  google.protobuf.Duration timeout = 2;
+  int32 success_threshold = 3;
+}
+
+message RetryDecision {
+  bool should_retry = 1;
+  google.protobuf.Duration delay = 2;
+  string reason = 3;
+}
+
+message DeadLetterEntry {
+  string id = 1;
+  Task task = 2;
+  string error = 3;
+  int32 attempt = 6;
+  google.protobuf.Timestamp timestamp = 4;
+  ThreadState thread_state = 7;
+  map<string, string> context = 5;
+}
+
+// ============================================================================
+// Security
+// ============================================================================
+
+message CapabilityToken {
+  string token = 1;
+  SessionId session_id = 2;
+  ChatThreadId thread_id = 3;
+  repeated string resources = 4;
+  google.protobuf.Timestamp issued_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  string signature = 7;
+}
+
+message AuditEntry {
+  string id = 1;
+  SessionId session_id = 2;
+  ChatThreadId thread_id = 3;
+  string action = 4;
+  google.protobuf.Any payload = 5;
+  google.protobuf.Timestamp timestamp = 6;
+  string actor = 9;
+  string resource = 7;
+  string decision = 8;
+  string merkle_proof = 10;
+}
+
+message RedactionResult {
+  string output = 1;
+  repeated Redaction redactions = 2;
+}
+
+message Redaction {
+  int32 start = 1;
+  int32 end = 2;
+  string type = 3;
+  string reason = 4;
+}
+
+// ============================================================================
+// Observability
+// ============================================================================
+
+message TraceContext {
+  string trace_id = 1;
+  string span_id = 2;
+  string parent_span_id = 3;
+  map<string, string> baggage = 4;
+  uint32 trace_flags = 5;
+}
+
+message Span {
+  string trace_id = 1;
+  string span_id = 2;
+  string parent_span_id = 3;
+  string name = 4;
+  google.protobuf.Timestamp start_time = 5;
+  google.protobuf.Timestamp end_time = 6;
+  map<string, string> attributes = 7;
+  string status = 8;
+  map<string, string> links = 9;
+}
+
+message Metric {
+  string name = 1;
+  double value = 2;
+  map<string, string> labels = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message LogEntry {
+  string level = 1;
+  string message = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  TraceContext trace_context = 5;
+  map<string, string> fields = 4;
+}
+
+// ============================================================================
+// Services
+// ============================================================================
+
+service SchedulerService {
+  rpc SubmitTask (SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc GetTaskStatus (GetTaskStatusRequest) returns (GetTaskStatusResponse);
+  rpc CancelTask (CancelTaskRequest) returns (CancelTaskResponse);
+  rpc GetFrontier (GetFrontierRequest) returns (GetFrontierResponse);
+  rpc SetPolicy (SetPolicyRequest) returns (SetPolicyResponse);
+}
+
+message SubmitTaskRequest {
+  SessionId session_id = 1;
+  Task task = 2;
+}
+
+message SubmitTaskResponse {
+  bool accepted = 1;
+  TaskId task_id = 2;
+  string error = 3;
+}
+
+message GetTaskStatusRequest {
+  SessionId session_id = 1;
+  TaskId task_id = 2;
+}
+
+message GetTaskStatusResponse {
+  TaskId task_id = 1;
+  string state = 2;
+  google.protobuf.Any result = 3;
+  string error = 4;
+}
+
+message CancelTaskRequest {
+  SessionId session_id = 1;
+  TaskId task_id = 2;
+  string reason = 3;
+}
+
+message CancelTaskResponse {
+  bool cancelled = 1;
+  string error = 2;
+}
+
+message GetFrontierRequest {
+  SessionId session_id = 1;
+}
+
+message GetFrontierResponse {
+  repeated TaskId ready_tasks = 1;
+  repeated TaskId running_tasks = 2;
+  repeated TaskId pending_tasks = 3;
+}
+
+message SetPolicyRequest {
+  SessionId session_id = 1;
+  SchedulingPolicy policy = 2;
+}
+
+message SetPolicyResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+service NexusService {
+  rpc Publish (PublishRequest) returns (PublishResponse);
+  rpc Subscribe (SubscribeRequest) returns (SubscribeResponse);
+  rpc Unsubscribe (UnsubscribeRequest) returns (UnsubscribeResponse);
+  rpc RequestResponse (RequestResponseRequest) returns (RequestResponseResponse);
+}
+
+message PublishRequest {
+  SessionId session_id = 1;
+  NexusMessage message = 2;
+}
+
+message PublishResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message SubscribeRequest {
+  SessionId session_id = 1;
+  Topic topic = 2;
+  ChatThreadId subscriber = 3;
+}
+
+message SubscribeResponse {
+  string subscription_id = 1;
+  string error = 2;
+}
+
+message UnsubscribeRequest {
+  SessionId session_id = 1;
+  string subscription_id = 2;
+}
+
+message UnsubscribeResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message RequestResponseRequest {
+  SessionId session_id = 1;
+  NexusMessage request = 2;
+  ChatThreadId target = 3;
+  google.protobuf.Duration timeout = 4;
+}
+
+message RequestResponseResponse {
+  google.protobuf.Any response = 1;
+  string error = 2;
+}
+
+service StateStoreService {
+  rpc GetSession (GetSessionRequest) returns (GetSessionResponse);
+  rpc PutSession (PutSessionRequest) returns (PutSessionResponse);
+  rpc BranchSession (BranchSessionRequest) returns (BranchSessionResponse);
+  rpc MergeSession (MergeSessionRequest) returns (MergeSessionResponse);
+  rpc CreateCheckpoint (CreateCheckpointRequest) returns (CreateCheckpointResponse);
+  rpc GetCheckpoint (GetCheckpointRequest) returns (GetCheckpointResponse);
+  rpc ListCheckpoints (ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  rpc WatchEvents (WatchEventsRequest) returns (stream StateEvent);
+}
+
+message GetSessionRequest {
+  SessionId session_id = 1;
+}
+
+message GetSessionResponse {
+  SessionState session = 1;
+  string error = 2;
+}
+
+message PutSessionRequest {
+  SessionState session = 1;
+}
+
+message PutSessionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message BranchSessionRequest {
+  SessionId session_id = 1;
+  string branch_name = 2;
+  string base_checkpoint_id = 3;
+}
+
+message BranchSessionResponse {
+  Branch branch = 1;
+  string error = 2;
+}
+
+message MergeSessionRequest {
+  SessionId session_id = 1;
+  string source_branch = 2;
+  string target_branch = 3;
+}
+
+message MergeSessionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message CreateCheckpointRequest {
+  SessionId session_id = 1;
+  string description = 2;
+}
+
+message CreateCheckpointResponse {
+  Checkpoint checkpoint = 1;
+  string error = 2;
+}
+
+message GetCheckpointRequest {
+  SessionId session_id = 1;
+  string checkpoint_id = 2;
+}
+
+message GetCheckpointResponse {
+  Checkpoint checkpoint = 1;
+  string error = 2;
+}
+
+message ListCheckpointsRequest {
+  SessionId session_id = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+}
+
+message ListCheckpointsResponse {
+  repeated Checkpoint checkpoints = 1;
+  int32 total = 2;
+}
+
+message WatchEventsRequest {
+  SessionId session_id = 1;
+  google.protobuf.Timestamp since = 2;
+}
+
+service GovernorService {
+  rpc ReserveBudget (ReserveBudgetRequest) returns (ReserveBudgetResponse);
+  rpc ReleaseBudget (ReleaseBudgetRequest) returns (ReleaseBudgetResponse);
+  rpc GetBudgetSnapshot (GetBudgetSnapshotRequest) returns (GetBudgetSnapshotResponse);
+  rpc SetBudget (SetBudgetRequest) returns (SetBudgetResponse);
+}
+
+message ReserveBudgetRequest {
+  BudgetRequest request = 1;
+}
+
+message ReserveBudgetResponse {
+  BudgetGrant grant = 1;
+  string error = 2;
+}
+
+message ReleaseBudgetRequest {
+  SessionId session_id = 1;
+  ChatThreadId thread_id = 2;
+  int64 tokens = 4;
+  int64 wall_time_ms = 5;
+  int32 tool_calls = 3;
+  double cost_usd = 6;
+}
+
+message ReleaseBudgetResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message GetBudgetSnapshotRequest {
+  SessionId session_id = 1;
+}
+
+message GetBudgetSnapshotResponse {
+  BudgetSnapshot snapshot = 1;
+  string error = 2;
+}
+
+message SetBudgetRequest {
+  SessionId session_id = 1;
+  Budget budget = 2;
+}
+
+message SetBudgetResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+service OrchestratorService {
+  rpc StartSession (StartSessionRequest) returns (StartSessionResponse);
+  rpc PauseSession (PauseSessionRequest) returns (PauseSessionResponse);
+  rpc ResumeSession (ResumeSessionRequest) returns (ResumeSessionResponse);
+  rpc CancelSession (CancelSessionRequest) returns (CancelSessionResponse);
+  rpc ScaleSession (ScaleSessionRequest) returns (ScaleSessionResponse);
+  rpc InjectMessage (InjectMessageRequest) returns (InjectMessageResponse);
+  rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
+  rpc GetLogs (GetLogsRequest) returns (stream LogEntry);
+  rpc GetTrace (GetTraceRequest) returns (stream Span);
+  rpc GetArtifacts (GetArtifactsRequest) returns (stream Artifact);
+}
+
+message StartSessionRequest {
+  WorkflowDef workflow = 1;
+  map<string, string> options = 2;
+}
+
+message StartSessionResponse {
+  SessionId session_id = 1;
+  string error = 2;
+}
+
+message PauseSessionRequest {
+  SessionId session_id = 1;
+}
+
+message PauseSessionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ResumeSessionRequest {
+  SessionId session_id = 1;
+}
+
+message ResumeSessionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message CancelSessionRequest {
+  SessionId session_id = 1;
+}
+
+message CancelSessionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ScaleSessionRequest {
+  SessionId session_id = 1;
+  int32 target_concurrency = 2;
+}
+
+message ScaleSessionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message InjectMessageRequest {
+  SessionId session_id = 1;
+  ChatThreadId thread_id = 2;
+  google.protobuf.Any message = 3;
+}
+
+message InjectMessageResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message GetStatusRequest {
+  SessionId session_id = 1;
+}
+
+message GetStatusResponse {
+  string phase = 1;
+  repeated TaskId frontier = 2;
+  map<string, ThreadState> thread_states = 3;
+  BudgetSnapshot budgets = 4;
+  string health = 5;
+}
+
+message GetLogsRequest {
+  SessionId session_id = 1;
+  map<string, string> filters = 2;
+}
+
+message GetTraceRequest {
+  SessionId session_id = 1;
+  string trace_id = 2;
+}
+
+message GetArtifactsRequest {
+  SessionId session_id = 1;
+  ChatThreadId thread_id = 2;
+}

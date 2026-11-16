@@ -41,11 +41,30 @@ grammar is still an identifier: do not put credentials in names.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+from typing import Any, TypedDict
 
 from swarm.tools.support import respond
+
+Report = dict[str, Any]  # a tool result: JSON-shaped, its values are validated where they are read
+Finding = dict[str, str]  # one finding: {id, severity, summary}
+
+
+class _PathStats(TypedDict):
+    id: str
+    services: int
+    current: int
+    outdated: int
+    unsupported: int
+
+
+class _Impact(TypedDict):
+    ref: str
+    direct_dependents: int
+    transitive_dependents: int
 
 SEVERITY_RANK = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
 MAX_FINDINGS = 300  # the list is cut here; finding_count always carries the true total
@@ -106,12 +125,12 @@ class _Bad(ValueError):
         self.field = field
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> Report:
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _guarded(work):
-    def run() -> dict:
+def _guarded(work: Callable[[], Report]) -> Callable[[], Report]:
+    def run() -> Report:
         try:
             return work()
         except _Bad as exc:
@@ -120,7 +139,13 @@ def _guarded(work):
     return run
 
 
-def _is_finite_number(value) -> bool:
+def _reply(payload: dict[str, Any], work: Callable[[], Report]) -> Report:
+    """`support.respond` is annotated to return Any; this keeps every handler's return type explicit."""
+    result: Report = respond(payload, work)
+    return result
+
+
+def _is_finite_number(value: object) -> bool:
     """True when the value is a number Decimal reads as finite (NaN, infinity, booleans and text are not)."""
     try:
         return Decimal(repr(value)).is_finite()
@@ -128,7 +153,7 @@ def _is_finite_number(value) -> bool:
         return False
 
 
-def _frac(value, field: str) -> Fraction:
+def _frac(value: object, field: str) -> Fraction:
     """Exact fraction of the number as written (shortest repr): 0.1 is 1/10, not its binary neighbour. A non-finite or
     non-numeric value is INVALID_INPUT naming `field`, never a value."""
     if not _is_finite_number(value):
@@ -136,7 +161,7 @@ def _frac(value, field: str) -> Fraction:
     return Fraction(Decimal(repr(value)))
 
 
-def _r(value, digits: int = 4) -> float:
+def _r(value: Fraction, digits: int = 4) -> float:
     """Round the exact value half away from zero (0.03125 -> 0.0313); float round() would go to even."""
     exact = Fraction(value)
     scale = 10**digits
@@ -144,7 +169,7 @@ def _r(value, digits: int = 4) -> float:
     return float(Fraction(rounded if exact >= 0 else -rounded, scale))
 
 
-def _ident(value, limit: int = 120) -> str:
+def _ident(value: object, limit: int = 120) -> str:
     """An identifier that is safe to echo: itself when short and made only of [A-Za-z0-9._:/#[]-], else only its length."""
     text = value if isinstance(value, str) else ""
     return text if 0 < len(text) <= limit and _SAFE_IDENT.fullmatch(text) else f"<{len(text)} chars>"
@@ -155,7 +180,7 @@ def _label(text: str, fallback: str, limit: int = 120) -> str:
     return text if 0 < len(text) <= limit and _SAFE_IDENT.fullmatch(text) else fallback
 
 
-def _s(value) -> str:
+def _s(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
@@ -174,16 +199,16 @@ def _micro(start: datetime, end: datetime) -> int:
     return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
-def _finding(rule: str, subject: str, severity: str, summary: str) -> dict:
+def _finding(rule: str, subject: str, severity: str, summary: str) -> Finding:
     """`subject` is echoed through _ident; `summary` is cut at MAX_SUMMARY. Callers never put an input value in a summary."""
     if len(summary) > MAX_SUMMARY:
         summary = summary[: MAX_SUMMARY - 3] + "..."
     return {"id": f"{rule}@{_ident(subject, 240)}" if subject else rule, "severity": severity, "summary": summary}
 
 
-def _cut(ordered: list[dict]) -> list[dict]:
+def _cut(ordered: list[Finding]) -> list[Finding]:
     """The leading findings of an already ordered list that fit MAX_FINDINGS and MAX_FINDINGS_BYTES (always at least one)."""
-    kept: list[dict] = []
+    kept: list[Finding] = []
     budget = MAX_FINDINGS_BYTES
     for finding in ordered[:MAX_FINDINGS]:
         size = sum(len(v) for v in finding.values() if isinstance(v, str)) + 48
@@ -194,16 +219,16 @@ def _cut(ordered: list[dict]) -> list[dict]:
     return kept
 
 
-def _finish(found: list[dict]) -> tuple[list[dict], int]:
+def _finish(found: list[Finding]) -> tuple[list[Finding], int]:
     ordered = sorted(found, key=lambda f: (SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
     return _cut(ordered), len(found)
 
 
-def _count(found: list[dict], *severities: str) -> int:
+def _count(found: list[Finding], *severities: str) -> int:
     return sum(1 for f in found if f["severity"] in severities)
 
 
-def _status(found: list[dict]) -> str:
+def _status(found: list[Finding]) -> str:
     if _count(found, "blocker", "major"):
         return "fail"
     return "warn" if _count(found, "minor") else "pass"
@@ -249,9 +274,9 @@ def _ref_text(ref: tuple[str, str, str]) -> str:
 # =============================================================================================================
 
 
-def _lint_entries(entries: list[dict], allowed_tiers: tuple[str, ...]) -> list[tuple[int, dict]]:
+def _lint_entries(entries: list[dict[str, Any]], allowed_tiers: tuple[str, ...]) -> list[tuple[int, Finding]]:
     """Every catalog rule over a batch of flattened entities: [(entry index, finding)]. Shared with scripts/plat_catalog_lint.py."""
-    found: list[tuple[int, dict]] = []
+    found: list[tuple[int, Finding]] = []
     seen: dict[tuple[str, str, str], int] = {}
     for index, entry in enumerate(entries):
         raw_kind, name = entry.get("kind") or "", entry.get("name") or ""  # never stripped: " a" and "a\n" are not valid names
@@ -262,7 +287,7 @@ def _lint_entries(entries: list[dict], allowed_tiers: tuple[str, ...]) -> list[t
         subject = f"{kind}:{lowered}/{name.lower()}" if _kind_ok(raw_kind) and _ns_ok(lowered) and _name_ok(name) else f"entry#{index}"
         scope = lowered if _ns_ok(lowered) else "default"  # namespace that relative references resolve in
 
-        def emit(rule: str, severity: str, summary: str, index=index, subject=subject) -> None:
+        def emit(rule: str, severity: str, summary: str, index: int = index, subject: str = subject) -> None:
             found.append((index, _finding(rule, subject, severity, summary)))
 
         if not _kind_ok(raw_kind):
@@ -341,10 +366,10 @@ def _lint_entries(entries: list[dict], allowed_tiers: tuple[str, ...]) -> list[t
     return found
 
 
-def catalog_lint(payload: dict) -> dict:
+def catalog_lint(payload: dict[str, Any]) -> Report:
     """Lint flattened catalog entities for owner, lifecycle, system, tier, dependsOn, docs and runbook metadata."""
 
-    def work() -> dict:
+    def work() -> Report:
         tiers = payload.get("allowed_tiers")
         if tiers is not None:
             if any(not _s(t) for t in tiers):
@@ -364,7 +389,7 @@ def catalog_lint(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -372,8 +397,8 @@ def catalog_lint(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def _by_name(items: list[dict], field: str) -> dict[str, dict]:
-    out: dict[str, dict] = {}
+def _by_name(items: list[dict[str, Any]], field: str) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
     for item in items:
         name = _s(item["name"])
         if not name:
@@ -384,13 +409,13 @@ def _by_name(items: list[dict], field: str) -> dict[str, dict]:
     return out
 
 
-def template_params_check(payload: dict) -> dict:
+def template_params_check(payload: dict[str, Any]) -> Report:
     """Compare a scaffolder template's parameters with the golden path's required inputs, types and allowed values."""
 
-    def work() -> dict:
+    def work() -> Report:
         template = _by_name(payload["template_parameters"], "template_parameters")
         golden = _by_name(payload["golden_inputs"], "golden_inputs")
-        found: list[dict] = []
+        found: list[Finding] = []
         missing = mismatched = 0
         for name in sorted(golden):
             want = golden[name]
@@ -436,7 +461,7 @@ def template_params_check(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -444,8 +469,8 @@ def template_params_check(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def _schema_fields(items: list[dict], field: str) -> dict[str, dict]:
-    out: dict[str, dict] = {}
+def _schema_fields(items: list[dict[str, Any]], field: str) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
     for item in items:
         path = item["path"]
         if not path or any((not seg) or seg != seg.strip() for seg in path.split(".")):
@@ -468,7 +493,7 @@ def _schema_fields(items: list[dict], field: str) -> dict[str, dict]:
 # =============================================================================================================
 
 
-def _limit_change(found: list[dict], stem: str, path: str, old, new, upper: bool) -> None:
+def _limit_change(found: list[Finding], stem: str, path: str, old: object, new: object, upper: bool) -> None:
     """Constraint drift of one bound: tightening breaks existing claims, loosening is additive."""
     if old is None and new is None:
         return
@@ -486,7 +511,7 @@ def _limit_change(found: list[dict], stem: str, path: str, old, new, upper: bool
         )
 
 
-def _optional_new_parent(path: str, old: dict[str, dict], new: dict[str, dict]) -> str | None:
+def _optional_new_parent(path: str, old: dict[str, dict[str, Any]], new: dict[str, dict[str, Any]]) -> str | None:
     """The shallowest ancestor of `path` that existing claims cannot set and that is new and optional, else None.
 
     A claim sets a path with every ancestor present (claim_validate's presence rule), and `required` binds only when all of them are
@@ -508,14 +533,14 @@ def _optional_new_parent(path: str, old: dict[str, dict], new: dict[str, dict]) 
     return None
 
 
-def composition_diff(payload: dict) -> dict:
+def composition_diff(payload: dict[str, Any]) -> Report:
     """Diff two versions of a composition schema (flattened XRD fields): breaking versus additive changes."""
 
-    def work() -> dict:
+    def work() -> Report:
         old = _schema_fields(payload["old_fields"], "old_fields")
         new = _schema_fields(payload["new_fields"], "new_fields")
         same_version = _s(payload["old_version"]) == _s(payload["new_version"])
-        found: list[dict] = []
+        found: list[Finding] = []
         for path in sorted(set(old) | set(new)):
             before, after = old.get(path), new.get(path)
             if before is None:
@@ -573,7 +598,7 @@ def composition_diff(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -592,7 +617,7 @@ def _decimal(text: str) -> Decimal | None:
         return None
 
 
-def _claim_number(item: dict, index: int) -> Decimal | None:
+def _claim_number(item: dict[str, Any], index: int) -> Decimal | None:
     """The numeric reading of a claim value, or None for non-numeric types. Out-of-range or malformed text is INVALID_INPUT."""
     text = item["value"]
     kind = item["type"]
@@ -622,12 +647,12 @@ def _enum_hit(value: str, number: Decimal | None, allowed: list[str]) -> bool:
     return False
 
 
-def claim_validate(payload: dict) -> dict:
+def claim_validate(payload: dict[str, Any]) -> Report:
     """Validate a claim's fields against a composition schema: required, types, enums, numeric bounds and string lengths."""
 
-    def work() -> dict:
+    def work() -> Report:
         schema = _schema_fields(payload["schema"], "schema")
-        claim: dict[str, dict] = {}
+        claim: dict[str, dict[str, Any]] = {}
         numbers: dict[str, Decimal | None] = {}
         for index, item in enumerate(payload["claim"]):
             path = item["path"]
@@ -639,7 +664,7 @@ def claim_validate(payload: dict) -> dict:
         for path in claim:
             parts = path.split(".")
             present.update(".".join(parts[: i + 1]) for i in range(len(parts)))
-        found: list[dict] = []
+        found: list[Finding] = []
         for path in sorted(claim):
             item, spec = claim[path], schema.get(path)
             if spec is None:
@@ -682,7 +707,7 @@ def claim_validate(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -690,18 +715,18 @@ def claim_validate(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def maturity_scorecard(payload: dict) -> dict:
+def maturity_scorecard(payload: dict[str, Any]) -> Report:
     """Cumulative maturity level (none, bronze, silver, gold) per service from ownership, SLO, runbook, on-call, tests, security."""
 
-    def work() -> dict:
+    def work() -> Report:
         minimum = _frac(payload.get("min_coverage_pct", DEFAULT_MIN_COVERAGE_PCT), "min_coverage_pct")
         required = dict(DEFAULT_REQUIRED_LEVELS)
         override = payload.get("required_levels")
         if override is not None:
             required = {"tier-0": override["tier_0"], "tier-1": override["tier_1"], "tier-2": override["tier_2"], "tier-3": override["tier_3"]}
         seen: set[str] = set()
-        rows: list[dict] = []
-        found: list[dict] = []
+        rows: list[dict[str, Any]] = []
+        found: list[Finding] = []
         counts = [0, 0, 0, 0]
         for position, service in enumerate(payload["services"]):
             name = _s(service["name"])
@@ -747,7 +772,7 @@ def maturity_scorecard(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -769,10 +794,10 @@ def _band_ascending(value: Fraction, limits: tuple[Fraction, Fraction, Fraction]
     return "low"
 
 
-def dora_bands(payload: dict) -> dict:
+def dora_bands(payload: dict[str, Any]) -> Report:
     """DORA four keys from deployment and change-caused incident events in a window, each banded elite..low."""
 
-    def work() -> dict:
+    def work() -> Report:
         start = _ts(payload["window_start"], "window_start", "window_start")
         end = _ts(payload["window_end"], "window_end", "window_end")
         window_us = _micro(start, end)
@@ -806,7 +831,7 @@ def dora_bands(payload: dict) -> dict:
             if dep in in_window:
                 failed.setdefault(dep, []).append((started, resolved))
         count = len(in_window)
-        found: list[dict] = []
+        found: list[Finding] = []
         if count == 0:
             found.append(_finding("no-deployments", "", "major", "no deployment in the window: the four keys cannot be banded"))
             findings, total = _finish(found)
@@ -867,7 +892,7 @@ def dora_bands(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -932,10 +957,10 @@ def _loop(cycle: list[str], adjacency: dict[str, list[str]]) -> list[str]:
     return [start, start]
 
 
-def catalog_graph(payload: dict) -> dict:
+def catalog_graph(payload: dict[str, Any]) -> Report:
     """Analyse the dependsOn graph: cycles, dangling targets, orphans, unowned entities, lifecycle conflicts, depth, blast radius."""
 
-    def work() -> dict:
+    def work() -> Report:
         lifecycle: dict[str, str] = {}
         owner: dict[str, str] = {}
         edges: dict[str, list[str]] = {}
@@ -950,14 +975,14 @@ def catalog_graph(payload: dict) -> dict:
             lifecycle[ref], owner[ref] = _s(entry.get("lifecycle")).lower(), _s(entry.get("owner"))
             targets: set[str] = set()
             for position, dep in enumerate(entry.get("depends_on", [])):
-                target = _parse_ref(_s(dep), "component", parsed[1])  # Backstage: a relative dependsOn resolves in the entity's own namespace
-                if target is None:
+                dependency = _parse_ref(_s(dep), "component", parsed[1])  # Backstage: a relative dependsOn resolves in the entity's own namespace
+                if dependency is None:
                     raise _Bad("entries", f"entries[{index}]: dependsOn[{position}] is not a valid entity reference")
-                targets.add(_ref_text(target))
+                targets.add(_ref_text(dependency))
             edges[ref] = sorted(targets)
         nodes = sorted(edges)
         adjacency = {n: [t for t in edges[n] if t in edges] for n in nodes}
-        found: list[dict] = []
+        found: list[Finding] = []
         for node in nodes:
             for target in edges[node]:
                 if target not in edges:
@@ -1004,7 +1029,7 @@ def catalog_graph(payload: dict) -> dict:
         for node in nodes:
             for target in adjacency[node]:
                 reverse[target].append(node)
-        impact = []
+        impact: list[_Impact] = []
         for node in nodes:
             reached: set[str] = set()
             frontier = list(reverse[node])
@@ -1034,7 +1059,7 @@ def catalog_graph(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -1042,15 +1067,15 @@ def catalog_graph(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def ephemeral_env_policy(payload: dict) -> dict:
+def ephemeral_env_policy(payload: dict[str, Any]) -> Report:
     """Check ephemeral environments against TTL, idle and cost policy at a given instant; names what to reclaim (never reclaims)."""
 
-    def work() -> dict:
+    def work() -> Report:
         checked = _ts(payload["checked_at"], "checked_at", "checked_at")
         max_ttl = _frac(payload["max_ttl_hours"], "max_ttl_hours")
         idle_limit = _frac(payload["idle_after_hours"], "idle_after_hours")
         max_cost = _frac(payload["max_cost_usd"], "max_cost_usd")
-        found: list[dict] = []
+        found: list[Finding] = []
         reclaim: set[str] = set()
         seen: set[str] = set()
         expired = idle = over = 0
@@ -1116,7 +1141,7 @@ def ephemeral_env_policy(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -1124,10 +1149,10 @@ def ephemeral_env_policy(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def quota_fit(payload: dict) -> dict:
+def quota_fit(payload: dict[str, Any]) -> Report:
     """Do the teams' quotas fit capacity (after platform reserve and overcommit)? Also flags over-quota, hot and idle teams."""
 
-    def work() -> dict:
+    def work() -> Report:
         reserve = _frac(payload.get("reserve_pct", 0), "reserve_pct")
         overcommit = _frac(payload.get("overcommit_ratio", 1), "overcommit_ratio")
         capacity: dict[str, Fraction] = {}
@@ -1146,8 +1171,8 @@ def quota_fit(payload: dict) -> dict:
             if (team, resource) in grants:
                 raise _Bad("allocations", f"allocations[{position}]: team and resource are listed twice")
             grants[(team, resource)] = (_frac(item["quota"], "quota"), _frac(item["used"], "used"))
-        found: list[dict] = []
-        rows: list[dict] = []
+        found: list[Finding] = []
+        rows: list[dict[str, Any]] = []
         oversubscribed = over_quota = 0
         for resource in sorted(capacity):
             total = capacity[resource]
@@ -1172,18 +1197,18 @@ def quota_fit(payload: dict) -> dict:
                 found.append(_finding("quota-hot", subject, "minor", f"used {_r(used / quota)} of quota (>= 0.9): raise the quota or reduce the load"))
             elif quota > 0 and used / quota < QUOTA_IDLE:
                 found.append(_finding("quota-idle", subject, "info", f"used {_r(used / quota)} of quota (< 0.2): {_r(quota - used, 2)} could be reclaimed"))
-        findings, total = _finish(found)
+        findings, finding_total = _finish(found)
         return {
             "state": "SUCCESS",
             "resources": rows,
             "oversubscribed_count": oversubscribed,
             "over_quota_count": over_quota,
-            "finding_count": total,
+            "finding_count": finding_total,
             "status": _status(found),
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -1198,10 +1223,10 @@ def _version(text: str, field: str, label: str) -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-def golden_path_coverage(payload: dict) -> dict:
+def golden_path_coverage(payload: dict[str, Any]) -> Report:
     """Adoption of golden-path templates across services: on-path, current, outdated, unsupported and off-path."""
 
-    def work() -> dict:
+    def work() -> Report:
         paths: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {}
         labels: dict[str, str] = {}
         for position, item in enumerate(payload["golden_paths"]):
@@ -1214,8 +1239,8 @@ def golden_path_coverage(payload: dict) -> dict:
             if floor > latest:
                 raise _Bad("golden_paths", f"golden_paths: {labels[pid]} min_supported_version is above latest_version")
             paths[pid] = (latest, floor)
-        stats = {pid: {"id": labels[pid], "services": 0, "current": 0, "outdated": 0, "unsupported": 0} for pid in sorted(paths)}
-        found: list[dict] = []
+        stats: dict[str, _PathStats] = {pid: _PathStats(id=labels[pid], services=0, current=0, outdated=0, unsupported=0) for pid in sorted(paths)}
+        found: list[Finding] = []
         seen: set[str] = set()
         current = outdated = unsupported = off_path = 0
         for position, service in enumerate(payload["services"]):
@@ -1276,7 +1301,7 @@ def golden_path_coverage(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -1284,14 +1309,14 @@ def golden_path_coverage(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def api_deprecation(payload: dict) -> dict:
+def api_deprecation(payload: dict[str, Any]) -> Report:
     """Check platform API deprecations: notice window by stability, sunset dates and consumers still on a sunset API."""
 
-    def work() -> dict:
+    def work() -> Report:
         checked = _ts(payload["checked_at"], "checked_at", "checked_at")
         warn_days = Fraction(payload.get("warn_days", 30))
         override = payload.get("min_window_days")
-        found: list[dict] = []
+        found: list[Finding] = []
         at_risk: set[str] = set()
         seen: set[str] = set()
         deprecated = past = removable = 0
@@ -1310,7 +1335,7 @@ def api_deprecation(payload: dict) -> dict:
             if announced is not None and sunset is not None and sunset <= announced:
                 raise _Bad("apis", f"apis[{index}]: sunset_at must be after deprecated_at")
 
-            def emit(rule: str, severity: str, summary: str, subject=subject, key=key) -> None:
+            def emit(rule: str, severity: str, summary: str, subject: str = subject, key: str = key) -> None:
                 found.append(_finding(rule, subject, severity, summary))
                 if severity in ("blocker", "major"):
                     at_risk.add(key)
@@ -1363,7 +1388,7 @@ def api_deprecation(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))
 
 
 # =============================================================================================================
@@ -1371,10 +1396,10 @@ def api_deprecation(payload: dict) -> dict:
 # =============================================================================================================
 
 
-def request_guardrails(payload: dict) -> dict:
+def request_guardrails(payload: dict[str, Any]) -> Report:
     """Decide allow / needs_approval / deny for self-service requests against region, class, size, cap and replica policy."""
 
-    def work() -> dict:
+    def work() -> Report:
         order = [_s(s) for s in payload["size_order"]]
         if any(not s for s in order) or len(set(order)) != len(order):
             raise _Bad("size_order", "size_order values must be non-blank and unique")
@@ -1388,8 +1413,8 @@ def request_guardrails(payload: dict) -> dict:
         regions, classes = set(payload["allowed_regions"]), set(payload["allowed_classes"])
         caps = (("cpu_cores", "cpu-above-cap"), ("memory_gib", "memory-above-cap"), ("storage_gib", "storage-above-cap"))
         limits = {"cpu_cores": payload["max_cpu_cores"], "memory_gib": payload["max_memory_gib"], "storage_gib": payload["max_storage_gib"]}
-        found: list[dict] = []
-        decisions: list[dict] = []
+        found: list[Finding] = []
+        decisions: list[dict[str, str]] = []
         seen: set[str] = set()
         for position, request in enumerate(payload["requests"]):
             raw_id = _s(request["id"])
@@ -1397,8 +1422,8 @@ def request_guardrails(payload: dict) -> dict:
                 raise _Bad("requests", f"requests[{position}]: id is blank or duplicated")
             seen.add(raw_id)
             rid = _label(raw_id, f"requests[{position}]")
-            denied: list[dict] = []
-            approval: list[dict] = []
+            denied: list[Finding] = []
+            approval: list[Finding] = []
             if request["region"] not in regions:
                 denied.append(_finding("region-not-allowed", rid, "major", "region is not in allowed_regions"))
             if request["service_class"] not in classes:
@@ -1431,4 +1456,4 @@ def request_guardrails(payload: dict) -> dict:
             "findings": findings,
         }
 
-    return respond(payload, _guarded(work))
+    return _reply(payload, _guarded(work))

@@ -1,0 +1,42 @@
+[package]
+name = "gsd-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Legacy Adapter for GSD-Core: zero-code migration layer for existing subagents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["development-tools", "migration", "adapter"]
+keywords = ["adapter", "migration", "legacy", "subagent"]
+
+[features]
+# The sandbox backend serves the write routes (`orch_status --transition`, `--ingest`, `orch_plan`, the APPROVED facts) from the
+# write-enabled guest (phase 14.5, pins P1 and P2): the nested guest is built with its `write-routes-2` feature and the binary embeds
+# it. Off, a write call on the sandbox backend is refused before any write (E-DEP, write_state not_started), and the guest bytes and
+# their pin are the default ones.
+sandbox-write = ["gsd-sandbox/write-routes"]
+
+[dependencies]
+gsd-proto = { path = "../gsd-proto" }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-serde = { path = "../gsd-serde" }
+gsd-failure = { path = "../gsd-failure" }
+gsd-scheduler = { path = "../gsd-scheduler" }
+gsd-state = { path = "../gsd-state" }
+gsd-pool = { path = "../gsd-pool" }
+gsd-governor = { path = "../gsd-governor" }
+gsd-route = { path = "../gsd-route" }
+gsd-sandbox = { path = "../gsd-sandbox" }
+gsd-sdk = { path = "../gsd-sdk" }
+gsd-taskwriter = { path = "../gsd-taskwriter" }
+gsd-envelope = { path = "../gsd-envelope" }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+tokio = { workspace = true }
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

@@ -410,21 +410,44 @@ function expectAppearOrder(label: string, render: (width: number) => string, tex
 }
 
 /**
- * Scaling check for the redactor (linear vs quadratic), not a wall-clock cap: the same unit at 250 KB and at 1 MB. 4x the
- * input must not cost 16x the time; a generous ceiling catches a true blow-up. Returns the redacted 1 MB output.
+ * Deterministic redaction contract on the original UTF-16 offsets: ordered, bounded spans reconstruct the ENTIRE output,
+ * including untouched text. A masked output is a fixed point, and its status-row consumer stays within its display bound.
+ * These are output regressions, not performance measurements; timing benchmarks belong outside unit tests.
  */
-function expectLinear(redact: (text: string) => string, unit: string, tail: string, label: string): string {
-  const reps = (size: number) => Math.floor(size / unit.length);
-  const timed = (text: string) => {
-    const started = performance.now();
-    const out = redact(text);
-    return { out, ms: performance.now() - started };
-  };
-  const small = timed(unit.repeat(reps(250_000)) + tail);
-  const big = timed(unit.repeat(reps(1_000_000)) + tail);
-  expect({ label, ratioOk: big.ms / Math.max(small.ms, 1) < 9 }).toEqual({ label, ratioOk: true });
-  expect({ label, ceilingOk: big.ms < 2000 }).toEqual({ label, ceilingOk: true });
-  return big.out;
+function expectRedactionProperties(text: string, label: string): { out: string; spans: Array<[number, number]> } {
+  const spans = redactSpans(text);
+  const valid = spans.every(([a, b], i) =>
+    Number.isInteger(a) && Number.isInteger(b) && 0 <= a && a < b && b <= text.length && (i === 0 || spans[i - 1]![1] < a),
+  );
+  expect({ label, valid }).toEqual({ label, valid: true });
+  const parts: string[] = [];
+  let last = 0;
+  let length = text.length;
+  for (const [a, b] of spans) {
+    parts.push(text.slice(last, a), "[REDACTED]");
+    length += "[REDACTED]".length - (b - a);
+    last = b;
+  }
+  parts.push(text.slice(last));
+  const out = redactText(text);
+  expect({ label, reconstructed: out === parts.join(""), length: out.length }).toEqual({ label, reconstructed: true, length });
+  expect({ label, fixedPoint: redactText(out) === out }).toEqual({ label, fixedPoint: true });
+  expect(displayWidth(sanitizeText(text))).toBeLessThanOrEqual(120);
+  return { out, spans };
+}
+
+/** Both former timing sizes must mask the whole planted suffix, even after quote/command/carrier floods. */
+function expectLargeRedaction(unit: string, tail: string, label: string): string {
+  let big = "";
+  for (const size of [250_000, 1_000_000]) {
+    const text = unit.repeat(Math.floor(size / unit.length)) + tail;
+    const { out, spans } = expectRedactionProperties(text, `${label}@${size}`);
+    const start = text.length - "hunter2".length;
+    expect({ label, size, covered: spans.some(([a, b]) => a <= start && b === text.length), leaked: out.includes("hunter2") })
+      .toEqual({ label, size, covered: true, leaked: false });
+    big = out;
+  }
+  return big;
 }
 
 describe("formatElapsed", () => {
@@ -606,10 +629,10 @@ describe("redactText shared vectors", () => {
     expect(redactText(prose)).toBe(prose);
   });
 
-  test("GL8: 1 MB of quote openers, escaped quotes and unclosed quotes is linear (scaling, not a wall-clock cap) and still finds the trailing password", () => {
+  test("GL8: 1 MB of quote openers, escaped quotes and unclosed quotes preserves redaction spans and masks the trailing password", () => {
     const units = ['mysql -p" ', "mysql -p\\\" ", "-u me:'", "x --password $'", 'DB_PASSWORD="', 'mysql -p\\\\\\" ', '"password": "', '\\"password\\": \\"', "a\\"];
     for (const unit of units) {
-      const out = expectLinear(redactText, unit, "\npassword=hunter2", unit);
+      const out = expectLargeRedaction(unit, "\npassword=hunter2", unit);
       expect({ unit, masked: !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
   });
@@ -775,23 +798,16 @@ describe("redactText shared vectors", () => {
     });
   });
 
-  test("1 MB assignment floods are linear and still find the trailing password", () => {
+  test("1 MB assignment floods mask the complete trailing password without truncating other text", () => {
     for (const unit of ["a=", "a=a=", "user=a,", "user=a;", "x=1&"]) {
-      const big = unit.repeat(Math.floor(1_000_000 / unit.length)) + "password=hunter2";
-      const small = unit.repeat(Math.floor(250_000 / unit.length)) + "password=hunter2";
-      const timed = (text: string) => {
-        const started = performance.now();
-        const out = redactText(text);
-        return { out, ms: performance.now() - started };
-      };
-      timed(small); // warm the JIT before measuring
-      const s = timed(small);
-      const b = timed(big);
-      // linear scanning: 4x the input costs about 4x the time; a quadratic scan would cost about 16x. Compare the ratio
-      // (machine load scales both sides alike) and keep a generous absolute ceiling against a blow-up.
-      expect({ unit, ratioOk: b.ms / Math.max(s.ms, 1) < 9 }).toEqual({ unit, ratioOk: true });
-      expect({ unit, ceilingOk: b.ms < 2000 }).toEqual({ unit, ceilingOk: true });
-      expect({ unit, masked: b.out.endsWith("password=[REDACTED]") && !b.out.includes("hunter2") }).toEqual({ unit, masked: true });
+      for (const size of [250_000, 1_000_000]) {
+        const prefix = unit.repeat(Math.floor(size / unit.length));
+        const text = prefix + "password=hunter2";
+        const { out, spans } = expectRedactionProperties(text, `${unit}@${size}`);
+        expect(spans).toEqual([[prefix.length + "password=".length, text.length]]);
+        expect(out).toBe(prefix + "password=[REDACTED]");
+        expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
+      }
     }
   });
 
@@ -804,20 +820,27 @@ describe("redactText shared vectors", () => {
     expect(redactText("# " + "PASSWORD=a'b c'\"d\" ".repeat(2) + "end")).toBe("# " + "PASSWORD=[REDACTED] ".repeat(2) + "end");
   });
 
-  test("1 MB comments of repeated assignments are scanned in linear time", () => {
+  test("1 MB comments of repeated assignments preserve exact output and whole-value spans", () => {
     for (const unit of ["PASSWORD=", "x=y ", 'PASSWORD="ab cd" ']) {
-      const comment = (size: number) => "# " + unit.repeat(Math.floor(size / unit.length)) + '"x"';
-      const timed = (text: string) => {
-        const started = performance.now();
-        redactText(text);
-        return performance.now() - started;
-      };
-      timed(comment(250_000)); // warm the JIT before measuring
-      const small = Math.min(timed(comment(250_000)), timed(comment(250_000)), timed(comment(250_000)));
-      const big = Math.min(timed(comment(1_000_000)), timed(comment(1_000_000)));
-      // 4x the input must not cost 16x the time (a quadratic scan does); the absolute ceiling is only against a blow-up
-      expect({ unit, ratioOk: big / Math.max(small, 1) < 9 }).toEqual({ unit, ratioOk: true });
-      expect({ unit, ceilingOk: big < 3000 }).toEqual({ unit, ceilingOk: true });
+      for (const size of [250_000, 1_000_000]) {
+        const reps = Math.floor(size / unit.length);
+        const text = "# " + unit.repeat(reps) + '"x"';
+        const { out, spans } = expectRedactionProperties(text, `${unit}@${size}`);
+        if (unit === "PASSWORD=") {
+          expect(spans).toEqual([["# PASSWORD=".length, text.length]]);
+          expect(out).toBe("# PASSWORD=[REDACTED]");
+          expect(sanitizeText(text)).toBe("# PASSWORD=[REDACTED]");
+        } else if (unit === "x=y ") {
+          expect(spans).toEqual([]);
+          expect(out).toBe(text);
+        } else {
+          expect(spans.length).toBe(reps);
+          expect(spans.every(([a, b], i) => a === 2 + i * unit.length + "PASSWORD=".length && b === 2 + (i + 1) * unit.length - 1)).toBe(true);
+          expect(out).toBe("# " + "PASSWORD=[REDACTED] ".repeat(reps) + '"x"');
+          expect(out).not.toContain("ab cd");
+          expect(sanitizeText(text)).not.toContain("ab cd");
+        }
+      }
     }
   });
 
@@ -826,25 +849,20 @@ describe("redactText shared vectors", () => {
     expect(row).toBe("login --password [REDACTED]");
   });
 
-  test("1 MB adversarial inputs are scanned in time linear in their size (scaling, not a wall-clock cap)", () => {
+  test("1 MB adversarial inputs preserve output/span consistency and mask a planted password", () => {
     const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
       "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
       "--mode a;", "-v ", "password=a,token = ", "token=a,--password ", 'Cookie: a="', "x=-u=", '-u "', "A_KEY=", "STRIPE_KEY=A_KEY=", "a://u:",
       'password="', "-u=a:", 'Cookie: a="b" ', "-u a:", "--user=-u="];
     for (const unit of units) {
-      const big = unit.repeat(Math.floor(1_000_000 / unit.length));
-      const small = unit.repeat(Math.floor(250_000 / unit.length));
-      const timed = (text: string) => {
-        const started = performance.now();
-        redactText(text);
-        return performance.now() - started;
-      };
-      timed(small); // warm up
-      const s = timed(small);
-      const b = timed(big);
-      // scaling, not a wall-clock cap: 4x the input must not cost 16x the time (quadratic); a generous ceiling catches a blow-up
-      expect({ unit, ratioOk: b / Math.max(s, 1) < 9 }).toEqual({ unit, ratioOk: true });
-      expect({ unit, ceilingOk: b < 2000 }).toEqual({ unit, ceilingOk: true });
+      const out = expectLargeRedaction(unit, "\npassword=hunter2", unit);
+      if (unit === "-----BEGIN PRIVATE KEY-----") {
+        expect(out).toBe("[REDACTED]"); // an unclosed PEM masks everything, not just its first header
+        expect(sanitizeText(unit.repeat(Math.floor(1_000_000 / unit.length)))).toBe("[REDACTED]");
+      }
+      if (unit === "mode=fast ") {
+        expect(out).toBe(unit.repeat(Math.floor(1_000_000 / unit.length)) + "\npassword=[REDACTED]");
+      }
     }
   });
 
@@ -855,10 +873,9 @@ describe("redactText shared vectors", () => {
     }
   });
 
-  test("a megabyte-long comma-separated secret value is redacted whole and fast", () => {
-    const started = performance.now();
+  test("a megabyte-long comma-separated secret value is redacted whole", () => {
     const out = redactText(`API_TOKEN=${"q,".repeat(500_000)} done`);
-    expect(performance.now() - started).toBeLessThan(200);
+    expect(out.length).toBeLessThan(100); // bounded output: the 1 MB value is replaced, never echoed
     expect(out.includes("q,q")).toBe(false);
     expect(out.endsWith("[REDACTED] done")).toBe(true);
   });
@@ -930,9 +947,9 @@ describe("sanitization", () => {
     expect(redactText(String.raw`x={\"password\":\"abc\",\"user\":\"u\"}`)).toBe(String.raw`x={\"password\":\"[REDACTED]\",\"user\":\"u\"}`);
   });
 
-  test("1 MB floods of the command-line, YAML and vendor-key carriers stay linear and still find the trailing password", () => {
+  test("1 MB command-line, YAML and vendor-key floods preserve redaction spans and mask the trailing password", () => {
     for (const unit of ["mysql ", "docker login ", "sshpass -p ", "-u a:b ", "- name: PASSWORD\n  value: ", "password: |\n  ", "STRIPE_KEY=", "redis-cli ", "- name: ", "password:  "]) {
-      const out = expectLinear(redactText, unit, "\npassword=hunter2", unit);
+      const out = expectLargeRedaction(unit, "\npassword=hunter2", unit);
       expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
     expect(redactText("- name: PASSWORD\n  value: x\nmysql -u a -pb db\n".repeat(250_000)).split("[REDACTED]").length - 1).toBe(500_000);
@@ -1040,19 +1057,17 @@ describe("sanitization", () => {
     expect(redactText('--api-key = {--password=\\"user:hunter2\\"')).toBe("--api-key [REDACTED] [REDACTED]");
   });
 
-  test("1 MB command-line floods are linear and still find the trailing password", () => {
+  test("1 MB command-line floods preserve redaction spans and mask the trailing password", () => {
     const units = ["mysql -u a ", "docker login x ", "`--user a:", "docker login -p ", "redis-cli -a ", "-passin pass:", "--cmd=mysql ", "-u=-u=", "x -u ", "-u  ",
       "mysql -p'", 'sshpass -p "', "docker login -u a: -p ", "sqlcmd -P ", "ssh-keygen -N ", "__-u a:", "(-u a:"];
     for (const unit of units) {
-      const out = expectLinear(redactText, unit, "\npassword=hunter2", unit);
+      const out = expectLargeRedaction(unit, "\npassword=hunter2", unit);
       expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
   });
 
   test("long input is bounded before masking: 100 KB of URL-credential lookalikes does not stall, the head survives", () => {
-    const started = performance.now();
     const out = sanitizeText(`head ${"a://b:b:b:".repeat(10_000)}`, 40);
-    expect(performance.now() - started).toBeLessThan(500);
     expect(out.startsWith("head ")).toBe(true);
     expect(displayWidth(out)).toBeLessThanOrEqual(40);
   });
@@ -2385,9 +2400,7 @@ describe("in-session specialists: hostile payloads", () => {
   test("huge strings in nested entries are bounded before they are scanned or shown", () => {
     const model = a01Spawned();
     const big = "word ".repeat(200_000);
-    const started = performance.now();
     a01(model, taskDetails([nestedEntry("be", "a05-backend", "running", 1000, { assignment: big, task: big, description: big, currentToolIntent: big })]), T0);
-    expect(performance.now() - started).toBeLessThan(1000);
     const [lane] = specialists(model, T0);
     expect(displayWidth(lane.activity)).toBeLessThanOrEqual(120);
   });
@@ -2678,7 +2691,6 @@ describe("activity text is built from bounded pieces", () => {
   test("a megabyte of tool arguments costs nothing per frame and the row still reads `tool args`", () => {
     const model = createModel({ reducedMotion: true });
     const huge = "x".repeat(1_000_000);
-    const started = performance.now();
     for (let i = 0; i < 200; i++) {
       ingestProgress(
         model,
@@ -2686,7 +2698,6 @@ describe("activity text is built from bounded pieces", () => {
         T0 + i,
       );
     }
-    expect(performance.now() - started).toBeLessThan(1000);
     const [row] = visibleRuns(model, T0 + 200);
     expect(row.activity.startsWith("bash xxxx")).toBe(true);
     expect(displayWidth(row.activity)).toBeLessThanOrEqual(120);

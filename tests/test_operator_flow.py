@@ -13,6 +13,7 @@ def _env():
     key = os.environ["SWARM_SIGNING_KEY"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("SWARM_")}
     env["SWARM_SIGNING_KEY"] = key
+    env["SWARM_PURE_PYTHON"] = "1"  # the oracle switch is a test setting, not an operator one: the scripts import the pure modules
     return env
 
 

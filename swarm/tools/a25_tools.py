@@ -51,10 +51,15 @@ limits, retention and restore-test age are caller inputs, never constants here.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
+from typing import Any, SupportsFloat
 
 from swarm.tools.support import respond
+
+Report = dict[str, Any]  # a tool result: JSON-shaped, its values are validated where they are read
+Finding = dict[str, str]  # one finding: {id, severity, subject, summary}
 
 SEVERITIES = ("blocker", "major", "minor", "info")
 _RANK = {name: index for index, name in enumerate(SEVERITIES)}
@@ -80,10 +85,10 @@ class _Invalid(Exception):
         self.message = message
 
 
-def _guard(work):
+def _guard(work: Callable[[], Report]) -> Callable[[], Report]:
     """Turn a semantic input problem raised inside ``work`` into the registry's INVALID_INPUT shape."""
 
-    def guarded() -> dict:
+    def guarded() -> Report:
         try:
             return work()
         except _Invalid as exc:
@@ -92,12 +97,18 @@ def _guard(work):
     return guarded
 
 
-def _dec(value) -> Decimal:
+def _reply(payload: dict[str, Any], work: Callable[[], Report]) -> Report:
+    """`support.respond` is annotated to return Any; this keeps every handler's return type explicit."""
+    result: Report = respond(payload, work)
+    return result
+
+
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written, so 0.1 is 0.1 and not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _round(value, digits: int = 4) -> float:
+def _round(value: SupportsFloat, digits: int = 4) -> float:
     return round(float(value), digits)
 
 
@@ -105,15 +116,15 @@ def _ceil(value: Decimal) -> int:
     return int(value.to_integral_value(rounding=ROUND_CEILING))
 
 
-def _finding(rule: str, severity: str, subject: str, summary: str) -> dict:
+def _finding(rule: str, severity: str, subject: str, summary: str) -> Finding:
     return {"id": rule, "severity": severity, "subject": subject, "summary": summary}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[Finding]) -> list[Finding]:
     return sorted(findings, key=lambda f: (_RANK[f["severity"]], f["id"], f["subject"], f["summary"]))
 
 
-def _status(findings: list[dict]) -> str:
+def _status(findings: list[Finding]) -> str:
     severities = {f["severity"] for f in findings}
     if severities & {"blocker", "major"}:
         return "fail"
@@ -147,7 +158,7 @@ def _unique(names: list[str], field: str, what: str) -> None:
         raise _Invalid(field, f"{field}: {what} names must be unique")
 
 
-def _fmt(value) -> str:
+def _fmt(value: SupportsFloat) -> str:
     """Number for finding text: no exponent, no 6-digit rounding that makes an exceeded limit look equal to the limit."""
     number = float(value)
     if number != 0 and abs(number) < 1e-4:
@@ -179,7 +190,7 @@ def _scaled(spec: str, total: int, field: str, label: str, what: str) -> int:
     return -(-value * total // 100)
 
 
-def _desired_healthy(replicas: int, min_spec, max_spec, label: str, fields: tuple[str, str]) -> int | None:
+def _desired_healthy(replicas: int, min_spec: str | None, max_spec: str | None, label: str, fields: tuple[str, str]) -> int | None:
     """Desired healthy pods the budget demands, or None when no budget is declared; fields = (min, max) input names."""
     if min_spec is not None and max_spec is not None:
         raise _Invalid(fields[0], f"{label}: min_available and max_unavailable are mutually exclusive in a PodDisruptionBudget")
@@ -193,7 +204,7 @@ def _desired_healthy(replicas: int, min_spec, max_spec, label: str, fields: tupl
 # --- 1. PodDisruptionBudget versus replicas ---------------------------------------------------------------------
 
 
-def pdb_check(payload: dict) -> dict:
+def pdb_check(payload: dict[str, Any]) -> Report:
     """Per workload: is a PodDisruptionBudget present, satisfiable, non-blocking and protective?
 
     desired healthy = minAvailable, or replicas - maxUnavailable (percentages rounded up); disruptions allowed
@@ -208,11 +219,11 @@ def pdb_check(payload: dict) -> dict:
       not-ready pods cannot be evicted, so a drain cannot remove the broken pod; AlwaysAllow lifts this).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         items = payload["workloads"]
         _unique([w["name"] for w in items], "workloads", "workload")
-        findings: list[dict] = []
-        budgets: list[dict] = []
+        findings: list[Finding] = []
+        budgets: list[dict[str, Any]] = []
         without = blocking = unsafe = 0
         for w in sorted(items, key=lambda w: w["name"]):
             name, replicas = w["name"], w["replicas"]
@@ -262,13 +273,13 @@ def pdb_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "workloads_checked": len(items), "without_pdb": without, "blocking": blocking,
                 "unsafe": unsafe, "budgets": budgets, "status": _status(findings), "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 2. topology spread and anti-affinity versus zone count ------------------------------------------------------
 
 
-def spread_check(payload: dict) -> dict:
+def spread_check(payload: dict[str, Any]) -> Report:
     """Spread constraints and anti-affinity of one workload versus its failure domains.
 
     Worst case pods in one zone: hard spread (DoNotSchedule, maxSkew s over D domains) bounds it by
@@ -280,7 +291,7 @@ def spread_check(payload: dict) -> dict:
     (major), unschedulable-replicas (blocker), replicas-below-zone-count (info), deprecated-zone-label (minor).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         workload, replicas = payload["workload"], payload["replicas"]
         if payload["min_available_replicas"] > replicas:
             raise _Invalid("min_available_replicas", "min_available_replicas cannot exceed replicas")
@@ -294,7 +305,7 @@ def spread_check(payload: dict) -> dict:
             raise _Invalid("topology_domains", f"topology_domains must include {ZONE_KEY}")
         zones = domains[zone_key]
         zone_keys = {ZONE_KEY, LEGACY_ZONE_KEY}
-        findings: list[dict] = []
+        findings: list[Finding] = []
         guarantees: list[int] = []
         hard_zone = soft_zone = legacy = False
         pending = 0
@@ -361,20 +372,20 @@ def spread_check(payload: dict) -> dict:
                 "pods_surviving_zone_loss": survivors, "unschedulable_replicas": pending, "status": _status(findings),
                 "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 3. probe sanity ---------------------------------------------------------------------------------------------
 
 
-def _probe(spec: dict | None) -> dict | None:
+def _probe(spec: dict[str, Any] | None) -> dict[str, Any] | None:
     if spec is None:
         return None
     return {**{key: spec.get(key, default) for key, default in PROBE_DEFAULTS.items()}, "kind": spec["kind"],
             "endpoint": spec.get("endpoint", "")}
 
 
-def probe_check(payload: dict) -> dict:
+def probe_check(payload: dict[str, Any]) -> Report:
     """Startup, liveness and readiness probes of one workload's containers.
 
     Budget = initialDelaySeconds + failureThreshold x periodSeconds (the Kubernetes docs size a startup probe as
@@ -387,12 +398,12 @@ def probe_check(payload: dict) -> dict:
     rejected by the API and answered with INVALID_INPUT.
     """
 
-    def work() -> dict:
+    def work() -> Report:
         workload, serves = payload["workload"], payload["serves_traffic"]
         expected = payload.get("expected_startup_seconds")
         containers = payload["containers"]
         _unique([c["name"] for c in containers], "containers", "container")
-        findings: list[dict] = []
+        findings: list[Finding] = []
         missing_readiness = probes = 0
         for container in sorted(containers, key=lambda c: c["name"]):
             name = container["name"]
@@ -435,13 +446,13 @@ def probe_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "containers_checked": len(containers), "missing_readiness": missing_readiness,
                 "probes_defined": probes, "status": _status(findings), "findings": [{**f, "subject": f"{workload}/{f['subject']}"} for f in findings]}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 4. backup coverage ------------------------------------------------------------------------------------------
 
 
-def backup_coverage(payload: dict) -> dict:
+def backup_coverage(payload: dict[str, Any]) -> Report:
     """Backup jobs versus the assets (volumes, etcd, databases, object stores) they must protect.
 
     Several jobs of one asset merge: shortest interval, longest retention, latest success, any off-site copy, latest
@@ -454,12 +465,12 @@ def backup_coverage(payload: dict) -> dict:
     (minor, older than restore_test_max_age_days).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         as_of = _ts(payload["as_of"], "as_of")
         assets = payload["assets"]
         _unique([a["name"] for a in assets], "assets", "asset")
         known = {a["name"] for a in assets}
-        merged: dict[str, dict] = {}
+        merged: dict[str, dict[str, Any]] = {}
         for job in payload["jobs"]:
             if job["asset"] not in known:
                 raise _Invalid("jobs", "a job references an asset that is not in assets")
@@ -468,15 +479,15 @@ def backup_coverage(payload: dict) -> dict:
             for stamp in (last, tested):
                 if stamp is not None and stamp > as_of:
                     raise _Invalid("jobs", "a job has a timestamp after as_of")
-            entry = merged.setdefault(job["asset"], {"interval": job["interval_hours"], "retention": job["retention_days"],
-                                                     "last": last, "offsite": job["offsite"], "tested": tested})
-            entry["interval"] = min(entry["interval"], job["interval_hours"])
-            entry["retention"] = max(entry["retention"], job["retention_days"])
-            entry["offsite"] = entry["offsite"] or job["offsite"]
+            combined = merged.setdefault(job["asset"], {"interval": job["interval_hours"], "retention": job["retention_days"],
+                                                         "last": last, "offsite": job["offsite"], "tested": tested})
+            combined["interval"] = min(combined["interval"], job["interval_hours"])
+            combined["retention"] = max(combined["retention"], job["retention_days"])
+            combined["offsite"] = combined["offsite"] or job["offsite"]
             for key, stamp in (("last", last), ("tested", tested)):
-                if stamp is not None and (entry[key] is None or stamp > entry[key]):
-                    entry[key] = stamp
-        findings: list[dict] = []
+                if stamp is not None and (combined[key] is None or stamp > combined[key]):
+                    combined[key] = stamp
+        findings: list[Finding] = []
         covered = protected = 0
         for asset in sorted(assets, key=lambda a: a["name"]):
             name, critical = asset["name"], asset["criticality"] == "critical"
@@ -521,13 +532,13 @@ def backup_coverage(payload: dict) -> dict:
                 "coverage_percent": _round(Decimal(covered) * 100 / Decimal(len(assets)), 2), "status": _status(findings),
                 "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 5. restore RTO estimate -------------------------------------------------------------------------------------
 
 
-def restore_rto(payload: dict) -> dict:
+def restore_rto(payload: dict[str, Any]) -> Report:
     """Restore time = fixed overhead + data / effective throughput + log replay, scaled by a safety margin.
 
     Effective throughput = per-stream throughput x (1 + (streams - 1) x efficiency), capped by network_limit_mib_s.
@@ -537,7 +548,7 @@ def restore_rto(payload: dict) -> dict:
     max_data_gib_for_target is the largest data size that still meets the target with the same rates and margin.
     """
 
-    def work() -> dict:
+    def work() -> Report:
         size, throughput = _dec(payload["data_size_gib"]), _dec(payload["restore_throughput_mib_s"])
         streams, efficiency = payload["parallel_streams"], _dec(payload["parallel_efficiency"])
         replay_gib = _dec(payload["replay_size_gib"])
@@ -555,7 +566,7 @@ def restore_rto(payload: dict) -> dict:
         available = target / margin - overhead - replay_min
         max_data = available * 60 * rate / 1024 if available > 0 else Decimal(0)
         meets = with_margin <= target
-        findings: list[dict] = []
+        findings: list[Finding] = []
         if estimated > target:
             findings.append(_finding("rto-exceeds-target", "blocker", "restore",
                                      f"estimated {_fmt(estimated)} min exceeds the {_fmt(target)} min RTO target"))
@@ -566,7 +577,7 @@ def restore_rto(payload: dict) -> dict:
         elif target - with_margin < target / 10:
             findings.append(_finding("thin-rto-headroom", "minor", "restore",
                                      f"only {_fmt(target - with_margin)} min of the {_fmt(target)} min target remain after the margin"))
-        if network_bound:
+        if network_bound and limit is not None:
             findings.append(_finding("network-bound", "info", "restore",
                                      f"{_fmt(raw_rate)} MiB/s of parallel restore is capped by the {_fmt(limit)} MiB/s network limit"))
         findings = _ordered(findings)
@@ -576,13 +587,13 @@ def restore_rto(payload: dict) -> dict:
                 "max_data_gib_for_target": _round(max_data, 2), "meets_target": meets, "status": _status(findings),
                 "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 6. chaos experiment spec check ------------------------------------------------------------------------------
 
 
-def chaos_spec_check(payload: dict) -> dict:
+def chaos_spec_check(payload: dict[str, Any]) -> Report:
     """Is a chaos experiment safe to run? Steady state, blast radius, abort conditions, window, approvals.
 
     Required autonomy follows the A25 ceiling: staging experiments L2, production experiments L3. The experiment
@@ -594,7 +605,7 @@ def chaos_spec_check(payload: dict) -> dict:
     error-budget-gate-not-passed (blocker); abort-not-tied-to-steady-state (minor); customer-impact (info).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         production = payload["environment"] == "production"
         start = _ts(payload["start"], "start")
         end = _after(start, timedelta(minutes=payload["duration_minutes"]), "start")
@@ -603,7 +614,7 @@ def chaos_spec_check(payload: dict) -> dict:
             raise _Invalid("affected_instances", "affected_instances cannot exceed total_instances")
         blast = Decimal(affected) * 100 / Decimal(total)
         name = payload["name"]
-        findings: list[dict] = []
+        findings: list[Finding] = []
         if not payload["steady_state"]:
             findings.append(_finding("no-steady-state-hypothesis", "blocker", name,
                                      "no steady-state hypothesis: nothing defines what 'healthy' means during the experiment"))
@@ -645,13 +656,13 @@ def chaos_spec_check(payload: dict) -> dict:
                 "required_autonomy": "L3" if production else "L2",
                 "blockers": sum(f["severity"] == "blocker" for f in findings), "status": _status(findings), "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 7. FMEA risk priority numbers -------------------------------------------------------------------------------
 
 
-def fmea_rpn(payload: dict) -> dict:
+def fmea_rpn(payload: dict[str, Any]) -> Report:
     """FMEA: RPN = severity x occurrence x detection (each 1-10, detection 10 = hardest to detect).
 
     A mode needs action when RPN >= rpn_threshold or severity >= 9 (house policy modelled on AIAG 4th-edition practice
@@ -662,14 +673,14 @@ def fmea_rpn(payload: dict) -> dict:
     the AIAG-VDA 2019 handbook replaces it with Action Priority tables, so treat the threshold as a team policy.
     """
 
-    def work() -> dict:
+    def work() -> Report:
         modes = payload["modes"]
         threshold = payload["rpn_threshold"]
         _unique([m["id"] for m in modes], "modes", "failure mode")
         ranked = sorted(({"id": m["id"], "rpn": m["severity"] * m["occurrence"] * m["detection"], "severity": m["severity"],
                           "occurrence": m["occurrence"], "detection": m["detection"]} for m in modes),
                         key=lambda m: (-m["rpn"], -m["severity"], m["id"]))
-        findings: list[dict] = []
+        findings: list[Finding] = []
         total = sum(m["rpn"] for m in ranked)
         cumulative = pareto = 0
         for mode in ranked:
@@ -696,13 +707,13 @@ def fmea_rpn(payload: dict) -> dict:
                 "max_rpn": ranked[0]["rpn"], "total_rpn": total, "pareto_count": pareto, "ranked": ranked,
                 "status": _status(findings), "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 8. error-budget gate for chaos experiments ------------------------------------------------------------------
 
 
-def chaos_budget_gate(payload: dict) -> dict:
+def chaos_budget_gate(payload: dict[str, Any]) -> Report:
     """Go / no-go of a chaos experiment against the error budget (feed budget_remaining_fraction from A13's obs_budget_remaining).
 
     Worst-case cost as a fraction of the whole window budget = expected_error_ratio x duration /
@@ -714,7 +725,7 @@ def chaos_budget_gate(payload: dict) -> dict:
     are always go. max_duration_minutes is the longest run the budget arithmetic alone allows (0 when none).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         slo, window_days = _dec(payload["slo_target"]), payload["window_days"]
         window_minutes = Decimal(window_days * 1440)
         duration, ratio = _dec(payload["experiment_duration_minutes"]), _dec(payload["expected_error_ratio"])
@@ -725,7 +736,7 @@ def chaos_budget_gate(payload: dict) -> dict:
         after = remaining - cost
         spendable = min(max_cost, remaining - reserve)
         max_duration = spendable * budget_minutes / ratio if spendable > 0 else Decimal(0)
-        findings: list[dict] = []
+        findings: list[Finding] = []
         if payload["environment"] == "staging":
             findings.append(_finding("staging-not-gated", "info", "staging", "staging experiments do not spend the production error budget"))
         else:
@@ -748,13 +759,13 @@ def chaos_budget_gate(payload: dict) -> dict:
                 "remaining_after_fraction": _round(after, 6), "max_duration_minutes": _round(max_duration, 2),
                 "status": "pass" if go else "fail", "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 9. graceful shutdown ----------------------------------------------------------------------------------------
 
 
-def shutdown_check(payload: dict) -> dict:
+def shutdown_check(payload: dict[str, Any]) -> Report:
     """terminationGracePeriodSeconds versus the time shutdown needs: preStop hook, then SIGTERM drain, sequentially.
 
     required = prestop_seconds + app_drain_seconds. When the pod serves traffic and stops accepting it on SIGTERM,
@@ -766,7 +777,7 @@ def shutdown_check(payload: dict) -> dict:
     drain, else minor), grace-exceeds-drain-timeout (major, grace > node drain timeout).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         grace, prestop, drain = payload["termination_grace_period_seconds"], payload["prestop_seconds"], payload["app_drain_seconds"]
         propagation = payload["endpoint_propagation_seconds"]
         serves, keeps = payload["serves_traffic"], payload["keeps_serving_after_sigterm"]
@@ -776,7 +787,7 @@ def shutdown_check(payload: dict) -> dict:
         effective_prestop = max(prestop, propagation) if serves and not keeps else prestop
         base = effective_prestop + drain
         recommended = base + max(SHUTDOWN_MIN_MARGIN_S, _ceil(Decimal(base) * SHUTDOWN_MARGIN_FRACTION))
-        findings: list[dict] = []
+        findings: list[Finding] = []
         if grace == 0:
             findings.append(_finding("grace-zero", "blocker", workload, "terminationGracePeriodSeconds is 0: the container is killed immediately"))
         elif required > grace:
@@ -799,13 +810,13 @@ def shutdown_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "required_seconds": required, "margin_seconds": margin, "recommended_grace_seconds": recommended,
                 "status": _status(findings), "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 10. DR drill cadence ----------------------------------------------------------------------------------------
 
 
-def drill_cadence(payload: dict) -> dict:
+def drill_cadence(payload: dict[str, Any]) -> Report:
     """Are DR drills run often enough, with evidence, and do they meet RTO and RPO?
 
     A drill counts for cadence only when its outcome is 'passed' and, if the requirement demands evidence, an
@@ -816,11 +827,11 @@ def drill_cadence(payload: dict) -> dict:
     rpo-not-measured (minor), drill-without-requirement (info, catches scenario typos).
     """
 
-    def work() -> dict:
+    def work() -> Report:
         as_of = _ts(payload["as_of"], "as_of")
         requirements = payload["requirements"]
         _unique([r["scenario"] for r in requirements], "requirements", "scenario")
-        by_scenario: dict[str, list[tuple[datetime, dict]]] = {}
+        by_scenario: dict[str, list[tuple[datetime, Report]]] = {}
         first_drill: dict[str, int] = {}
         for index, drill in enumerate(payload["drills"]):
             when = _ts(drill["performed_at"], "drills")
@@ -828,8 +839,8 @@ def drill_cadence(payload: dict) -> dict:
                 raise _Invalid("drills", "a drill is dated after as_of")
             by_scenario.setdefault(drill["scenario"], []).append((when, drill))
             first_drill.setdefault(drill["scenario"], index)
-        findings: list[dict] = []
-        schedule: list[dict] = []
+        findings: list[Finding] = []
+        schedule: list[Report] = []
         compliant = overdue = never = 0
         for req in sorted(requirements, key=lambda r: r["scenario"]):
             name, interval = req["scenario"], req["max_interval_days"]
@@ -883,13 +894,13 @@ def drill_cadence(payload: dict) -> dict:
         return {"state": "SUCCESS", "scenarios_total": len(requirements), "compliant": compliant, "overdue": overdue,
                 "never_drilled": never, "schedule": schedule, "status": _status(findings), "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 11. load-shedding policy ------------------------------------------------------------------------------------
 
 
-def load_shed_check(payload: dict) -> dict:
+def load_shed_check(payload: dict[str, Any]) -> Report:
     """Load-shedding policy of one service: demand by Little's law, priority-ordered admission, queue bounds.
 
     needed concurrency = ceil(expected_rps x p99_service_ms / 1000): Little's law L = lambda x W, with the p99 service
@@ -904,7 +915,7 @@ def load_shed_check(payload: dict) -> dict:
     It is a steady-state model: bursts, retries and warm-up are out of scope.
     """
 
-    def work() -> dict:
+    def work() -> Report:
         capacity, timeout = payload["capacity_concurrency"], _dec(payload["client_timeout_ms"])
         classes = payload["classes"]
         _unique([c["name"] for c in classes], "classes", "class")
@@ -924,7 +935,7 @@ def load_shed_check(payload: dict) -> dict:
             take = min(row["cap"] - row["admitted"], left)
             row["admitted"] += take
             left -= take
-        findings: list[dict] = []
+        findings: list[Finding] = []
         reserved_total = sum(c["reserved_concurrency"] for c in classes)
         if reserved_total > capacity:
             findings.append(_finding("reservations-exceed-capacity", "blocker", "capacity",
@@ -962,13 +973,13 @@ def load_shed_check(payload: dict) -> dict:
                 "overloaded": any(r["admitted"] < r["needed"] for r in rows), "shed_plan": plan, "status": _status(findings),
                 "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))
 
 
 # --- 12. StatefulSet quorum safety -------------------------------------------------------------------------------
 
 
-def quorum_safety(payload: dict) -> dict:
+def quorum_safety(payload: dict[str, Any]) -> Report:
     """Quorum survival of a replicated StatefulSet (etcd, ZooKeeper, Consul, Raft or Kafka-style) across zones and drains.
 
     quorum = floor(n / 2) + 1 unless quorum_size overrides it; fault tolerance = n - quorum. A zone may hold at most
@@ -988,7 +999,7 @@ def quorum_safety(payload: dict) -> dict:
     witnesses, rack awareness and leader placement are out of scope.
     """
 
-    def work() -> dict:
+    def work() -> Report:
         workload, n = payload["workload"], payload["replicas"]
         zones = payload["members_per_zone"]
         if sum(zones) != n:
@@ -1008,7 +1019,7 @@ def quorum_safety(payload: dict) -> dict:
                                    ("min_available", "max_unavailable"))
         worst = max(zones)
         survives = n - worst >= quorum
-        findings: list[dict] = []
+        findings: list[Finding] = []
         majority = n // 2 + 1
         if custom is not None and custom < majority and consensus:
             findings.append(_finding("quorum-below-majority", "blocker", workload,
@@ -1054,4 +1065,4 @@ def quorum_safety(payload: dict) -> dict:
                 "min_zones_required": -(-n // tolerance) if tolerance > 0 else -1, "pdb_disruptions_allowed": allowed,
                 "status": _status(findings), "findings": findings}
 
-    return respond(payload, _guard(work))
+    return _reply(payload, _guard(work))

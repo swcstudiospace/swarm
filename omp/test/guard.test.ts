@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { callingAgent } from "../src/context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, parseSignerDenyPaths, RULES, ruleReason, SWARM_SLUGS } from "../src/guard.ts";
+import { swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
@@ -248,11 +249,32 @@ describe("fail", () => {
     expect(run(call("bash", { command: "ls" }), brokenBranch(entries))).toBeUndefined();
   });
 
-  test("a guard throw with an unreadable session log returns undefined (swarm marker not established)", () => {
-    process.env.SWARM_TASK_ID = "T-1";
-    const { run } = guardHandler({ activeTools: ["task"] });
-    const unreadable: ExtensionContext = { cwd: CWD, sessionManager: { getEntries: throwing, getBranch: throwing } };
-    expect(run(call("bash", {}), unreadable)).toBeUndefined();
+  const unreadableSession: ExtensionContext = {
+    cwd: CWD,
+    sessionManager: {
+      getEntries: () => {
+        throw new Error("session log unreadable");
+      },
+      getBranch: () => {
+        throw new Error("branch must not be read");
+      },
+    },
+  };
+
+  test("an unreadable session log without a swarm marker leaves main-session tools unaffected", () => {
+    const { pi, run } = guardHandler({ activeTools: ["task"] });
+    expect(run(call("bash", {}), unreadableSession)).toBeUndefined();
+    expect(pi.runtimeCalls).toEqual([]);
+  });
+
+  test.each(["SWARM_TASK_ID", "SWARM_AGENT"])("an unreadable session log with %s fails closed before reading active tools", (marker) => {
+    process.env[marker] = marker === "SWARM_TASK_ID" ? "T-1" : "a05-backend";
+    const { pi, run } = guardHandler({ activeTools: ["task"] });
+    expect(run(call("bash", {}), unreadableSession)).toEqual({
+      block: true,
+      reason: `${GUARD_ERROR_PREFIX}session log unreadable)`,
+    });
+    expect(pi.runtimeCalls).toEqual([]);
   });
 
   test.each([
@@ -555,7 +577,11 @@ describe("HOOK-02", () => {
     expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
-  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 30_000 }, () => {
+  // Budget covers the differential leg and the fresh-process scaling probe, which take about 1-2 minutes under host load.
+  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 600_000 }, () => {
+    // Nested `$(…)` chain: each level's body holds the next level's substitution, innermost body `git status`.
+    // Each level is 14 bytes; the body text is padded so every cut body carries real words.
+    const nestedSubstitution = (levels: number): string => `${"$(echo x y z ".repeat(levels)}git status${")".repeat(levels)}`;
     // Same-size differential per shape: [name, adversarial input, expected for adversarial].
     // Adversarial keeps the original 1 MB inputs, so full-scale correctness coverage is unchanged.
     const shapes: [string, string, string[] | undefined][] = [
@@ -569,6 +595,7 @@ describe("HOOK-02", () => {
       ["quoted pairs", "'a b' ".repeat(150_000), undefined],
       ["brace groups", "x { ".repeat(200_000), undefined],
       ["heredoc lines", `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`, undefined],
+      ["nested substitution", nestedSubstitution(71_000), undefined],
     ];
     // Same-shape builder for the scaling leg: rebuilds each adversarial shape
     // at an arbitrary byte size with the same repeat unit, so the small and
@@ -591,6 +618,7 @@ describe("HOOK-02", () => {
           const header = "cat <<EOF\n".repeat(1000);
           return header + "x\n".repeat(Math.max(1, Math.ceil((bytes - header.length) / 2)));
         }
+        case "nested substitution": return nestedSubstitution(Math.max(1, Math.floor((bytes - 10) / 14)));
         default: throw new Error(`scalingFor: unknown shape ${name}`);
       }
     };
@@ -608,10 +636,11 @@ describe("HOOK-02", () => {
     // reference; the WR-09 backtracking class costs ~1000x or more, so a 40x
     // cap catches a genuine regression decisively with wide headroom. No
     // absolute wall-clock bound is asserted. The { timeout } above is a
-    // runaway budget, not a correctness assertion: a genuine superlinear hang
-    // still fails fast (via the ratio or the timeout) instead of hanging CI,
-    // and normal runs never approach it. Best-of-3 keeps the full-suite cost
-    // at ~2-4s even under contention from the ~1400 preceding tests.
+    // runaway budget, not a correctness assertion, and it is not headroom
+    // over a fast test: the 1 MB reference inputs dominate, and the
+    // differential leg plus the fresh-process scaling probe take one to
+    // three minutes under host load. A genuine superlinear hang still fails
+    // (via the ratio or the budget) instead of hanging CI.
     const LINEAR_CAP = 40;
     const REPS = 3;
     const BENIGN_UNIT = "git status ; ";
@@ -644,36 +673,51 @@ describe("HOOK-02", () => {
     expect(over).toEqual([]);
     // Same-shape scaling leg: the differential above cannot catch shared-path
     // quadratic work, because both sides of an equal-size comparison grow
-    // together and their ratio stays flat (~1x) even when absolute cost is
-    // superlinear. So each adversarial shape is also timed against ITSELF at
-    // two sizes, both above the measured ~200 KB regime knee: SMALL ~400 KB
-    // vs LARGE ~800 KB, i.e. a size ratio of ~2x. Linear work scales with
-    // size (~2x time); shared-path quadratic work scales ~4x. SCALING_CAP 3x
-    // is the size ratio (2x) with 1.5x headroom: linear passes with margin,
-    // pure quadratic fails decisively. Same interleaved best-of-N protocol as
-    // the differential leg, and likewise no absolute wall-clock assertion.
-    const SMALL_BYTES = 400_000;
-    const LARGE_BYTES = 800_000;
+    // together. So each adversarial shape is timed against ITSELF at four sizes
+    // (200 KB, 400 KB, 800 KB, 1.6 MB) in a fresh bun process: earlier tests in
+    // this file leave a large heap and warm JIT state, which swung single samples
+    // several-fold on a loaded host. CPU time, best of 5 per size. Linear work
+    // doubles per doubling of input; quadratic work quadruples. The check is the
+    // MEDIAN of the three per-doubling growth factors, so one noisy size cannot
+    // fail it, and it must stay below SCALING_CAP (3x: linear reads ~2x, quadratic ~4x).
+    const SIZES = [200_000, 400_000, 800_000, 1_600_000];
     const SCALING_CAP = 3;
-    const scalingOver: string[] = [];
-    for (const [name] of shapes) {
-      const small = scalingFor(name, SMALL_BYTES);
-      const large = scalingFor(name, LARGE_BYTES);
-      let smallMs = Infinity;
-      let largeMs = Infinity;
-      for (let i = 0; i < REPS; i++) {
-        let t = performance.now();
-        normalize(small);
-        const sMs = performance.now() - t;
-        if (sMs < smallMs) smallMs = sMs;
-        t = performance.now();
-        normalize(large);
-        const lMs = performance.now() - t;
-        if (lMs < largeMs) largeMs = lMs;
+    const shapeNames = shapes.map(([name]) => name);
+    const guardPath = new URL("../src/guard.ts", import.meta.url).pathname;
+    const probe = `
+      import { readFileSync } from "node:fs";
+      import { normalize } from ${JSON.stringify(guardPath)};
+      const inputs = JSON.parse(readFileSync(0, "utf8"));
+      const cpuMs = (run) => {
+        const before = process.cpuUsage();
+        run();
+        const used = process.cpuUsage(before);
+        return (used.user + used.system) / 1000;
+      };
+      const out = {};
+      for (const [name, inputsAtSizes] of Object.entries(inputs)) {
+        out[name] = inputsAtSizes.map((input) => {
+          let best = Infinity;
+          for (let i = 0; i < 5; i++) {
+            Bun.gc(true);
+            best = Math.min(best, cpuMs(() => normalize(input)));
+          }
+          return best;
+        });
       }
-      const sizeRatio = large.length / small.length;
-      const timeRatio = largeMs / smallMs;
-      if (timeRatio >= SCALING_CAP) scalingOver.push(`${name}: ${timeRatio.toFixed(2)}x time for ${sizeRatio.toFixed(2)}x size (large ${largeMs.toFixed(1)}ms @ ${large.length}B / small ${smallMs.toFixed(1)}ms @ ${small.length}B, best of ${REPS}, cap ${SCALING_CAP}x)`);
+      console.log(JSON.stringify(out));
+    `;
+    const sizes = Object.fromEntries(shapeNames.map((name) => [name, SIZES.map((bytes) => scalingFor(name, bytes))]));
+    const probeRun = Bun.spawnSync([process.execPath, "-e", probe], { stdin: new TextEncoder().encode(JSON.stringify(sizes)), stdout: "pipe", stderr: "pipe" });
+    if (probeRun.exitCode !== 0) throw new Error(`scaling probe exited ${probeRun.exitCode}: ${probeRun.stderr.toString()}`);
+    const measuredLine = probeRun.stdout.toString().trim().split("\n").at(-1) ?? "{}";
+    const measured = JSON.parse(measuredLine) as Record<string, number[]>;
+    const scalingOver: string[] = [];
+    for (const name of shapeNames) {
+      const times = measured[name];
+      const growth = times.slice(1).map((t, i) => t / times[i]).sort((a, b) => a - b);
+      const medianGrowth = growth[Math.floor(growth.length / 2)];
+      if (medianGrowth >= SCALING_CAP) scalingOver.push(`${name}: median ${medianGrowth.toFixed(2)}x per size doubling (CPU ms at ${SIZES.join(" / ")} B: ${times.map((t) => t.toFixed(1)).join(" / ")}; cap ${SCALING_CAP}x)`);
     }
     expect(scalingOver).toEqual([]);
   });
@@ -704,6 +748,13 @@ describe("HOOK-02", () => {
     const a05 = agentCtx(CWD, B05, [], false);
     expect(run(bash(`rm -rf ${tmpdir()}/build-cache`), a05)).toBeUndefined();
     expect((run(bash(`rm -rf ${tmpdir()}`), a05) as { reason?: string }).reason).toEndWith(": rm-rf-protected)");
+  });
+
+  test("OSA-01: a substitution past the 256-per-level cut cap is still judged, never left in the command text", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const a05 = agentCtx(CWD, B05, [], false);
+    const res = run(bash("$(:) ".repeat(257) + "`rm -rf /etc -f`"), a05) as { block?: boolean };
+    expect(res?.block).toBe(true);
   });
 
   /** WR-08: read-only kubectl/helm forms and markers that only occur in file or resource names pass for A11. */
@@ -2028,6 +2079,13 @@ describe("HOOK-03 shell twin and D-08", () => {
     },
   );
 
+  test("an uncompilable glob such as [z-a]x may name a protected component, so the shell write is refused in a swarm", () => {
+    expect(guardToolCall(bash("echo x > [z-a]x"), facts(B05))).toEqual({
+      block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-shell)",
+    });
+    expect(guardToolCall(bash("echo x > [z-a]x"), facts(undefined))).toBeUndefined();
+  });
+
   test.each([
     "cat .swarm/tasks.db", "cp .omp/config.yml /tmp/x.yml", "echo x > out.txt", "ls 2>&1 | tee log.txt",
     // WR-06 negatives: reads and mutations elsewhere
@@ -2763,5 +2821,21 @@ describe("private signer file reads", () => {
   ])("comparison tools that print signer operands are refused: %s", (command) => {
     expect(guardToolCall(call("bash", { command }), facts)).toEqual(blockedShell);
     expect(guardToolCall(call("bash", { command: "diff src/guard.ts /dev/null" }), facts)).toBeUndefined();
+  });
+});
+
+describe("HOOK-01 fail-open is traced (TS-16)", () => {
+  test("a throwing classifier leaves the prompt untouched and logs one debug entry carrying the error", () => {
+    const debug: { message: string; detail: unknown }[] = [];
+    const log = { debug: (message: string, detail?: unknown) => void debug.push({ message, detail }) };
+    const boom = () => {
+      throw new Error("classifier exploded");
+    };
+    const out = swarmContext({ prompt: "implement the billing module", systemPrompt: ["base"] }, fakeCtx("/nonexistent-hook-cwd"), {}, boom, log);
+    expect(out).toBeUndefined();
+    expect(debug).toHaveLength(1);
+    expect(debug[0].message).toContain("classifier");
+    expect(debug[0].detail).toBeInstanceOf(Error);
+    expect((debug[0].detail as Error).message).toBe("classifier exploded");
   });
 });

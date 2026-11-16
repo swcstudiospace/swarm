@@ -11,6 +11,7 @@ Tools:
 from __future__ import annotations
 
 import math
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -38,8 +39,8 @@ def _unresolved(deps: dict[str, set[str]]) -> set[str]:
     return {tid for tid, count in pending.items() if count > 0}
 
 
-def dag_blocked(payload: dict) -> dict:
-    def work() -> dict:
+def dag_blocked(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         tasks = payload["tasks"]
         ids = [task["id"] for task in tasks]
         if len(set(ids)) != len(ids):
@@ -50,7 +51,7 @@ def dag_blocked(payload: dict) -> dict:
         unresolved = _unresolved(deps)
         ready: list[str] = []
         waiting: list[str] = []
-        blocked: list[dict] = []
+        blocked: list[dict[str, Any]] = []
         for tid in sorted(state):
             if state[tid] not in DISPATCHABLE:
                 continue
@@ -78,8 +79,8 @@ def dag_blocked(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def gate_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def gate_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         rules = payload["rules"]
         risks = [rule["risk"] for rule in rules]
         if len(set(risks)) != len(risks):
@@ -104,8 +105,8 @@ def gate_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def rework_bound(payload: dict) -> dict:
-    def work() -> dict:
+def rework_bound(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         cap = payload.get("max_loops", DEFAULT_MAX_LOOPS)
         loops = payload["rework_loops"]
         if payload["blocking_findings"] == 0:
@@ -135,7 +136,7 @@ def _is_int(value: object) -> bool:
 
 
 def _is_num(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and (isinstance(value, int) or math.isfinite(value))
 
 
 def _shown_ratio(ratio: float, breached: bool) -> float:
@@ -144,14 +145,14 @@ def _shown_ratio(ratio: float, breached: bool) -> float:
     return shown if breached or shown < 1.0 else 0.9999
 
 
-def dispatch_batch(payload: dict) -> dict:
+def dispatch_batch(payload: dict[str, Any]) -> dict[str, Any]:
     """Pick which ready tasks start this round: per-agent ceiling first, then the global cap.
 
     Order is priority (higher first, default 0), then the order supplied. The per-agent test is
     swarm.blast_radius.take_agent_slot, the same function the runner uses.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         from swarm.blast_radius import take_agent_slot
 
         ready, running, ceilings = payload["ready"], payload["running"], payload["ceilings"]
@@ -179,7 +180,7 @@ def dispatch_batch(payload: dict) -> dict:
         counts = dict(running)
         ordered = sorted(enumerate(ready), key=lambda row: (-row[1].get("priority", 0), row[0]))
         start: list[str] = []
-        deferred: list[dict] = []
+        deferred: list[dict[str, Any]] = []
         for _index, task in ordered:
             agent, ceiling = task["agent_id"], ceilings[task["agent_id"]]
             if not take_agent_slot(dict(counts), agent, ceiling):
@@ -200,14 +201,14 @@ def dispatch_batch(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def budget_guard(payload: dict) -> dict:
+def budget_guard(payload: dict[str, Any]) -> dict[str, Any]:
     """Decide OK, WARN, HARD_STOP, or ESCALATED from usage against budget and earlier breaches.
 
     A dimension breaches at 100 % of its budget. The first breach hard-stops (checkpoint, requeue once with an
     annotated budget); a breach after a prior one escalates (agents/A01 section 3, rule 5).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         budget, usage = payload["budget"], payload["usage"]
         warn_at = payload.get("warn_at", WARN_AT_DEFAULT)
         if not _is_num(warn_at) or not 0 < warn_at < 1:
@@ -220,7 +221,10 @@ def budget_guard(payload: dict) -> dict:
                 return {"state": "INVALID_INPUT", "field": "budget", "message": f"max_{dim} must be a number above 0"}
             if not _is_num(used) or used < 0:
                 return {"state": "INVALID_INPUT", "field": "usage", "message": f"{dim} must be a number >= 0"}
-            ratio = used / limit
+            try:
+                ratio = used / limit
+            except OverflowError:  # an int too large for a float ratio: reported below as not comparable
+                ratio = math.inf
             if not math.isfinite(ratio):
                 return {"state": "INVALID_INPUT", "field": "usage", "message": f"{dim} is too large relative to max_{dim} to compare"}
             raw[dim] = ratio

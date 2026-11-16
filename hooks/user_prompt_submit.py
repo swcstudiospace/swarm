@@ -8,9 +8,14 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Prompts containing these (case-insensitive) are owned by other plugins or explicitly opt out.
 NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
+# Uplift wrappers, mirrored from swarm/signal_detector.py UPLIFT_ROOT. This file must run without that import, so the fallback
+# below uses it: a wrapped prompt is silent, since the fallback cannot unescape <ORIGINAL> the way the primary classifier does.
+UPLIFT_ROOT = re.compile(r"^<(BUILD_PROMPT|FIX_PROMPT|RESEARCH_PROMPT|CHANGE_PROMPT|UPLIFTED_PROMPT|uplifted|ultrathink)\b", re.I | re.A)
 
 # Tags the /swarm dispatch prompt so the hook never re-steers the swarm's own dispatch.
 DISPATCH_MARKER = "[agent-swarm:dispatch]"
@@ -55,11 +60,14 @@ def classify(prompt: str) -> bool:
         from swarm.signal_detector import classify as _sd_classify
         res = _sd_classify(prompt)
         return res == "sdlc"
-    except Exception:
-        # fail-open fallback to original logic
+    except Exception as exc:
+        # fail-open fallback to original logic; the reason goes to stderr so a broken import is visible, not silent
+        print(f"user_prompt_submit: swarm.signal_detector unavailable ({exc!r}); using fallback classifier", file=sys.stderr)
         trimmed = prompt.strip()
         low = trimmed.lower()
         if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
+            return False
+        if UPLIFT_ROOT.match(trimmed):
             return False
         if DISPATCH_MARKER in low or any(n in low for n in NEGATIVE):
             return False
@@ -76,7 +84,10 @@ def main() -> int:
             print("{}")
             return 0
         prompt = extract_prompt(payload)
-        if os.environ.get("SWARM_CHILD") == "1":
+        if os.environ.get("SWARM_DISABLED") == "1":
+            # Operator kill switch (SWARM_DISABLED=1): no swarm context, no kickoff, same as omp's extension.
+            print("{}")
+        elif os.environ.get("SWARM_CHILD") == "1":
             # Headless swarm agent session: never re-inject orchestration or re-kick the swarm.
             print("{}")
         elif classify(prompt):
@@ -85,7 +96,8 @@ def main() -> int:
             json.dump({"additionalContext": CONTEXT}, sys.stdout)
         else:
             print("{}")
-    except Exception:
+    except Exception as exc:
+        print(f"user_prompt_submit: {exc!r}; injecting nothing", file=sys.stderr)
         print("{}")
     return 0
 

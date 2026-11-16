@@ -12,6 +12,7 @@ import math
 import re
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -55,8 +56,8 @@ def _tokens(text: str) -> frozenset[str]:
     return frozenset(kept)
 
 
-def invest_score(payload: dict) -> dict:
-    def work() -> dict:
+def invest_score(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         words = _WORD.findall(payload["story"].lower())
         if not words:
             return {"state": "INVALID_INPUT", "field": "story", "message": "story must contain words"}
@@ -76,8 +77,8 @@ def invest_score(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def ambiguity_scan(payload: dict) -> dict:
-    def work() -> dict:
+def ambiguity_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         lowered = payload["text"].lower()
         if not _WORD.search(lowered):
             return {"state": "INVALID_INPUT", "field": "text", "message": "text must contain words"}
@@ -102,8 +103,8 @@ def ambiguity_scan(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def story_duplicates(payload: dict) -> dict:
-    def work() -> dict:
+def story_duplicates(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         stories = payload["stories"]
         ids = [story["id"] for story in stories]
         if len(set(ids)) != len(ids):
@@ -132,8 +133,8 @@ def story_duplicates(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def wsjf_rank(payload: dict) -> dict:
-    def work() -> dict:
+def wsjf_rank(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         items = payload["items"]
         ids = [item["id"] for item in items]
         if len(set(ids)) != len(ids):
@@ -160,8 +161,8 @@ def wsjf_rank(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def criteria_testability(payload: dict) -> dict:
-    def work() -> dict:
+def criteria_testability(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         criteria = payload["criteria"]
         ids = [criterion["id"] for criterion in criteria]
         if len(set(ids)) != len(ids):
@@ -188,8 +189,8 @@ def criteria_testability(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def traceability_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def traceability_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         requirements = payload["requirement_ids"]
         if len(set(requirements)) != len(requirements):
             return {"state": "INVALID_INPUT", "field": "requirement_ids", "message": "requirement ids must be unique"}
@@ -213,8 +214,8 @@ def traceability_coverage(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def change_impact(payload: dict) -> dict:
-    def work() -> dict:
+def change_impact(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         affected = set(payload["affected_ids"])
         committed = set(payload["committed_ids"])
         tasks = sorted({link["task_id"] for link in payload["task_links"] if link["requirement_id"] in affected})
@@ -232,8 +233,8 @@ def change_impact(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def nfr_coverage(payload: dict) -> dict:
-    def work() -> dict:
+def nfr_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         nfrs = payload["nfrs"]
         present = {nfr["kind"] for nfr in nfrs}
         required = list(dict.fromkeys(payload.get("required_kinds", _NFR_KINDS)))
@@ -332,8 +333,8 @@ class _Claimed:
         self.kinds.insert(index, kind)
 
 
-def pii_scan(payload: dict) -> dict:
-    def work() -> dict:
+def pii_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         text = payload["text"]
         if not text.strip():
             return {"state": "INVALID_INPUT", "field": "text", "message": "text must contain non-whitespace characters"}
@@ -391,8 +392,8 @@ def _parse_timestamp(value: str) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def clarification_window(payload: dict) -> dict:
-    def work() -> dict:
+def clarification_window(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         now = _parse_timestamp(payload["now"])
         if now is None:
             return {"state": "INVALID_INPUT", "field": "now", "message": "now must be an ISO 8601 timestamp"}
@@ -459,20 +460,20 @@ def _finite_number(text: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _same_value(left: dict, right: dict) -> bool:
+def _same_value(left: dict[str, Any], right: dict[str, Any]) -> bool:
     if left["num"] is not None and right["num"] is not None:
-        return left["num"] == right["num"]
-    return left["value"].strip().casefold() == right["value"].strip().casefold()
+        return bool(left["num"] == right["num"])
+    return bool(left["value"].strip().casefold() == right["value"].strip().casefold())
 
 
-def _violates(eq: dict, bound: dict) -> bool:
+def _violates(eq: dict[str, Any], bound: dict[str, Any]) -> bool:
     if eq["num"] is None:
         return False  # a non-numeric value cannot be compared with a numeric bound
     op, limit, value = bound["op"], bound["num"], eq["num"]
     return not {"lt": value < limit, "le": value <= limit, "gt": value > limit, "ge": value >= limit}[op]
 
 
-def _clash(left: dict, right: dict) -> str | None:
+def _clash(left: dict[str, Any], right: dict[str, Any]) -> str | None:
     pair = {left["op"], right["op"]}
     if pair == {"eq"}:
         return None if _same_value(left, right) else "value"
@@ -492,8 +493,8 @@ def _clash(left: dict, right: dict) -> str | None:
     return "bounds" if empty else None
 
 
-def conflict_matrix(payload: dict) -> dict:
-    def work() -> dict:
+def conflict_matrix(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         entries = payload["requirements"]
         ids = [entry["id"] for entry in entries]
         if len(set(ids)) != len(ids):
@@ -508,9 +509,9 @@ def conflict_matrix(payload: dict) -> dict:
                     "message": f"requirements[{index}].value must be a finite number for op {entry['op']}",
                 }
             rows.append({**entry, "num": number, "index": index})
-        conflicts: list[dict] = []
+        conflicts: list[dict[str, Any]] = []
         blocked: set[str] = set()
-        equal_rank: list[dict] = []
+        equal_rank: list[dict[str, Any]] = []
         for position, left in enumerate(rows):
             for right in rows[position + 1 :]:
                 if (left["subject"].strip().casefold(), left["attribute"].strip().casefold()) != (

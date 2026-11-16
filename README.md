@@ -86,7 +86,7 @@ A01–A15 are the core SDLC agents. A16–A30 are three specialist domains of fi
 
 The spec is executable. Each agent is a Claude Code subagent in [.claude/agents/](.claude/agents/) whose
 XML-tagged system prompt lives in [prompts/](prompts/) and whose tools are Python scripts in [scripts/](scripts/),
-built on the stdlib-only runtime in [swarm/](swarm/) (signed `swarm.v1` envelopes, SQLite Task Store with the
+built on the runtime in [swarm/](swarm/) (no Python dependencies, plus the required PyO3 extension `swarm._native`; signed `swarm.v1` envelopes, SQLite Task Store with the
 lifecycle state machine, fail-closed gates, manifest registry). [agents.json](agents.json) is the manifest.
 
 ```bash
@@ -119,8 +119,17 @@ Live/reused `orch_plan` responses include a cryptographically verified `executio
 when a real signer is available. `/swarm` refuses missing, unsigned, or mismatched kickoff
 assignments instead of dispatching an unauthenticated A01 turn. Specialist sessions cannot
 auto-load private references. OMP uses normal `write` approvals (or `--approval-mode always-ask`);
-Grok headless dispatch currently fails closed because its installed interface does not support
-the old stdin transport. Start a fresh OMP process after updating the extension.
+Grok headless dispatch reads its assignment from a 0600 `--prompt-file` under `$SWARM_DIR/prompts`
+and runs in the workspace. Start a fresh OMP process after updating the extension.
+
+**Kill switch:** `SWARM_DISABLED=1` turns the swarm off for a session: the omp extension registers
+no tools, `/swarm`, hooks, guard or bar, and the UserPromptSubmit hook injects nothing. Start a
+blocked session with `SWARM_DISABLED=1 omp` to get back to normal work.
+
+**Credentials:** each agent's `SUBSTRATE_TOKEN` is read from
+`~/.config/agent-swarm/agents/<hash>/<slug>.env`, where `<hash>` is the first 16 hex digits of the
+SHA-256 of the workspace's resolved path. Moving or re-cloning the repo changes that path, so the
+credentials must be copied into the new hash directory. Without them A01 has no token and blocks.
 
 The omp `tool_call` guard (`omp/src/guard.ts`) covers every swarm session. It blocks with `BLOCKED needs: human-approval` the Web3 rows `chain-broadcast` and `chain-key-material` and the cluster lifecycle rows under `prod_infra` (`argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle`, `kubeadm-lifecycle`). Its per-agent lists are documentation, not an allow list. See [AGENTS.md](AGENTS.md) (HOOK-02).
 
@@ -130,6 +139,23 @@ Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then 
 ### Swarm Command Center (v2.2)
 
 `swarm_run.py` runs a continuous scheduler: a slot is refilled the moment a session ends, bounded by `--max-parallel` (`SWARM_MAX_PARALLEL`, default 4, ceiling 32) and each agent's own limit, with a lifecycle state machine, cancellation, timeouts, backoff and rate-limit backpressure. One telemetry channel (`.swarm/events.jsonl` and `.swarm/live.json`) feeds the logs, `scripts/swarm_live.py` and the swarm bar of omp (always there, two full-width rows above the editor) that shows every subagent's state and elapsed time and the session's token savings. Agents hand work over with a versioned, validated `swarm.handover.v1` document. Every agent has a shared baseline of tools and skills plus 10 to 15 of its own, found with `swarm_catalog` and called with `swarm_tool_call`. Start at [docs/swarm-command-center.md](docs/swarm-command-center.md) (architecture, how to add an agent, tool or skill, configuration, troubleshooting, security model, known limits) and [docs/swarm-bar.md](docs/swarm-bar.md) (reading the bar).
+
+## Rust core
+
+The Rust engine is opt-in everywhere. Every default below is Python, and no route has been flipped. The crates, the binding, the pins and the CI jobs are in [docs/rust-core.md](docs/rust-core.md).
+
+| Switch | Default | Opt-in |
+|---|---|---|
+| `GSD_ENGINE` | `python` on every route | `rust` sends each claimed call of the routes listed in [docs/rust-core.md](docs/rust-core.md) section 4 to the `gsd_engine` binary |
+| `GSD_RUST_BACKEND` | `host` | `sandbox` runs the Wasm guest first; write calls need a binary built with `sandbox-write` |
+| `SWARM_REDACT_ENGINE` | `python` | `rust` computes the redaction spans in `swarm._native.redact_spans` |
+| `SWARM_CLAIMS_ENGINE` | `python` | `rust` decides claim conflicts in `swarm._native.ClaimTable` |
+| `SWARM_TASKSTORE_WAL` | off | `1` opens `tasks.db` in WAL mode |
+| `SWARM_PURE_PYTHON` | unset | `1` skips the extension import and forces Python on every route |
+
+The PyO3 extension `swarm._native` is required unless `SWARM_PURE_PYTHON=1`. Build it with `pip install .` (maturin, Python 3.12+). The Rust workspace has 22 crates under `crates/`. The `gsd_engine` binary is built from `crates/gsd-adapter`.
+
+The write routes (`orch_status --transition` and `--ingest`, `orch_plan`, `orch_assign`, and the gates `qa_gate`, `rel_plan`, `rev_gate`, `sec_gate`) run through one write flow: a write is never run twice, and a verdict committed before a later failure is final. A child that holds a signing key starts only as the binary whose sha256 is `GSD_ENGINE_BIN_SHA256`, with core dumps off and an empty HOME and XDG_CONFIG_HOME made for the call. An explicit `GSD_ENGINE=rust` refused by that check exits 2 with `E-POLICY`, and Python does not run. The open limits are listed in [docs/rust-core.md](docs/rust-core.md) section 10: an unkeyed child keeps the caller's HOME, so the binary can still consult the conventional signing-key path for it; the identity check keys on three key names only; and the digest check is not atomic with the exec.
 
 ## Install into a workspace
 

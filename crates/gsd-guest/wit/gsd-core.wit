@@ -1,0 +1,7 @@
+package gsd:core@0.1.0;
+
+world gsd-core {
+    enum error-code { input, timeout, dep, capacity, contract, policy, internal }
+    record invoke-error { code: error-code, message: string }
+    export invoke: func(input: list<u8>) -> result<list<u8>, invoke-error>;
+}

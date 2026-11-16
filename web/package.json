@@ -1,0 +1,16 @@
+{
+  "name": "agent-swarm-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser build of the gsd-core read route: a dev-time jco transpile of the server-built WIT component. Nothing here ships an npm runtime dependency.",
+  "type": "module",
+  "scripts": {
+    "transpile": "node transpile.mjs",
+    "serve": "node serve.mjs"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "1.39.0",
+    "playwright-core": "1.64.1"
+  },
+  "dependencies": {}
+}

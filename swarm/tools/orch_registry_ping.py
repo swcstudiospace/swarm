@@ -5,10 +5,12 @@ without a task-store side effect. Callers that omit it get SUCCESS.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from swarm.tools.support import sleep_until_cancelled
 
 
-def call(payload: dict) -> dict:
+def call(payload: Mapping[str, object]) -> dict[str, object]:
     probe = payload.get("probe")
     if probe == "sleep":
         sleep_until_cancelled(0.2)

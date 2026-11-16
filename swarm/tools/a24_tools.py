@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Container
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
 from swarm.redact import REDACTED, redact_spans, redact_text
 from swarm.tools.support import respond
@@ -37,6 +39,7 @@ MAX_FINDINGS = 500  # findings returned; `finding_count` always reports the true
 MAX_NODES = 200_000  # JSON nodes accepted per free-form input
 OUTPUT_BUDGET = 100_000  # characters of JSON per capped list; the registry withholds results of 256 KiB or more
 MAX_CONTAINERS = 200  # containers accepted per pod spec
+MAX_MACRO_EXPANSIONS = 50_000  # macro expansions per rule-lint call (Falco macros): a cyclic or huge macro graph fails as INVALID_INPUT
 
 
 class _Bad(Exception):
@@ -48,24 +51,26 @@ class _Bad(Exception):
         self.message = message
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, Any]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _guarded(work):
+def _guarded(work: Callable[[], dict[str, Any]]) -> Callable[[], dict[str, Any]]:
     """Wrap `work` so a `_Bad` raised anywhere inside becomes the INVALID_INPUT result."""
 
-    def run() -> dict:
+    def run() -> dict[str, Any]:
         try:
             return work()
         except _Bad as exc:
             return _invalid(exc.field, exc.message)
+        except RecursionError:  # a macro chain nests one call per level; too deep to analyse is an input problem, not a dependency fault
+            return _invalid("rules", "macro chain too deep to analyse")
 
     return run
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
@@ -118,26 +123,26 @@ def _is_boolean_setting(text: str, start: int, end: int) -> bool:
     return text[start:end].lower() in _NOT_SECRET_VALUES and _key_before_value(text, start) in _BOOLEAN_SETTINGS
 
 
-def _finding(rule: str, severity: str, location: str, summary: str) -> dict:
+def _finding(rule: str, severity: str, location: str, summary: str) -> dict[str, Any]:
     """A finding. Its location and summary copy names from the manifest, and a name can hold a pasted credential, so both pass
     through `_public`. The rule id is a fixed identifier and is left as written."""
     location, summary = _public(location), _public(summary)
     return {"id": f"{rule}:{location}" if location else rule, "severity": severity, "summary": summary}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Deduplicate and sort: worst first, then id, then summary. Deterministic."""
     unique = {(f["id"], f["severity"], f["summary"]): f for f in findings}
     return sorted(unique.values(), key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
 
 
-def _verdict(findings: list[dict]) -> str:
+def _verdict(findings: list[dict[str, Any]]) -> str:
     return "fail" if any(SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"] for f in findings) else "pass"
 
 
-def _within_budget(items: list[dict], limit: int, budget: int = OUTPUT_BUDGET) -> list[dict]:
+def _within_budget(items: list[dict[str, Any]], limit: int, budget: int = OUTPUT_BUDGET) -> list[dict[str, Any]]:
     """The leading items, at most `limit`, whose JSON stays under `budget` characters (the registry withholds results of 256 KiB)."""
-    kept: list[dict] = []
+    kept: list[dict[str, Any]] = []
     size = 0
     for item in items[:limit]:
         size += len(json.dumps(item)) + 2  # the item plus its ", " separator
@@ -161,26 +166,26 @@ def _capped_names(names: list[str], budget: int) -> list[str]:
     return kept
 
 
-def _report(findings: list[dict]) -> dict:
+def _report(findings: list[dict[str, Any]]) -> dict[str, Any]:
     """The shared tail of every result: total count, verdict and the ordered list capped by count and by size."""
     ordered = _ordered(findings)
     return {"finding_count": len(ordered), "verdict": _verdict(ordered), "findings": _within_budget(ordered, MAX_FINDINGS)}
 
 
-def _dict(value) -> dict:
+def _dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _list(value) -> list:
+def _list(value: object) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-def _in(value, allowed) -> bool:
+def _in(value: object, allowed: Container[str]) -> bool:
     """Membership that tolerates unhashable or non-string junk (a malformed manifest is a violation, not a crash)."""
     return isinstance(value, str) and value in allowed
 
 
-def _strings(value) -> list[str]:
+def _strings(value: object) -> list[str]:
     return [item for item in _list(value) if isinstance(item, str)]
 
 
@@ -190,7 +195,7 @@ _SHOWN = re.compile(r"[A-Za-z0-9_.-]{0,16}")
 _TIMESTAMPISH = re.compile(r"[0-9TtZz:+. -]{1,40}")
 
 
-def _val(value, shown=_SHOWN) -> str:
+def _val(value: object, shown: re.Pattern[str] = _SHOWN) -> str:
     """repr of a short plain value; a long or odd string, a list entry or an object is withheld (length or type only)."""
     if value is None or isinstance(value, (bool, int, float)):
         return repr(value)
@@ -202,7 +207,7 @@ def _val(value, shown=_SHOWN) -> str:
 
 
 
-def _check_size(value, field: str) -> None:
+def _check_size(value: object, field: str) -> None:
     """Refuse absurdly large free-form inputs (iterative walk, so depth cannot overflow the stack)."""
     stack, count = [value], 0
     while stack:
@@ -216,13 +221,13 @@ def _check_size(value, field: str) -> None:
             stack.extend(node)
 
 
-def _manifests(items, field: str, depth: int = 0) -> list[dict]:
+def _manifests(items: list[Any], field: str, depth: int = 0) -> list[dict[str, Any]]:
     """Validate manifests (objects with a string `kind`) and flatten `kind: List` / `<Kind>List` wrappers.
 
     Items of a typed list such as PodList carry no `kind` of their own in API responses; they inherit it.
     """
     _check_size(items, field)
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for index, item in enumerate(items):
         if not isinstance(item, dict) or not isinstance(item.get("kind"), str) or not item["kind"]:
             raise _Bad(field, f"{field}[{index}] must be an object with a non-empty string kind")
@@ -241,11 +246,11 @@ def _manifests(items, field: str, depth: int = 0) -> list[dict]:
     return out
 
 
-def _meta(manifest: dict) -> dict:
+def _meta(manifest: dict[str, Any]) -> dict[str, Any]:
     return _dict(manifest.get("metadata"))
 
 
-def _loc(manifest: dict) -> str:
+def _loc(manifest: dict[str, Any]) -> str:
     """Stable location: Kind/namespace/name, or Kind/name for cluster-scoped objects."""
     meta = _meta(manifest)
     name = meta.get("name") if isinstance(meta.get("name"), str) and meta.get("name") else "(unnamed)"
@@ -258,7 +263,7 @@ def _loc(manifest: dict) -> str:
 _TEMPLATE_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job")
 
 
-def _workloads(items, field: str) -> list[dict]:
+def _workloads(items: list[Any], field: str) -> list[dict[str, Any]]:
     """Pod-bearing manifests as {kind, loc, spec, meta}. Other kinds (Service, ConfigMap, ...) are ignored.
 
     Pod -> spec; Deployment/StatefulSet/DaemonSet/ReplicaSet/ReplicationController/Job -> spec.template;
@@ -283,7 +288,7 @@ def _workloads(items, field: str) -> list[dict]:
     return out
 
 
-def _containers(workload: dict, field: str) -> list[tuple[str, str, dict]]:
+def _containers(workload: dict[str, Any], field: str) -> list[tuple[str, str, dict[str, Any]]]:
     """(section, name, container) for containers, initContainers and ephemeralContainers."""
     out = []
     for section in ("containers", "initContainers", "ephemeralContainers"):
@@ -300,7 +305,7 @@ def _containers(workload: dict, field: str) -> list[tuple[str, str, dict]]:
     return out
 
 
-def _csc(container: dict) -> dict:
+def _csc(container: dict[str, Any]) -> dict[str, Any]:
     return _dict(container.get("securityContext"))
 
 
@@ -337,17 +342,17 @@ _HOOK_NAMES = ("postStart", "preStop")
 _PSS_BLOCKERS = frozenset({"host-process", "host-namespaces", "privileged", "host-path"})
 
 
-def _nz(value):
+def _nz(value: object) -> object:
     """A JSON null field is an unset field: it reads as the empty string the PSS tables allow."""
     return "" if value is None else value
 
 
-def _is_zero(value) -> bool:
+def _is_zero(value: object) -> bool:
     """True for a numeric zero; a boolean is not a user id, so `false` is not root."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
 
 
-def _pss_violations(workload: dict, field: str) -> list[tuple[str, str, str]]:
+def _pss_violations(workload: dict[str, Any], field: str) -> list[tuple[str, str, str]]:
     """(level, control, message) for one pod spec. Level is baseline or restricted."""
     spec, meta = workload["spec"], workload["meta"]
     pod_sc = _dict(spec.get("securityContext"))
@@ -461,7 +466,7 @@ def _pss_violations(workload: dict, field: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def pss_check(payload: dict) -> dict:
+def pss_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Check pod specs against the Pod Security Standards (baseline, restricted) and say which level they satisfy.
 
     Controls and allowed values are the tables of the Pod Security Standards page. Restricted includes every baseline
@@ -470,10 +475,10 @@ def pss_check(payload: dict) -> dict:
     gate, and per-version pinning of the sysctl list (the full current safe list is accepted). highest_compliant_level is absent when no pod spec was checked.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         level = payload["level"]
         workloads = _workloads(payload["workloads"], "workloads")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         highest = "restricted"
         for workload in workloads:
             for control_level, control, message in _pss_violations(workload, "workloads"):
@@ -500,7 +505,7 @@ _READ_VERBS = frozenset({"get", "list", "watch"})
 _REMOVED_RBAC_API = "rbac.authorization.k8s.io/v1beta1"
 
 
-def _rules_of(role: dict, field: str) -> list[dict]:
+def _rules_of(role: dict[str, Any], field: str) -> list[dict[str, Any]]:
     """The PolicyRules of a role, every list normalised to a list of strings. A rule field that is not a list is refused, since a
     bare string such as "*" would otherwise read as no grant."""
     rules = role.get("rules")
@@ -508,7 +513,7 @@ def _rules_of(role: dict, field: str) -> list[dict]:
         return []
     if not isinstance(rules, list) or any(not isinstance(r, dict) for r in rules):
         raise _Bad(field, f"{_loc(role)} rules must be a list of objects")
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for rule in rules:
         normalised: dict[str, list[str]] = {}
         for key in ("apiGroups", "resources", "resourceNames", "verbs", "nonResourceURLs"):
@@ -520,18 +525,18 @@ def _rules_of(role: dict, field: str) -> list[dict]:
     return out
 
 
-def _selector_matches(selector: dict, labels: dict) -> bool:
+def _selector_matches(selector: dict[str, Any], labels: dict[str, Any]) -> bool:
     """Kubernetes LabelSelector semantics; an empty selector matches everything."""
-    for key, value in _dict(selector.get("matchLabels")).items():
-        if labels.get(key) != value:
+    for match_key, value in _dict(selector.get("matchLabels")).items():
+        if labels.get(match_key) != value:
             return False
     for expression in _list(selector.get("matchExpressions")):
         expression = _dict(expression)
         key, operator, values = expression.get("key"), expression.get("operator"), _strings(expression.get("values"))
         present = isinstance(key, str) and key in labels
-        if operator == "In" and not (present and labels[key] in values):
+        if operator == "In" and not (present and labels[str(key)] in values):
             return False
-        if operator == "NotIn" and present and labels[key] in values:
+        if operator == "NotIn" and present and labels[str(key)] in values:
             return False
         if operator == "Exists" and not present:
             return False
@@ -543,7 +548,7 @@ def _selector_matches(selector: dict, labels: dict) -> bool:
 AGGREGATION_BUDGET = 1_000_000  # selector matches and walk steps per call; a call that needs more is refused rather than expanded
 
 
-def _aggregated_children(role: dict, cluster_roles: list[dict]) -> list[dict]:
+def _aggregated_children(role: dict[str, Any], cluster_roles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """ClusterRoles whose labels match one of the role's clusterRoleSelectors (an empty selector matches every role), not the role itself."""
     aggregation = role.get("aggregationRule")
     name = _meta(role).get("name")
@@ -557,10 +562,10 @@ def _aggregated_children(role: dict, cluster_roles: list[dict]) -> list[dict]:
     return out
 
 
-def _distinct(rules: list[dict]) -> list[dict]:
+def _distinct(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The rules without repeats, first occurrence kept: aggregated roles that select the same role contribute the same rules."""
     seen: set[str] = set()
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for rule in rules:
         key = json.dumps(rule, sort_keys=True)
         if key not in seen:
@@ -575,12 +580,12 @@ class _Aggregation:
     two roles select the same pair. Children and effective rules are memoised per role object, and the rules a walk collects are
     de-duplicated. Selector matches and walk steps share one budget; a call that exceeds it is refused, not partly answered."""
 
-    def __init__(self, cluster_roles: list[dict], field: str):
+    def __init__(self, cluster_roles: list[dict[str, Any]], field: str):
         self.roles = cluster_roles
         self.field = field
         self.steps = 0
-        self._children: dict[int, list[dict]] = {}
-        self._rules: dict[int, list[dict]] = {}
+        self._children: dict[int, list[dict[str, Any]]] = {}
+        self._rules: dict[int, list[dict[str, Any]]] = {}
 
     def _spend(self, steps: int) -> None:
         self.steps += steps
@@ -588,13 +593,13 @@ class _Aggregation:
             raise _Bad(self.field, f"the aggregated ClusterRoles need more than {AGGREGATION_BUDGET} steps to resolve: "
                                    "the aggregation graph is too large")
 
-    def children(self, role: dict) -> list[dict]:
+    def children(self, role: dict[str, Any]) -> list[dict[str, Any]]:
         if id(role) not in self._children:
             self._spend(len(self.roles))
             self._children[id(role)] = _aggregated_children(role, self.roles)
         return self._children[id(role)]
 
-    def uses_own_rules(self, role: dict) -> bool:
+    def uses_own_rules(self, role: dict[str, Any]) -> bool:
         """True for a role judged on its own `rules`: not aggregated, or aggregated with selectors that match no supplied role
         (a live dump whose children were not supplied: its rules are then the aggregation result and are never dropped)."""
         aggregation = role.get("aggregationRule")
@@ -603,18 +608,18 @@ class _Aggregation:
         has_selectors = any(isinstance(s, dict) for s in _list(aggregation.get("clusterRoleSelectors")))
         return has_selectors and not self.children(role)
 
-    def effective(self, role: dict) -> list[dict]:
+    def effective(self, role: dict[str, Any]) -> list[dict[str, Any]]:
         """Rules of a role. An aggregated ClusterRole gets the rules of the roles its selectors reach; the control plane overwrites
         its own `rules` (RBAC docs), so they are ignored, except when no supplied role matches (see `uses_own_rules`)."""
         if id(role) not in self._rules:
             self._rules[id(role)] = _rules_of(role, self.field) if self.uses_own_rules(role) else self._reached(role)
         return self._rules[id(role)]
 
-    def _reached(self, role: dict) -> list[dict]:
+    def _reached(self, role: dict[str, Any]) -> list[dict[str, Any]]:
         """The own rules of every role reached from `role` through aggregation, each role visited once, de-duplicated."""
         visited = {str(_meta(role).get("name"))}
         stack = list(reversed(self.children(role)))
-        found: list[dict] = []
+        found: list[dict[str, Any]] = []
         while stack:
             node = stack.pop()
             name = str(_meta(node).get("name"))
@@ -634,7 +639,7 @@ def _role_label(kind: str, namespace: str, name: str) -> str:
     return f"{kind}/{namespace}/{name}" if kind == "Role" else f"{kind}/{name}"
 
 
-def _split_rbac(roles, bindings, roles_field: str, bindings_field: str) -> tuple[list[dict], list[dict]]:
+def _split_rbac(roles: list[Any], bindings: list[Any], roles_field: str, bindings_field: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     role_list = _manifests(roles, roles_field)
     binding_list = _manifests(bindings, bindings_field)
     for index, role in enumerate(role_list):
@@ -646,7 +651,7 @@ def _split_rbac(roles, bindings, roles_field: str, bindings_field: str) -> tuple
     return role_list, binding_list
 
 
-def _role_ref(binding: dict, field: str) -> tuple[str, str]:
+def _role_ref(binding: dict[str, Any], field: str) -> tuple[str, str]:
     ref = binding.get("roleRef")
     if not isinstance(ref, dict) or ref.get("kind") not in ("Role", "ClusterRole") or not isinstance(ref.get("name"), str):
         raise _Bad(field, f"{_loc(binding)} roleRef must name a Role or ClusterRole")
@@ -655,7 +660,7 @@ def _role_ref(binding: dict, field: str) -> tuple[str, str]:
     return ref["kind"], ref["name"]
 
 
-def _binding_namespace(binding: dict, field: str) -> str:
+def _binding_namespace(binding: dict[str, Any], field: str) -> str:
     if binding["kind"] == "ClusterRoleBinding":
         return ""
     namespace = _meta(binding).get("namespace")
@@ -664,7 +669,7 @@ def _binding_namespace(binding: dict, field: str) -> str:
     return namespace
 
 
-def _subjects(binding: dict, field: str) -> list[dict]:
+def _subjects(binding: dict[str, Any], field: str) -> list[dict[str, Any]]:
     subjects = binding.get("subjects")
     if subjects is None:
         return []
@@ -685,7 +690,7 @@ def _covers(resources: set[str], target: str) -> bool:
     return target in resources or (bool(subresource) and f"*/{subresource}" in resources)
 
 
-def _rule_risks(rule: dict) -> list[tuple[str, str, str]]:
+def _rule_risks(rule: dict[str, Any]) -> list[tuple[str, str, str]]:
     """(rule id, severity, text) for one normalised PolicyRule."""
     verbs, resources, groups, names = set(rule["verbs"]), set(rule["resources"]), set(rule["apiGroups"]), rule["resourceNames"]
     star_verb, star_resource = "*" in verbs, "*" in resources
@@ -736,7 +741,7 @@ def _worst(severities: list[str]) -> str:
     return max(severities, key=lambda s: SEVERITY_RANK[s]) if severities else "info"
 
 
-def rbac_risk_scan(payload: dict) -> dict:
+def rbac_risk_scan(payload: dict[str, Any]) -> dict[str, Any]:
     """Scan Roles, ClusterRoles and their bindings for privilege-escalation risk.
 
     Rules: admin-equivalent (verbs, resources and API groups all *, not narrowed by resourceNames), wildcard verbs/resources/API groups (a read-only `*`
@@ -752,13 +757,13 @@ def rbac_risk_scan(payload: dict) -> dict:
     rbac.authorization.k8s.io/v1beta1 was removed in Kubernetes 1.22.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         roles, bindings = _split_rbac(payload["roles"], payload["bindings"], "roles", "bindings")
         if not roles and not bindings:
             raise _Bad("roles", "supply at least one role or binding")
         cluster_roles = [r for r in roles if r["kind"] == "ClusterRole"]
         aggregation = _Aggregation(cluster_roles, "roles")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         risk: dict[str, str] = {}
         for role in roles:
             if role.get("apiVersion") == _REMOVED_RBAC_API:
@@ -815,7 +820,7 @@ def rbac_risk_scan(payload: dict) -> dict:
 MAX_PERMISSIONS = 200
 
 
-def _identity(subject: dict, extra_groups: list[str]) -> dict:
+def _identity(subject: dict[str, Any], extra_groups: list[str]) -> dict[str, Any]:
     kind, name, namespace = subject["kind"], subject["name"], subject.get("namespace", "")
     if kind == "ServiceAccount":
         if not namespace:
@@ -830,7 +835,7 @@ def _identity(subject: dict, extra_groups: list[str]) -> dict:
     return {"kind": kind, "name": name, "namespace": namespace, "username": username, "groups": sorted(set(groups) | set(extra_groups))}
 
 
-def _subject_matches(entry: dict, identity: dict, binding_namespace: str) -> bool:
+def _subject_matches(entry: dict[str, Any], identity: dict[str, Any], binding_namespace: str) -> bool:
     """RBAC appliesToUser: a ServiceAccount subject without namespace means the namespace of its RoleBinding."""
     kind, name = entry.get("kind"), entry.get("name")
     if kind == "User":
@@ -854,7 +859,7 @@ def _resource_matches(rule_resources: list[str], resource: str, subresource: str
     return False
 
 
-def _rule_allows(rule: dict, verb: str, group: str, resource: str, subresource: str, name: str) -> bool:
+def _rule_allows(rule: dict[str, Any], verb: str, group: str, resource: str, subresource: str, name: str) -> bool:
     if "*" not in rule["verbs"] and verb not in rule["verbs"]:
         return False
     if "*" not in rule["apiGroups"] and group not in rule["apiGroups"]:
@@ -864,19 +869,19 @@ def _rule_allows(rule: dict, verb: str, group: str, resource: str, subresource: 
     return not rule["resourceNames"] or (name != "" and name in rule["resourceNames"])
 
 
-def _wildcard_rule() -> dict:
+def _wildcard_rule() -> dict[str, Any]:
     return {"apiGroups": ["*"], "resources": ["*"], "resourceNames": [], "verbs": ["*"], "nonResourceURLs": ["*"]}
 
 
 _BOOTSTRAP_CLUSTER_ADMIN = {"kind": "ClusterRole", "metadata": {"name": "cluster-admin"}, "rules": [_wildcard_rule()]}
 
 
-def _is_admin_rule(rule: dict) -> bool:
+def _is_admin_rule(rule: dict[str, Any]) -> bool:
     """Every verb on every resource of every API group, not narrowed by resourceNames."""
     return "*" in rule["verbs"] and "*" in rule["resources"] and "*" in rule["apiGroups"] and not rule["resourceNames"]
 
 
-def rbac_effective_access(payload: dict) -> dict:
+def rbac_effective_access(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve what one subject can do through RoleBindings, ClusterRoleBindings and aggregated ClusterRoles.
 
     Identity: a ServiceAccount is the user system:serviceaccount:<ns>:<name> in groups system:serviceaccounts,
@@ -891,17 +896,17 @@ def rbac_effective_access(payload: dict) -> dict:
     cluster-scoped rule on every verb, resource and API group that resourceNames do not narrow. Non-resource URLs are not modelled.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         roles, bindings = _split_rbac(payload["roles"], payload["bindings"], "roles", "bindings")
         subject = payload["subject"]
         identity = _identity(subject, _strings(payload.get("groups")))
         cluster_roles = [r for r in roles if r["kind"] == "ClusterRole"]
         aggregation = _Aggregation(cluster_roles, "roles")
-        index = {}
-        for role in roles:
-            meta = _meta(role)
-            index[_role_label(role["kind"], str(meta.get("namespace", "")), str(meta.get("name", "")))] = role
-        grants: list[dict] = []
+        index: dict[str, dict[str, Any]] = {}
+        for supplied in roles:
+            meta = _meta(supplied)
+            index[_role_label(supplied["kind"], str(meta.get("namespace", "")), str(meta.get("name", "")))] = supplied
+        grants: list[dict[str, Any]] = []
         roles_used: set[str] = set()
         unresolved: set[str] = set()
         matched = 0
@@ -970,12 +975,12 @@ _VAP_ACTIONS = ("Deny", "Warn", "Audit")
 _REMOVED_ADMISSION_API = "admissionregistration.k8s.io/v1beta1"
 
 
-def _group(manifest: dict) -> str:
+def _group(manifest: dict[str, Any]) -> str:
     api_version = manifest.get("apiVersion")
     return api_version.split("/")[0] if isinstance(api_version, str) and "/" in api_version else ""
 
 
-def _exclusions(selector) -> list[str]:
+def _exclusions(selector: object) -> list[str]:
     """matchExpressions of a label selector that remove objects from scope (NotIn, DoesNotExist)."""
     out = []
     for expression in _list(_dict(selector).get("matchExpressions")):
@@ -986,7 +991,7 @@ def _exclusions(selector) -> list[str]:
     return sorted(out)
 
 
-def _lint_webhooks(manifest: dict, findings: list[dict]) -> None:
+def _lint_webhooks(manifest: dict[str, Any], findings: list[dict[str, Any]]) -> None:
     location, kind = _loc(manifest), manifest["kind"]
     if manifest.get("apiVersion") == _REMOVED_ADMISSION_API:
         findings.append(_finding("admission.api-removed", "blocker", location, f"{_REMOVED_ADMISSION_API} is removed since Kubernetes 1.22; use admissionregistration.k8s.io/v1"))
@@ -1021,7 +1026,7 @@ def _lint_webhooks(manifest: dict, findings: list[dict]) -> None:
             findings.append(_finding("admission.object-selector-exclusion", "minor", where, "objectSelector lets objects opt out by label: " + "; ".join(object_exclusions)))
 
 
-def _lint_vap(manifest: dict, findings: list[dict]) -> None:
+def _lint_vap(manifest: dict[str, Any], findings: list[dict[str, Any]]) -> None:
     location, spec = _loc(manifest), _dict(manifest.get("spec"))
     if spec.get("failurePolicy") == "Ignore":
         findings.append(_finding("admission.fail-open", "major", location, "failurePolicy Ignore admits requests when the policy cannot be evaluated"))
@@ -1033,7 +1038,7 @@ def _lint_vap(manifest: dict, findings: list[dict]) -> None:
         findings.append(_finding("admission.namespace-exclusion", "minor", location, "namespaceSelector excludes: " + "; ".join(exclusions)))
 
 
-def _identity_exclusions(rule: dict) -> tuple[list[str], bool]:
+def _identity_exclusions(rule: dict[str, Any]) -> tuple[list[str], bool]:
     """(identity-based exclusion kinds, excludes every namespace) over a Kyverno rule's exclude blocks."""
     exclude = _dict(rule.get("exclude"))
     blocks = [exclude] + [_dict(b) for key in ("any", "all") for b in _list(exclude.get(key))]
@@ -1048,7 +1053,7 @@ def _identity_exclusions(rule: dict) -> tuple[list[str], bool]:
     return sorted(kinds), all_namespaces
 
 
-def _lint_kyverno(manifest: dict, findings: list[dict]) -> tuple[bool, bool]:
+def _lint_kyverno(manifest: dict[str, Any], findings: list[dict[str, Any]]) -> tuple[bool, bool]:
     """Lint a Kyverno policy. Returns (has enforce rule, has audit-only validate rule)."""
     location, spec = _loc(manifest), _dict(manifest.get("spec"))
     if spec.get("failurePolicy") == "Ignore":
@@ -1087,7 +1092,7 @@ def _lint_kyverno(manifest: dict, findings: list[dict]) -> tuple[bool, bool]:
     return enforcing, audit and not enforcing
 
 
-def _admission_point(entry: dict) -> bool:
+def _admission_point(entry: dict[str, Any]) -> bool:
     """A scopedEnforcementActions entry acts on admission when it names validation.gatekeeper.sh (the webhook), vap.k8s.io
     (ValidatingAdmissionPolicy) or `*`; audit.gatekeeper.sh and gator.gatekeeper.sh never block a live request, and an entry
     with no enforcementPoints is unrecognised and enforced nowhere (Gatekeeper enforcement-points docs and source)."""
@@ -1095,7 +1100,7 @@ def _admission_point(entry: dict) -> bool:
     return bool(points & {"validation.gatekeeper.sh", "vap.k8s.io", "*"})
 
 
-def _lint_gatekeeper(manifest: dict, findings: list[dict]) -> str:
+def _lint_gatekeeper(manifest: dict[str, Any], findings: list[dict[str, Any]]) -> str:
     """Lint a Gatekeeper constraint. Returns enforce | audit | other."""
     location, spec = _loc(manifest), _dict(manifest.get("spec"))
     action = spec.get("enforcementAction")
@@ -1116,7 +1121,7 @@ def _lint_gatekeeper(manifest: dict, findings: list[dict]) -> str:
     return "other"
 
 
-def admission_policy_lint(payload: dict) -> dict:
+def admission_policy_lint(payload: dict[str, Any]) -> dict[str, Any]:
     """Lint admission control: webhook configurations, ValidatingAdmissionPolicy and bindings, Kyverno, Gatekeeper.
 
     Flags fail-open (failurePolicy Ignore), invalid v1 webhook fields (timeoutSeconds 1-30, sideEffects None or
@@ -1128,9 +1133,9 @@ def admission_policy_lint(payload: dict) -> dict:
     was removed in Kubernetes 1.22.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         manifests = _manifests(payload["policies"], "policies")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         counted = enforcing = audit_only = 0
         vap_names: dict[str, str] = {}
         binding_refs: list[tuple[str, str]] = []
@@ -1203,7 +1208,7 @@ def _exact(value: Decimal) -> str:
     return text if "." in text else f"{text}.0"
 
 
-def cis_score(payload: dict) -> dict:
+def cis_score(payload: dict[str, Any]) -> dict[str, Any]:
     """Score CIS Kubernetes Benchmark results (kube-bench style PASS/FAIL/WARN/INFO per recommendation id).
 
     Only scored (Automated) recommendations count: score = PASS / (PASS + FAIL + WARN) as a percentage (reported rounded half
@@ -1215,14 +1220,14 @@ def cis_score(payload: dict) -> dict:
     ids must be unique dotted numbers.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         results = payload["results"]
         threshold = _dec(payload["min_score_pct"])
         seen: set[str] = set()
         counts = {"PASS": 0, "FAIL": 0, "WARN": 0}
         sections: dict[str, dict[str, int]] = {}
         manual = 0
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         for index, item in enumerate(results):
             rec = item["id"]
             if not _CIS_ID.fullmatch(rec):
@@ -1270,9 +1275,9 @@ ENCRYPTION_PROVIDERS = ("identity", "aescbc", "aesgcm", "secretbox", "kms")
 # aesgcm must be rotated every 200,000 writes, secretbox strong, kms v1 deprecated since 1.28, kms v2 strongest.
 
 
-def _secret_volumes(spec: dict) -> dict[str, tuple[str, object, list]]:
+def _secret_volumes(spec: dict[str, Any]) -> dict[str, tuple[str, object, list[Any]]]:
     """volume name -> (kind, defaultMode, per-item modes) for secret and secret-projecting volumes."""
-    out: dict[str, tuple[str, object, list]] = {}
+    out: dict[str, tuple[str, object, list[Any]]] = {}
     for volume in _list(spec.get("volumes")):
         volume = _dict(volume)
         name = volume.get("name")
@@ -1292,7 +1297,7 @@ def _secret_volumes(spec: dict) -> dict[str, tuple[str, object, list]]:
     return out
 
 
-def _encryption_findings(config: dict, findings: list[dict]) -> str:
+def _encryption_findings(config: dict[str, Any], findings: list[dict[str, Any]]) -> str:
     if config.get("kind") != "EncryptionConfiguration":
         raise _Bad("encryption_config", "encryption_config.kind must be EncryptionConfiguration")
     entries = config.get("resources")
@@ -1335,7 +1340,7 @@ def _encryption_findings(config: dict, findings: list[dict]) -> str:
     return status
 
 
-def secret_exposure_check(payload: dict) -> dict:
+def secret_exposure_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Check how workloads consume Secrets and whether Secrets are encrypted at rest.
 
     Per workload: secrets injected as environment variables (secretKeyRef, envFrom secretRef) are visible to child
@@ -1346,9 +1351,9 @@ def secret_exposure_check(payload: dict) -> dict:
     first or no covering entry is a blocker.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         workloads = _workloads(payload["workloads"], "workloads")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         for workload in workloads:
             volumes = _secret_volumes(workload["spec"])
             for volume_name, (kind, default_mode, item_modes) in sorted(volumes.items()):
@@ -1395,7 +1400,7 @@ TOKEN_MAX_SECONDS = 2**32
 TOKEN_LONG_LIVED_SECONDS = 86400
 
 
-def sa_token_audit(payload: dict) -> dict:
+def sa_token_audit(payload: dict[str, Any]) -> dict[str, Any]:
     """Audit service-account token exposure of workloads.
 
     Effective automount: pod spec.automountServiceAccountToken, else the ServiceAccount's, else true. A workload that
@@ -1406,11 +1411,11 @@ def sa_token_audit(payload: dict) -> dict:
     non-expiring bearer tokens (major). A workload without serviceAccountName uses the namespace's `default` account.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         workloads = _workloads(payload["workloads"], "workloads")
         accounts = _manifests(payload.get("service_accounts", []), "service_accounts")
         required = set(_strings(payload.get("token_required")))
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         known: dict[tuple[str, str], object] = {}
         account_count = 0
         for account in accounts:
@@ -1480,7 +1485,7 @@ def _registry_host(host: str) -> str:
     return "docker.io" if host in _DOCKER_ALIASES else host
 
 
-def _parse_image(ref: str) -> dict:
+def _parse_image(ref: str) -> dict[str, Any]:
     """Split an image reference into registry, repository, tag and digest (Docker reference grammar).
 
     The first path component is a registry when it contains a dot or a colon, equals localhost or is not all lowercase;
@@ -1514,7 +1519,7 @@ def _parse_image(ref: str) -> dict:
     return {"registry": registry, "repo": repo, "tag": tag, "digest": digest}
 
 
-def image_admission_check(payload: dict) -> dict:
+def image_admission_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Check workload images against an allowed-registry list, digest pinning and signature evidence.
 
     An allowed entry matches at a path boundary: ghcr.io/acme allows ghcr.io/acme/app but not ghcr.io/acmeevil/app.
@@ -1526,7 +1531,7 @@ def image_admission_check(payload: dict) -> dict:
     A malformed reference is refused without echoing it (it may carry credentials).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         workloads = _workloads(payload["workloads"], "workloads")
         allowed = []
         for index, entry in enumerate(payload["allowed_registries"]):
@@ -1542,7 +1547,7 @@ def image_admission_check(payload: dict) -> dict:
                 raise _Bad("verified_digests", f"verified_digests[{index}] must be sha256:<64 hex> (or sha384/sha512 of the exact length)")
             verified.add(digest)
         require_digest, require_signature = payload["require_digest"], payload["require_signature"]
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         distinct: set[str] = set()
         for workload in workloads:
             for section, name, container in _containers(workload, "workloads"):
@@ -1587,31 +1592,53 @@ _VALUE_OPERAND = re.compile(
 _TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_.\[\]]*")
 
 
-def _condition_fields(condition: str, macros: dict[str, str], seen: frozenset[str] = frozenset()) -> tuple[set[str], bool]:
+def _condition_fields(condition: str, macros: dict[str, str]) -> tuple[set[str], bool]:
     """(filter fields used, True when a bare word could not be resolved to a supplied macro).
 
     Quoted strings, `in (...)` lists and operator operands are values, not macro references. A word that is not a
     supplied macro may be a macro defined elsewhere, so the caller must not conclude anything about missing fields.
     """
+    budget = [MAX_MACRO_EXPANSIONS]  # expansions left for this call: a cyclic macro graph stops here instead of exponential work
+    fields, unresolved, _ = _expand_condition(condition, macros, frozenset(), {}, budget)
+    return fields, unresolved
+
+
+def _expand_condition(condition: str, macros: dict[str, str], seen: frozenset[str],
+                      done: dict[str, tuple[set[str], bool]], budget: list[int]) -> tuple[set[str], bool, bool]:
+    """`_condition_fields` with its expansion state: (fields, unresolved, cut), where cut is True when a macro already on the
+    expansion path (`seen`) was named. A macro expanded without a cut has no cycle below it, so its result does not depend on
+    the path that reached it and is kept in `done`: a macro that names another macro twice is expanded once, not once per path."""
     text = _VALUE_OPERAND.sub(" ", _LIST_OPERAND.sub(" ", _QUOTED.sub('""', condition)))
     fields: set[str] = set()
-    unresolved = False
+    unresolved = cut = False
     for token in _TOKEN.findall(text):
         if "." in token:
             fields.add(token.split("[")[0])
         elif token.lower() in _FALCO_WORDS:
             continue
         elif token in macros:
-            if token not in seen:
-                inner, inner_unresolved = _condition_fields(macros[token], macros, seen | {token})
+            if token in seen:
+                cut = True
+            elif token in done:
+                inner, inner_unresolved = done[token]
                 fields |= inner
                 unresolved = unresolved or inner_unresolved
+            else:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise _Bad("rules", f"macro expansion exceeds {MAX_MACRO_EXPANSIONS} steps: the macros are cyclic or too many")
+                inner, inner_unresolved, inner_cut = _expand_condition(macros[token], macros, seen | {token}, done, budget)
+                fields |= inner
+                unresolved = unresolved or inner_unresolved
+                cut = cut or inner_cut
+                if not inner_cut:
+                    done[token] = (inner, inner_unresolved)
         else:
             unresolved = True
-    return fields, unresolved
+    return fields, unresolved, cut
 
 
-def _lint_exceptions(rule: dict, name: str, append: bool, findings: list[dict]) -> None:
+def _lint_exceptions(rule: dict[str, Any], name: str, append: bool, findings: list[dict[str, Any]]) -> None:
     exceptions = rule.get("exceptions")
     if exceptions is None:
         return
@@ -1643,7 +1670,7 @@ def _lint_exceptions(rule: dict, name: str, append: bool, findings: list[dict]) 
                     break
 
 
-def runtime_rule_lint(payload: dict) -> dict:
+def runtime_rule_lint(payload: dict[str, Any]) -> dict[str, Any]:
     """Lint Falco rules (the parsed items of a rules file) for loadability, exceptions, scope and alert noise.
 
     Items are rules (key `rule`), macros (key `macro`; `append: true` extends an earlier macro) and ignored list or
@@ -1655,11 +1682,11 @@ def runtime_rule_lint(payload: dict) -> dict:
     With `alert_counts` over `window_hours`, a rate above `max_alerts_per_hour` is noisy: minor, major beyond 10 times it.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         items = payload["rules"]
         _check_size(items, "rules")
         macros: dict[str, str] = {}
-        rules: list[dict] = []
+        rules: list[dict[str, Any]] = []
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 raise _Bad("rules", f"rules[{index}] must be an object")
@@ -1674,7 +1701,7 @@ def runtime_rule_lint(payload: dict) -> dict:
                 macros[item["macro"]] = joined
             elif not ({"list", "required_engine_version", "required_plugin_versions"} & set(item)):
                 raise _Bad("rules", f"rules[{index}] is neither a rule, a macro, a list nor a version requirement")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         seen: dict[str, int] = {}
         for rule in rules:
             name = rule["rule"]
@@ -1733,12 +1760,12 @@ PSA_LABEL = "pod-security.kubernetes.io/"
 PSA_LEVELS = {"privileged": 0, "baseline": 1, "restricted": 2}
 
 
-def _empty_selector(selector) -> bool:
+def _empty_selector(selector: object) -> bool:
     selector = _dict(selector)
     return not selector.get("matchLabels") and not _list(selector.get("matchExpressions"))
 
 
-def _policy_types(spec: dict) -> set[str]:
+def _policy_types(spec: dict[str, Any]) -> set[str]:
     """spec.policyTypes; when omitted Ingress is always set and Egress only if the policy has egress rules."""
     declared = {t for t in _list(spec.get("policyTypes")) if t in ("Ingress", "Egress")}
     if _list(spec.get("policyTypes")):
@@ -1746,12 +1773,12 @@ def _policy_types(spec: dict) -> set[str]:
     return {"Ingress", "Egress"} if _list(spec.get("egress")) else {"Ingress"}
 
 
-def _matches_all_peers(rule, side: str) -> bool:
+def _matches_all_peers(rule: object, side: str) -> bool:
     """A NetworkPolicy rule with no from/to matches every peer; ports, when named, only narrow the ports it admits."""
     return not _list(_dict(rule).get(side))
 
 
-def tenant_isolation_check(payload: dict) -> dict:
+def tenant_isolation_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Check that tenant namespaces are isolated from each other.
 
     Per tenant namespace: a Namespace with pod-security.kubernetes.io/enforce at or above `required_psa_level`
@@ -1764,11 +1791,11 @@ def tenant_isolation_check(payload: dict) -> dict:
     A tenant is `isolated` when it has no major or blocker finding.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         tenants = sorted(set(payload["tenant_namespaces"]))
         required = payload["required_psa_level"]
         manifests = _manifests(payload["manifests"], "manifests")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         failed: set[str] = set()
 
         def add(namespace: str, rule: str, severity: str, location: str, summary: str) -> None:
@@ -1776,7 +1803,7 @@ def tenant_isolation_check(payload: dict) -> dict:
             if SEVERITY_RANK[severity] >= SEVERITY_RANK["major"]:
                 failed.add(namespace)
 
-        def in_namespace(kind: str, namespace: str) -> list[dict]:
+        def in_namespace(kind: str, namespace: str) -> list[dict[str, Any]]:
             return [m for m in manifests if m["kind"] == kind and str(_meta(m).get("namespace", "default")) == namespace]
 
         for namespace in tenants:
@@ -1879,7 +1906,7 @@ AUDIT_PROBES = (
 )
 
 
-def _audit_list(rule: dict, key: str, index: int) -> list[str]:
+def _audit_list(rule: dict[str, Any], key: str, index: int) -> list[str]:
     value = rule.get(key)
     if value is None:
         return []
@@ -1888,7 +1915,7 @@ def _audit_list(rule: dict, key: str, index: int) -> list[str]:
     return value
 
 
-def _audit_rule(rule, index: int) -> dict:
+def _audit_rule(rule: object, index: int) -> dict[str, Any]:
     if not isinstance(rule, dict) or not isinstance(rule.get("level"), str) or rule["level"] not in AUDIT_LEVELS:
         raise _Bad("policy", f"policy.rules[{index}].level must be one of {', '.join(AUDIT_LEVELS)}")
     raw_resources = rule.get("resources")
@@ -1908,7 +1935,7 @@ def _audit_rule(rule, index: int) -> dict:
             "urls": _audit_list(rule, "nonResourceURLs", index), "resources": resources, "stages": stages}
 
 
-def _audit_matches(rule: dict, verb: str, group: str, resource: str, subresource: str, namespace: str) -> bool:
+def _audit_matches(rule: dict[str, Any], verb: str, group: str, resource: str, subresource: str, namespace: str) -> bool:
     """Policy rule match for a resource request by the probe user, following the API server's rule checker."""
     if rule["users"] and PROBE_USER not in rule["users"]:
         return False
@@ -1940,14 +1967,14 @@ def _audit_matches(rule: dict, verb: str, group: str, resource: str, subresource
     return not rule["urls"]  # a non-resource rule never matches a resource request
 
 
-def _audit_level(rules: list[dict], verb: str, group: str, resource: str, subresource: str, namespace: str) -> tuple[str, int]:
+def _audit_level(rules: list[dict[str, Any]], verb: str, group: str, resource: str, subresource: str, namespace: str) -> tuple[str, int]:
     for index, rule in enumerate(rules):
         if _audit_matches(rule, verb, group, resource, subresource, namespace):
             return rule["level"], index
     return "None", -1  # the API server default when no rule matches
 
 
-def audit_policy_check(payload: dict) -> dict:
+def audit_policy_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Check an audit.k8s.io/v1 Policy for completeness by simulating the API server's first-match rule evaluation.
 
     Eight probe request families are evaluated as the user kpol-probe-user in system:authenticated (rules naming other
@@ -1961,7 +1988,7 @@ def audit_policy_check(payload: dict) -> dict:
     Rule semantics: https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/ (first matching rule wins).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         policy = payload["policy"]
         _check_size(policy, "policy")
         if policy.get("apiVersion") != "audit.k8s.io/v1" or policy.get("kind") != "Policy":
@@ -1973,7 +2000,7 @@ def audit_policy_check(payload: dict) -> dict:
         policy_stages = policy.get("omitStages")
         if policy_stages is not None and (not isinstance(policy_stages, list) or any(s not in AUDIT_STAGES for s in policy_stages)):
             raise _Bad("policy", f"policy.omitStages entries must be one of {', '.join(AUDIT_STAGES)}")
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         failed: set[str] = set()
         for probe, group, targets, verbs, minimum, maximum, under, over, why in AUDIT_PROBES:
             low: list[str] = []
@@ -2029,7 +2056,7 @@ def _timestamp(value: str, field: str, label: str) -> datetime:
     return moment
 
 
-def exception_register_check(payload: dict) -> dict:
+def exception_register_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Audit a policy exception register for expiry, staleness and approval hygiene at the instant `now`.
 
     Per exception (timestamps ISO-8601 with an explicit offset): expired when expires_at <= now (major); expiring soon
@@ -2042,10 +2069,10 @@ def exception_register_check(payload: dict) -> dict:
     expired yet (UTC, Z suffix), empty when none has an end date.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         now = _timestamp(payload["now"], "now", "now")
         warn, longest, review = (timedelta(days=payload[k]) for k in ("warn_days", "max_duration_days", "review_interval_days"))
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
         seen: set[str] = set()
         expired = soon = unbounded = 0
         earliest: datetime | None = None
@@ -2064,7 +2091,7 @@ def exception_register_check(payload: dict) -> dict:
                 raise _Bad("exceptions", f"exceptions[{index}].last_reviewed_at must not precede granted_at")
             where = f"{ident} ({entry['policy']} / {entry['scope']})"
             is_expired = expires is not None and expires <= now
-            if is_expired:
+            if expires is not None and expires <= now:
                 expired += 1
                 findings.append(_finding("exception.expired", "major", where, f"expired at {expires.isoformat()}: remove it or have a human re-approve it"))
             elif expires is None:

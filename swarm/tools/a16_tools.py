@@ -34,14 +34,21 @@ import ipaddress
 import math
 import re
 import sys
+from collections.abc import Callable, Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
+from typing import Any, overload
 
 from swarm.redact import redact_text
 from swarm.tools.support import respond
 
 SEVERITY_RANK = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
 MINUTES_PER_YEAR = 525600  # 365 days, the convention behind "99.9% = 8.76 h/year"
+
+# A registry-validated payload, or one record taken from it. agents.json's input_schema is checked before a handler runs; its nested
+# shapes would need a TypedDict per tool to express, so the values read from a payload are Any.
+Payload = dict[str, Any]
+_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 # twelve-factor: judgement thresholds
 STARTUP_MAX_S = Decimal("30")
@@ -94,31 +101,31 @@ DEFAULT_TIE_MARGIN_PCT = Decimal("5")
 COMPOSITE_PRECISION = 1500
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, object]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr): 0.1 is 0.1, not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, str]:
     return {"id": fid, "severity": severity, "summary": summary}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[dict[str, str]]) -> list[dict[str, str]]:
     return sorted(findings, key=lambda item: (SEVERITY_RANK[item["severity"]], item["id"]))
 
 
-def _verdict(findings: list[dict]) -> str:
+def _verdict(findings: Sequence[Mapping[str, str]]) -> str:
     """fail on any major or worse finding, warn on a minor one, else pass."""
     worst = min((SEVERITY_RANK[item["severity"]] for item in findings), default=SEVERITY_RANK["info"])
     return "fail" if worst <= SEVERITY_RANK["major"] else "warn" if worst == SEVERITY_RANK["minor"] else "pass"
 
 
-def _round(value, places: int = 2) -> float:
+def _round(value: Fraction | Decimal | float, places: int = 2) -> float:
     """Round half up on the exact value (a Fraction or Decimal), never on its binary float; clamp to the float range."""
     with localcontext() as ctx:
         ctx.prec = 400
@@ -127,8 +134,23 @@ def _round(value, places: int = 2) -> float:
     return max(-sys.float_info.max, min(sys.float_info.max, rounded)) + 0.0  # + 0.0 turns -0.0 into 0.0
 
 
-def _pct(value: Decimal, places: int = 2) -> float:
+def _pct(value: Fraction | Decimal | float, places: int = 2) -> float:
     return _round(value, places)
+
+
+def _respond(payload: Payload, work: Callable[[], dict[str, object]]) -> dict[str, object]:
+    """support.respond with its result typed: `respond` is untyped and returns the dict that `work` produces."""
+    result: dict[str, object] = respond(payload, work)
+    return result
+
+
+def _nested(inner: _Network, outer: _Network) -> bool:
+    """inner.subnet_of(outer); networks of different IP versions are never nested, so the answer is False for them."""
+    if isinstance(inner, ipaddress.IPv4Network) and isinstance(outer, ipaddress.IPv4Network):
+        return inner.subnet_of(outer)
+    if isinstance(inner, ipaddress.IPv6Network) and isinstance(outer, ipaddress.IPv6Network):
+        return inner.subnet_of(outer)
+    return False
 
 
 def _duplicates(values: list[str]) -> list[str]:
@@ -165,7 +187,15 @@ def _safe_label(text: str) -> str:
     return f"[redacted:{kind}:{len(text)}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:6]}]"
 
 
-def _scrub(value):
+@overload
+def _scrub(value: str) -> str: ...
+@overload
+def _scrub(value: list[object]) -> list[object]: ...
+@overload
+def _scrub(value: dict[str, object]) -> dict[str, object]: ...
+@overload
+def _scrub(value: object) -> object: ...
+def _scrub(value: object) -> object:
     if isinstance(value, str):
         return _safe_label(value)
     if isinstance(value, list):
@@ -175,11 +205,11 @@ def _scrub(value):
     return value
 
 
-def _safe(handler):
+def _safe(handler: Callable[[Payload], dict[str, object]]) -> Callable[[Payload], dict[str, object]]:
     """Run a handler on a payload whose secret-shaped strings are already labels."""
 
     @functools.wraps(handler)
-    def wrapper(payload: dict) -> dict:
+    def wrapper(payload: Payload) -> dict[str, object]:
         return handler(_scrub(payload))
 
     return wrapper
@@ -197,12 +227,12 @@ FACTOR_NAMES = {1: "codebase", 2: "dependencies", 3: "config", 4: "backing_servi
                 7: "port_binding", 8: "concurrency", 9: "disposability", 10: "dev_prod_parity", 11: "logs", 12: "admin_processes"}
 
 
-def _is_int(value, expected: int) -> bool:
+def _is_int(value: object, expected: int) -> bool:
     """True when value is the integer `expected`. A boolean is not an integer here, although True == 1."""
     return type(value) is int and value == expected
 
 
-def _real(value) -> bool:
+def _real(value: object) -> bool:
     """A real number that is not a boolean: an int, or a finite float. NaN and infinity are not real."""
     if isinstance(value, bool):
         return False
@@ -211,13 +241,14 @@ def _real(value) -> bool:
     return isinstance(value, int)
 
 
-def _huge(value) -> bool:
+def _huge(value: object) -> bool:
     """An integer larger than any float (over 1024 bits), so out of range for every bound here. It is judged before any conversion:
     Decimal(repr(value)) raises ValueError past the integer string limit, so an integer such as 10**5000 cannot be converted at all."""
     return isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 1024
 
 
-def _number_error(value, low, high, *, low_open: bool = False, high_open: bool = False, integer: bool = False) -> bool:
+def _number_error(value: object, low: int | Decimal, high: int | Decimal, *, low_open: bool = False, high_open: bool = False,
+                  integer: bool = False) -> bool:
     """True when value is not a usable number within the range: a boolean, NaN or infinity, an integer beyond the conversion limit, a
     float where an integer is required (an integer field takes an int only), or a value outside [low, high] (an open end excludes its
     bound). The checks run before any conversion, so a value that cannot be converted is reported as out of range instead of raising."""
@@ -233,12 +264,12 @@ def _number_error(value, low, high, *, low_open: bool = False, high_open: bool =
     return (low_open and exact == low) or (high_open and exact == high)
 
 
-def _at_most(value, limit: Decimal) -> bool:
+def _at_most(value: object, limit: Decimal) -> bool:
     """True when value is a real number no greater than limit. Any other type, booleans included, does not pass."""
     return _real(value) and not _huge(value) and _dec(value) <= limit
 
 
-def _outside_range(value, low: Decimal, high: Decimal) -> bool:
+def _outside_range(value: object, low: Decimal, high: Decimal) -> bool:
     """True when value is a number outside [low, high], including NaN, infinity and an integer too large to convert. Other types are
     not judged here: their own check fails, so a boolean is never reported as out of range."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -249,7 +280,7 @@ def _outside_range(value, low: Decimal, high: Decimal) -> bool:
 
 
 # (factor, descriptor key, passes(value), severity when failing, summary). Booleans are listed with the passing value.
-TWELVE_FACTOR_CHECKS = (
+TWELVE_FACTOR_CHECKS: tuple[tuple[int, str, Callable[[object], bool], str, str], ...] = (
     (1, "codebase_in_vcs", lambda v: v is True, "blocker", "the app is not tracked in version control"),
     (1, "repos_per_app", lambda v: _is_int(v, 1), "major", "one app must map to exactly one codebase; shared code belongs in libraries"),
     (2, "dependencies_declared", lambda v: v is True, "major", "dependencies are not declared in a manifest"),
@@ -285,7 +316,7 @@ TWELVE_FACTOR_CHECKS = (
 
 
 @_safe
-def twelve_factor_audit(payload: dict) -> dict:
+def twelve_factor_audit(payload: Payload) -> dict[str, object]:
     """Score a service descriptor against the twelve factors: percent of checks passed per factor and overall.
 
     A check the descriptor does not declare counts as not passed. Unknown is not conformant, so an undeclared check yields a
@@ -293,14 +324,14 @@ def twelve_factor_audit(payload: dict) -> dict:
     descriptor that leaves out a major-class check cannot pass or warn.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         service = payload["service"]
         for key, (low, high) in (("startup_seconds", STARTUP_RANGE_S), ("deploy_gap_days", DEPLOY_GAP_RANGE_DAYS)):
             if key in service and _outside_range(service[key], low, high):
                 return _invalid(key, f"{key} must be a number from {low} to {high}")
         passed = dict.fromkeys(FACTOR_NAMES, 0)
         total = dict.fromkeys(FACTOR_NAMES, 0)
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         for factor, key, passes, severity, summary in TWELVE_FACTOR_CHECKS:
             total[factor] += 1
             if key not in service:  # not demonstrated is not conformant, but it is not a known violation either
@@ -325,7 +356,7 @@ def twelve_factor_audit(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 2. composite availability ---------------------------------------------------------------------------------
@@ -348,7 +379,7 @@ def _k_of_n(availability: Decimal, replicas: int, needed: int) -> Decimal:
 
 
 @_safe
-def composite_availability(payload: dict) -> dict:
+def composite_availability(payload: Payload) -> dict[str, object]:
     """Series composition of tiers; each tier is k-of-n replicas with independent failures unless they share a failure domain.
 
     The arithmetic runs at COMPOSITE_PRECISION digits so that the unavailability of a heavily replicated chain (down to 1e-800)
@@ -358,7 +389,7 @@ def composite_availability(payload: dict) -> dict:
     reliability arithmetic; the year is 365 days (525600 minutes).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         tiers = payload["tiers"]
         dupes = _duplicates([tier["id"] for tier in tiers])
         if dupes:
@@ -383,7 +414,7 @@ def composite_availability(payload: dict) -> dict:
         with localcontext() as ctx:
             ctx.prec = COMPOSITE_PRECISION
             target = _dec(payload["target_pct"]) / 100
-            effective: list[tuple[Decimal, str, dict]] = []
+            effective: list[tuple[Decimal, str, Payload]] = []
             for tier in tiers:
                 single = _dec(tier["availability_pct"]) / 100
                 # replicas in one failure domain fail together: no redundancy credit is given
@@ -396,7 +427,7 @@ def composite_availability(payload: dict) -> dict:
             nines = _nines(unavailability)
             effective.sort(key=lambda item: (item[0], item[1]))
             meets = composite >= target
-            findings = []
+            findings: list[dict[str, str]] = []
             for value, tier_id, tier in effective:
                 if value < target:
                     findings.append(_finding(f"tier-below-target:{tier_id}", "major",
@@ -421,13 +452,13 @@ def composite_availability(payload: dict) -> dict:
                 "verdict": "pass" if meets else "fail",
             }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 3. DR feasibility -----------------------------------------------------------------------------------------
 
 
-def _replication_rpo_min(payload: dict) -> Decimal | None:
+def _replication_rpo_min(payload: Payload) -> Decimal | None:
     if payload.get("synchronous_replication") is True:
         return Decimal(0)
     if "replication_lag_s" in payload:
@@ -435,7 +466,7 @@ def _replication_rpo_min(payload: dict) -> Decimal | None:
     return None
 
 
-def _dr_model(strategy: str, payload: dict) -> tuple[Decimal, Decimal] | str:
+def _dr_model(strategy: str, payload: Payload) -> tuple[Decimal, Decimal] | str:
     """(rto_min, rpo_min) of one strategy, or the name of the first input it still needs."""
     base = _dec(payload["detect_decide_min"]) + _dec(payload["traffic_cutover_min"])
     validation = _dec(payload["validation_min"])
@@ -455,7 +486,7 @@ def _dr_model(strategy: str, payload: dict) -> tuple[Decimal, Decimal] | str:
 
 
 @_safe
-def dr_feasibility(payload: dict) -> dict:
+def dr_feasibility(payload: Payload) -> dict[str, object]:
     """Whether the declared DR strategy meets RTO and RPO (inclusive), and the least ready strategy that would.
 
     House model, not a standard: RTO = detect_decide + traffic_cutover + validation + the strategy's step (backup_restore:
@@ -465,7 +496,7 @@ def dr_feasibility(payload: dict) -> dict:
     tool ranks by that order and gives no money figure.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         strategy = payload["strategy"]
         declared = _dr_model(strategy, payload)
         if isinstance(declared, str):
@@ -473,7 +504,8 @@ def dr_feasibility(payload: dict) -> dict:
         rto, rpo = declared
         rto_target, rpo_target = _dec(payload["rto_target_min"]), _dec(payload["rpo_target_min"])
         meets_rto, meets_rpo = rto <= rto_target, rpo <= rpo_target
-        evaluated, sufficient = [], ""
+        evaluated: list[str] = []
+        sufficient = ""
         for name in DR_STRATEGIES:
             model = _dr_model(name, payload)
             if isinstance(model, str):
@@ -481,7 +513,7 @@ def dr_feasibility(payload: dict) -> dict:
             evaluated.append(name)
             if not sufficient and model[0] <= rto_target and model[1] <= rpo_target:
                 sufficient = name
-        findings = []
+        findings: list[dict[str, str]] = []
         if not meets_rto:
             findings.append(_finding("rto-missed", "blocker", f"{strategy} recovers in {_pct(rto, 4)} min, target is {payload['rto_target_min']} min"))
         if not meets_rpo:
@@ -511,7 +543,7 @@ def dr_feasibility(payload: dict) -> dict:
             "verdict": "pass" if meets_rto and meets_rpo else "fail",
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 4. data residency -----------------------------------------------------------------------------------------
@@ -521,7 +553,7 @@ PERSISTENT_KINDS = ("primary", "replica", "backup", "analytics")
 
 
 @_safe
-def data_residency(payload: dict) -> dict:
+def data_residency(payload: Payload) -> dict[str, object]:
     """Placements of data classes in regions checked against the jurisdictions each class may live in.
 
     The match is label equality (trimmed, case-folded) between a region's jurisdiction and a class's allowed list; a class
@@ -529,7 +561,7 @@ def data_residency(payload: dict) -> dict:
     house policy. Legal questions beyond the label are not modelled.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         regions = payload["regions"]
         dupes = _duplicates([item["region"] for item in regions])
         if dupes:
@@ -544,7 +576,7 @@ def data_residency(payload: dict) -> dict:
         if any("" in allowed for allowed in allowed_of.values()):
             return _invalid("rules", "allowed_jurisdictions must not contain blank entries")
         tally: dict[str, list[int]] = {}
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         violations = unruled = 0
         taken: dict[str, int] = {}
         for index, place in enumerate(payload["placements"]):
@@ -577,7 +609,7 @@ def data_residency(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 5. landing zone lint --------------------------------------------------------------------------------------
@@ -593,7 +625,7 @@ def _required_guardrails(role: str) -> tuple[str, ...]:
 
 
 @_safe
-def landing_zone_lint(payload: dict) -> dict:
+def landing_zone_lint(payload: Payload) -> dict[str, object]:
     """Account/OU hierarchy, guardrail coverage, central audit and log accounts, root MFA and break-glass readiness.
 
     Guardrail keys and the keys each role needs (BASELINE_GUARDRAILS, ROLE_GUARDRAILS) are this lane's own vocabulary, to be
@@ -601,7 +633,7 @@ def landing_zone_lint(payload: dict) -> dict:
     guardrail coverage because AWS service control policies do not restrict it.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         accounts = payload["accounts"]
         dupes = _duplicates([item["id"] for item in accounts])
         if dupes:
@@ -611,8 +643,8 @@ def landing_zone_lint(payload: dict) -> dict:
                 return _invalid("accounts", f"account {item['id']}: ou must be '' (root) or a path of non-empty OU names like Workloads/Prod")
         # canonical OU paths: surrounding whitespace is not part of an OU name, so 'Workloads/Prod ' is the OU 'Workloads/Prod'
         accounts = [{**item, "ou": "/".join(part.strip() for part in item["ou"].split("/"))} for item in accounts]
-        findings: list[dict] = []
-        by_role: dict[str, list[dict]] = {role: [] for role in LANDING_ROLES}
+        findings: list[dict[str, str]] = []
+        by_role: dict[str, list[Payload]] = {role: [] for role in LANDING_ROLES}
         for item in accounts:
             by_role[item["role"]].append(item)
         count = len(by_role["management"])
@@ -678,21 +710,21 @@ def landing_zone_lint(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 6. Well-Architected scorecard -----------------------------------------------------------------------------
 
 
 @_safe
-def wellarch_scorecard(payload: dict) -> dict:
+def wellarch_scorecard(payload: Payload) -> dict[str, object]:
     """Weighted per-pillar scores from risk answers (none 0, medium 1/2, high 1 of the weight) and a ranked remediation list.
 
     The six pillars and the none/medium/high risk levels follow the AWS Well-Architected Framework; the weighting, the
     0-100 scores and the remediation severity (high risk = blocker at weight 4 or more, else major; medium = minor) are house policy.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         answers = payload["answers"]
         keys = [f"{a['pillar']}:{a['question']}" for a in answers]
         dupes = _duplicates(keys)
@@ -703,8 +735,8 @@ def wellarch_scorecard(payload: dict) -> dict:
             return _invalid("answers", f"every pillar needs at least one answer, missing: {', '.join(missing)}")
         pillar_weight = {name: 1 for name in PILLARS}
         pillar_weight.update(payload.get("pillar_weights", {}))
-        results = []
-        remediation = []
+        results: list[Payload] = []
+        remediation: list[tuple[Any, int, Any, str, Any]] = []
         for name in PILLARS:
             rows = [a for a in answers if a["pillar"] == name]
             weight_sum = sum(a["weight"] for a in rows)
@@ -721,7 +753,7 @@ def wellarch_scorecard(payload: dict) -> dict:
         total_weight = sum(pillar_weight.values())
         overall = sum(r["score"] * pillar_weight[r["pillar"]] for r in results) / total_weight
         weakest = min(results, key=lambda r: (r["score"], PILLARS.index(r["pillar"])))
-        ranked = [
+        ranked: list[Payload] = [
             {"rank": rank, "id": f"{a['pillar']}:{a['question']}", "severity": severity, "pillar": a["pillar"],
              "summary": f"{a['risk']} risk on '{a['question']}' (weight {a['weight']})", "impact": float(-neg)}
             for rank, (neg, _, _, severity, a) in enumerate(remediation, start=1)
@@ -737,7 +769,7 @@ def wellarch_scorecard(payload: dict) -> dict:
             "verdict": _verdict([{"id": item["id"], "severity": item["severity"]} for item in ranked]),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 7. blast radius -------------------------------------------------------------------------------------------
@@ -749,7 +781,7 @@ def _domain_label(key: tuple[str, ...]) -> str:
 
 
 @_safe
-def blast_radius(payload: dict) -> dict:
+def blast_radius(payload: Payload) -> dict[str, object]:
     """Loss of each AZ, region and cell: which services go down (directly or through hard dependencies) and the criticality share lost.
 
     A cell id names one failure domain wherever it appears, so the same id in two regions is one cell. The limit applies to AZ and
@@ -757,7 +789,7 @@ def blast_radius(payload: dict) -> dict:
     (major at criticality 8 or more, else minor, house policy).
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         services = payload["services"]
         ids = [s["id"] for s in services]
         dupes = _duplicates(ids)
@@ -788,7 +820,7 @@ def blast_radius(payload: dict) -> dict:
         for s in services:
             for dep in s["depends_on"]:
                 dependents[dep].append(s["id"])
-        evaluated = []
+        evaluated: list[Payload] = []
         spof: set[str] = set()
         for key in sorted(domains):
             scope = key[0]
@@ -816,7 +848,7 @@ def blast_radius(payload: dict) -> dict:
         scope_order = {"cell": 0, "az": 1, "region": 2}
         affecting.sort(key=lambda e: (-e["blast"], -e["degraded"], scope_order[e["scope"]], e["domain"]))
         limit = _dec(payload["max_az_blast_pct"])
-        findings = []
+        findings: list[dict[str, str]] = []
         for e in affecting:
             if e["scope"] in ("az", "cell") and e["blast"] > limit:
                 findings.append(_finding(f"blast-exceeds-limit:{e['domain']}", "major",
@@ -838,7 +870,7 @@ def blast_radius(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 8. cell capacity ------------------------------------------------------------------------------------------
@@ -857,10 +889,10 @@ CELL_BOUNDS = {
 
 
 @_safe
-def cell_capacity(payload: dict) -> dict:
+def cell_capacity(payload: Payload) -> dict[str, object]:
     """Cells for a projected load at a target utilisation, plus spare cells (N+1 style), the per-cell blast radius and the gap to the deployed count."""
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         for field, (low, high, low_open, integer) in CELL_BOUNDS.items():
             if _number_error(payload[field], low, high, low_open=low_open, integer=integer):
                 kind = "an integer" if integer else "a number"
@@ -893,7 +925,7 @@ def cell_capacity(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 9. CIDR plan ----------------------------------------------------------------------------------------------
@@ -908,14 +940,14 @@ def _is_network(text: str) -> bool:
     return True
 
 
-def _relation(a, b) -> str:
+def _relation(a: _Network, b: _Network) -> str:
     if a == b:
         return "equals"
-    return "contains" if a.supernet_of(b) else "is inside"
+    return "contains" if _nested(b, a) else "is inside"
 
 
 @_safe
-def cidr_plan(payload: dict) -> dict:
+def cidr_plan(payload: Payload) -> dict[str, object]:
     """Overlaps between networks that must coexist (same group, or both routable), private-range use and address sizing.
 
     Every network is sized like a subnet: `reserved_addresses` (default 5, what AWS and Azure reserve per subnet; Google Cloud
@@ -924,12 +956,12 @@ def cidr_plan(payload: dict) -> dict:
     Inputs are address/prefix-length strings with no host bits; the value is never repeated in a message.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         nets = payload["networks"]
         dupes = _duplicates([n["name"] for n in nets])
         if dupes:
             return _invalid("networks", f"network names must be unique: {', '.join(dupes)}")
-        parsed = []
+        parsed: list[tuple[Payload, _Network]] = []
         for n in nets:
             if not CIDR_FORM.fullmatch(n["cidr"]):
                 return _invalid("networks", f"network {n['name']}: not an IPv4 or IPv6 address/prefix-length")
@@ -940,7 +972,7 @@ def cidr_plan(payload: dict) -> dict:
                                 if _is_network(n["cidr"]) else f"network {n['name']}: not an IPv4 or IPv6 address/prefix-length")
         reserved = payload.get("reserved_addresses", DEFAULT_RESERVED_ADDRESSES)
         headroom = 1 + Fraction(_dec(payload.get("headroom_pct", 0))) / 100
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         overlaps = undersized = 0
         for i, (a, na) in enumerate(parsed):
             for b, nb in parsed[i + 1:]:
@@ -955,8 +987,8 @@ def cidr_plan(payload: dict) -> dict:
                 findings.append(_finding(f"overlap:{first}:{second}", "blocker" if both_routable else "major",
                                          f"{first} ({left}) {_relation(left, right)} {second} ({right})"))
         for n, net in parsed:
-            if not any(net.version == p.version and net.subnet_of(p) for p in PRIVATE_NETWORKS) and not (
-                    net.version == 6 and net.subnet_of(GLOBAL_UNICAST_V6) and not net.overlaps(DOCUMENTATION_V6)):
+            if not any(_nested(net, p) for p in PRIVATE_NETWORKS) and not (
+                    net.version == 6 and _nested(net, GLOBAL_UNICAST_V6) and not net.overlaps(DOCUMENTATION_V6)):
                 findings.append(_finding(f"public-range:{n['name']}", "minor", f"{n['name']} ({net}) is outside RFC 1918, RFC 6598 and RFC 4193 private space"))
             required = n.get("required_addresses")
             if required is not None:
@@ -977,17 +1009,17 @@ def cidr_plan(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 10. managed versus self-hosted ----------------------------------------------------------------------------
 
 
 @_safe
-def managed_vs_self_hosted(payload: dict) -> dict:
+def managed_vs_self_hosted(payload: Payload) -> dict[str, object]:
     """Weighted 1-5 scores (5 = best for that option) for both options, with knockout on critical criteria scored 1."""
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         criteria = payload["criteria"]
         dupes = _duplicates([c["id"] for c in criteria])
         if dupes:
@@ -1012,7 +1044,7 @@ def managed_vs_self_hosted(payload: dict) -> dict:
             recommendation = "managed" if managed > hosted else "self_hosted"
         deltas = sorted(((c["weight"] * abs(c["managed_score"] - c["self_hosted_score"]), c["id"]) for c in criteria if c["managed_score"] != c["self_hosted_score"]),
                         key=lambda item: (-item[0], item[1]))
-        findings = []
+        findings: list[dict[str, str]] = []
         for option in out:
             findings.append(_finding(f"knocked-out:{option}", "info", f"{option} scores 1 on a critical criterion and is disqualified"))
         if recommendation == "none":
@@ -1033,7 +1065,7 @@ def managed_vs_self_hosted(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 11. replica placement -------------------------------------------------------------------------------------
@@ -1051,10 +1083,10 @@ def _min_azs(total: int, failures: int, required_live: int) -> int:
 
 
 @_safe
-def replica_placement(payload: dict) -> dict:
+def replica_placement(payload: Payload) -> dict[str, object]:
     """Whether a quorum-based replica set keeps its quorum when the largest AZs fail, and the AZ count that would."""
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         placements = payload["placements"]
         dupes = _duplicates([p["az"] for p in placements])
         if dupes:
@@ -1078,7 +1110,7 @@ def replica_placement(payload: dict) -> dict:
         remaining = total - sum(sizes[:failures])
         survives = remaining >= required_live
         min_azs = _min_azs(total, failures, required_live)
-        findings = []
+        findings: list[dict[str, str]] = []
         if not intersects:
             findings.append(_finding("quorums-do-not-intersect", "blocker",
                                      f"read {payload['read_quorum']} + write {payload['write_quorum']} must exceed {total} and 2*write must exceed {total}"))
@@ -1103,14 +1135,14 @@ def replica_placement(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)
 
 
 # --- 12. latency budget ----------------------------------------------------------------------------------------
 
 
 @_safe
-def latency_budget(payload: dict) -> dict:
+def latency_budget(payload: Payload) -> dict[str, object]:
     """Critical-path latency: sequential hops add, hops of one parallel group contribute their maximum; compared with the p99 target.
 
     Per-hop p99 values summed along the path are a planning figure, not the end-to-end p99 (percentiles do not add), and the
@@ -1119,7 +1151,7 @@ def latency_budget(payload: dict) -> dict:
     meet at least one hop above its own p99 is 1 - 0.99^N for N hop calls.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, object]:
         hops = payload["hops"]
         dupes = _duplicates([h["name"] for h in hops])
         if dupes:
@@ -1148,7 +1180,7 @@ def latency_budget(payload: dict) -> dict:
             ctx.prec = 40
             tail = (1 - Decimal("0.99") ** calls) * 100
         ranked = sorted(stages.items(), key=lambda item: (-item[1][0], item[0]))
-        findings = []
+        findings: list[dict[str, str]] = []
         if total99 > target:
             findings.append(_finding("over-budget", "major", f"critical path p99 {_pct(total99, 3)} ms exceeds the {payload['p99_target_ms']} ms target"))
         for name, (p99, _) in ranked:
@@ -1170,4 +1202,4 @@ def latency_budget(payload: dict) -> dict:
             "verdict": _verdict(findings),
         }
 
-    return respond(payload, work)
+    return _respond(payload, work)

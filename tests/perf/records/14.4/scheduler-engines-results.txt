@@ -1,0 +1,367 @@
+scheduler engines: CPU cost of the scheduler's own code, Python against swarm._native (Phase 14.4, D-P21)
+python 3.12.3, repository /root/src/repos/agent-swarm, work /root/.cache/gsd-redact-work/SchBenchPy/run, 30 inputs per row, min of 7 passes
+/proc/loadavg at start: 23.40 53.92 59.54 67/3503 2216946   (nproc 8)
+
+== 0. parity gate (nothing is timed until every row below says PARITY)
+   corpus order_ready         123 cases  PARITY
+   corpus priority_fallback    25 cases  PARITY
+   corpus claim_normalize     172 cases  PARITY
+   corpus claim_overlap       215 cases  PARITY
+   corpus claim_conflict      153 cases  PARITY
+   corpus claim_table          70 cases  PARITY
+   corpus aimd                 95 cases  PARITY
+   corpus backoff             208 cases  PARITY
+   corpus drain_plan          176 cases  PARITY
+   order_ready n=50: 30 inputs, Python order == native order == facade order: PARITY
+   order_ready n=500: 30 inputs, Python order == native order == facade order: PARITY
+   claims '50 sequential single-claim acquires into a fresh table': 30 inputs, Python ClaimTable == native ClaimTable (results and held view): PARITY
+   claims 'one acquire of 50 claims': 30 inputs, Python ClaimTable == native ClaimTable (results and held view): PARITY
+   claims 'acquire 50 claims, then release': 30 inputs, Python ClaimTable == native ClaimTable (results and held view): PARITY
+   claims '500 sequential single-claim acquires into a fresh table': 2 inputs, Python ClaimTable == native ClaimTable (results and held view): PARITY
+   aimd 'success' x 30 parameter sets x 256 ops, fake clock: Python scheduler/limiter == native, every step: PARITY
+   aimd 'rate_limit' x 30 parameter sets x 256 ops, fake clock: Python scheduler/limiter == native, every step: PARITY
+   aimd 'failure' x 30 parameter sets x 256 ops, fake clock: Python scheduler/limiter == native, every step: PARITY
+   backoff: 30 parameter sets x 8 attempts, Python backoff_s (injected sample) == sched_backoff_s: PARITY
+   drain plan: 30 inputs, inline arithmetic == the real Scheduler._cancel_drain == sched_drain_plan: PARITY
+   decision n=50 (every task declares claims, cap = ceiling = n (stress: every task examined)): Python _schedule batch == batch of sched_order_ready + native ClaimTable (5 inputs, 50 ready): PARITY
+   decision n=50 (1 task in 10 declares claims, cap = ceiling = n): Python _schedule batch == batch of sched_order_ready + native ClaimTable (5 inputs, 50 ready): PARITY
+   decision n=50 (1 task in 10 declares claims, cap 8, class ceiling 4: slots run out early): Python _schedule batch == batch of sched_order_ready + native ClaimTable (5 inputs, 50 ready): PARITY
+   decision n=500 (every task declares claims, cap = ceiling = n (stress: every task examined)): Python _schedule batch == batch of sched_order_ready + native ClaimTable (2 inputs, 500 ready): PARITY
+   decision n=500 (1 task in 10 declares claims, cap = ceiling = n): Python _schedule batch == batch of sched_order_ready + native ClaimTable (5 inputs, 500 ready): PARITY
+   decision n=500 (1 task in 10 declares claims, cap 8, class ceiling 4: slots run out early): Python _schedule batch == batch of sched_order_ready + native ClaimTable (5 inputs, 500 ready): PARITY
+   port bodies (section 3) and the pool: Python only, no native counterpart to compare
+
+== 1. primitive latency: Python against swarm._native called from Python (the PyO3 call overhead is inside the native rows)
+   [measured] thread CPU time, min of 7 passes per input, median and p99 over 30 inputs; verdict 'native faster' needs p50 and p99 below 1.00x
+   /proc/loadavg: 27.95 49.32 57.56 48/3472 2219874
+
+-- order_ready, 50 rows   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python order_ready (scripts/swarm_run.py)                           11.01 us    15.53 us    1.00x    1.00x
+   native sched_order_ready, rows prebuilt (PyO3 call only)             7.00 us     8.18 us    0.64x    0.53x  native faster
+   native facade: build rows from dicts + call + map back              13.09 us    18.28 us    1.19x    1.18x  NO GAIN (native slower)
+
+-- order_ready, 500 rows   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python order_ready (scripts/swarm_run.py)                          178.14 us   258.16 us    1.00x    1.00x
+   native sched_order_ready, rows prebuilt (PyO3 call only)            85.39 us   108.34 us    0.48x    0.42x  native faster
+   native facade: build rows from dicts + call + map back             142.81 us   172.78 us    0.80x    0.67x  native faster
+
+-- claims: 50 sequential single-claim acquires into a fresh table (CPU per scenario, not per claim)   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  p50 x alt  verdict
+   Python swarm.claims.ClaimTable (lru caches warm: steady state)       2.41 ms     2.83 ms    1.00x    1.00x      0.26x
+   Python swarm.claims.ClaimTable (lru caches cleared: first sight)     9.22 ms    12.21 ms    3.82x    4.31x      1.00x
+   native ClaimTable, claims as (pattern, mode) tuples                136.26 us   164.84 us    0.06x    0.06x      0.01x  native faster
+   native ClaimTable, claims converted from Claim objects             144.91 us   178.41 us    0.06x    0.06x      0.02x  native faster
+
+-- claims: one acquire of 50 claims (CPU per scenario, not per claim)   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python swarm.claims.ClaimTable (lru caches warm: steady state)     155.66 us   222.68 us    1.00x    1.00x
+   native ClaimTable, claims as (pattern, mode) tuples                 42.90 us    55.37 us    0.28x    0.25x  native faster
+   native ClaimTable, claims converted from Claim objects              50.04 us    56.51 us    0.32x    0.25x  native faster
+
+-- claims: acquire 50 claims, then release (CPU per scenario, not per claim)   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python swarm.claims.ClaimTable (lru caches warm: steady state)     167.41 us   238.19 us    1.00x    1.00x
+   native ClaimTable, claims as (pattern, mode) tuples                 52.24 us    63.55 us    0.31x    0.27x  native faster
+   native ClaimTable, claims converted from Claim objects              60.42 us    71.44 us    0.36x    0.30x  native faster
+
+-- claims: 500 sequential single-claim acquires into a fresh table (CPU per scenario, not per claim)   [measured, CPU per operation, 2 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python swarm.claims.ClaimTable (lru caches warm; at 500 the 4096-entry overlap cache thrashes)  4886.74 ms  5506.40 ms    1.00x    1.00x
+   native ClaimTable, claims as (pattern, mode) tuples                  6.75 ms     8.80 ms    0.00x    0.00x  native faster
+   native ClaimTable, claims converted from Claim objects               7.41 ms     9.20 ms    0.00x    0.00x  native faster
+
+-- AIMD success   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  p50 x alt  verdict
+   Python AimdLimiter.on_success() (bare limiter op)                     300 ns      378 ns    1.00x    1.00x      0.30x
+   Python Scheduler._backpressure (success: limiter + streak + log)     1.01 us     1.33 us    3.37x    3.53x      1.00x
+   native AimdLimiter.on_success (+ time.monotonic() per call)           126 ns      141 ns    0.42x    0.37x      0.13x  native faster
+
+-- AIMD rate_limit   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  p50 x alt  verdict
+   Python AimdLimiter.on_rate_limit() (bare limiter op)                  644 ns      787 ns    1.00x    1.00x      0.46x
+   Python Scheduler._backpressure (rate_limit: limiter + streak + log)     1.40 us     2.19 us    2.17x    2.78x      1.00x
+   native AimdLimiter.on_rate_limit (+ time.monotonic() per call)        128 ns      167 ns    0.20x    0.21x      0.09x  native faster
+
+-- AIMD failure   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python Scheduler._backpressure (failure: limiter + streak + log)      372 ns      624 ns    1.00x    1.00x
+   native AimdLimiter.on_failure (+ time.monotonic() per call)           150 ns      251 ns    0.40x    0.40x  native faster
+
+   [measured] PyO3 call floor, native AimdLimiter.current() from Python: p50 47 ns per call
+
+-- backoff, explicit base/cap/jitter   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python swarm.retry.backoff_s                                          791 ns     1.36 us    1.00x    1.00x
+   native sched_backoff_s (+ rng.uniform sample per call)                174 ns      240 ns    0.22x    0.18x  native faster
+
+-- backoff, the production call backoff_s(attempt) (env defaults, module random)   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python backoff_s(attempt)                                            2.90 us     3.55 us    1.00x    1.00x
+   native facade: two env lookups + sample + sched_backoff_s            1.99 us     2.58 us    0.69x    0.73x  native faster
+
+-- drain plan (once per cancelled run, never on the dispatch path)   [measured, CPU per operation, 30 inputs]
+   variant                                                                  p50         p99    p50 x    p99 x  verdict
+   Python: the two max/min lines of Scheduler._cancel_drain, inline      465 ns      558 ns    1.00x    1.00x
+   native sched_drain_plan                                               108 ns      158 ns    0.23x    0.28x  native faster
+
+/proc/loadavg: 46.60 46.21 53.55 59/3383 2231962
+
+== 2. the Python decision pass: the real Scheduler._schedule with every port stubbed to a trivial body
+   (reconcile, dispatchable, log_phase, resolve_agent, parse_claims, leases, submit and telemetry are trivial; the ClaimTable, order_ready,
+    select_batch, the AIMD limiter and ErrorHandler are the real code; select_batch is a module function of scripts/swarm_run.py)
+
+-- decision pass, 50 ready tasks, every task declares claims, cap = ceiling = n (stress: every task examined)   [measured, CPU per pass; 30 inputs, min of 7 passes]
+   variant                                                                                              p50         p99    p50/task    p50 x    p99 x
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches warm)                             3.99 ms     6.13 ms    79.71 us
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches cleared)                         14.43 ms    25.17 ms   288.52 us
+   Scheduler._schedule, ports stubbed, RunBook no-op: the decision part                             2.99 ms     5.02 ms    59.86 us
+   select_batch alone, real ClaimTable                                                              3.85 ms     5.26 ms    76.92 us
+   order_ready alone                                                                               14.21 us    16.22 us      284 ns
+   native replay of the decision: sched_order_ready + filters + native ClaimTable (via PyO3)      188.26 us   269.53 us     3.77 us    0.06x    0.05x  native faster (vs the decision part)
+   [measured] overlap cache after these passes: size 4096 of 4096, hits 927234, misses 118601
+
+-- decision pass, 50 ready tasks, 1 task in 10 declares claims, cap = ceiling = n   [measured, CPU per pass; 30 inputs, min of 7 passes]
+   variant                                                                                              p50         p99    p50/task    p50 x    p99 x
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches warm)                           323.21 us   555.68 us     6.46 us
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches cleared)                        441.02 us     1.19 ms     8.82 us
+   Scheduler._schedule, ports stubbed, RunBook no-op: the decision part                           189.34 us   368.80 us     3.79 us
+   select_batch alone, real ClaimTable                                                            112.95 us   222.95 us     2.26 us
+   order_ready alone                                                                               14.10 us    16.42 us      282 ns
+   native replay of the decision: sched_order_ready + filters + native ClaimTable (via PyO3)       63.10 us    93.79 us     1.26 us    0.33x    0.25x  native faster (vs the decision part)
+   [measured] overlap cache after these passes: size 786 of 4096, hits 9770, misses 786
+
+-- decision pass, 50 ready tasks, 1 task in 10 declares claims, cap 8, class ceiling 4: slots run out early   [measured, CPU per pass; 30 inputs, min of 7 passes]
+   variant                                                                                              p50         p99    p50/task    p50 x    p99 x
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches warm)                           212.36 us   246.88 us     4.25 us
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches cleared)                        213.62 us   336.59 us     4.27 us
+   Scheduler._schedule, ports stubbed, RunBook no-op: the decision part                            89.97 us   113.17 us     1.80 us
+   select_batch alone, real ClaimTable                                                             21.83 us    34.95 us      437 ns
+   order_ready alone                                                                               14.30 us    17.31 us      286 ns
+   native replay of the decision: sched_order_ready + filters + native ClaimTable (via PyO3)       30.11 us    38.38 us      602 ns    0.33x    0.34x  native faster (vs the decision part)
+   [measured] overlap cache after these passes: size 11 of 4096, hits 101, misses 11
+
+-- decision pass, 500 ready tasks, every task declares claims, cap = ceiling = n (stress: every task examined)   [measured, CPU per pass; 3 inputs, min of 2 passes]
+   variant                                                                                              p50         p99    p50/task    p50 x    p99 x
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches warm)                          6620.32 ms  6964.84 ms    13.24 ms
+   Scheduler._schedule, ports stubbed, RunBook no-op: the decision part                          5718.78 ms  6737.75 ms    11.44 ms
+   select_batch alone, real ClaimTable                                                           7245.28 ms  7658.63 ms    14.49 ms
+   order_ready alone                                                                              220.17 us   253.11 us      440 ns
+   native replay of the decision: sched_order_ready + filters + native ClaimTable (via PyO3)        9.69 ms    11.07 ms    19.39 us    0.00x    0.00x  native faster (vs the decision part)
+   [measured] overlap cache after these passes: size 4096 of 4096, hits 615987, misses 3547749
+
+-- decision pass, 500 ready tasks, 1 task in 10 declares claims, cap = ceiling = n   [measured, CPU per pass; 15 inputs, min of 7 passes]
+   variant                                                                                              p50         p99    p50/task    p50 x    p99 x
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches warm)                             7.62 ms    11.04 ms    15.25 us
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches cleared)                         21.74 ms    31.81 ms    43.48 us
+   Scheduler._schedule, ports stubbed, RunBook no-op: the decision part                             6.96 ms     8.93 ms    13.91 us
+   select_batch alone, real ClaimTable                                                              5.58 ms    35.79 ms    11.16 us
+   order_ready alone                                                                              162.16 us   212.00 us      324 ns
+   native replay of the decision: sched_order_ready + filters + native ClaimTable (via PyO3)      727.16 us   869.88 us     1.45 us    0.10x    0.10x  native faster (vs the decision part)
+   [measured] overlap cache after these passes: size 4096 of 4096, hits 527335, misses 109860
+
+-- decision pass, 500 ready tasks, 1 task in 10 declares claims, cap 8, class ceiling 4: slots run out early   [measured, CPU per pass; 15 inputs, min of 7 passes]
+   variant                                                                                              p50         p99    p50/task    p50 x    p99 x
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches warm)                             1.66 ms     2.60 ms     3.32 us
+   Scheduler._schedule, ports stubbed, RunBook real (claim caches cleared)                          1.83 ms     2.44 ms     3.67 us
+   Scheduler._schedule, ports stubbed, RunBook no-op: the decision part                           760.99 us   917.79 us     1.52 us
+   select_batch alone, real ClaimTable                                                             67.69 us    89.33 us      135 ns
+   order_ready alone                                                                              176.45 us   203.47 us      353 ns
+   native replay of the decision: sched_order_ready + filters + native ClaimTable (via PyO3)      284.81 us   337.14 us      570 ns    0.37x    0.37x  native faster (vs the decision part)
+   [measured] overlap cache after these passes: size 7 of 4096, hits 77, misses 7
+
+/proc/loadavg: 53.28 60.09 53.68 73/3434 2288718
+
+== 3. the port bodies that stay in Python under architecture B (real SQLite Task Store; stub run; no leases)
+
+-- port bodies on a real SQLite Task Store, 50 tasks (24 ready at the start; states {'DONE': 3, 'PLANNED': 33, 'IN_PROGRESS': 8, 'IN_REVIEW': 4, 'FAILED': 2}); 8 stores, min of 5 passes   [measured, CPU]
+   port body (steady state, a store already settled by one pass)                       p50/call    p99/call    p50/task
+   reconcile (IN_REVIEW targets with a live gate task)                                  3.98 ms     5.13 ms    79.60 us
+   dispatchable (ready, rework, FAILED scan)                                            1.10 ms     1.38 ms    21.96 us
+   store.list(correlation_id) (the telemetry loop's read)                             762.81 us   919.08 us    15.26 us
+   log_phase('reconcile') -> events.jsonl                                             997.09 us     1.13 ms    19.94 us
+   begin_pass body measured together: reconcile + log_phase + dispatchable + list       7.62 ms    29.44 ms   152.47 us
+   store.transition CLAIMED then IN_PROGRESS (per transition; live.json refresh included)    11.62 ms    15.10 ms
+   store.set_notes(retry_after=...) (the retry write)                                 892.79 us     1.06 ms
+   Scheduler._complete, success, real events, stub run                                  5.39 ms    13.15 ms
+   Scheduler._complete, transient failure (+ _schedule_retry write)                    11.31 ms    23.58 ms
+
+-- port bodies on a real SQLite Task Store, 500 tasks (200 ready at the start; states {'DONE': 25, 'PLANNED': 300, 'IN_PROGRESS': 100, 'IN_REVIEW': 50, 'FAILED': 25}); 4 stores, min of 3 passes   [measured, CPU]
+   port body (steady state, a store already settled by one pass)                       p50/call    p99/call    p50/task
+   reconcile (IN_REVIEW targets with a live gate task)                               1738.55 ms  1905.24 ms     3.48 ms
+   dispatchable (ready, rework, FAILED scan)                                           22.45 ms    23.49 ms    44.89 us
+   store.list(correlation_id) (the telemetry loop's read)                              10.42 ms    11.66 ms    20.83 us
+   log_phase('reconcile') -> events.jsonl                                               1.04 ms     1.38 ms     2.07 us
+   store.transition CLAIMED then IN_PROGRESS (per transition; live.json refresh included)    45.99 ms    59.06 ms
+   store.set_notes(retry_after=...) (the retry write)                                 980.71 us     1.00 ms
+   Scheduler._complete, success, real events, stub run                                  7.95 ms    18.74 ms
+   Scheduler._complete, transient failure (+ _schedule_retry write)                    17.13 ms    20.35 ms
+
+/proc/loadavg: 49.69 81.37 74.98 36/3306 2345595
+
+== 3b. worker pool dispatch and the GIL attach probe
+   [measured] Python WorkerPool(8), 64 trivial jobs, process CPU per job: fresh pool (thread starts included) p50 48.74 us p99 64.64 us; pool already running p50 17.43 us p99 23.82 us
+   [measured] Python WorkerPool(32), 64 trivial jobs, process CPU per job: fresh pool (thread starts included) p50 125.20 us p99 184.01 us; pool already running p50 68.81 us p99 1.13 ms
+   [quoted] Rust pool, one thread per dispatch (loop bench): about 2.0 ms per job at 32 workers, per-pass p99 up to 270.0 ms
+
+== 4. synthesis (measured = this run; quoted = the loop bench figures given in the task, not re-measured by this script)
+-- output of this unit's own `cargo run --release --example loop_bench -p gsd-sched-core` (loop_bench.log; measured by cargo, outside this script, release build, private target dir, same saturated host):
+   |    Compiling gsd-sched-core v0.1.0 (/root/src/repos/agent-swarm/crates/gsd-sched-core)
+   |     Finished `release` profile [optimized] target(s) in 2m 13s
+   |      Running `/root/.cache/gsd-redact-work/SchBenchPy/target/release/examples/loop_bench`
+   | loadavg at start: 61.89 44.14 40.29 71/3341 1835701
+   | pool alone (thread start per job, std::thread):
+   |   Pool:  50 immediate jobs on  4 workers   per job p50    42.5 us p99  3819.7 us (submit with a thread start + completion)
+   |   Pool:  50 immediate jobs on 32 workers   per job p50  2416.8 us p99 17898.7 us (submit with a thread start + completion)
+   |   Pool: 500 immediate jobs on  4 workers   per job p50     4.6 us p99   410.2 us (submit with a thread start + completion)
+   |   Pool: 500 immediate jobs on 32 workers   per job p50   349.9 us p99  2027.2 us (submit with a thread start + completion)
+   | loop with stub ports (zero-cost closures), release build expected:
+   |   50 tasks  4 workers | passes/run  46.2 (dispatching  42.7) | all passes p50    24.3 p99    307.4 us | dispatching passes p50    25.4 p99    334.5 us | per dispatched task p50   25.2 p99   252.2 us | loop cpu/pass  123.8 us | end-to-end per task p50  2285.7 p99 18021.3 us
+   |   50 tasks 32 workers | passes/run  24.6 (dispatching   9.1) | all passes p50     1.0 p99  86881.5 us | dispatching passes p50    29.7 p99 295599.9 us | per dispatched task p50   28.3 p99 18564.7 us | loop cpu/pass  325.7 us | end-to-end per task p50  3638.3 p99 25930.2 us
+   |  500 tasks  4 workers | passes/run 417.4 (dispatching 414.1) | all passes p50    62.1 p99   1219.9 us | dispatching passes p50    62.5 p99   1257.3 us | per dispatched task p50   56.5 p99  1023.6 us | loop cpu/pass  257.9 us | end-to-end per task p50  2851.0 p99  6820.9 us
+   |  500 tasks 32 workers | passes/run 197.4 (dispatching 181.0) | all passes p50    64.5 p99 210905.1 us | dispatching passes p50    68.5 p99 275646.7 us | per dispatched task p50   57.7 p99 48979.7 us | loop cpu/pass  523.2 us | end-to-end per task p50  3797.3 p99  6955.2 us
+   | 
+   | per-call cost of the primitives the Python loop runs per pass (median of at least 50 samples):
+   |   order_ready over  50 rows               0.9 us
+   |   order_ready over 500 rows              33.8 us
+   |   ClaimTable: 50 acquires, 1 claim each, into a fresh table        87.2 us total,      1.7 us per acquire (grows with the table)
+   |   ClaimTable: one acquire of 50 claims                  28.0 us
+   |   ClaimTable: 50 acquires then 50 releases              66.2 us total
+   |   AimdLimiter::on_success                                3.7 ns
+   |   AimdLimiter::on_rate_limit                             2.7 ns
+   |   AimdLimiter::on_failure (distinct task ids)           49.9 ns
+   |   backoff_s                                              2.2 ns
+   | 
+   | loadavg at end: 62.61 56.67 46.94 26/3309 1921312
+
+-- the quoted Rust primitives against this run's native calls from Python (the difference is PyO3 argument conversion and call overhead)
+   order_ready 50 rows   quoted 1.0 us        measured via PyO3: call only 7.00 us, with row building 13.09 us
+   order_ready 500 rows  quoted 23.8 us       measured via PyO3: call only 85.39 us, with row building 142.81 us
+   one acquire of 50     quoted 18.1 us       measured via PyO3: 42.90 us
+   50 sequential acquires quoted 1384 us     measured via PyO3: 136.26 us
+   AIMD ops              quoted 3 to 56 ns        measured via PyO3: success 126 ns, rate limit 128 ns, failure 150 ns (PyO3 floor 47 ns)
+   backoff               quoted 2.6 ns        measured via PyO3: 174 ns (with the rng sample)
+
+   [measured, proxy] a thread Python did not create entering the interpreter (ctypes pthread callback: PyGILState_Ensure/Release, the CPython call under PyO3's attach; not PyO3 itself), GIL free: 13.0 us of process CPU per attach (minimum batch of 100 spawns over a bare pthread create+join); in wall time p50 57.3 us, min 15.3 us
+   [measured, proxy] the same while the interpreter thread runs Python code without blocking: p50 93.74 ms, min 5.35 ms (switch interval 5.0 ms); not added to the sums below
+   A Rust loop thread pays one attach per port call: per dispatched task agent_for, claims_for, lease, submit and complete (5), and begin_pass and observe_pass once per pass (crates/gsd-sched-core/src/ports.rs).
+
+   The begin_pass cost of a pass is spread over the n tasks that pass dispatches, the most favourable share for the decision code: the continuous scheduler runs a pass after every completion. Port-body stores hold n tasks (about 40% ready), the decision inputs n ready tasks.
+
+-- 50 ready tasks, 1 task in 10 declares claims; one pass dispatching all of them; microseconds of CPU
+   Python decision code (ordering, eligibility, select_batch, claims)                 189.3 per pass       3.79 /task  [measured]
+      of which order_ready 14.1 and select_batch 113.0 per pass                                                [measured]
+   native replay of the same decision (via PyO3, what a Python facade pays)            63.1 per pass       1.26 /task  [measured]
+   Python bookkeeping that stays Python (RunBook loop over every task)                133.9 per pass       2.68 /task  [measured]
+   begin_pass body on a store of 50 tasks (reconcile + log_phase + dispatchable + list)       6837.8 per pass     136.76 /task  [measured]
+   submit path, two transitions per task (commit + live.json refresh each)                             23238.70 /task  [measured]
+   complete path, Scheduler._complete with real events                                                  5393.96 /task  [measured]
+   GIL attach, 5 + 2/50 port calls per task                                                               65.32 /task  [measured proxy]
+   => Python engine 28775.88 us/task, decision code 0.013% of it
+   => Engine B (Rust decisions, Python ports, attach) 28838.68 us/task = 1.0022x the Python engine
+      with decisions free and attach free: 0.9999x (the bound on any gain: 0.013%); with decisions free and the measured attach: 1.0021x
+      with the quoted thread-per-dispatch pool (+1931 us/task over the Python pool's 68.8 us measured per job): 1.069x
+
+-- 50 ready tasks, every task declares claims (stress); one pass dispatching all of them; microseconds of CPU
+   Python decision code (ordering, eligibility, select_batch, claims)                2993.2 per pass      59.86 /task  [measured]
+      of which order_ready 14.2 and select_batch 3845.9 per pass                                                [measured]
+   native replay of the same decision (via PyO3, what a Python facade pays)           188.3 per pass       3.77 /task  [measured]
+   Python bookkeeping that stays Python (RunBook loop over every task)                133.9 per pass       2.68 /task  [measured]
+   begin_pass body on a store of 50 tasks (reconcile + log_phase + dispatchable + list)       6837.8 per pass     136.76 /task  [measured]
+   submit path, two transitions per task (commit + live.json refresh each)                             23238.70 /task  [measured]
+   complete path, Scheduler._complete with real events                                                  5393.96 /task  [measured]
+   GIL attach, 5 + 2/50 port calls per task                                                               65.32 /task  [measured proxy]
+   => Python engine 28831.96 us/task, decision code 0.208% of it
+   => Engine B (Rust decisions, Python ports, attach) 28841.18 us/task = 1.0003x the Python engine
+      with decisions free and attach free: 0.9979x (the bound on any gain: 0.208%); with decisions free and the measured attach: 1.0002x
+      with the quoted thread-per-dispatch pool (+1931 us/task over the Python pool's 68.8 us measured per job): 1.067x
+
+-- 500 ready tasks, 1 task in 10 declares claims; one pass dispatching all of them; microseconds of CPU
+   Python decision code (ordering, eligibility, select_batch, claims)                6957.4 per pass      13.91 /task  [measured]
+      of which order_ready 162.2 and select_batch 5581.7 per pass                                                [measured]
+   native replay of the same decision (via PyO3, what a Python facade pays)           727.2 per pass       1.45 /task  [measured]
+   Python bookkeeping that stays Python (RunBook loop over every task)                665.6 per pass       1.33 /task  [measured]
+   begin_pass body on a store of 500 tasks (reconcile + log_phase + dispatchable + list)    1772445.1 per pass    3544.89 /task  [measured]
+   submit path, two transitions per task (commit + live.json refresh each)                             91980.97 /task  [measured]
+   complete path, Scheduler._complete with real events                                                  7954.84 /task  [measured]
+   GIL attach, 5 + 2/500 port calls per task                                                               64.86 /task  [measured proxy]
+   => Python engine 103495.94 us/task, decision code 0.013% of it
+   => Engine B (Rust decisions, Python ports, attach) 103548.34 us/task = 1.0005x the Python engine
+      with decisions free and attach free: 0.9999x (the bound on any gain: 0.013%); with decisions free and the measured attach: 1.0005x
+      with the quoted thread-per-dispatch pool (+1931 us/task over the Python pool's 68.8 us measured per job): 1.019x
+
+-- 500 ready tasks, every task declares claims (stress); one pass dispatching all of them; microseconds of CPU
+   Python decision code (ordering, eligibility, select_batch, claims)             5718777.8 per pass   11437.56 /task  [measured]
+      of which order_ready 220.2 and select_batch 7245279.7 per pass                                                [measured]
+   native replay of the same decision (via PyO3, what a Python facade pays)          9694.5 per pass      19.39 /task  [measured]
+   Python bookkeeping that stays Python (RunBook loop over every task)                665.6 per pass       1.33 /task  [measured]
+   begin_pass body on a store of 500 tasks (reconcile + log_phase + dispatchable + list)    1772445.1 per pass    3544.89 /task  [measured]
+   submit path, two transitions per task (commit + live.json refresh each)                             91980.97 /task  [measured]
+   complete path, Scheduler._complete with real events                                                  7954.84 /task  [measured]
+   GIL attach, 5 + 2/500 port calls per task                                                               64.86 /task  [measured proxy]
+   => Python engine 114919.58 us/task, decision code 9.953% of it
+   => Engine B (Rust decisions, Python ports, attach) 103566.27 us/task = 0.9012x the Python engine
+      with decisions free and attach free: 0.9005x (the bound on any gain: 9.953%); with decisions free and the measured attach: 0.9010x
+      with the quoted thread-per-dispatch pool (+1931 us/task over the Python pool's 68.8 us measured per job): 0.918x
+
+-- where Rust gives NO gain in this run (native/Python p50 >= 1.00x or p99 >= 1.00x; rows above):
+   - order_ready, 50 rows / native facade: build rows from dicts + call + map back: p50 1.19x p99 1.18x
+-- where the native call is faster in both p50 and p99:
+   - order_ready, 50 rows / native sched_order_ready, rows prebuilt (PyO3 call only): p50 0.64x p99 0.53x
+   - order_ready, 500 rows / native sched_order_ready, rows prebuilt (PyO3 call only): p50 0.48x p99 0.42x
+   - order_ready, 500 rows / native facade: build rows from dicts + call + map back: p50 0.80x p99 0.67x
+   - claims: 50 sequential single-claim acquires into a fresh table (CPU per scenario, not per claim) / native ClaimTable, claims as (pattern, mode) tuples: p50 0.06x p99 0.06x
+   - claims: 50 sequential single-claim acquires into a fresh table (CPU per scenario, not per claim) / native ClaimTable, claims converted from Claim objects: p50 0.06x p99 0.06x
+   - claims: one acquire of 50 claims (CPU per scenario, not per claim) / native ClaimTable, claims as (pattern, mode) tuples: p50 0.28x p99 0.25x
+   - claims: one acquire of 50 claims (CPU per scenario, not per claim) / native ClaimTable, claims converted from Claim objects: p50 0.32x p99 0.25x
+   - claims: acquire 50 claims, then release (CPU per scenario, not per claim) / native ClaimTable, claims as (pattern, mode) tuples: p50 0.31x p99 0.27x
+   - claims: acquire 50 claims, then release (CPU per scenario, not per claim) / native ClaimTable, claims converted from Claim objects: p50 0.36x p99 0.30x
+   - claims: 500 sequential single-claim acquires into a fresh table (CPU per scenario, not per claim) / native ClaimTable, claims as (pattern, mode) tuples: p50 0.00x p99 0.00x
+   - claims: 500 sequential single-claim acquires into a fresh table (CPU per scenario, not per claim) / native ClaimTable, claims converted from Claim objects: p50 0.00x p99 0.00x
+   - AIMD success / native AimdLimiter.on_success (+ time.monotonic() per call): p50 0.42x p99 0.37x
+   - AIMD rate_limit / native AimdLimiter.on_rate_limit (+ time.monotonic() per call): p50 0.20x p99 0.21x
+   - AIMD failure / native AimdLimiter.on_failure (+ time.monotonic() per call): p50 0.40x p99 0.40x
+   - backoff, explicit base/cap/jitter / native sched_backoff_s (+ rng.uniform sample per call): p50 0.22x p99 0.18x
+   - backoff, the production call backoff_s(attempt) (env defaults, module random) / native facade: two env lookups + sample + sched_backoff_s: p50 0.69x p99 0.73x
+   - drain plan (once per cancelled run, never on the dispatch path) / native sched_drain_plan: p50 0.23x p99 0.28x
+   - decision pass 50 ready, every task declares claims, cap = ceiling = n (stress: every task examined): native replay p50 0.06x p99 0.05x of the Python decision part
+   - decision pass 50 ready, 1 task in 10 declares claims, cap = ceiling = n: native replay p50 0.33x p99 0.25x of the Python decision part
+   - decision pass 50 ready, 1 task in 10 declares claims, cap 8, class ceiling 4: slots run out early: native replay p50 0.33x p99 0.34x of the Python decision part
+   - decision pass 500 ready, every task declares claims, cap = ceiling = n (stress: every task examined): native replay p50 0.00x p99 0.00x of the Python decision part
+   - decision pass 500 ready, 1 task in 10 declares claims, cap = ceiling = n: native replay p50 0.10x p99 0.10x of the Python decision part
+   - decision pass 500 ready, 1 task in 10 declares claims, cap 8, class ceiling 4: slots run out early: native replay p50 0.37x p99 0.37x of the Python decision part
+
+VERDICT: a measurable end-to-end speedup (more than 5% of the per-task CPU, thread-per-dispatch pool excluded) is possible only where the Python claim scan dominates: 500 ready, every task declares claims (stress) (0.901x). Everywhere else it is not. The decision code alone is cheaper natively (the native replay costs 0.00x to 0.37x of the Python decision part at p50), but it is only 0.013% to 9.95% of the per-task CPU, the rest being port bodies that stay Python. Per scenario: 50 ready, 1 task in 10 declares claims: Engine B 1.002x Python (bound 0.01% gain; 1.07x with the quoted thread-per-dispatch pool); 50 ready, every task declares claims (stress): Engine B 1.000x Python (bound 0.21% gain; 1.07x with the quoted thread-per-dispatch pool); 500 ready, 1 task in 10 declares claims: Engine B 1.001x Python (bound 0.01% gain; 1.02x with the quoted thread-per-dispatch pool); 500 ready, every task declares claims (stress): Engine B 0.901x Python (bound 9.95% gain; 0.92x with the quoted thread-per-dispatch pool).
+
+== 5. the dry-run proxy: scripts/orch_plan.py then scripts/swarm_run.py --dry-run --json (13 tasks), fresh SWARM_DIR per run
+   [measured] CPU of the process tree (RUSAGE_CHILDREN, user+sys) for three runs: 6.45 s, 6.55 s, 6.25 s; median 6.45 s
+-- per-thread profile of one dry run (`profile`, the pure-Python twin of cProfile: cProfile on CPython 3.12 mixes the scheduler thread with the workers and printed negative times) [measured]
+   profiled thread = the scheduler loop, clock = its CPU time, profiler overhead included: 10.022 s; the whole process tree used 24.683 s of CPU for this run (workers and the startup included, unprofiled)
+   function                                         calls     cum CPU    share of profiled thread
+   Scheduler.loop (the whole scheduling loop)           1    6955.9 ms                      69.40%
+   Scheduler._schedule (one pass)                      11    5534.3 ms                      55.22%
+     select_batch                                      11      88.4 ms                       0.88%
+     order_ready                                       11       0.3 ms                       0.00%
+     dispatchable                                      11     609.4 ms                       6.08%
+     reconcile                                         12     979.1 ms                       9.77%
+     log_phase (a runlog event per pass)               12     851.3 ms                       8.49%
+     RunBook.seen (telemetry rows)                     74     513.3 ms                       5.12%
+   Scheduler._submit (spawn events, subagent id)       13    2509.8 ms                      25.04%
+   Scheduler._complete                                 13    1408.6 ms                      14.05%
+     Scheduler._backpressure (limiter + streak)        13       0.5 ms                       0.00%
+   runlog.emit (every event, any caller)              300    3626.3 ms                      36.18%
+   redact.redact (inside emit)                        300    1177.4 ms                      11.75%
+   observability.emit_gsd_omp                         117    1831.7 ms                      18.28%
+   observability.stream_subagent_status                42    1194.4 ms                      11.92%
+   TaskStore.transition                                26     329.7 ms                       3.29%
+   TaskStore.get                                      237     453.1 ms                       4.52%
+   TaskStore.list                                      83     943.2 ms                       9.41%
+   TaskStore.set_notes                                  0       0.0 ms                       0.00%
+   TaskStore.ready                                     11     605.8 ms                       6.04%
+   TaskStore.update                                     0       0.0 ms                       0.00%
+   taskstore.py own time (all functions)                      404.3 ms                       4.03%
+   sqlite3 execute/executescript/commit, own time             187.0 ms                       1.87%
+   (cumulative times nest: _schedule includes select_batch, dispatchable, reconcile and log_phase; the shares do not add up)
+
+/proc/loadavg at end: 61.32 50.52 61.66 63/3340 2372335

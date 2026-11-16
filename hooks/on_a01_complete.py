@@ -11,11 +11,10 @@ from pathlib import Path
 # Support absolute-path invocation from workspace installs (greptile fix)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from swarm.hook_trigger import fire_if_ready
-
 
 def main() -> int:
     try:
+        from swarm.hook_trigger import fire_if_ready
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         # extract session/transcript rough

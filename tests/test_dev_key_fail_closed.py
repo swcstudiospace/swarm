@@ -6,6 +6,7 @@ verifies only while SWARM_ALLOW_INSECURE_DEV_KEY=1, and never when
 SWARM_REQUIRE_KEY=1 or SWARM_ED25519_KEY is set.
 """
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -231,3 +232,58 @@ def test_keyless_major_per_target_finding_fails_with_no_rows(tmp_path, swarm_dir
     assert envelope["payload"].get("advisory") is True
     assert envelope["payload"]["verdict"] == "fail"
     assert verify_envelope(envelope) is False
+
+
+def test_dev_key_audit_failure_is_logged(swarm_dir, monkeypatch, caplog):
+    """A failing security.dev_key audit write is logged; signing itself stays non-fatal."""
+    from swarm import runlog
+    from swarm.envelope import sign_envelope
+
+    def _sink_down(*_args, **_kwargs):
+        raise RuntimeError("audit sink down")
+
+    monkeypatch.setattr(runlog, "emit", _sink_down)
+    monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
+    env = {"type": "gate.verdict", "source": "A09", "correlation_id": "c", "payload": {}}
+    signed = sign_envelope(env, root=swarm_dir)
+    assert signed["sig"].startswith("hmac:")
+    logged = [r for r in caplog.records if r.name == "swarm.envelope" and r.levelno >= logging.WARNING]
+    assert any("RuntimeError" in r.getMessage() for r in logged), caplog.text
+
+
+def test_lifecycle_messages_reach_logging(swarm_dir, capsys, caplog):
+    """Operator lifecycle text goes through logging and still reaches stderr unchanged."""
+    from swarm.envelope import perform_signing_key_lifecycle
+
+    caplog.set_level(logging.INFO, logger="swarm.envelope")
+    result = perform_signing_key_lifecycle(root=swarm_dir)
+    msg = result["message"]
+    logged = [r.getMessage() for r in caplog.records if r.name == "swarm.envelope"]
+    assert logged == [msg]
+    assert capsys.readouterr().err == msg + "\n"
+
+
+def test_key_lifecycle_message_via_logging(swarm_dir, monkeypatch, caplog):
+    """The enterprise-required failure is logged on swarm.envelope at ERROR before it raises."""
+    from swarm.envelope import perform_signing_key_lifecycle
+    from swarm.errors import SwarmError
+
+    monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    caplog.set_level(logging.INFO, logger="swarm.envelope")
+    with pytest.raises(SwarmError):
+        perform_signing_key_lifecycle(root=swarm_dir)
+    recs = [r for r in caplog.records if r.name == "swarm.envelope"]
+    assert recs and recs[-1].levelno == logging.ERROR
+    assert recs[-1].getMessage().startswith(
+        "Signing key required for enterprise audit/integrity of parallel swarm. "
+        "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured")
+
+
+def test_bad_ed25519_key_names_cause_not_value(monkeypatch):
+    """A malformed SWARM_ED25519_KEY is reported by variable name and cause, never by its value."""
+    from swarm.envelope import signing_config_error
+
+    monkeypatch.setenv("SWARM_ED25519_KEY", "zz")
+    err = signing_config_error()
+    assert err is not None and "SWARM_ED25519_KEY" in err
+    assert "zz" not in err

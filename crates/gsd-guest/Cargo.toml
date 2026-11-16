@@ -1,0 +1,25 @@
+[package]
+name = "gsd-guest"
+version = "0.1.0"
+edition = "2021"
+description = "GSD-Core sandboxed guest: the gsd:core WIT world exporting invoke over the pure route logic"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Switches the `transition` mode on (Phase 14.5 pin P1). Off, the guest is the read-only build whose digest is committed in
+# `gsd-sandbox/guest-module.sha256`; on, it is the build pinned by `gsd-sandbox/guest-module-write.sha256`.
+write-routes = ["gsd-route/write-routes"]
+# Adds the second batch (Phase 14.5 pin P2): the ingest, plan, approval and catalog modes. Implies `write-routes`. Off, the guest bytes
+# are the ones pinned by `guest-module-write.sha256` (P1) and `guest-module.sha256` (read only).
+write-routes-2 = ["write-routes", "gsd-route/write-routes-2"]
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
+# `default-features = false`: the guest gets the transition mode only through its own `write-routes` feature (see gsd-route).
+gsd-route = { path = "../gsd-route", default-features = false }
+wit-bindgen = "=0.57.1"

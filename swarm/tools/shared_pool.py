@@ -1,20 +1,21 @@
 """Shared tools promoted in the Phase 4 dedup review. Each one is already called from more than one lane."""
 from __future__ import annotations
 
+from typing import Any
 from swarm.gates import derive_verdict
 from swarm.tools.support import respond, script, target_root
 
 _SEVERITIES = {"info", "minor", "major", "critical", "blocker"}
 
 
-def _scan(payload: dict) -> dict | None:
+def _scan(payload: dict[str, Any]) -> dict[str, Any] | None:
     if payload["scan"] is not True:
         return {"state": "INVALID_INPUT", "field": "scan", "message": "scan must be true"}
     return None
 
 
-def verdict(payload: dict) -> dict:
-    def work() -> dict:
+def verdict(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         severities = payload["severities"]
         if not isinstance(severities, list):
             return {"state": "INVALID_INPUT", "field": "severities", "message": "severities must be a list"}
@@ -28,8 +29,8 @@ def verdict(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def toolchain(payload: dict) -> dict:
-    def work() -> dict:
+def toolchain(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         refused = _scan(payload)
         if refused:
             return refused
@@ -39,8 +40,8 @@ def toolchain(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def check_plan(payload: dict) -> dict:
-    def work() -> dict:
+def check_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         refused = _scan(payload)
         if refused:
             return refused
@@ -53,8 +54,8 @@ def check_plan(payload: dict) -> dict:
     return respond(payload, work)
 
 
-def git_head(payload: dict) -> dict:
-    def work() -> dict:
+def git_head(payload: dict[str, Any]) -> dict[str, Any]:
+    def work() -> dict[str, Any]:
         refused = _scan(payload)
         if refused:
             return refused

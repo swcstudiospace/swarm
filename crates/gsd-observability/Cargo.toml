@@ -1,0 +1,22 @@
+[package]
+name = "gsd-observability"
+version = "0.1.0"
+edition = "2021"
+description = "Observability Stack for GSD-Core: structured logging, distributed tracing, metrics, replay/debugging"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["monitoring", "logging", "tracing", "metrics", "development-tools"]
+keywords = ["observability", "tracing", "metrics", "logging", "replay", "debugging"]
+
+[dependencies]
+gsd-proto = { path = "../gsd-proto" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+metrics = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

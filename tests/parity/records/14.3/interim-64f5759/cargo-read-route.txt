@@ -1,0 +1,15 @@
+== read_route_faults (dev profile, HEAD 53df964 plus uncommitted files) ==
+test error_messages_carry_no_path_or_secret ... ok
+test a_mutating_argv_is_refused_before_any_read ... ok
+test a_spent_deadline_is_e_timeout ... ok
+test reads_match_host_rust_on_an_empty_store ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+== read_route_budget (dev profile) ==
+
+running 1 test
+test read_route_budget_record has been running for over 60 seconds
+test read_route_budget_record ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 119.19s
+
+loadavg_end: 71.38 62.30 56.30

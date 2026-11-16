@@ -19,6 +19,8 @@ import math
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, localcontext
+from collections.abc import Callable
+from typing import Any
 
 from swarm.tools.support import respond
 
@@ -100,8 +102,8 @@ class _Bad(Exception):
         self.message = message
 
 
-def _safe(work):
-    def run() -> dict:
+def _safe(work: Callable[[], dict[str, Any]]) -> Callable[[], dict[str, Any]]:
+    def run() -> dict[str, Any]:
         try:
             return work()
         except _Bad as bad:
@@ -110,22 +112,22 @@ def _safe(work):
     return run
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr), so 0.1 is 0.1 and not its binary neighbour."""
     return Decimal(repr(value))
 
 
-def _finding(fid: str, severity: str, summary: str) -> dict:
+def _finding(fid: str, severity: str, summary: str) -> dict[str, Any]:
     if len(fid) > 120:  # a long public key plus a host must not collapse two findings onto one truncated id
         fid = fid[:107] + "~" + hashlib.sha256(fid.encode("utf-8")).hexdigest()[:12]
     return {"id": fid, "severity": severity, "summary": summary[:400]}
 
 
-def _ordered(findings: list[dict]) -> list[dict]:
+def _ordered(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"]))
 
 
-def _verdict(findings: list[dict]) -> str:
+def _verdict(findings: list[dict[str, Any]]) -> str:
     worst = max((SEVERITY_RANK[f["severity"]] for f in findings), default=0)
     return "fail" if worst >= 2 else "warn" if worst == 1 else "pass"
 
@@ -190,7 +192,7 @@ def _label(field: str, text: str) -> str:
     return text
 
 
-def _gwei_to_wei(value) -> int:
+def _gwei_to_wei(value: object) -> int:
     return int((_dec(value) * 10**9).to_integral_value(ROUND_HALF_EVEN))
 
 
@@ -198,14 +200,14 @@ def _wei_to_gwei(wei: int) -> float:
     return round(wei / 10**9, 9)
 
 
-def client_diversity(payload: dict) -> dict:
+def client_diversity(payload: dict[str, Any]) -> dict[str, Any]:
     """Share of one layer's clients: more than 1/3 is minor, more than 1/2 major, 2/3 or more blocker (exact integers).
 
     1/3 and 2/3 come from the Ethereum consensus spec: finality needs attesting balance * 3 >= total * 2, so a client that
     holds exactly 2/3 can finalize its own (buggy) chain, while taking strictly more than 1/3 offline stops finality.
     The 1/2 tier is this tool's own intermediate step (a majority wins fork choice), not a protocol constant."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         clients = payload["clients"]
         names = [_label("clients", c["name"]).strip().lower() for c in clients]
         if any(not n for n in names):
@@ -250,14 +252,14 @@ def client_diversity(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def node_sizing(payload: dict) -> dict:
+def node_sizing(payload: dict[str, Any]) -> dict[str, Any]:
     """Disk runway to a horizon, memory, cores, uplink, IOPS headroom and disk class against the node floors.
 
     Floors are the ethereum.org minimums for an Ethereum full node (the 8 cores / 64 GB for a validating host are its
     EIP-7870 recommendation, the 2 TB disk is compared in decimal GB, and `uplink_mbps` is compared with the guide's 25 Mbit/s
     bandwidth figure). The 80 % soft and 90 % hard disk fill and the 70 % IOPS headroom are this tool's own policy."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         if payload["node_type"] == "archive" and payload["sync_mode"] == "snap":
             raise _Bad("sync_mode", "an archive node keeps every historical state and must be synced in full mode from genesis, not snap")
         used, prov = _dec(payload["disk_used_gb"]), _dec(payload["disk_provisioned_gb"])
@@ -321,14 +323,14 @@ def node_sizing(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def rpc_failover_plan(payload: dict) -> dict:
+def rpc_failover_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """Order eligible providers by p95 latency, hedge after the primary's p95, check capacity and N-1 survival.
 
     Hedging after the 95th percentile adds about 5 % load (Dean and Barroso, "The Tail at Scale", CACM 2013), the 1.05 factor
     applied to demand whenever two or more providers are eligible. Ordering by p95 is this tool's policy; rate limits are
     compared as given (the caller states requests or compute units per second)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         providers = payload["providers"]
         names = [_label("providers", p["name"]).strip().lower() for p in providers]
         if any(not n for n in names) or len(set(names)) != len(names):
@@ -412,7 +414,7 @@ def _attacker_success(q: float, z: int) -> float:
     return min(1.0, total)
 
 
-def confirmation_depth(payload: dict) -> dict:
+def confirmation_depth(payload: dict[str, Any]) -> dict[str, Any]:
     """Confirmations and block tag from the finality model, value at risk, loss tolerance and observed reorg depth.
 
     probabilistic: Nakamoto section 11 counts z blocks linked AFTER the block that holds the transaction, so the number of
@@ -420,7 +422,7 @@ def confirmation_depth(payload: dict) -> dict:
     are the worst-case slots until the block's epoch is justified (safe) or finalized (consensus spec: finality needs two
     consecutive justified epochs); the 100x value-to-tolerance switch between them is this tool's own policy. An observed reorg of r blocks bounds the depth too: it needs r + 1."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         model = payload["finality_model"]
         value, tolerance = _dec(payload["value_at_risk_usd"]), _dec(payload["loss_tolerance_usd"])
         slot_s = _dec(payload["block_time_s"])
@@ -475,13 +477,13 @@ def confirmation_depth(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def l2_withdrawal_window(payload: dict) -> dict:
+def l2_withdrawal_window(payload: dict[str, Any]) -> dict[str, Any]:
     """Withdrawal timeline of a rollup: batch posting, proof, challenge window and L1 finality against a policy.
 
     Delays are rounded up to whole seconds and the ready time up to the next second. The 24 h floor for an optimistic
     challenge window is this tool's policy, not a protocol rule; the 7 day reference is OP Mainnet (Arbitrum One: about 6.4 days)."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         started, as_of = _ts("initiated_at", payload["initiated_at"]), _ts("as_of", payload["as_of"])
         if as_of < started:
             raise _Bad("as_of", "as_of precedes initiated_at")
@@ -534,12 +536,12 @@ def l2_withdrawal_window(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def indexer_lag(payload: dict) -> dict:
+def indexer_lag(payload: dict[str, Any]) -> dict[str, Any]:
     """Head versus indexed block over time: lag in blocks and seconds, trend, catch-up ETA and freshness SLO breach.
 
     Rates use the first and last sample. The 1x (major) and 3x (blocker) SLO tiers are this tool's policy."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         samples = payload["samples"]
         stamps = [_ts("samples", s["observed_at"]) for s in samples]
         if any(b <= a for a, b in zip(stamps, stamps[1:])):
@@ -594,13 +596,13 @@ def indexer_lag(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def backfill_plan(payload: dict) -> dict:
+def backfill_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """Size eth_getLogs windows to provider limits, then duration, catch-up against the moving head and bisect depth.
 
     A window is planned to fill at most half of the provider's response cap (this tool's safety factor of 2), so a busier
     block than the average still fits; the average logs per block is the caller's measurement."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         start, end = payload["from_block"], payload["to_block"]
         if end < start:
             raise _Bad("to_block", "to_block must not precede from_block")
@@ -664,10 +666,10 @@ def _next_base_fee(base: int, gas_used: int, gas_limit: int, elasticity: int, de
     return max(base - base * (target - gas_used) // target // denominator, 0)
 
 
-def fee_policy(payload: dict) -> dict:
+def fee_policy(payload: dict[str, Any]) -> dict[str, Any]:
     """EIP-1559 fee policy: exact next base fee, projections, capped max fee and priority fee, runway in full blocks."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         limit, elasticity, denominator = payload["gas_limit"], payload["elasticity_multiplier"], payload["base_fee_change_denominator"]
         if limit // elasticity < 1:
             raise _Bad("gas_limit", "gas_limit divided by elasticity_multiplier must be at least 1")
@@ -727,10 +729,10 @@ def _gap_text(gaps: list[tuple[int, int]]) -> str:
     return ",".join(shown) + (",..." if len(gaps) > 5 else "")
 
 
-def stuck_transactions(payload: dict) -> dict:
+def stuck_transactions(payload: dict[str, Any]) -> dict[str, Any]:
     """Per account: nonce gaps, queued transactions behind them, underpriced or aged transactions, replacement bids."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         as_of, base_wei = _ts("as_of", payload["as_of"]), _gwei_to_wei(payload["base_fee_gwei"])
         limit_s = payload["stuck_after_minutes"] * 60
         accounts = payload["accounts"]
@@ -814,10 +816,10 @@ def _key_identity(ref: str) -> str:
     return ref.lower()
 
 
-def validator_slashing_risk(payload: dict) -> dict:
+def validator_slashing_risk(payload: dict[str, Any]) -> dict[str, Any]:
     """Validator keys by label: the same key active twice, missing slashing protection, unsafe standby failover."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         instances = payload["instances"]
         seen = set()
         for inst in instances:
@@ -827,7 +829,7 @@ def validator_slashing_risk(payload: dict) -> dict:
             if pair in seen:
                 raise _Bad("instances", "one key_ref appears twice on the same host")
             seen.add(pair)
-        by_key: dict[str, list[dict]] = {}
+        by_key: dict[str, list[dict[str, Any]]] = {}
         for inst in instances:
             by_key.setdefault(_key_identity(inst["key_ref"]), []).append(inst)
         findings, double_keys, unprotected = [], [], 0
@@ -905,10 +907,10 @@ def _exact_text(value: Decimal) -> str:
         return format(value.normalize(), "f")
 
 
-def bridge_monitor(payload: dict) -> dict:
+def bridge_monitor(payload: dict[str, Any]) -> dict[str, Any]:
     """Lock-and-mint bridge health: message lag, overdue in-flight messages, collateral invariant, pause advice."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         as_of = _ts("as_of", payload["as_of"])
         limit_s = _dec(payload["max_lag_minutes"]) * 60
         locked, minted = _amount("locked_amount", payload["locked_amount"]), _amount("minted_amount", payload["minted_amount"])
@@ -970,13 +972,13 @@ def bridge_monitor(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def network_guard(payload: dict) -> dict:
+def network_guard(payload: dict[str, Any]) -> dict[str, Any]:
     """Chain id versus environment and the autonomy level an operation needs; unknown chain ids count as mainnet.
 
     Policy, not a protocol rule: a non-production environment may not target a mainnet-grade chain even for a read, and the
     production environment may not target a testnet or local chain."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         chain_id, env, op = payload["target_chain_id"], payload["environment"], payload["operation"]
         known = CHAINS.get(chain_id)
         net_class = known[1] if known else "unknown"
@@ -994,7 +996,7 @@ def network_guard(payload: dict) -> dict:
         if env != "production" and mainnet_grade:
             approval_only = False
             findings.append(_finding("environment-mismatch", "blocker", f"a {env} environment targets {'a mainnet' if known else 'an unknown'} chain (id {chain_id}): point it at a testnet or a local chain"))
-        if env == "production" and net_class in ("testnet", "local"):
+        if known and env == "production" and net_class in ("testnet", "local"):
             approval_only = False
             findings.append(_finding("production-on-testnet", "major", f"the production environment targets {known[0]} (id {chain_id}), a {net_class} chain"))
         rpc = payload.get("rpc_chain_id")
@@ -1021,10 +1023,10 @@ def network_guard(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
-def mempool_privacy(payload: dict) -> dict:
+def mempool_privacy(payload: dict[str, Any]) -> dict[str, Any]:
     """Route a transaction through the public mempool, a private relay or a sequencer by its MEV exposure."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         kind, network = payload["tx_kind"], payload["network_kind"]
         value, tolerance = _dec(payload["value_usd"]), _dec(payload["max_acceptable_loss_usd"])
         sandwich = kind in SANDWICH_KINDS

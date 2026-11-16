@@ -57,6 +57,12 @@ def test_nfr_allocation_quantitative_without_limit_is_unmeasurable_not_allocated
     assert result["fully_allocated"] is False
 
 
+def test_nfr_allocation_null_limit_is_unmeasurable_not_allocated():
+    result = nfr_allocation({"nfrs": [_nfr("NFR-1")], "bindings": [_bind("NFR-1", limit=None)]})
+    assert result["unmeasurable"] == ["NFR-1"] and result["allocated"] == []
+    assert result["fully_allocated"] is False
+
+
 def test_nfr_allocation_zero_limit_counts_as_numeric():
     result = nfr_allocation({"nfrs": [_nfr("NFR-1")], "bindings": [_bind("NFR-1", limit=0, unit="errors")]})
     assert result["allocated"] == ["NFR-1"] and result["fully_allocated"] is True

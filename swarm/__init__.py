@@ -1,4 +1,4 @@
-"""AgentSwarm runtime toolkit (stdlib-only core).
+"""AgentSwarm runtime toolkit (stdlib-only core; the PyO3 extension swarm._native is required unless SWARM_PURE_PYTHON=1).
 
 Modules
 -------
@@ -12,6 +12,11 @@ runlog     append-only JSONL event log (the logger unit): emits structured logs 
 paths      .swarm resolver + logging_paths() spec
 """
 from __future__ import annotations
+
+from ._native_loader import load_native, pure_python_requested
+
+if not pure_python_requested():
+    load_native()
 
 from .errors import SwarmError, ErrorCode
 from .envelope import build_envelope, validate_envelope, sign_envelope, verify_envelope

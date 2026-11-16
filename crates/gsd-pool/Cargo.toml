@@ -1,0 +1,25 @@
+[package]
+name = "gsd-pool"
+version = "0.1.0"
+edition = "2021"
+description = "Thread Pool Manager for GSD-Core: lifecycle, pooling, reuse, and isolation for chat-thread subagents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["concurrency", "development-tools", "thread-pool"]
+keywords = ["thread-pool", "subagent", "orchestration", "lifecycle"]
+
+[dependencies]
+tokio = { workspace = true }
+gsd-runtime = { path = "../gsd-runtime" }
+gsd-proto = { path = "../gsd-proto" }
+gsd-codes = { path = "../gsd-codes" }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = "1.2"

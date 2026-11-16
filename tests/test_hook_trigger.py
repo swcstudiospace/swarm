@@ -249,3 +249,29 @@ def test_failed_spawn_releases_its_slot(state, monkeypatch):
 
     assert result["reason"] == "spawn-failed"
     assert get_manager().active_ids() == []
+
+
+def test_failed_spawn_does_not_suppress_retry(state, monkeypatch):
+    """hook_trigger inserts the trigger row before Popen and never removes it on spawn failure, so an identical retry is
+    deduped and the completion trigger is lost. Expected to fail today: the retry returns deduped True, fired False."""
+    _clear_cloud(monkeypatch)
+    monkeypatch.setenv("SWARM_ALLOW_AUTONOMOUS", "1")
+    reset_manager()
+    attempts = []
+
+    def _flaky(argv, **kwargs):
+        attempts.append(argv)
+        if len(attempts) == 1:
+            raise OSError("spawn refused by test")
+        return _NotAProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", _flaky)
+
+    first = fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)
+    assert first["fired"] is False and first["reason"] == "spawn-failed"
+
+    retry = fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)
+
+    assert len(attempts) == 2
+    assert retry["fired"] is True
+    assert retry["deduped"] is False

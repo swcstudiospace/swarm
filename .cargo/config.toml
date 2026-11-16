@@ -1,0 +1,3 @@
+[net]
+# Retry transient network failures (registry index and crate downloads) up to 5 times.
+retry = 5

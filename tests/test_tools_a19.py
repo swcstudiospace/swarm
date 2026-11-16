@@ -1512,17 +1512,35 @@ def test_unicode_digits_are_not_rfc3339_or_semver_digits():
     invalid("event_asyncapi_lint", {"document": json.dumps({"asyncapi": "\u0663.\u0660.\u0660", "info": {"title": "T", "version": "1"}})}, "document")
 
 
-def test_very_long_names_are_answered_quickly_and_never_echoed():
-    import time
+def test_very_long_names_are_answered_quickly_and_never_echoed(monkeypatch):
+    module = importlib.import_module("swarm.tools.a19_tools")
+    shape_reads = []
 
+    class Counted:
+        def __init__(self, pattern):
+            self.pattern = pattern
+
+        def search(self, text, *args):
+            shape_reads.append(len(text))
+            return self.pattern.search(text, *args)
+
+        def finditer(self, text, *args):
+            shape_reads.append(len(text))
+            return self.pattern.finditer(text, *args)
+
+    monkeypatch.setattr(module, "_SECRET_SHAPES", tuple(Counted(shape) for shape in module._SECRET_SHAPES))
+    monkeypatch.setattr(module, "_LONG_RUN", Counted(module._LONG_RUN))
     name = "a" * 150_000  # a quadratic secret-shape scan over such a name used to take minutes
     base = obj_schema({name: STR}, additionalProperties=False)
-    started = time.monotonic()
     result = compat(base, obj_schema({}, additionalProperties=False), "backward")
-    assert time.monotonic() - started < 5
     assert fx(result) == [("blocker", f"[backward] $.<redacted: {len(name)} chars>: accepted by the source but rejected by the closed target schema")]
     channel = aa({"asyncapi": "2.6.0", "info": {"title": "T", "version": "1"}, "channels": {name: {}}})
     assert fx(channel) == [("minor", f"channels/<redacted: {len(name)} chars>: no publish or subscribe operation")]
+    # counted instead of timed: no secret-shape pattern reads a text over the scan limit, so the 150,000-character name is never scanned
+    assert max(shape_reads, default=0) <= module._SCAN_LIMIT, max(shape_reads, default=0)
+    # the counting double is wired: a short name is read by the shape patterns, so its reads are counted
+    aa({"asyncapi": "2.6.0", "info": {"title": "T", "version": "1"}, "channels": {"orders": {}}})
+    assert shape_reads, "the counting double never ran"
 
 
 # --- QA-03 regressions ----------------------------------------------------------------------------------------------
@@ -1686,9 +1704,23 @@ def test_asyncapi_channel_parameters_must_be_an_object_not_a_string_or_list():
     assert aa(document({"id": {"schema": {"type": "string"}}}))["verdict"] == "pass"
 
 
-def test_asyncapi_one_of_chain_with_a_repeated_alternative_is_linear_not_exponential():
-    import time
+def _record_walks(monkeypatch, module):
+    """Every lint walk, recorded by a counting double on its step charge; the last one's `steps` is the work it did."""
+    walks = []
+    real_charge = module._AsyncApiWalk.charge
 
+    def counted_charge(self, steps):
+        if not walks or walks[-1] is not self:
+            walks.append(self)
+        return real_charge(self, steps)
+
+    monkeypatch.setattr(module._AsyncApiWalk, "charge", counted_charge)
+    return walks
+
+
+def test_asyncapi_one_of_chain_with_a_repeated_alternative_is_linear_not_exponential(monkeypatch):
+    module = importlib.import_module("swarm.tools.a19_tools")
+    walks = _record_walks(monkeypatch, module)
     # each level lists the next message twice: the unmemoised walk doubled per level and took minutes at depth 26
     depth = 26
     components = {f"M{depth}": MSG}
@@ -1698,10 +1730,10 @@ def test_asyncapi_one_of_chain_with_a_repeated_alternative_is_linear_not_exponen
     doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
            "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
            "components": {"messages": components}}
-    started = time.monotonic()
     result = aa(doc)
-    assert time.monotonic() - started < 3
     assert (result["verdict"], result["findings"], result["messages"]) == ("pass", [], 1)
+    # counted: a memoised walk charges a few steps per level (132 at depth 26 at HEAD); the unmemoised walk needed 2**26 paths
+    assert walks and walks[-1].steps <= 12 * depth, walks[-1].steps if walks else None
 
 
 def test_asyncapi_shared_leaf_keeps_its_findings_for_every_path_that_reaches_it():
@@ -1788,11 +1820,9 @@ def test_asyncapi_cyclic_three_channel_document_matches_the_unmemoised_walk():
     ]
 
 
-def test_asyncapi_cyclic_document_past_the_step_budget_stops_with_a_reason_in_under_two_seconds():
+def test_asyncapi_cyclic_document_past_the_step_budget_stops_with_a_reason():
     # S-6: every component is a oneOf of all the others plus a leaf; the unbounded walk grows about x14 per component (n=9 took
-    # 16 s). Past its budgets the walk stops, and the document is reported fail with the budget reason.
-    import time
-
+    # 16 s). Past its budgets the walk stops and the document is reported fail with the budget reason: that reason is the counted check.
     module = importlib.import_module("swarm.tools.a19_tools")
     n = 9
     comps = {f"C{i}": {"oneOf": [{"$ref": f"#/components/messages/C{j}"} for j in range(n) if j != i] + [{"contentType": "x"}]}
@@ -1800,9 +1830,7 @@ def test_asyncapi_cyclic_document_past_the_step_budget_stops_with_a_reason_in_un
     doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
            "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/C0"}}}},
            "components": {"messages": comps}}
-    started = time.monotonic()
     result = aa(doc)
-    assert time.monotonic() - started < 2
     assert result["verdict"] == "fail"
     stopped = [summary for severity, summary in fx(result) if severity == "major" and summary.startswith(module.ASYNCAPI_WALK_STOPPED)]
     assert len(stopped) == 1 and f"after {module.ASYNCAPI_EMIT_BUDGET} findings copied" in stopped[0]

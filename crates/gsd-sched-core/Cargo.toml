@@ -1,0 +1,17 @@
+[package]
+name = "gsd-sched-core"
+version = "0.1.0"
+edition = "2021"
+description = "Scheduler decision core for GSD-Core: AIMD limiter, claim table, ordering, backoff and the pass loop behind a ports trait, std only"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["concurrency", "development-tools"]
+keywords = ["scheduler", "aimd", "claims", "orchestration"]
+
+[dependencies]
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

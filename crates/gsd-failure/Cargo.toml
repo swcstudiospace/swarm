@@ -1,0 +1,32 @@
+[package]
+name = "gsd-failure"
+version = "0.1.0"
+edition = "2021"
+description = "Failure Domain Isolation for GSD-Core: circuit breakers, retries, dead-letter queues, graceful degradation"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["error-handling", "resilience", "fault-tolerance", "development-tools"]
+keywords = ["circuit-breaker", "retry", "dead-letter", "graceful-degradation", "resilience"]
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+crossbeam = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = "1.2"
+tempfile = { workspace = true }

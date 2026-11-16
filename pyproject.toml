@@ -1,3 +1,23 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "agent-swarm"
+version = "0.1.0"
+description = "AgentSwarm runtime toolkit with the required swarm._native PyO3 extension"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.maturin]
+# Mixed Rust/Python layout (U2 default): the Python package lives at ./swarm and the
+# compiled extension is installed as swarm/_native*.so. bindings = "pyo3" selects PyO3 (abi3-py312).
+manifest-path = "crates/gsd-python/Cargo.toml"
+module-name = "swarm._native"
+python-source = "."
+bindings = "pyo3"
+features = ["extension-module"]
+
 [tool.ruff]
 line-length = 140
 target-version = "py312"

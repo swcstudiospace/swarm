@@ -1,10 +1,10 @@
 {
+  "subagent_id": "subagent-Tea7e-v7-a09-8993db89e1a8-1794793805487",
+  "task_id": "Tea7e-v7-a09",
+  "wave": "wave1",
   "version": "1.0",
-  "correlation_id": "11a78d07-e51b-4a52-9844-a9eea90249d7",
+  "correlation_id": "ea7e01fc-7b17-4553-8698-95e67261d524",
   "swarm_state": "COMPLETE",
-  "updated_at": "2026-10-20T03:52:48Z",
-  "progress": {},
-  "subagent_id": "subagent-X-docs-9a50f5c57112-1792468368500",
-  "task_id": "X-docs",
-  "wave": "wave1"
+  "updated_at": "2026-11-16T01:54:44Z",
+  "progress": {}
 }

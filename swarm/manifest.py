@@ -7,7 +7,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_FILE = Path(os.environ.get("SWARM_AGENTS_FILE", ROOT / "agents.json"))
@@ -130,31 +133,116 @@ def _describe(value: object) -> str:
     return "an empty list" if value == [] else type(value).__name__
 
 
-def load_manifest(path: Path | None = None) -> list[dict]:
-    source = Path(path or AGENTS_FILE)
+class _Record:
+    """Immutable cached view of one validated roster; only JSON text is kept so callers can never alias it."""
+
+    __slots__ = ("all_text", "agent_texts", "index", "capabilities", "slugs")
+
+    def __init__(self, agents: list[dict[str, Any]]) -> None:
+        self.all_text: str = json.dumps(agents)
+        self.agent_texts: tuple[str, ...] = tuple(json.dumps(a) for a in agents)
+        index: dict[str, int] = {}
+        for pos, a in enumerate(agents):
+            for key in (a["id"], a["code"], a["slug"]):
+                index.setdefault(key.lower(), pos)  # first agent wins, like the old first-match loop
+        self.index: dict[str, int] = index
+        self.capabilities: tuple[tuple[str, ...], ...] = tuple(tuple(a["capabilities"]) for a in agents)
+        self.slugs: tuple[str, ...] = tuple(a["slug"] for a in agents)
+
+
+_CacheKey = tuple[str, int, int, int]
+_CACHE_MAX = 4
+_CACHE_MIN_AGE_NS = 2_000_000_000  # files modified more recently are never cached (same-mtime rewrites stay visible)
+_cache: dict[_CacheKey, _Record] = {}
+_cache_lock = threading.Lock()
+
+
+def _read_roster(source: Path) -> list[dict[str, Any]]:
     try:
-        data = json.loads(source.read_text(encoding="utf-8"))
+        data: object = json.loads(source.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"{source.name}: invalid JSON: {exc}") from exc
     if isinstance(data, dict):
         if "agents" not in data:
             raise ValueError(f"{source.name}: document has no 'agents' key")
-        agents = data["agents"]
+        agents: object = data["agents"]
     else:
         agents = data
     problems = validate_agents(agents)
     if problems:
         raise ValueError("\n".join(f"{source.name}: {p}" for p in problems))
-    return agents
+    # validate_agents() accepted this value, so it is a non-empty list of agent objects.
+    return cast(list[dict[str, Any]], agents)
 
 
-def get_agent(ident: str, path: Path | None = None) -> dict:
+def _record(path: Path | None) -> _Record | list[dict[str, Any]]:
+    """Cached record when available; otherwise the freshly validated (uncacheable) list."""
+    source = Path(path or AGENTS_FILE)
+    try:
+        before = os.stat(source)
+        key: _CacheKey = (str(source.resolve()), before.st_mtime_ns, before.st_size, before.st_ino)
+    except OSError:
+        # Missing/unreadable: take the plain read path so the same exception is raised as before.
+        return _read_roster(source)
+    with _cache_lock:
+        hit = _cache.get(key)
+    if hit is not None:
+        return hit
+    agents = _read_roster(source)
+    try:
+        after = os.stat(source)
+    except OSError:
+        return agents
+    stable = (after.st_mtime_ns, after.st_size, after.st_ino) == (before.st_mtime_ns, before.st_size, before.st_ino)
+    if not stable or time.time_ns() - before.st_mtime_ns < _CACHE_MIN_AGE_NS:
+        return agents
+    record = _Record(agents)
+    with _cache_lock:
+        if key not in _cache and len(_cache) >= _CACHE_MAX:
+            _cache.clear()
+        _cache[key] = record
+    return record
+
+
+def load_manifest(path: Path | None = None) -> list[dict[str, Any]]:
+    rec = _record(path)
+    if isinstance(rec, list):
+        return rec
+    return cast(list[dict[str, Any]], json.loads(rec.all_text))
+
+
+def get_agent(ident: str, path: Path | None = None) -> dict[str, Any]:
     ident_l = ident.lower()
-    for a in load_manifest(path):
-        if ident_l in (a["id"].lower(), a["code"].lower(), a["slug"].lower()):
-            return a
+    rec = _record(path)
+    if isinstance(rec, list):
+        for a in rec:
+            if ident_l in (a["id"].lower(), a["code"].lower(), a["slug"].lower()):
+                return a
+    else:
+        pos = rec.index.get(ident_l)
+        if pos is not None:
+            return cast(dict[str, Any], json.loads(rec.agent_texts[pos]))
     raise KeyError(f"no agent matches {ident!r}")
 
 
-def by_capability(capability: str, path: Path | None = None) -> list[dict]:
-    return [a for a in load_manifest(path) if capability in a["capabilities"]]
+def agent_slug(ident: str, path: Path | None = None) -> str:
+    """The `slug` of the agent `ident` names (id, code or slug, any case): `get_agent(ident, path)["slug"]` without copying the
+    record. A str is immutable, so the cached roster is never aliased. KeyError when no agent matches."""
+    ident_l = ident.lower()
+    rec = _record(path)
+    if isinstance(rec, list):
+        for a in rec:
+            if ident_l in (a["id"].lower(), a["code"].lower(), a["slug"].lower()):
+                return str(a["slug"])
+    else:
+        pos = rec.index.get(ident_l)
+        if pos is not None:
+            return rec.slugs[pos]
+    raise KeyError(f"no agent matches {ident!r}")
+
+
+def by_capability(capability: str, path: Path | None = None) -> list[dict[str, Any]]:
+    rec = _record(path)
+    if isinstance(rec, list):
+        return [a for a in rec if capability in a["capabilities"]]
+    return [json.loads(rec.agent_texts[i]) for i, caps in enumerate(rec.capabilities) if capability in caps]

@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from conftest import ROOT
 
 ONE_TASK = {"tasks": [{"id": "one", "capability": "code.backend", "agent": "A05", "title": "one", "depends_on": [], "gates": []}]}
@@ -111,6 +112,33 @@ def test_gitignore_not_overwritten(tmp_path, monkeypatch):
     first, second = swarm_dir(create=True), swarm_dir(create=True)
     assert first == second
     assert (tmp_path / ".swarm" / ".gitignore").read_text() == "custom"
+
+
+def test_create_adds_gitignore_to_an_existing_dir_without_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    (tmp_path / ".swarm").mkdir()
+    from swarm.paths import swarm_dir
+    assert swarm_dir(create=True) == (tmp_path / ".swarm").resolve()
+    assert (tmp_path / ".swarm" / ".gitignore").read_text() == "*"
+
+
+def test_create_leaves_a_dangling_gitignore_link_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    (tmp_path / ".swarm").mkdir()
+    link = tmp_path / ".swarm" / ".gitignore"
+    link.symlink_to(tmp_path / "nowhere")
+    from swarm.paths import swarm_dir
+    swarm_dir(create=True)
+    assert link.is_symlink() and not (tmp_path / "nowhere").exists()
+
+
+def test_create_still_fails_when_the_state_path_is_a_file(tmp_path, monkeypatch):
+    blocker = tmp_path / ".swarm"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("SWARM_DIR", str(blocker))
+    from swarm.paths import swarm_dir
+    with pytest.raises(FileExistsError):
+        swarm_dir(create=True)
 
 
 def test_swarm_run_children_get_absolute_dir(tmp_path):

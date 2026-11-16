@@ -23,7 +23,7 @@ Don't use for: Do not implement domain artifacts (code/docs/IaC).
 - Swarm root with `agents.json`, `scripts/`, `swarm/`.
 - `SWARM_DIR` (default `<git toplevel>/.swarm`, made absolute).
 - `python3` and/or `bun` on PATH.
-- Signed `task.assign` with task_id and correlation_id.
+- A project brief, or a signed `task.assign` with task_id and correlation_id. A brief is planned with orch_plan before any BLOCKED yield.
 
 ## How to Run
 
@@ -36,7 +36,7 @@ Don't use for: Do not implement domain artifacts (code/docs/IaC).
 
 ## Procedure
 
-1. Validate the signed task.assign. Echo task_id and correlation_id.
+1. If the message is a signed task.assign, echo task_id and correlation_id. If it is a project brief, run orch_plan on it first; do not reject it as unsigned.
 2. Read upstream artifacts in consumes: project.brief, task.bid, task.status, task.result, gate.verdict, agent.heartbeat, conflict.report.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only task.offer, task.assign, plan.updated, conflict.arbitration, escalation.request, swarm.status.

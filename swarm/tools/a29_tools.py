@@ -39,8 +39,10 @@ import ipaddress
 import json
 import re
 import unicodedata
+from collections.abc import Iterator
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from typing import Any, NoReturn, TypeGuard
 
 from swarm.tools import support
 from swarm.tools.support import respond
@@ -71,12 +73,12 @@ MAX_DEPTH = 32
 _HEXCHARS = frozenset("0123456789abcdefABCDEF")
 
 
-def _invalid(field: str, message: str) -> dict:
+def _invalid(field: str, message: str) -> dict[str, str]:
     """The one INVALID_INPUT shape: {state, field, message}. `field` is an input property name."""
     return {"state": "INVALID_INPUT", "field": field, "message": message}
 
 
-def _dec(value) -> Decimal:
+def _dec(value: object) -> Decimal:
     """Exact decimal of the number as written (shortest repr)."""
     return Decimal(repr(value))
 
@@ -85,12 +87,12 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def _f(fid: str, severity: str, summary: str) -> dict:
+def _f(fid: str, severity: str, summary: str) -> dict[str, str]:
     """One finding. Summaries may quote caller-supplied names, so they are clipped to keep every result small."""
     return {"id": fid, "severity": severity, "summary": _clip(summary, MAX_SUMMARY_CHARS)}
 
 
-def _finish(findings: list[dict]) -> tuple[list[dict], int, int, int, str]:
+def _finish(findings: list[dict[str, str]]) -> tuple[list[dict[str, str]], int, int, int, str]:
     """(sorted findings capped at MAX_FINDINGS, blocker count, major count, minor count, verdict). Counts are pre-cap."""
     ordered = sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
     blockers = sum(1 for f in ordered if f["severity"] == "blocker")
@@ -166,7 +168,7 @@ def _is_hex(text: str) -> bool:
     return all(c in _HEXCHARS for c in text)
 
 
-def _is_address(value) -> bool:
+def _is_address(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and len(value) == 42 and value.startswith("0x") and _is_hex(value[2:])
 
 
@@ -184,7 +186,7 @@ def _same_address(left: str, right: str) -> bool:
     return left.lower() == right.lower()
 
 
-def _address_findings(prefix: str, label: str, address, findings: list[dict]) -> bool:
+def _address_findings(prefix: str, label: str, address: object, findings: list[dict[str, str]]) -> bool:
     """Shape and EIP-55 findings for one address-valued field. Returns True when it is a well-formed address."""
     if not _is_address(address):
         findings.append(_f(f"{prefix}-ADDRESS-MALFORMED", "blocker", f"{label} is not a 0x-prefixed 20-byte hex address"))
@@ -199,7 +201,7 @@ def _address_findings(prefix: str, label: str, address, findings: list[dict]) ->
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 
 
-def _parse_iso(value: str):
+def _parse_iso(value: str) -> datetime | None:
     """Aware datetime of an ISO-8601 string with an explicit offset, else None."""
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
@@ -212,7 +214,7 @@ def _epoch(moment: datetime) -> int:
     return int(moment.timestamp() // 1)
 
 
-def _digits(value) -> int | None:
+def _digits(value: object) -> int | None:
     """Non-negative integer of a decimal-digit string of at most MAX_DIGITS characters (uint256 needs 78), else None."""
     if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= MAX_DIGITS:
         return int(value)
@@ -238,7 +240,7 @@ def _pct_text(value: Decimal, rounding: str) -> str:
     return format(value.quantize(Decimal("0.0001"), rounding=rounding).normalize(), "f")
 
 
-def _deadline_findings(prefix: str, label: str, deadline: int, now_epoch: int, max_ttl: int, findings: list[dict]) -> bool:
+def _deadline_findings(prefix: str, label: str, deadline: int, now_epoch: int, max_ttl: int, findings: list[dict[str, str]]) -> bool:
     """Expiry findings for a unix-seconds deadline. Returns True when the remaining time is meaningful (not never/ms)."""
     if deadline >= MAX_UINT256:
         findings.append(_f(f"{prefix}-DEADLINE-NEVER", "major", f"{label} is max uint256: the signature never expires"))
@@ -273,11 +275,11 @@ class _TooDeep(Exception):
     pass
 
 
-def _reject_constant(name: str):
+def _reject_constant(name: str) -> NoReturn:
     raise ValueError(f"{name} is not valid JSON")
 
 
-def _int_of(value) -> int | None:
+def _int_of(value: object) -> int | None:
     """Integer of a JSON number, decimal string or 0x-hex string; None for anything else (bool included)."""
     if isinstance(value, bool):
         return None
@@ -319,7 +321,7 @@ def _base_type(type_name: str) -> str:
         type_name = match.group(1)
 
 
-def _walk_value(types: dict, type_name: str, value, path: str, findings: list[dict], depth: int) -> None:
+def _walk_value(types: dict[str, Any], type_name: str, value: object, path: str, findings: list[dict[str, str]], depth: int) -> None:
     if depth > MAX_DEPTH:
         raise _TooDeep()
     if len(type_name) > MAX_TYPE_CHARS:
@@ -375,11 +377,11 @@ def _walk_value(types: dict, type_name: str, value, path: str, findings: list[di
             findings.append(_f("TD-VALUE-RANGE", "blocker", f"{path}: value does not fit {type_name}"))
 
 
-def _find_member(message: dict, names: tuple[str, ...]):
+def _find_member(message: dict[str, Any], names: tuple[str, ...]) -> tuple[str, Any] | None:
     """First (path, value) of any of `names` in `message`, shallowest first, names in the given order. Descends into nested structs and
     into arrays of structs (Permit2 PermitBatch keeps one nonce per `details[]` entry)."""
 
-    def children(prefix: str, value):
+    def children(prefix: str, value: object) -> Iterator[tuple[str, dict[str, Any]]]:
         stack = [(prefix, value, 0)]
         while stack:  # iterative and depth-capped: array nesting inside a 64 KiB document can exceed the recursion limit
             path, node, depth = stack.pop()
@@ -400,10 +402,10 @@ def _find_member(message: dict, names: tuple[str, ...]):
     return None
 
 
-def typed_data_check(payload: dict) -> dict:
+def typed_data_check(payload: dict[str, Any]) -> dict[str, Any]:
     """EIP-712 eth_signTypedData_v4 payload: type closure, domain, chain id, value types, deadline and nonce."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         now = _parse_iso(payload["now"])
         if now is None:
             return _invalid("now", "now must be an ISO-8601 timestamp with an explicit offset")
@@ -421,7 +423,7 @@ def typed_data_check(payload: dict) -> dict:
         for name, fields in types.items():
             if not isinstance(fields, list) or not all(isinstance(f, dict) and isinstance(f.get("name"), str) and isinstance(f.get("type"), str) for f in fields):
                 return _invalid("typed_data_json", f"types.{name} must be a list of {{name, type}} string pairs")
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
 
         # type closure
         for name in sorted(types):
@@ -531,13 +533,14 @@ def typed_data_check(payload: dict) -> dict:
             "deadline_checked": deadline_checked, "deadline_remaining_seconds": remaining,
         }
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 2. permit (ERC-2612 / Permit2) ----------------------------------------------------------------------------------
 
 
-def permit_check(payload: dict) -> dict:
+def permit_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Pre-sign check of an ERC-2612 permit or Permit2 AllowanceTransfer permit: nonce equality, deadline, spender, amount.
 
     `permit2` means AllowanceTransfer (PermitSingle / PermitBatch: sequential uint48 nonce, uint160 amount, uint48 allowance expiration).
@@ -545,7 +548,7 @@ def permit_check(payload: dict) -> dict:
     tool must not be used to judge their nonce.
     """
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         now = _parse_iso(payload["now"])
         if now is None:
             return _invalid("now", "now must be an ISO-8601 timestamp with an explicit offset")
@@ -586,7 +589,7 @@ def permit_check(payload: dict) -> dict:
                     return _invalid(field, "a Permit2 nonce is a uint48")
         max_ttl = payload.get("max_ttl_seconds", DEFAULT_MAX_TTL_S)
         owner, spender = payload["owner"], payload["spender"]
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         for label, address in (("owner", owner), ("spender", spender), ("token", payload["token"])):
             if _checksum_state(address) == "invalid":
                 findings.append(_f("PERMIT-ADDRESS-CHECKSUM", "major", f"{label} has mixed case that fails its EIP-55 checksum"))
@@ -628,7 +631,8 @@ def permit_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "verdict": verdict, "findings": ordered, "blocker_count": blockers, "major_count": majors, "minor_count": minors,
                 "unlimited": unlimited, "nonce_matches": nonce_matches, "deadline_remaining_seconds": remaining}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 3. SIWE (EIP-4361) ----------------------------------------------------------------------------------------------
@@ -652,17 +656,17 @@ def _host_only(authority: str) -> str:
     return host
 
 
-def siwe_check(payload: dict) -> dict:
+def siwe_check(payload: dict[str, Any]) -> dict[str, Any]:
     """EIP-4361 Sign-In with Ethereum message: field grammar, domain binding, address, chain, nonce and validity window."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         now = _parse_iso(payload["now"])
         if now is None:
             return _invalid("now", "now must be an ISO-8601 timestamp with an explicit offset")
         if "expected_address" in payload and not _is_address(payload["expected_address"]):
             return _invalid("expected_address", "expected_address must be a 0x-prefixed 20-byte hex address")
         max_age = payload.get("max_age_seconds", DEFAULT_SIWE_MAX_AGE_S)
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         text = payload["message"]
         if "\r" in text:
             findings.append(_f("SIWE-LINE-ENDINGS", "major", "message contains carriage returns; EIP-4361 separates lines with LF only"))
@@ -780,7 +784,8 @@ def siwe_check(payload: dict) -> dict:
                 "domain": _clip(bare_domain, 255), "address_checksum": checksum, "resource_count": len(resources), "has_expiration": "Expiration Time" in fields,
                 "issued_at_valid": issued is not None, "issued_age_seconds": issued_age, "expires_in_seconds": expires_in}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 4. chain configuration (EIP-3085) -------------------------------------------------------------------------------
@@ -810,12 +815,12 @@ WELL_KNOWN_NAMES = {
 _TESTNET_WORDS = re.compile(r"\b(?:test\w*|sepolia|goerli|holesky|hoodi|amoy|devnet|fuji)\b", re.IGNORECASE)
 
 
-def chain_config_check(payload: dict) -> dict:
+def chain_config_check(payload: dict[str, Any]) -> dict[str, Any]:
     """EIP-3085 wallet_addEthereumChain parameters: chain id form, https RPC and explorer URLs without credentials, native currency."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         raw = payload["chain_id"]
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         if raw.startswith("0x") and len(raw) > 2 and _is_hex(raw[2:]):
             chain_id = int(raw[2:], 16)
             if len(raw) > 3 and raw[2] == "0":
@@ -882,10 +887,11 @@ def chain_config_check(payload: dict) -> dict:
                 "chain_id": chain_id, "chain_id_hex": hex(chain_id), "network_class": network_class, "mainnet_enable_requires_approval": mainnet,
                 "rpc_count": len(rpc_urls)}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
-def _url_findings(prefix: str, label: str, info: dict, allow_local: bool, findings: list[dict]) -> None:
+def _url_findings(prefix: str, label: str, info: dict[str, Any], allow_local: bool, findings: list[dict[str, str]]) -> None:
     """Findings for one inspected RPC URL (see scripts/dapp_wallet_check.py rpc_url_inspect)."""
     for issue in info["issues"]:
         code, detail = issue["code"], issue["detail"]
@@ -906,16 +912,16 @@ def _url_findings(prefix: str, label: str, info: dict, allow_local: bool, findin
 # ---- 5. token approval risk ------------------------------------------------------------------------------------------
 
 
-def approval_risk(payload: dict) -> dict:
+def approval_risk(payload: dict[str, Any]) -> dict[str, Any]:
     """Risk of the token approvals a flow asks the user to grant: unlimited allowances, blanket NFT approvals, unknown spenders."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         known = []
         for index, entry in enumerate(payload["known_spenders"]):
             if not _is_address(entry):
                 return _invalid("known_spenders", f"known_spenders[{index}] is not a 0x-prefixed 20-byte hex address")
             known.append(entry.lower())
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         unlimited = unknown = blanket = revokes = 0
         for index, item in enumerate(payload["approvals"]):
             kind = item["kind"]
@@ -972,7 +978,8 @@ def approval_risk(payload: dict) -> dict:
                 "approval_count": len(payload["approvals"]), "unlimited_count": unlimited, "unknown_spender_count": unknown,
                 "nft_blanket_count": blanket, "revoke_count": revokes}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 6. transaction state machine ------------------------------------------------------------------------------------
@@ -998,10 +1005,10 @@ DEFAULT_REQUIRED_CONFIRMATIONS = 1
 _TX_HASH = re.compile(r"0x[0-9a-fA-F]{64}")
 
 
-def tx_state_machine(payload: dict) -> dict:
+def tx_state_machine(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate a transaction lifecycle history against the allowed transitions, the simulate-then-confirm policy and stuck handling."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         now = _parse_iso(payload["now"])
         if now is None:
             return _invalid("now", "now must be an ISO-8601 timestamp with an explicit offset")
@@ -1016,7 +1023,7 @@ def tx_state_machine(payload: dict) -> dict:
             stamps.append(stamp)
         if _epoch(now) < max(_epoch(s) for s in stamps):
             return _invalid("now", "now precedes the latest event timestamp")
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         invalid_transitions = 0
         seen_simulated = seen_confirmed = False
         policy_breach = False
@@ -1078,7 +1085,8 @@ def tx_state_machine(payload: dict) -> dict:
                 "final_state": last, "terminal": last in TX_TERMINAL, "valid": blockers == 0, "transition_count": len(events) - 1,
                 "invalid_transition_count": invalid_transitions, "pending_seconds": pending_seconds, "allowed_next": sorted(TX_TRANSITIONS[last])}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 7. ERC-4337 UserOperation ---------------------------------------------------------------------------------------
@@ -1086,22 +1094,22 @@ def tx_state_machine(payload: dict) -> dict:
 GAS_VALUE_LIMIT = 2**120  # EntryPoint v0.6.0 and v0.7.0: maxGasValues <= type(uint120).max else AA94 "gas values overflow"
 
 
-def _hex_quantity(text: str):
+def _hex_quantity(text: str) -> int | None:
     if text.startswith("0x") and len(text) > 2 and _is_hex(text[2:]):
         return int(text[2:], 16)
     return None
 
 
-def _hex_bytes(text: str):
+def _hex_bytes(text: str) -> bytes | None:
     if text.startswith("0x") and len(text) % 2 == 0 and _is_hex(text[2:]):
         return bytes.fromhex(text[2:])
     return None
 
 
-def userop_check(payload: dict) -> dict:
+def userop_check(payload: dict[str, Any]) -> dict[str, Any]:
     """ERC-4337 UserOperation coherence for EntryPoint v0.6/v0.7: fee ordering, gas limits, calldata floor, init code, paymaster, prefund."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         version = payload["entry_point_version"]
         if not _is_address(payload["sender"]):
             return _invalid("sender", "sender must be a 0x-prefixed 20-byte hex address")
@@ -1122,7 +1130,7 @@ def userop_check(payload: dict) -> dict:
             available = _digits(payload["prefund_available_wei"])
             if available is None:
                 return _invalid("prefund_available_wei", "prefund_available_wei must be a decimal digit string")
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         if _same_address(payload["sender"], ZERO_ADDRESS):
             findings.append(_f("UOP-SENDER-ZERO", "blocker", "sender is the zero address"))
         if quantities["max_priority_fee_per_gas"] > quantities["max_fee_per_gas"]:
@@ -1183,7 +1191,8 @@ def userop_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "verdict": verdict, "findings": ordered, "blocker_count": blockers, "major_count": majors, "minor_count": minors,
                 "required_prefund_wei": str(prefund), "calldata_gas_floor": floor, "paymaster_present": paymaster, "deploys_account": deploys}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 8. provider error mapping ---------------------------------------------------------------------------------------
@@ -1277,10 +1286,10 @@ def _has_fragment(text: str, fragment: str) -> bool:
     return re.search(r"(?<![a-z0-9])" + re.escape(fragment), text) is not None
 
 
-def provider_error_map(payload: dict) -> dict:
+def provider_error_map(payload: dict[str, Any]) -> dict[str, Any]:
     """Map an EIP-1193 / JSON-RPC provider error to a UX category, message class and action; decode Solidity revert data."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         code = payload["code"]
         message = payload.get("message", "")
         revert_kind, revert_reason = "", ""
@@ -1306,7 +1315,8 @@ def provider_error_map(payload: dict) -> dict:
                 "suggested_action": action, "show_error_toast": klass in ("warning", "error"), "matched_by": matched,
                 "revert_kind": revert_kind, "revert_reason": revert_reason}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 9. RPC fallback configuration -----------------------------------------------------------------------------------
@@ -1316,14 +1326,14 @@ MAX_TIMEOUT_MS = 30000
 MAX_RETRIES = 3
 
 
-def rpc_fallback_check(payload: dict) -> dict:
+def rpc_fallback_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Client-side RPC fallback configuration: failure-domain diversity, quorum, timeouts, retries and worst-case time to failure."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         providers = payload["providers"]
         quorum, backoff, budget = payload["quorum"], payload["backoff_ms"], payload["ui_budget_ms"]
         inspect = support.script("dapp_wallet_check").rpc_url_inspect
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         hosts: list[str] = []
         total_weight = 0
         worst = 0
@@ -1364,7 +1374,8 @@ def rpc_fallback_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "verdict": verdict, "findings": ordered, "blocker_count": blockers, "major_count": majors, "minor_count": minors,
                 "provider_count": len(providers), "distinct_hosts": distinct, "total_weight": total_weight, "worst_case_ms": worst, "majority_quorum": majority}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 10. wallet capability matrix ------------------------------------------------------------------------------------
@@ -1376,13 +1387,13 @@ DISCOURAGED_METHODS = {"eth_sign": ("blocker", "signs an arbitrary hash blind an
                        "eth_signTypedData_v3": ("minor", "lacks array and recursive-struct support of v4")}
 
 
-def wallet_matrix(payload: dict) -> dict:
+def wallet_matrix(payload: dict[str, Any]) -> dict[str, Any]:
     """Capability matrix of candidate wallets against required RPC methods and chains, with EIP-6963 announcement validation."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         wallets = payload["wallets"]
         required_methods, required_chains = payload["required_methods"], payload["required_chain_ids"]
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         for method in sorted(set(required_methods)):
             if method in DISCOURAGED_METHODS:
                 severity, why = DISCOURAGED_METHODS[method]
@@ -1443,7 +1454,8 @@ def wallet_matrix(payload: dict) -> dict:
                 "method_coverage": [{"method": m, "wallet_count": n} for m, n in method_count.items()],
                 "chain_coverage": [{"chain_id": c, "wallet_count": n} for c, n in chain_count.items()]}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 11. ENS names ---------------------------------------------------------------------------------------------------
@@ -1479,17 +1491,17 @@ def _joins_emoji(label: str, index: int) -> bool:
     return unicodedata.category(label[index - 1]) in ("So", "Sk", "Mn") and unicodedata.category(label[index + 1]) == "So"
 
 
-def ens_name_check(payload: dict) -> dict:
+def ens_name_check(payload: dict[str, Any]) -> dict[str, Any]:
     """ENS name hygiene: normalization form, homograph and invisible-character checks, EIP-137 namehash, reverse-record forward verification."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         name = payload["name"]
         address = payload.get("address")
         forward = payload.get("forward_address")
         for field, value in (("address", address), ("forward_address", forward)):
             if value is not None and not _is_address(value):
                 return _invalid(field, f"{field} must be a 0x-prefixed 20-byte hex address")
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         labels = name.split(".")
         ascii_only = name.isascii()
         if any(label == "" for label in labels):
@@ -1546,7 +1558,8 @@ def ens_name_check(payload: dict) -> dict:
                 "normalized": normalized, "normalization": normalization, "label_count": len(labels), "namehash": node,
                 "reverse_name": reverse_name, "reverse_node": reverse_node, "reverse_verified": verified}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 12. signing request and link scan -------------------------------------------------------------------------------
@@ -1593,7 +1606,8 @@ def _registrable(host: str) -> str:
 
 
 def _scheme_of(url: str) -> str:
-    return support.script("dapp_wallet_check").url_scheme_userinfo(url)[0]
+    scheme: str = support.script("dapp_wallet_check").url_scheme_userinfo(url)[0]
+    return scheme
 
 
 _TAB_OR_NEWLINE = re.compile(r"[\t\r\n]")
@@ -1608,7 +1622,7 @@ def _whatwg_strip(text: str) -> tuple[str, bool]:
     return _TAB_OR_NEWLINE.sub("", trimmed), _TAB_OR_NEWLINE.search(trimmed) is not None  # only an inner tab or newline is a look-alike signal
 
 
-def _userinfo_findings(prefix: str, tag: str, url: str, findings: list[dict]) -> None:
+def _userinfo_findings(prefix: str, tag: str, url: str, findings: list[dict[str, str]]) -> None:
     """Userinfo in a displayed link or origin. Never echoes it: `app.example.com@evil.com` is the classic look-alike, `user:pw@host` a credential."""
     kind = support.script("dapp_wallet_check").url_scheme_userinfo(url)[1]
     if kind == "host-like":
@@ -1632,7 +1646,7 @@ def _squash(name: str) -> str:
     return name.replace(".", "").replace("-", "")
 
 
-def _domain_findings(label: str, host: str, expected: list[str], findings: list[dict], *, kind: str) -> None:
+def _domain_findings(label: str, host: str, expected: list[str], findings: list[dict[str, str]], *, kind: str) -> None:
     if any(host == e or host.endswith("." + e) for e in expected):
         return
     if host.startswith("xn--") or ".xn--" in host:
@@ -1656,10 +1670,10 @@ def _domain_findings(label: str, host: str, expected: list[str], findings: list[
     findings.append(_f(f"{kind}-UNEXPECTED", "major" if kind == "ORIGIN" else "minor", f"{label} host {host} is not one of the expected domains"))
 
 
-def signing_request_scan(payload: dict) -> dict:
+def signing_request_scan(payload: dict[str, Any]) -> dict[str, Any]:
     """Phishing indicators in pending signing/transaction requests, hard-coded addresses and displayed links."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         known = []
         for index, entry in enumerate(payload["known_contracts"]):
             if not _is_address(entry):
@@ -1672,8 +1686,8 @@ def signing_request_scan(payload: dict) -> dict:
         if any(not e or " " in e or "/" in e for e in expected):
             return _invalid("expected_domains", "expected_domains entries must be bare host names such as app.example.com")
         inspect = support.script("dapp_wallet_check").rpc_url_inspect
-        findings: list[dict] = []
-        decoded: list[dict] = []
+        findings: list[dict[str, str]] = []
+        decoded: list[dict[str, Any]] = []
         for index, request in enumerate(payload["requests"]):
             method, tag = request["method"], f"requests[{index}]"
             if method in BLIND_METHODS:
@@ -1775,7 +1789,8 @@ def signing_request_scan(payload: dict) -> dict:
         return {"state": "SUCCESS", "verdict": verdict, "findings": ordered, "blocker_count": blockers, "major_count": majors, "minor_count": minors,
                 "request_count": len(payload["requests"]), "link_count": len(payload["link_urls"]), "decoded_calls": decoded}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result
 
 
 # ---- 13. gas estimate buffer -----------------------------------------------------------------------------------------
@@ -1788,15 +1803,15 @@ STALE_ESTIMATE_S = 60
 INTRINSIC_GAS = 21000
 
 
-def gas_buffer_check(payload: dict) -> dict:
+def gas_buffer_check(payload: dict[str, Any]) -> dict[str, Any]:
     """Gas limit headroom over eth_estimateGas, block and protocol caps, and whether the balance covers value plus gas_limit * maxFeePerGas."""
 
-    def work() -> dict:
+    def work() -> dict[str, Any]:
         estimate, limit, block = payload["estimated_gas"], payload["gas_limit"], payload["block_gas_limit"]
         cap = payload.get("tx_gas_cap")
         contract = payload["contract_call"]
         buffer_pct = (_dec(limit) - _dec(estimate)) / _dec(estimate) * 100
-        findings: list[dict] = []
+        findings: list[dict[str, str]] = []
         if limit < INTRINSIC_GAS:
             findings.append(_f("GAS-BELOW-INTRINSIC", "blocker", f"gas limit {limit} is below the {INTRINSIC_GAS} intrinsic gas of any transaction"))
         if limit < estimate:
@@ -1828,4 +1843,5 @@ def gas_buffer_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "verdict": verdict, "findings": ordered, "blocker_count": blockers, "major_count": majors, "minor_count": minors,
                 "buffer_percent": round(float(buffer_pct), 4), "max_cost_wei": str(max_cost), "recommended_gas_limit": recommended}
 
-    return respond(payload, work)
+    result: dict[str, Any] = respond(payload, work)
+    return result

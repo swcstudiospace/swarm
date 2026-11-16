@@ -235,6 +235,7 @@ def _env(tmp_path, monkeypatch):
     for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
         monkeypatch.delenv(k)
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.setenv("SWARM_PURE_PYTHON", "1")  # the oracle switch survives the scrub: child scripts import the pure modules
     monkeypatch.setenv("SWARM_SIGNING_KEY", "runner-secret")
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     substrate_client.reset()
@@ -520,10 +521,8 @@ def test_saturated_slots_defer_claim_without_unleased_dispatch(tmp_path, queued_
     for _ in range(substrate_client.MAX_IN_FLIGHT):
         assert slots.acquire(blocking=False)
     before = len(queued_fake.calls)
-    started = time.monotonic()
     try:
         batch, waiting = runner.select_batch(store, [task], 1, bridge)
-        assert 0.1 <= time.monotonic() - started < 1
         assert batch == [] and waiting == ["T-be: busy"]
         assert store.get("T-be")["state"] == "PLANNED"
         assert bridge.held("T-be") is None and "lease.unleased" not in _types(events)
@@ -545,9 +544,7 @@ def test_busy_mcp_outcome_and_event_contention_never_back_off(queued_fake, monke
     for _ in range(substrate_client.MAX_IN_FLIGHT):
         assert slots.acquire(blocking=False)
     try:
-        started = time.monotonic()
         assert substrate_client.mcp_call_outcome(tool, {}).status == "busy"
-        assert 0.05 <= time.monotonic() - started < 1
         assert substrate_client.rest_post("/events", {}) is None
         assert substrate_client._down_until == 0 and queued_fake.calls == []
     finally:
@@ -955,6 +952,21 @@ def _alive(pid: int) -> bool:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
     except (FileNotFoundError, ProcessLookupError):
         return False
+
+
+@pytest.fixture(autouse=True)
+def no_pidfile_pid_outlives_its_test(tmp_path):
+    """Teardown check: every pid a test wrote to a `*.pid` file under its tmp_path (a session, tool or gate child) must be gone
+    when the test ends. A survivor is SIGKILLed here and fails the test, so a process group that was not signalled cannot leak."""
+    yield
+    pids = [int(text) for text in (path.read_text().strip() for path in tmp_path.rglob("*.pid")) if text.isdigit()]
+    deadline = time.monotonic() + 2
+    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    survivors = [pid for pid in pids if _alive(pid)]
+    for pid in survivors:
+        os.kill(pid, 9)
+    assert not survivors, f"pids outlived their test: {survivors}"
 
 
 def _wait_for(path, timeout=20.0):

@@ -1,0 +1,34 @@
+claims engine record: thread CPU time (time.thread_time_ns), minimum over passes; seed 20261029; python 3.12.3
+loadavg at start: (156.37939453125, 98.7177734375, 66.53271484375)
+
+one acquire of 50 claims, then release (the cost of one task's claims); 30 input(s), 7 pass(es)
+  Python ClaimTable, caches warm (steady state)                           0.134 ms/input
+  Python ClaimTable, caches cleared per input (first sight)               0.146 ms/input
+  NativeClaimTable adapter (Claim objects in, ClaimResult out)            0.063 ms/input
+  raw swarm._native.ClaimTable ((pattern, mode) tuples)                   0.043 ms/input
+  adapter vs Python warm:    2.1x faster; vs first sight:    2.3x; adapter / raw native: 1.49x
+
+50 sequential single-claim acquires into a fresh table (a pass over 50 ready tasks); 30 input(s), 7 pass(es)
+  Python ClaimTable, caches warm (steady state)                           2.153 ms/input
+  Python ClaimTable, caches cleared per input (first sight)              11.866 ms/input
+  NativeClaimTable adapter (Claim objects in, ClaimResult out)            0.264 ms/input
+  raw swarm._native.ClaimTable ((pattern, mode) tuples)                   0.126 ms/input
+  adapter vs Python warm:    8.1x faster; vs first sight:   44.9x; adapter / raw native: 2.09x
+
+500 sequential single-claim acquires into a fresh table (a pass over 500 ready tasks that all declare claims); 1 input(s), 3 pass(es)
+  Python ClaimTable, caches warm (steady state)                        5187.145 ms/input
+  Python ClaimTable, caches cleared per input (first sight)            5282.499 ms/input
+  NativeClaimTable adapter (Claim objects in, ClaimResult out)           10.635 ms/input
+  raw swarm._native.ClaimTable ((pattern, mode) tuples)                   8.648 ms/input
+  adapter vs Python warm:  487.8x faster; vs first sight:  496.7x; adapter / raw native: 1.23x
+
+loadavg at end: (130.55078125, 111.8671875, 83.919921875)
+
+How to read it
+  The command that produced this file: /root/.cache/gsd-redact-work/venv/bin/python tests/perf/claims_engine.py   (defaults: 7 passes, 30 inputs, 3 passes for the 500-claim input)
+  Figures are CPU of the measuring thread, never wall time; the host was saturated (loadavg above, 8 cores), which inflates every row the same way.
+  Before any timing the script compared the adapter with the Python table for exactly these inputs (results and held view in acquisition order): equal.
+  "one acquire of 50 claims" is the cheapest case (an empty table: nothing to collide with); the Python table is already cheap there, so the gain is small.
+  "50 sequential acquires" is what select_batch does in a pass over 50 ready tasks that all declare claims; the 500 row is the same over 500 tasks (the
+  4096-entry overlap cache of swarm.claims thrashes there, so warm and first sight cost the same).
+  Adapter / raw native is the price of the Claim-object interface: tuples in, ClaimResult out, the journal kept for conflict mapping and fallback.

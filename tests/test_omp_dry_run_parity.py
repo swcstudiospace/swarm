@@ -7,8 +7,9 @@ from pathlib import Path
 
 from conftest import ROOT, _scrubbed_base_env, omp_calls, run_script, stub_omp
 
-KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY")
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY")
 # T-06-19: the dry-run line also unsets the runner's task and correlation ids, matching the live child env.
+# U3.4e: the child strip also drops the insecure-dev-key opt-in, so a controller that has it set cannot hand it to a session.
 SESSION_UNSET = (*KEY_VARS, "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
 KEYS = {"SWARM_SIGNING_KEY": "runner-secret", "SWARM_ED25519_KEY": "11" * 32, "SWARM_REQUIRE_KEY": "1"}
 RESULT = {"state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],

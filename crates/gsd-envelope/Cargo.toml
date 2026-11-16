@@ -1,0 +1,22 @@
+[package]
+name = "gsd-envelope"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-side swarm envelope canonical form, signing and verification (HMAC-SHA256 and Ed25519) with Python's key precedence; the only GSD-Core crate that reads signing keys"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+categories = ["development-tools", "cryptography"]
+keywords = ["envelope", "hmac", "ed25519", "signing", "migration"]
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
+gsd-route = { path = "../gsd-route" }
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

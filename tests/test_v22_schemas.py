@@ -30,6 +30,20 @@ class TestValidatorKeywords:
         assert "minLength" in validate("", {"minLength": 1})[0]
         assert validate(5, {"minLength": 1}) == []
 
+    def test_validate_enforces_min_items(self):
+        assert "minItems" in validate([], {"type": "array", "minItems": 1})[0]
+        assert validate([1], {"type": "array", "minItems": 1}) == []
+        assert validate("text", {"minItems": 1}) == [], "keyword is inert for non-arrays"
+
+    def test_exclusive_minimum_is_strict(self):
+        assert "exclusive minimum" in validate(0, {"exclusiveMinimum": 0})[0]
+        assert validate(0.1, {"exclusiveMinimum": 0}) == []
+        assert validate(True, {"exclusiveMinimum": 0}) == [], "keyword is inert for booleans"
+
+    def test_unknown_type_name_raises(self):
+        with pytest.raises(ValueError, match="unknown type"):
+            validate(1, {"type": "integr"})
+
     def test_all_of_collects_every_branch(self):
         sch = {"allOf": [{"type": "object", "required": ["a"]}, {"type": "object", "required": ["b"]}]}
         assert validate({"a": 1, "b": 2}, sch) == []

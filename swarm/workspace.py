@@ -26,14 +26,16 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from types import TracebackType
+from typing import Any, Mapping
 
-from .manifest import get_agent
+from .manifest import agent_slug
 
-SPEC = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
+SPEC: dict[str, Any] = json.loads((Path(__file__).resolve().parent / "substrate_mcp.json").read_text(encoding="utf-8"))
 SERVER: str = SPEC["server"]
 # Claude Code's name for every tool of the server; it goes in an agent's `tools:` and in `--allowedTools`.
 CLAUDE_TOOLS = f"mcp__{SERVER}"
@@ -57,7 +59,8 @@ def server_var(surface: str) -> str:
 
 def mcp_config(workspace: str | Path, runtime: str) -> Path:
     """The project file `runtime` reads the substrate entry from."""
-    return Path(workspace) / SPEC["runtimes"][runtime]["path"]
+    path: str = SPEC["runtimes"][runtime]["path"]
+    return Path(workspace) / path
 
 
 def projected_mcp(workspace: str | Path, runtime: str) -> bool:
@@ -106,7 +109,7 @@ def _private_directory(path: Path, st: os.stat_result) -> None:
 
 
 def _open_directory(path: Path, *, create: bool = False, private: bool = False,
-                    created: list | None = None) -> int:
+                    created: list[tuple[int, str, os.stat_result]] | None = None) -> int:
     """Walk from the root with pinned, no-follow directory descriptors, never through an ancestor symlink."""
     path = path.absolute()
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
@@ -290,7 +293,8 @@ class FileTransaction:
             item.committed = True
         self.complete = True
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
+                 tb: TracebackType | None) -> None:
         problems = []
         try:
             if not self.complete:
@@ -356,6 +360,21 @@ def write_token(path: Path, token: str) -> None:
         transaction.commit()
 
 
+def primary_checkout(workspace: str | Path) -> Path | None:
+    """The primary checkout that a git worktree of `workspace` belongs to (the parent of the shared `.git` dir), else None.
+    A worktree has its own path, hence its own env dir; its tokens are the repo's, so it reads the primary's."""
+    try:
+        out = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = Path(out.stdout.strip()) if out.returncode == 0 else None
+    if common is None or common.name != ".git":
+        return None
+    primary = common.parent
+    return None if primary.resolve() == Path(workspace).resolve() else primary
+
+
 def credential(agent_id: str | None, workspace: str | Path | None,
                env: Mapping[str, str] | None = None) -> tuple[str | None, str, str]:
     """(token, source, problem): THE lookup of an agent's own token, shared by its session (`child_env`), the leases the
@@ -368,7 +387,9 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     3. Else `SUBSTRATE_TOKEN` in `env` only when running inside this agent's own child session (`SWARM_AGENT_SESSION == "1"`
        and `SWARM_AGENT == slug`), where `child_env` stripped the server-specific variables.
     4. Else nothing. Never `SUBSTRATE_TOKEN` in the runner: that is A01's, and a claim or a run-log row of another
-       agent sent with it would be misattributed, or refused for naming another surface."""
+       agent sent with it would be misattributed, or refused for naming another surface.
+    A git worktree with no env file of its own reads the env file of its primary checkout (`primary_checkout`), so a
+    session started in any worktree of the repo holds the same agent token as the repo itself."""
     from .substrate_tee import AGENT_SURFACES  # lazy: the tee imports this module
 
     e = os.environ if env is None else env
@@ -376,9 +397,15 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     if surface is None:
         return None, "", f"no substrate surface for agent {agent_id!r}"
     path = None
+    slug: str | None = None  # looked up once, on the first branch that needs it
     if workspace is not None:
         try:
-            path = env_file(workspace, get_agent(agent_id or "")["slug"], e)
+            slug = agent_slug(agent_id or "")
+            path = env_file(workspace, slug, e)
+            if not os.path.lexists(path):
+                primary = primary_checkout(workspace)
+                if primary is not None and os.path.lexists(env_file(primary, slug, e)):
+                    path = env_file(primary, slug, e)
         except KeyError:
             return None, "", f"no agent {agent_id!r} in the manifest"
         try:
@@ -394,10 +421,11 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     given = (e.get(var) or "").strip()
     if valid_token(given):
         return given, f"${var}", ""
-    try:
-        slug = get_agent(agent_id or "")["slug"]
-    except KeyError:
-        slug = ""
+    if slug is None:
+        try:
+            slug = agent_slug(agent_id or "")
+        except KeyError:
+            slug = ""
     if (e.get("SWARM_AGENT_SESSION") or "").strip() == "1" and slug and (e.get("SWARM_AGENT") or "").strip() == slug:
         session_token = (e.get(TOKEN) or "").strip()
         if valid_token(session_token):

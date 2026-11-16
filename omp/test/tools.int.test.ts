@@ -1,20 +1,31 @@
 /** Integration: tools → real bridge → real python scripts → tmp Task Store (never the repo's .swarm/). */
 import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, runPy, SwarmToolError } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry } from "../src/omp-api.ts";
-import { agentCtx, callTool, ephemeralSigningKey, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
+import { agentCtx, callTool, ephemeralSigningKey, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, REPO_ROOT, runPython, tmpDir } from "./helpers.ts";
 import { SWARM_SLUGS } from "../src/guard.ts";
 
 isolateEnv(
   "SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION", "SWARM_AGENT",
   "SWARM_SIGNING_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENTS_FILE",
+  "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY", "HOME", "XDG_CONFIG_HOME",
+  "SWARM_PURE_PYTHON", "SWARM_GSD_STATE_FILE", "SWARM_CLAUDE_STATE_DIR",
 );
 beforeEach(() => {
   process.env.SWARM_SIGNING_KEY = ephemeralSigningKey();
+  // No host signing references or state mirrors, even if a test clears the ephemeral raw key.
+  delete process.env.SWARM_ED25519_KEY;
+  delete process.env.SWARM_ED25519_KEY_FILE;
+  delete process.env.SWARM_ALLOW_INSECURE_DEV_KEY;
+  delete process.env.SWARM_REQUIRE_KEY;
+  process.env.HOME = tmpDir("swarm-omp-home-");
+  process.env.XDG_CONFIG_HOME = tmpDir("swarm-omp-config-");
+  process.env.SWARM_GSD_STATE_FILE = "";
+  process.env.SWARM_CLAUDE_STATE_DIR = tmpDir("swarm-omp-claude-");
 });
 
 /** All tools over the real bridge, counting bridge calls. */
@@ -131,6 +142,59 @@ test("plan dash brief is passed intact", async () => {
   expect(tasks.tasks[0].notes.brief_excerpt).toBe(brief);
 });
 
+test("plan content shows a verified execution assignment and omits it when unsigned", { timeout: 30_000 }, async () => {
+  const { ctx } = tmpStore();
+  const { tool } = swarm();
+  const real = await callTool(tool("swarm_plan"), HOTFIX, ctx);
+  const details = real.details as {
+    status: string;
+    correlation_id: string;
+    summary: string;
+    execution_assignment_verified?: boolean;
+    execution_assignment?: { schema?: string; type?: string; target?: string; payload?: { capability?: string } };
+  };
+  const visible = JSON.parse(real.content[0].text) as Record<string, unknown>;
+  const verified = details.execution_assignment_verified === true;
+  expect(verified).toBe(true);
+  expect(visible.execution_assignment_verified).toBe(true);
+  expect(visible.status).toBe(details.status);
+  expect(visible.correlation_id).toBe("c-hot");
+  expect(visible.pattern).toBe("hotfix");
+  expect(visible.reused).toBe(false);
+  expect(visible.summary).toBe(details.summary);
+  expect(visible.execution_assignment).toEqual(details.execution_assignment);
+  expect(details.execution_assignment?.schema).toBe("swarm.v1.task.assign");
+  expect(details.execution_assignment?.type).toBe("task.assign");
+  expect(details.execution_assignment?.target).toBe("A01");
+  expect(details.execution_assignment?.payload?.capability).toBe("plan.execute");
+  expect(JSON.stringify(real)).not.toMatch(/SWARM_SIGNING_KEY|SWARM_ED25519_KEY_FILE|PRIVATE KEY/);
+
+  const again = await callTool(tool("swarm_plan"), HOTFIX, ctx);
+  const reused = JSON.parse(again.content[0].text) as { reused?: boolean; execution_assignment_verified?: boolean; execution_assignment?: { schema?: string } };
+  expect((again.details as { reused?: boolean }).reused).toBe(true);
+  expect(reused.reused).toBe(true);
+  expect(reused.execution_assignment_verified).toBe(true);
+  expect(reused.execution_assignment?.schema).toBe("swarm.v1.task.assign");
+
+  const dry = await callTool(tool("swarm_plan"), { ...HOTFIX, correlation_id: "c-dry", dry_run: true }, ctx);
+  const dryVisible = JSON.parse(dry.content[0].text) as Record<string, unknown>;
+  expect((dry.details as { execution_assignment_verified?: boolean }).execution_assignment_verified).not.toBe(true);
+  expect(dryVisible.execution_assignment_verified).toBe(false);
+  expect(dryVisible).not.toHaveProperty("execution_assignment");
+  expect(typeof dryVisible.summary).toBe("string");
+
+  delete process.env.SWARM_SIGNING_KEY;
+  try {
+    const unsigned = await callTool(tool("swarm_plan"), { ...HOTFIX, correlation_id: "c-open", prefix: "U" }, ctx);
+    const open = JSON.parse(unsigned.content[0].text) as Record<string, unknown>;
+    expect((unsigned.details as { execution_assignment_verified?: boolean }).execution_assignment_verified).not.toBe(true);
+    expect(open.execution_assignment_verified).toBe(false);
+    expect(open).not.toHaveProperty("execution_assignment");
+  } finally {
+    process.env.SWARM_SIGNING_KEY = ephemeralSigningKey();
+  }
+});
+
 test("assignment uses the real canonical script for a leased task without mutating task state", async () => {
   const { ctx, sdir } = tmpStore();
   const { calls, tool } = swarm();
@@ -152,7 +216,14 @@ test("assignment uses the real canonical script for a leased task without mutati
     },
   });
   const details = res.details as { prompt: string; assignment: { sig: string } };
-  expect(res.content).toEqual([{ type: "text", text: details.prompt }]);
+  const marker = "\n--- prompt ---\n";
+  const visible = res.content[0].text;
+  const splitAt = visible.indexOf(marker);
+  expect(JSON.parse(visible.slice(0, splitAt))).toEqual({
+    status: "ok", assignment_verified: true, task_id: "H-rca", correlation_id: "c-hot", agent_slug: "a14-maintenance",
+  });
+  expect(visible.slice(0, splitAt)).not.toContain(details.assignment.sig);
+  expect(visible.slice(splitAt + marker.length)).toBe(details.prompt);
   const embedded = /# task\.assign \(signed envelope\)\n```json\n([\s\S]*?)\n```/.exec(details.prompt);
   expect(embedded).not.toBeNull();
   expect(JSON.parse(embedded![1])).toEqual(details.assignment);
@@ -161,6 +232,9 @@ test("assignment uses the real canonical script for a leased task without mutati
   process.env.SWARM_AGENT = "a01-orchestrator";
   const headless = await callTool(tool("swarm_assignment"), { task_id: "H-rca", correlation_id: "c-hot" }, fakeCtx(ctx.cwd));
   expect(headless.details).toMatchObject({ assignment_verified: true, task_id: "H-rca", agent_slug: "a14-maintenance" });
+  const headlessText = headless.content[0].text;
+  const headlessPrompt = (headless.details as { prompt: string }).prompt;
+  expect(headlessText.slice(headlessText.indexOf(marker) + marker.length)).toBe(headlessPrompt);
   expect(readFileSync(db)).toEqual(before);
   expect(readdirSync(sdir, { recursive: true }).sort()).toEqual(files);
 });
@@ -320,6 +394,9 @@ test("assignment accepts the verified envelope when memory quotes the heading an
   createSwarmExtension({ bridge: async () => quoted })(pi.api);
   const res = await callTool(pi.tool("swarm_assignment"), params, controller);
   expect(res.details).toMatchObject({ assignment_verified: true, task_id: "H-rca", agent_slug: "a14-maintenance" });
+  const quotedText = res.content[0].text;
+  const quotedMarker = "\n--- prompt ---\n";
+  expect(quotedText.slice(quotedText.indexOf(quotedMarker) + quotedMarker.length)).toBe(quoted.json.prompt);
 
   const duplicated = structuredClone(valid);
   const real = valid.json.prompt as string;
@@ -515,6 +592,300 @@ test("gate dry run end to end: canned pass reaches the agent and satisfies no re
   expect(reviewOf("F-be").missing).toBe("fail");
   expect(reviewOf("F-fe").missing).toBeUndefined();
 });
+
+/** Real pytest, canonical qa_gate and a leased temporary Task Store; no synthetic gate replies. */
+async function qualityFixture(delayS = 0.05) {
+  const store = tmpStore();
+  // Match the isolated controller fixtures above: the test key records rows, not a keyless agent session.
+  delete process.env.SWARM_AGENT_SESSION;
+  process.env.SWARM_PURE_PYTHON = "1";
+  process.env.SWARM_ROOT = REPO_ROOT;
+  // A real runner deadline needs the child interpreter's clock; fake JS timers cannot drive it.
+  writeFileSync(join(store.repo, "pytest.ini"), "[pytest]\n");
+  writeFileSync(join(store.repo, "test_deadline.py"), [
+    "import time",
+    "from pathlib import Path",
+    "def test_bounded_work():",
+    "    Path('runner-started').write_text('started')",
+    `    time.sleep(${delayS})`,
+    "    assert 2 + 2 == 4",
+    "    Path('runner-finished').write_text('finished')",
+    "",
+  ].join("\n"));
+  const setup = swarm();
+  await callTool(setup.tool("swarm_plan"), { ...HOTFIX, risk_class: "medium" }, store.ctx);
+  await lease(setup.tool, store.ctx, "H-qa");
+  return {
+    ...store, ...setup,
+    owner: agentCtx(store.repo, "a08-qa"),
+    params: { gate: "quality", task_id: "H-qa", correlation_id: "c-hot" },
+  };
+}
+
+function qualityHistory(sdir: string, target = "H-patch") {
+  const h = runPython("orch_status.py", [`--history=${target}`], { SWARM_DIR: sdir });
+  expect(h.code, h.stderr).toBe(0);
+  return {
+    row: jsonAt(h.json, "verdicts", "quality"),
+    missing: jsonAt(h.json, "missing_gate_reasons", "quality"),
+  };
+}
+
+async function waitForRunner(file: string): Promise<void> {
+  // Real subprocess readiness: fake timers cannot drive a child interpreter or its filesystem writes.
+  const end = Date.now() + 5_000;
+  while (!existsSync(file) && Date.now() < end) await Bun.sleep(25);
+  expect(existsSync(file)).toBe(true);
+}
+
+test("quality timeout validation rejects before findings files, bridge calls or Task Store effects", async () => {
+  const { ctx, sdir } = tmpStore();
+  const { calls, tool } = swarm();
+  await callTool(tool("swarm_plan"), { ...HOTFIX, risk_class: "medium" }, ctx);
+  const db = readFileSync(join(sdir, "tasks.db"));
+  const files = readdirSync(sdir, { recursive: true }).sort();
+  const start = calls.length;
+  const base = { task_id: "H-qa", correlation_id: "c-hot", per_target_findings: { "H-patch": [] } };
+  const invalid: unknown[] = [
+    undefined, null, false, true, "", "1", "7200", NaN, Infinity, -Infinity,
+    0, -1, 0.5, 1.5, 7200.5, 7201, {}, [],
+  ];
+  for (const timeout_s of invalid) {
+    const err = await rejection(callTool(tool("swarm_gate"), { ...base, gate: "quality", timeout_s }, agentCtx(ctx.cwd, "a08-qa")));
+    expect(err.code).toBe("E-INPUT");
+  }
+  for (const [gate, slug] of [["review", "a09-reviewer"], ["security", "a10-security"], ["release", "a12-release"]]) {
+    for (const timeout_s of [1, 7200, null, undefined]) {
+      const err = await rejection(callTool(tool("swarm_gate"), { ...base, gate, timeout_s }, agentCtx(ctx.cwd, slug)));
+      expect(err.code).toBe("E-INPUT");
+    }
+  }
+  expect(calls.length).toBe(start);
+  expect(readFileSync(join(sdir, "tasks.db"))).toEqual(db);
+  expect(readdirSync(sdir, { recursive: true }).sort()).toEqual(files);
+  expect(existsSync(join(sdir, "results"))).toBe(false);
+  expect(existsSync(join(sdir, "verdicts"))).toBe(false);
+  expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+});
+
+test("quality timeout does not weaken owner-only or plan-mode protection", async () => {
+  const { ctx, sdir } = tmpStore();
+  const { calls, tool } = swarm();
+  await callTool(tool("swarm_plan"), HOTFIX, ctx);
+  const db = readFileSync(join(sdir, "tasks.db"));
+  const files = readdirSync(sdir, { recursive: true }).sort();
+  const start = calls.length;
+  for (const owner of [
+    ...SWARM_SLUGS.filter((slug) => slug !== "a08-qa").map((slug) => agentCtx(ctx.cwd, slug)),
+    agentCtx(ctx.cwd, "task"),
+    agentCtx(ctx.cwd, "a08-qa", PLAN_MODE),
+  ]) {
+    for (const timeout_s of [1, 7200]) {
+      const err = await rejection(callTool(tool("swarm_gate"), {
+        gate: "quality", task_id: "H-qa", correlation_id: "c-hot", timeout_s,
+        per_target_findings: { "H-patch": [] },
+      }, owner));
+      expect(err.code).toBe("E-POLICY");
+    }
+  }
+  expect(calls.length).toBe(start);
+  expect(readFileSync(join(sdir, "tasks.db"))).toEqual(db);
+  expect(readdirSync(sdir, { recursive: true }).sort()).toEqual(files);
+});
+
+test("quality accepts a 30 s and a 7200 s deadline with real signed canonical results and unchanged risk tiers", async () => {
+  const { tool, owner, params, sdir, ctx, repo } = await qualityFixture();
+  for (const timeout_s of [30, 7200]) {
+    const res = await callTool(tool("swarm_gate"), { ...params, timeout_s }, owner);
+    expect(res.details).toMatchObject({
+      status: "ok", verdict: "pass", risk_class: "medium", recorded: ["H-patch"],
+      runs: { unit: "pass", integration: "pass", e2e: "skipped:not-selected", perf: "skipped:not-selected" },
+      executed: [{ runner: "pytest", returncode: 0, passed: 1, failed: 0 }],
+    });
+    expect(existsSync(join(repo, "runner-finished"))).toBe(true);
+    const row = qualityHistory(sdir).row;
+    expect(jsonAt(row, "verdict")).toBe("pass");
+    const envelope = JSON.parse(String(jsonAt(row, "envelope_json")));
+    expect(envelope.sig).toMatch(/^(hmac|ed25519):.+/);
+    expect(envelope.payload).toMatchObject({ task_id: "H-patch", gate_task: "H-qa", gate: "quality" });
+    expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("IN_PROGRESS");
+  }
+}, 60_000);
+
+test("quality short runner timeout is fail-closed; a later omitted deadline runs normally", async () => {
+  const { tool, owner, params, sdir, ctx, repo } = await qualityFixture(12);
+  const err = await rejection(callTool(tool("swarm_gate"), { ...params, timeout_s: 5 }, owner));
+  // subprocess.TimeoutExpired is the existing canonical Python E-INTERNAL contract, not a signed failure.
+  expect(err.code).toBe("E-INTERNAL");
+  expect(err.message).toContain("TimeoutExpired");
+  expect(existsSync(join(repo, "runner-started"))).toBe(true);
+  expect(existsSync(join(repo, "runner-finished"))).toBe(false);
+  expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+  expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+  expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("IN_PROGRESS");
+  const normal = await callTool(tool("swarm_gate"), params, owner);
+  expect(normal.details).toMatchObject({
+    status: "ok", verdict: "pass", recorded: ["H-patch"],
+    executed: [{ runner: "pytest", returncode: 0, passed: 1, failed: 0 }],
+  });
+  expect(existsSync(join(repo, "runner-finished"))).toBe(true);
+  expect(jsonAt(qualityHistory(sdir).row, "verdict")).toBe("pass");
+}, 40_000);
+
+test("quality concurrent deadlines isolate the timed-out target from the successful invocation", async () => {
+  const { tool, owner, params, ctx, sdir } = await qualityFixture(1.5);
+  await callTool(tool("swarm_plan"), { ...HOTFIX, risk_class: "medium", prefix: "J", correlation_id: "c-other" }, ctx);
+  await lease(tool, ctx, "J-qa");
+  const [short, longer] = await Promise.all([
+    rejection(callTool(tool("swarm_gate"), { ...params, timeout_s: 1 }, owner)),
+    callTool(tool("swarm_gate"), {
+      gate: "quality", task_id: "J-qa", correlation_id: "c-other", timeout_s: 5,
+    }, owner),
+  ]);
+  expect(short.code).toBe("E-INTERNAL");
+  expect(short.message).toContain("TimeoutExpired");
+  expect(longer.details).toMatchObject({ status: "ok", verdict: "pass", recorded: ["J-patch"] });
+  expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+  expect(jsonAt(qualityHistory(sdir, "J-patch").row, "verdict")).toBe("pass");
+  expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+  expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("IN_PROGRESS");
+  expect(stateOf(await statusRows(tool, ctx, "c-other"), "J-qa")).toBe("IN_PROGRESS");
+}, 15_000);
+
+test("quality explicit deadlines preserve canonical correlation and ended-lease refusal without rows", async () => {
+  const { tool, owner, params, ctx, sdir } = await qualityFixture();
+  const wrongCorr = await rejection(callTool(tool("swarm_gate"), { ...params, correlation_id: "wrong", timeout_s: 7200 }, owner));
+  expect(wrongCorr.code).toBe("E-POLICY");
+  expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+  expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+  await callTool(tool("swarm_transition"), { task_id: "H-qa", state: "BLOCKED", reason: "lease ended" }, ctx);
+  const ended = await rejection(callTool(tool("swarm_gate"), { ...params, timeout_s: 7200 }, owner));
+  expect(ended.code).toBe("E-POLICY");
+  expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+  expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+  expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("BLOCKED");
+}, 15_000);
+
+test("quality cancellation and an earlier session deadline kill real runner work without verdict rows", async () => {
+  const { tool, owner, params, ctx, sdir, repo } = await qualityFixture(30);
+  for (const reason of [undefined, new DOMException("shorter session deadline", "TimeoutError")]) {
+    if (existsSync(join(repo, "runner-started"))) unlinkSync(join(repo, "runner-started"));
+    const controller = new AbortController();
+    const work = rejection(callTool(tool("swarm_gate"), { ...params, timeout_s: 7200 }, owner, controller.signal));
+    try {
+      await waitForRunner(join(repo, "runner-started"));
+      controller.abort(reason);
+      const err = await work;
+      expect(err.code).toBe(reason === undefined ? "E-INTERNAL" : "E-TIMEOUT");
+      expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+      expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+      expect(existsSync(join(repo, "runner-finished"))).toBe(false);
+      expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("IN_PROGRESS");
+    } finally {
+      controller.abort();
+      await work;
+    }
+  }
+}, 15_000);
+
+test("quality rechecks a lease ended while the bounded real runner was in flight", async () => {
+  const { tool, owner, params, ctx, sdir, repo } = await qualityFixture(1.5);
+  const controller = new AbortController();
+  const work = rejection(callTool(tool("swarm_gate"), { ...params, timeout_s: 5 }, owner, controller.signal));
+  try {
+    await waitForRunner(join(repo, "runner-started"));
+    await callTool(tool("swarm_transition"), { task_id: "H-qa", state: "BLOCKED", reason: "lease ended during QA" }, ctx);
+    const err = await work;
+    expect(err.code).toBe("E-POLICY");
+    expect(existsSync(join(repo, "runner-finished"))).toBe(true);
+    expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+    expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+    expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("BLOCKED");
+  } finally {
+    controller.abort();
+    await work;
+  }
+}, 15_000);
+
+test("quality outer supervision bounds a real delayed child group including its cleanup margin", async () => {
+  const { tool, owner, params, ctx, sdir, repo } = await qualityFixture();
+  // Same isolated runtime-fixture pattern as bridge.test.ts, but no canned JSON or argv echo:
+  // if supervision fails, this finite child finishes and delegates to the REAL canonical gate.
+  // Real process-group timers cannot be advanced with fake JS timers; only this test waits out the 60s margin.
+  const runtime = tmpDir("swarm-omp-delayed-runtime-");
+  mkdirSync(join(runtime, "scripts"));
+  writeFileSync(join(runtime, "scripts", "orch_plan.py"), "");
+  const pids = join(repo, "delayed-pids.json");
+  writeFileSync(join(runtime, "scripts", "qa_gate.py"), [
+    "import json, os, runpy, signal, subprocess, sys",
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(65)'])",
+    "def stop(signum, frame):",
+    "    child.terminate()",
+    "    child.wait()",
+    "    raise SystemExit(143)",
+    "signal.signal(signal.SIGTERM, stop)",
+    `with open(${JSON.stringify(pids)}, 'w') as f:`,
+    "    json.dump({'parent': os.getpid(), 'child': child.pid}, f)",
+    "child.wait()",
+    `sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})`,
+    `runpy.run_path(${JSON.stringify(join(REPO_ROOT, "scripts", "qa_gate.py"))}, run_name='__main__')`,
+    "",
+  ].join("\n"));
+  process.env.SWARM_ROOT = runtime;
+  const controller = new AbortController();
+  const start = Date.now();
+  const work = rejection(callTool(tool("swarm_gate"), { ...params, timeout_s: 1 }, owner, controller.signal));
+  try {
+    await waitForRunner(pids);
+    const err = await work;
+    expect(err.code).toBe("E-TIMEOUT");
+    // Not merely argv forwarding: a real process outlives the one-second runner budget,
+    // survives for its cleanup margin, and is then killed rather than recording success.
+    expect(Date.now() - start).toBeGreaterThanOrEqual(60_000);
+    const ids = JSON.parse(readFileSync(pids, "utf8")) as { parent: number; child: number };
+    // kill(0) stays true for a zombie. A SIGKILLed grandchild is reparented to init and
+    // stays in Z until init reaps it, which lags when the suite is loaded. A process
+    // still sleeping (S/R) is a missed group kill and must fail.
+    await expectGroupKilled([ids.parent, ids.child]);
+    expect(existsSync(join(repo, "runner-started"))).toBe(false);
+    expect(qualityHistory(sdir)).toEqual({ row: undefined, missing: "absent" });
+    expect(existsSync(join(sdir, "verdicts", "H-qa.quality.json"))).toBe(false);
+    process.env.SWARM_ROOT = REPO_ROOT;
+    expect(stateOf(await statusRows(tool, ctx, "c-hot"), "H-qa")).toBe("IN_PROGRESS");
+  } finally {
+    controller.abort();
+    await work;
+  }
+}, 75_000);
+
+/** `undefined` means the pid is gone. `Z` is a killed process init has not reaped yet. */
+function procState(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const end = stat.lastIndexOf(")");
+    if (end < 0 || end + 2 >= stat.length) return "unknown";
+    return stat[end + 2];
+  } catch {
+    return undefined;
+  }
+}
+
+async function expectGroupKilled(pids: number[]): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  const pending = new Set(pids);
+  while (pending.size > 0) {
+    for (const pid of pending) {
+      const state = procState(pid);
+      if (state === undefined || state === "Z") pending.delete(pid);
+    }
+    if (pending.size === 0) return;
+    if (Date.now() >= deadline) {
+      const detail = [...pending].map((pid) => `${pid}=${procState(pid) ?? "gone"}`).join(", ");
+      throw new Error(`process group still running after the group kill: ${detail}`);
+    }
+    await Bun.sleep(50);
+  }
+}
 
 function statusTool() {
   const pi = fakePi();

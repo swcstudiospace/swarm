@@ -1,0 +1,2246 @@
+{
+  "mode": {
+    "rust": false,
+    "backend": null
+  },
+  "cases_passed": 12,
+  "cases_total": 12,
+  "served_by_counts": {
+    "python": 354
+  },
+  "pending": [],
+  "cases": [
+    {
+      "name": "happy_path",
+      "route": "orch_status + swarm_tool",
+      "description": "Seeded task read back; catalog lists the caller's tools; call returns a registry result.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "orch_status reads the seeded task",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "catalog lists the caller's tools",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "call returns the registry result",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "transition_legal_illegal",
+      "route": "orch_status",
+      "description": "Legal CREATED -> CANCELLED succeeds; illegal CREATED -> DONE is refused with E-CONTRACT.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "legal transition CREATED -> CANCELLED",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "illegal transition CREATED -> DONE refused",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "gate_pass_fail_major",
+      "route": "orch_status",
+      "description": "Signed review verdicts read back via --history: a clean pass, and a fail carrying a major finding.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "gate pass verdict reads back as pass",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "gate fail-major verdict reads back as fail with its major finding",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "boundary_100kb",
+      "route": "swarm_tool",
+      "description": "--input of exactly the cap is accepted; one byte more is refused as E-INPUT.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "boundary payloads are exactly 100000 and 100001 bytes",
+          "ok": true,
+          "detail": "100000 and 100001 bytes",
+          "served_by": "python"
+        },
+        {
+          "label": "100000 bytes is accepted (unregistered name gives INVALID_INPUT)",
+          "ok": true,
+          "detail": "exit 1",
+          "served_by": "python"
+        },
+        {
+          "label": "100001 bytes is refused as E-INPUT",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "validation_error",
+      "route": "orch_status + swarm_tool",
+      "description": "Bad task id, unknown task and unknown caller each exit 2 with E-INPUT.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "task id containing '..' is refused before any work",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "history of an unknown task is refused",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "unknown caller is refused",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "empty",
+      "route": "orch_status + swarm_tool",
+      "description": "Empty store and a catalog query matching nothing are success-empty, not a crash.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "empty store reads as success with no tasks",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "catalog query matching nothing returns an empty list",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "large",
+      "route": "orch_status + swarm_tool",
+      "description": "200 tasks in one correlation and the full A01 catalog both read back.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "orch_status reads 200 tasks in one correlation",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "full catalog for A01 (tools and skills)",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "malformed",
+      "route": "swarm_tool",
+      "description": "Non-JSON input, non-object input and a missing --name are each E-INPUT with exit 2.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "input that is not JSON is E-INPUT, never uncaught",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "input that is not a JSON object is E-INPUT",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "call without --name is E-INPUT",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "timeout",
+      "route": "swarm_tool",
+      "description": "A handler that outlives its timeout_s reports state TIMEOUT (status fail, exit 1).",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "handler past timeout_s is reported as TIMEOUT (status fail, exit 1)",
+          "ok": true,
+          "detail": "exit 1",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "policy",
+      "route": "orch_status + swarm_tool",
+      "description": "Plan mode refuses a WRITE tool; a hand move of a gate task is refused; both as E-POLICY with no paths leaked.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "plan mode refuses a WRITE tool before its handler is imported",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "hand move of a gate task to IN_REVIEW is refused with a scrubbed message",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "classifier_quadruple_mirror",
+      "route": "errors + retry + omp bridge",
+      "description": "ErrorCode, retry partitions, bridge.ts, classify() and the selector's fallback set agree.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "retry TRANSIENT and PERMANENT sets are disjoint",
+          "ok": true,
+          "detail": "shared []",
+          "served_by": "python"
+        },
+        {
+          "label": "retry partitions plus E-INTERNAL equal ErrorCode",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "omp/src/bridge.ts ERROR_CODES keys equal ErrorCode",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "omp/src/bridge.ts ErrorCode union equals ErrorCode",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-CAPACITY)) keeps E-CAPACITY",
+          "ok": true,
+          "detail": "got E-CAPACITY",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-CONTRACT)) keeps E-CONTRACT",
+          "ok": true,
+          "detail": "got E-CONTRACT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-DEP)) keeps E-DEP",
+          "ok": true,
+          "detail": "got E-DEP",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-INPUT)) keeps E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-INTERNAL)) keeps E-INTERNAL",
+          "ok": true,
+          "detail": "got E-INTERNAL",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-POLICY)) keeps E-POLICY",
+          "ok": true,
+          "detail": "got E-POLICY",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(SwarmError(E-TIMEOUT)) keeps E-TIMEOUT",
+          "ok": true,
+          "detail": "got E-TIMEOUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(TimeoutError) is E-TIMEOUT",
+          "ok": true,
+          "detail": "got E-TIMEOUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(FileNotFoundError) is E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(ValueError) is E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(KeyError) is E-INPUT",
+          "ok": true,
+          "detail": "got E-INPUT",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(ConnectionError) is E-DEP",
+          "ok": true,
+          "detail": "got E-DEP",
+          "served_by": "python"
+        },
+        {
+          "label": "classify(RuntimeError) is E-INTERNAL",
+          "ok": true,
+          "detail": "got E-INTERNAL",
+          "served_by": "python"
+        },
+        {
+          "label": "scripts/orch_status.py RUST_FALLBACK_CODES equals the harness copy",
+          "ok": true,
+          "detail": "missing [], extra []",
+          "served_by": "python"
+        },
+        {
+          "label": "scripts/orch_status.py DEFAULT_ENGINE equals route_table.rs ORCH_STATUS_READ_DEFAULT",
+          "ok": true,
+          "detail": "selector 'python', route table 'python'",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    },
+    {
+      "name": "transition_matrix",
+      "route": "orch_status --transition",
+      "description": "Every (from, to) pair, rework, claim, gate, state-name and unknown-task vector plus dry-run, id, grammar and lease cells: the binary leaves Python's stdout, store and effects, or refuses before any write and Python answers.",
+      "status": "pass",
+      "checks": [
+        {
+          "label": "the derived Rust refusals agree with the vectors' own flags on every manual vector case",
+          "ok": true,
+          "detail": "351 vector cases",
+          "served_by": "python"
+        },
+        {
+          "label": "every vector case is a cell, and the added cells follow them",
+          "ok": true,
+          "detail": "375 cells",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CREATED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-VALIDATED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-PLANNED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CLAIMED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_PROGRESS-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-IN_REVIEW-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CHANGES_REQUESTED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-APPROVED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-DONE-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-BLOCKED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-FAILED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-RETRY-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-ESCALATED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-CREATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-VALIDATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-PLANNED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-CLAIMED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-IN_PROGRESS: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-IN_REVIEW: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-CHANGES_REQUESTED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-APPROVED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-DONE: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-BLOCKED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-FAILED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-RETRY: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-ESCALATED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-matrix-CANCELLED-CANCELLED: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-plain: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-null-notes: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-result-meta: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-meta-first-order: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-only-meta: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-falsy-result-empty-dict: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-falsy-result-meta: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-falsy-null-false: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-falsy-list-float: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-truthy-str-int: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-truthy-true: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-truthy-float: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-evidence-list: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-evidence-str: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-evidence-null: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-evidence-str-no-prior: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-verdicts-since-keeps-position: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-verdicts-since-zero-int: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-loops-1: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-loops-negative: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-unicode-notes: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-reason-empty: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-reason-unicode: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-reason-newline: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-time-zero: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-time-fraction: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-time-large: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-no-prior: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-prior: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-prior-evidence: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-evidence-str: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-loops-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-loops-7-empty-reason: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-loops-i64-max: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-null-notes: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-cap-time: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-null-loops: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-text-loops: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-rework-null-loops-other-target: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-0-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-2-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-3-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-5-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-0-of-0: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-0-of-1: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED--1-of-0: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-9223372036854775807-of-9223372036854775807: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-PLANNED-9223372036854775806-of-9223372036854775807: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-0-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-2-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-3-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-5-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-0-of-0: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-0-of-1: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY--1-of-0: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-9223372036854775807-of-9223372036854775807: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-RETRY-9223372036854775806-of-9223372036854775807: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-0-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-2-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-3-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-5-of-3: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-0-of-0: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-0-of-1: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED--1-of-0: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-9223372036854775807-of-9223372036854775807: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-BLOCKED-9223372036854775806-of-9223372036854775807: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-null-attempt: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-text-attempt: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-null-max: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-null-attempt-other-target: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-exhausted-other-target: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-claim-attempt-untouched-in-progress: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-to-in-review-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-to-failed-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-illegal-in-review-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-unknown-state-name: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-lowercase-in-review: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-weird-row-state: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-to-cancelled-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-falsy-empty-str: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-falsy-null: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-falsy-zero: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-falsy-false: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-falsy-empty-list: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-truthy-int: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-truthy-list: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-truthy-dict: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-truthy-true: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-gate-truthy-space: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-name-bogus-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-name-empty-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-name-lower-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-name-lead-space-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-name-trail-newline-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-name-title-case-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-unknown-task-manual: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-unknown-task-manual-bad-name: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-unknown-task-manual-in-review: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-approved-illegal-from-in-progress-no-facts: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-corrupt-text: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-big-int: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-too-deep: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-corrupt-other-target: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-array-text: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-string-text: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-number-text: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-empty-text: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-array-other-target: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-notes-duplicate-keys: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-row-corrupt-inputs: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-row-corrupt-budget: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-row-weird-state: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-row-lowercase-state: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 2",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-row-null-depends-on: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        },
+        {
+          "label": "cell vec-row-empty-json-columns: Python answers the command line as the vectors recorded",
+          "ok": true,
+          "detail": "exit 0",
+          "served_by": "python"
+        }
+      ],
+      "pending": []
+    }
+  ]
+}

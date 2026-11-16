@@ -1146,12 +1146,12 @@ def test_mnemonic_shape_needs_a_seed_mnemonic_or_phrase_name(tmp_path):  # NW5
 
 
 def test_line_with_twenty_thousand_key_matches_is_read_once_and_the_budget_bounds_it(tmp_path, monkeypatch):  # NW6
-    import time
     loaded = module()
-    write(tmp_path, "src/many.ts", "secret=a " * 20000 + "\n")
-    start = time.monotonic()
+    line = "secret=a " * 20000 + "\n"
+    write(tmp_path, "src/many.ts", line)
+    # counted: a linear reader spends about a fifth of a unit per character on this line (40,002 units for 180,001 characters at HEAD)
+    monkeypatch.setattr(loaded, "SCAN_LINE_BUDGET", 2 * len(line))
     report = loaded.scan_tree(tmp_path, tmp_path)
-    assert time.monotonic() - start < 2.0  # linear in the line: each key name reads only up to the next one
     assert report["status"] == "ok" and report["skipped"] == []
     monkeypatch.setattr(loaded, "SCAN_LINE_BUDGET", 1000)  # the budget bounds the work: a low budget gives the budget reason
     report = loaded.scan_tree(tmp_path, tmp_path)
@@ -1388,13 +1388,21 @@ def test_the_suspect_reason_fires_once_per_markup_line_and_a_plain_line_gives_no
 
 
 def test_a_long_line_of_keys_inside_one_literal_is_scanned_in_linear_time(tmp_path, monkeypatch):  # NX-M1d: was quadratic
-    import time
     loaded = module()
-    write(tmp_path, "src/many.ts", 'const s = "' + "secret: a " * 32000 + '"\n')
-    start = time.monotonic()
+    keys = 32000
+    write(tmp_path, "src/many.ts", 'const s = "' + "secret: a " * keys + '"\n')
+    classified = []
+    real_name_kinds = loaded._name_kinds
+
+    def counted(word):
+        classified.append(word)
+        return real_name_kinds(word)
+
+    monkeypatch.setattr(loaded, "_name_kinds", counted)
     report = loaded.scan_tree(tmp_path, tmp_path)
-    assert time.monotonic() - start < 3.0  # about 0.2 s when linear; the quadratic form took 8 s at this size
     assert report["status"] == "ok" and report["skipped"] == []
+    # counted instead of timed: each key occurrence is classified once (about 32,000 calls); a rescan per key adds calls
+    assert keys <= len(classified) <= keys + 2, len(classified)
 
 
 def test_a_value_ending_in_a_closing_angle_at_end_of_file_is_closed(tmp_path):  # NX-M1e: > is not a binary operator, so the value closes

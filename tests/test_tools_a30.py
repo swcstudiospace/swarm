@@ -14,6 +14,7 @@ import functools
 import hashlib
 import importlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1368,16 +1369,39 @@ def test_secret_scan_every_slip132_private_version_is_found(version, name):
     assert kinds(ok("custody_secret_scan", scan(("k", f"x {token} y")))) == [("extended-private-key", "k:1", len(token), "blocker")]
 
 
-def test_secret_scan_stays_linear_on_many_hits_in_large_files():
+def test_secret_scan_stays_linear_on_many_hits_in_large_files(monkeypatch):
+    # Counted work, not wall time: the scanner may make a fixed number of whole-text searches per file (the END-marker search,
+    # the newline index and two keystore probes). A whole-text search per hit would make the count grow with the ~48,700 hits.
+    # The wall clock is a backstop.
     import time
 
+    module = importlib.import_module("swarm.tools.a30_tools")
+    whole_text_searches = []
+
+    class CountingRe:
+        def __getattr__(self, name):
+            return getattr(re, name)
+
+        def finditer(self, pattern, string, *args, **kwargs):
+            if isinstance(pattern, str) and len(string) >= 100_000:
+                whole_text_searches.append(pattern)
+            return re.finditer(pattern, string, *args, **kwargs)
+
+        def search(self, pattern, string, *args, **kwargs):
+            if isinstance(pattern, str) and len(string) >= 100_000:
+                whole_text_searches.append(pattern)
+            return re.search(pattern, string, *args, **kwargs)
+
+    monkeypatch.setattr(module, "re", CountingRe())
     pem = "-----BEGIN PRIVATE KEY-----\n" * (1_000_000 // 28)
     keys = ("PRIVATE_KEY=" + "ab12" * 16 + "\n") * (1_000_000 // 77)
     started = time.monotonic()
     result = ok("custody_secret_scan", scan(("a.pem", pem), ("b.env", keys)))
-    assert time.monotonic() - started < 8, "quadratic line lookup or END-marker search"
     assert result["files_scanned"] == 2 and result["finding_count"] == (1_000_000 // 28) + (1_000_000 // 77) and len(result["findings"]) == 100
     assert len(json.dumps(result)) < 256 * 1024
+    assert whole_text_searches, "the counting double never ran"
+    assert len(whole_text_searches) <= 4 * result["files_scanned"], whole_text_searches
+    assert time.monotonic() - started < 60, "backstop only: the counted bound above is the check"
 
 
 def test_travel_rule_below_threshold_still_reports_the_minimal_party_data_fatf_expects():
@@ -1487,9 +1511,26 @@ def test_secret_scan_mnemonic_phrase_split_over_lines_commas_or_a_json_array_is_
     assert "abandon" not in json.dumps(result)
 
 
-def test_secret_scan_mnemonic_search_is_bounded_on_long_word_runs():
+def test_secret_scan_mnemonic_search_is_bounded_on_long_word_runs(monkeypatch):
+    # Counted work, not wall time: each mnemonic candidate may try at most one cut per line break of a 24-word phrase, and
+    # each cut reads at most 24 words. An unbounded phrase or a re-read per cut exceeds these counts. The wall clock is a backstop.
     import time
 
+    module = importlib.import_module("swarm.tools.a30_tools")
+    word_passes, words_read = [], []
+    real_word_re = module._MNEMONIC_WORD_RE
+
+    class CountingWords:
+        def __getattr__(self, name):
+            return getattr(real_word_re, name)
+
+        def finditer(self, string, pos=0, endpos=None):
+            word_passes.append(string)
+            for match in real_word_re.finditer(string, pos, len(string) if endpos is None else endpos):
+                words_read.append(match)
+                yield match
+
+    monkeypatch.setattr(module, "_MNEMONIC_WORD_RE", CountingWords())
     words = ["abandon"] * 5000
     same_line = [" ".join(words), "mnemonic: " + " ".join(words), "mnemonic: abandon" + " " * 100_000 + "abandon",
                  "mnemonic: " + ("abandon" + " " * 31) * 500]
@@ -1498,4 +1539,8 @@ def test_secret_scan_mnemonic_search_is_bounded_on_long_word_runs():
         assert ok("custody_secret_scan", scan(("w.txt", text)))["findings"] == []
     # one word per line: the first 24 words are a valid run and are reported; the scan must still finish promptly
     assert ok("custody_secret_scan", scan(("w.txt", "mnemonic:\n" + "\n".join(words))))["files_scanned"] == 1
-    assert time.monotonic() - started < 2, "mnemonic search backtracks on long word runs"
+    candidates = len(same_line) + 1
+    assert word_passes, "the counting double never ran"
+    assert len(word_passes) <= 24 * candidates, len(word_passes)
+    assert len(words_read) <= 24 * 24 * candidates, len(words_read)
+    assert time.monotonic() - started < 60, "backstop only: the counted bounds above are the check"

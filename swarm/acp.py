@@ -9,7 +9,8 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable
 
 from swarm.tools.support import Busy, StillRunning, Waiting, invoke_bounded
 
@@ -35,16 +36,16 @@ class ACPStatus(Exception):
         super().__init__(message)
 
 
-def load_agents(path=None) -> dict:
+def load_agents(path: Path | None = None) -> dict[str, Any]:
     from swarm.tool_registry import load_document
 
     return load_document(path)
 
 
-def routing_table(data: dict | None = None) -> dict[str, dict]:
+def routing_table(data: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     """One row per agent in agents.json. Endpoints are derived from the agent id."""
     data = data if data is not None else load_agents()
-    table = {}
+    table: dict[str, dict[str, Any]] = {}
     for agent in data.get("agents") or []:
         if not isinstance(agent, dict) or "id" not in agent:
             continue
@@ -57,7 +58,7 @@ def routing_table(data: dict | None = None) -> dict[str, dict]:
     return table
 
 
-def message_allowed(data: dict, sender: str, recipient: str, message_type: str) -> bool:
+def message_allowed(data: dict[str, Any], sender: str, recipient: str, message_type: str) -> bool:
     table = routing_table(data)
     source = table.get(sender)
     target = table.get(recipient)
@@ -66,7 +67,7 @@ def message_allowed(data: dict, sender: str, recipient: str, message_type: str) 
     return message_type in source["produces"] and message_type in target["accepts"]
 
 
-def tool_allowed(data: dict, caller: str, tool_name: str) -> bool:
+def tool_allowed(data: dict[str, Any], caller: str, tool_name: str) -> bool:
     from swarm.tool_registry import iter_entries
 
     for _container, tool in iter_entries(data):
@@ -102,7 +103,7 @@ class Bus:
     def __init__(
         self,
         *,
-        data: dict | None = None,
+        data: dict[str, Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         max_attempts: int = 3,
         backoff_s: float = 0.01,
@@ -115,17 +116,17 @@ class Bus:
         self.backoff_s = backoff_s
         self.max_backoff_s = max_backoff_s
         self.breaker_threshold = breaker_threshold
-        self.handlers: dict[str, Callable[[dict], dict]] = {}
-        self.dead: list[dict] = []
-        self.audit: list[dict] = []
+        self.handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+        self.dead: list[dict[str, Any]] = []
+        self.audit: list[dict[str, Any]] = []
         self._failures: dict[str, int] = {}
         self.open_circuits: set[str] = set()
         self._lock = threading.Lock()
 
-    def register(self, agent_id: str, handler: Callable[[dict], dict]) -> None:
+    def register(self, agent_id: str, handler: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self.handlers[agent_id] = handler
 
-    def invoke_tool(self, caller: str, tool_name: str, payload: dict) -> dict:
+    def invoke_tool(self, caller: str, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Local tool call. Peer circuit state does not apply."""
         from swarm.tool_registry import call_tool
 
@@ -144,7 +145,7 @@ class Bus:
             }
         return call_tool(tool_name, caller, payload, data=self.data)
 
-    def request(self, envelope: dict) -> dict:
+    def request(self, envelope: dict[str, Any]) -> dict[str, Any]:
         errors = validate_envelope(envelope)
         if errors:
             return {
@@ -278,15 +279,15 @@ class Bus:
         return self._fail_peer(original, "DEAD_LETTERED", self.max_attempts, history, last_error)
 
     def _delay(self, attempt: int) -> float:
-        return min(self.backoff_s * (2 ** (attempt - 1)), self.max_backoff_s)
+        return min(self.backoff_s * float(2 ** (attempt - 1)), self.max_backoff_s)
 
-    def _save(self, envelope: dict, state: str, attempts: int, history: list[str], reason: str) -> dict:
+    def _save(self, envelope: dict[str, Any], state: str, attempts: int, history: list[str], reason: str) -> dict[str, Any]:
         """Keep the envelope for replay. The handler never started, so the peer did not fail."""
         with self._lock:
             self.dead.append({"envelope": envelope, "reason": reason, "state": state})
         return self._terminal(envelope, state, attempts=attempts, history=history, reason=reason)
 
-    def _fail_peer(self, envelope: dict, state: str, attempts: int, history: list[str], reason: str) -> dict:
+    def _fail_peer(self, envelope: dict[str, Any], state: str, attempts: int, history: list[str], reason: str) -> dict[str, Any]:
         recipient = envelope["recipient"]
         with self._lock:
             self._failures[recipient] = self._failures.get(recipient, 0) + 1
@@ -295,7 +296,7 @@ class Bus:
             self.dead.append({"envelope": envelope, "reason": reason, "state": state})
         return self._terminal(envelope, state, attempts=attempts, history=history, reason=reason)
 
-    def _terminal(self, envelope: dict, state: str, *, attempts: int, history: list[str], reason: str, retryable: bool = True) -> dict:
+    def _terminal(self, envelope: dict[str, Any], state: str, *, attempts: int, history: list[str], reason: str, retryable: bool = True) -> dict[str, Any]:
         return {
             "ok": False,
             "state": state,

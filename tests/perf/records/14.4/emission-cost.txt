@@ -1,0 +1,136 @@
+Unit E1 EmissionCost (phase 14.4, D-P27): the per-event cost of the run log, the state store and the substrate tee. Python first, bytes unchanged.
+Host: shared, load 17 to 160 during the measurements (see each section); every figure is CPU time (thread or process), min of several runs; a before and an after run alternate.
+Harnesses (kept in /root/.cache/gsd-redact-work/Wr144EmissionCost, not in the repository): prof.py (the `profile`-module per-thread profile of tests/perf/scheduler_engines.py section 5, same method),
+lightprof.py (two thread-CPU clock reads around each function, no profiler), bench.py (per-call CPU), strace for syscall counts. BEFORE = git HEAD tree (git archive), AFTER = HEAD + this unit's diff only.
+
+== 1. What the profile hid
+The `profile` module adds about 10 us per Python call, so call-heavy code (pathlib, json, redact) is inflated. Same dry run, same 13 tasks, without the profiler (lightprof, BEFORE tree, min of 4 runs):
+process CPU 3.20 s of which interpreter startup and imports about 0.4 to 0.5 s; runlog.emit 502 calls 583 ms (1.16 ms avg), observability.emit_gsd_omp 195 calls 323 ms, stream_subagent_status 68 calls 201 ms,
+SwarmStateStore.append_gsd_audit 323 calls 115 ms, redaction inside emit 139 ms. So emission is about 20% of the process CPU, not 36%; the profile still ranks it first.
+
+== 2. Callee level (what one call costs)
+- emit_gsd_omp = 42 syscalls per call (strace): 3 swarm_dir resolutions (getcwd + 4 lstat + stat + stat .gitignore each, via Path.cwd().resolve()), a SwarmStateStore constructor (mkdir EEXIST + is_dir stat + 2 exists), two text-mode appends
+  (openat, fstat, lseek x3, ioctl TCGETS, write, close = 8 each), uuid4 getrandom. Syscalls are 5 to 10 us each here and much more under load: they, not Python, were the cost.
+- stream_subagent_status = two emits (per-unit + the stream record) + audit + store constructor, so about 2x that.
+- SwarmStateStore.update: json.dumps(indent=2) twice (the pure-Python encoder), two write_text_atomic (not in this unit's file list; unchanged).
+- With SUBSTRATE_URL set (as in this shell) every tee'd event runs substrate_tee.tee -> workspace.credential -> manifest.get_agent TWICE: each a json.loads of the whole agent record (about 1.5 ms) plus a roster stat+resolve.
+  Measured emit tee=False 0.11 ms vs tee=True 3.0 ms per call (profile before the fix, no token: the row stays local and says so once).
+- redact.redact is about 12% of the profiled thread (4 ms per event under the profiler, 30 to 45 us unprofiled for a small payload). Its _name_tokens is uncached; redact.py is not in the unit's file list: not touched.
+- "Skip the stream when no OMP session listens": nothing in the code listens. emit_gsd_omp / stream_subagent_status write run-log events (events.jsonl, the substrate tee maps them to `note`), and tests read them
+  (tests/test_scheduler_continuous.py:725, tests/typecheck/test_group_g4b_defects.py:32, tests/test_substrate_tee.py:910). There is no session, flag or subscriber test, so a skip rule would change events.jsonl: NOT done.
+- log_phase (one event per pass): left as is (it changes events.jsonl; no test pins the count but every pass of a dry run dispatches, so "only on change" would save nothing here). Option for the user.
+
+== 3. Changes (bytes written are identical)
+swarm/paths.py: swarm_dir remembers one resolution per input (SWARM_DIR, root, cwd only where one of them is relative or absent); create=True still stats .gitignore on every call; append_text = one write(2) on an O_APPEND fd
+  (the bytes of open(path,"a",encoding="utf-8").write(text), nothing buffered across calls).
+swarm/runlog.py: emit appends through append_text.  swarm/state_store.py: audit log through append_text; constructor skips mkdir when the state file exists; update renders its JSON once for both files (unserialisable extra: nothing written, as before).
+swarm/manifest.py: agent_slug (immutable str, cached roster not aliased; same cache key rules, 2 s rule untouched).  swarm/workspace.py: credential looks the slug up once through agent_slug.
+docs/swarm-command-center.md: two lines (append contract, SWARM_DIR resolution). tests/test_emission_cost.py: 36 tests.
+
+== 4. The same per-thread profile, before and after (3 runs each, alternating; load 30 to 70)
+   profiled thread (the scheduler loop, its CPU time, profiler overhead included), min of 3 runs each: before 9.810 s, after 7.612 s
+   per run: before [9.81, 10.332, 10.096]  after [8.926, 8.919, 7.612]
+   function                                        calls b/a  before ms   share  after ms   share  ms/call b  ms/call a
+   Scheduler.loop (the whole scheduling loop)            1/1     6182.8   63.0%    4432.7   58.2%   6182.813   4432.662
+   Scheduler._schedule (one pass)                      11/14     4526.4   46.1%    3570.6   46.9%    411.495    255.045
+     select_batch                                      11/14       17.0    0.2%      19.3    0.3%      1.545      1.377
+     dispatchable                                      11/14      118.9    1.2%      61.7    0.8%     10.812      4.409
+     reconcile                                         12/15      618.0    6.3%     949.2   12.5%     51.498     63.278
+     log_phase (a runlog event per pass)               12/15      437.7    4.5%     533.6    7.0%     36.473     35.573
+     RunBook.seen (telemetry rows)                     74/91      319.6    3.3%     295.3    3.9%      4.318      3.245
+   Scheduler._submit (spawn events, subagent id)       13/13     2670.0   27.2%    1655.1   21.7%    205.388    127.315
+   Scheduler._complete                                 13/13     1453.3   14.8%     771.2   10.1%    111.791     59.326
+   runlog.emit (every event, any caller)             300/306     3204.2   32.7%    2446.2   32.1%     10.681      7.994
+   redact.redact (inside emit)                       300/306     1265.0   12.9%    1209.3   15.9%      4.217      3.952
+   observability.emit_gsd_omp                        117/117     2152.9   21.9%    1203.0   15.8%     18.401     10.282
+   observability.stream_subagent_status                42/42     1104.4   11.3%     648.7    8.5%     26.295     15.445
+   TaskStore.transition                                26/26      257.3    2.6%     262.8    3.5%      9.896     10.107
+   TaskStore.get                                     231/255      150.5    1.5%      85.0    1.1%      0.651      0.333
+   TaskStore.list                                     81/104      531.1    5.4%     831.1   10.9%      6.557      7.991
+   TaskStore.ready                                     11/14      109.9    1.1%      58.0    0.8%      9.994      4.140
+   paths.swarm_dir                                   746/751     1625.3   16.6%     224.0    2.9%      2.179      0.298
+   state_store.append_gsd_audit                      193/193      488.3    5.0%     230.8    3.0%      2.530      1.196
+   state_store.update                                  34/34      182.0    1.9%     211.4    2.8%      5.354      6.219
+   substrate_tee.tee                                   51/54      340.9    3.5%     386.6    5.1%      6.685      7.159
+   workspace.credential                                12/15      334.4    3.4%     379.9    5.0%     27.870     25.323
+   manifest.get_agent                                  50/26      411.1    4.2%      34.6    0.5%      8.222      1.331
+   manifest.agent_slug                                  0/15        0.0    0.0%     357.0    4.7%      0.000     23.800
+
+(cumulative times nest; shares are of the profiled thread. reconcile, TaskStore.list and log_phase got NOT faster: load noise, their code is untouched. workspace.credential/agent_slug: in a 13-task dry run they are called
+ 15 times and the cost is the first roster load, which both trees pay once.)
+
+== 5. Without the profiler (lightprof, 5 alternating pairs, load 30 to 160, min of runs; cumulative CPU of all threads)
+process CPU per run: before [4.16, 4.01, 3.82, 2.74, 3.62] min 2.74 s; after [3.46, 2.85, 3.41, 2.91, 3.07] min 2.85 s  -> NOT distinguishable: the per-run spread (2.7 to 4.2 s) is larger than the saving.
+runlog.emit 743 -> 464 ms (507/509 calls); emit_gsd_omp 409 -> 137; stream_subagent_status 134 -> 42; append_gsd_audit 116 -> 20; SwarmStateStore.__init__ 52 -> 21; paths.swarm_dir 12.8 -> 4.4;
+_redact_payload 144 -> 70; Scheduler._submit 190 -> 132; Scheduler._complete 125 -> 43. Rows that look slower after (tee 71 -> 128, update 54 -> 113, log_phase 76 -> 132, TaskStore.transition) are 15 to 80 calls under
+load 100 to 160: noise, their code did not get slower by construction (update writes less, tee does less).
+
+== 6. Per-call CPU (bench.py, 4 alternating rounds x 9 batches x 60 calls, min, load 45 to 52)
+loadavg start 68.15 62.21 64.82 63/3351 3765495
+loads ['48.40', '46.21', '51.17', '45.28', '46.09', '47.18', '49.00', '51.88']
+per call, us (min of 4 rounds x 9 batches x 60 calls, thread CPU)         before     after   ratio
+runlog.emit (spawn payload, tee=False)                                     176.7      89.6     2.0x
+runlog.emit (tee=True, no SUBSTRATE_URL)                                  1064.1     285.0     3.7x
+runlog.log_phase reconcile                                                1084.7     282.0     3.8x
+observability.emit_gsd_omp                                                 422.4     234.7     1.8x
+observability.stream_subagent_status                                       897.4     340.8     2.6x
+lifecycle._drive_gsd_state                                                1485.7    1088.9     1.4x
+runlog._redact_payload(spawn)                                               36.7      30.4     1.2x
+redact.redact(spawn)                                                        41.0      31.5     1.3x
+runlog.redact_leases(spawn)                                                  0.9       1.4     0.6x
+paths.swarm_dir(ROOT, create=True)                                          41.3       3.9    10.6x
+paths.swarm_dir(None, create=True)                                          41.5       3.6    11.5x
+SwarmStateStore(root=ROOT)                                                  78.4      24.4     3.2x
+store.update(RUNNING)                                                      593.8     537.4     1.1x
+store.append_gsd_audit                                                      78.3      26.4     3.0x
+store.append_gsd_line (mirror disabled)                                      0.3       0.4     0.7x
+uuid.uuid4().hex                                                             2.2       2.2     1.0x
+time.strftime(gmtime)                                                        0.6       0.6     1.0x
+loadavg end 51.88 51.50 58.34 29/3205 3786032
+
+== 7. Existing suites, before and after (the full suite was not run)
+Suites: test_paths test_lifecycle test_observability_review_fixes test_runner_lifecycle test_scheduler_continuous test_scheduler_engine_rig test_telemetry test_e2e_swarm test_manifest test_manifest_cache test_substrate_tee
+test_agent_token test_install_substrate test_substrate_lease test_audit_log test_handover test_hook_trigger test_atomic_temp_names test_live_contract test_install_workspace_cli test_roster_routing test_blast_radius tests/typecheck.
+Full run (HEAD tests; BEFORE=HEAD source, AFTER=HEAD + diff; both at load 40 to 110): 1267 tests each; before 14 failed, after 20 failed (junit counts). Every failure is a wall-clock/concurrency test (tests/test_scheduler_continuous, test_e2e_swarm,
+test_runner_lifecycle, test_audit_log::test_the_audit_row_costs_next_to_nothing, test_substrate_lease x2). The 6 tests failing only after were rerun on both trees: matrix below (same 13 failing of 23 in both trees, different members each run;
+test_substrate_lease passed in both reruns). Failing messages are timings (4.6 s startup vs < 4, spans that did not overlap, a second task timed out under load).
+test                                                                                                 after_1 after_2 before_1
+test_audit_log::test_the_audit_row_costs_next_to_nothing                                             FAIL FAIL FAIL
+test_e2e_swarm::test_a_failed_and_a_timed_out_task_do_not_stop_the_other_runs                        ok   FAIL ok  
+test_e2e_swarm::test_a_mid_run_snapshot_with_every_row_kind_is_captured_for_the_contract_fixture     ok   FAIL ok  
+test_e2e_swarm::test_a_per_agent_ceiling_is_honoured_with_free_global_slots                          FAIL FAIL ok  
+test_e2e_swarm::test_dependencies_start_only_after_their_upstream_finished                           ok   FAIL ok  
+test_e2e_swarm::test_elapsed_in_live_json_comes_from_monotonic_differences_not_the_wall_clock        ok   FAIL FAIL
+test_e2e_swarm::test_independent_tasks_ran_at_the_same_time                                          FAIL FAIL FAIL
+test_e2e_swarm::test_the_final_live_snapshot_is_valid_and_every_run_is_terminal                      FAIL FAIL ok  
+test_e2e_swarm::test_the_global_cap_holds_and_the_overflow_queue_drains                              FAIL FAIL FAIL
+test_runner_lifecycle::test_extension_load_failure_does_not_start_the_next_task                      ok   FAIL FAIL
+test_runner_lifecycle::test_extension_load_failure_stops_before_any_tool                             FAIL FAIL FAIL
+test_scheduler_continuous::test_a_session_that_leaves_within_the_grace_is_not_killed                 FAIL ok   ok  
+test_scheduler_continuous::test_a_slow_task_does_not_delay_newly_ready_work                          FAIL FAIL FAIL
+test_scheduler_continuous::test_heartbeat_and_stall_events_carry_correlation_ids_and_no_secrets      ok   FAIL FAIL
+test_scheduler_continuous::test_one_failing_task_keeps_the_parallelism_and_follows_the_retry_ladder  ok   FAIL FAIL
+test_scheduler_continuous::test_overlapping_claims_serialize_tasks[claims_b1-False]                  FAIL FAIL ok  
+test_scheduler_continuous::test_per_agent_ceiling_holds_with_free_global_slots                       ok   ok   FAIL
+test_scheduler_continuous::test_rounds_mode_still_cancels_on_the_swarm_timeout_without_orphans       FAIL FAIL FAIL
+test_scheduler_continuous::test_sigterm_from_the_hook_ends_a_session_that_ignores_sigterm_inside_the FAIL FAIL ok  
+test_scheduler_continuous::test_swarm_timeout_writes_the_flag_waits_the_grace_then_kills_without_orp FAIL FAIL FAIL
+test_scheduler_continuous::test_three_failures_in_a_row_halve_the_parallelism_once_and_successes_res FAIL FAIL FAIL
+{'after_1': 13, 'after_2': 19, 'before_1': 13}
+
+Second repetition (after_2, before_2) was still running when the budget ended; not reported.
+test_emission_cost.py against the HEAD source: the byte, store, credential-parity, SIGKILL and tee-without-token tests PASS there (they characterise the old behaviour), the new-API / cache / no-decode tests FAIL there (18).
+
+== 8. Teeth (mutations in a copy; each makes named tests fail)
+M1 SWARM_DIR left out of the cache key: 16 fail (test_swarm_dir_follows_every_input_that_decides_it, test_emit_follows_swarm_dir_and_cwd_between_calls, ...). M1b cwd left out: 2 fail (same two).
+M2a ensure_ascii: 1 fail (emit_writes_exactly_the_record[note]). M2b no newline: 9 fail. M2c append in 4 KiB writes: test_concurrent_big_records_never_interleave. M2d audit format: 4 fail.
+M3a store never makes its dir: 3 fail. M3b .gitignore looked up only on the first call (the nearest thing to a skip rule; there is no listener-skip rule): 17 fail. M3c unserialisable extra raises: 1 fail.
+M3d credential decodes the whole agent again: test_the_tee_decodes_no_agent_record_per_event. M4 agent_slug ignores a rewritten roster: 2 fail.
+
+== 9. Did not improve / options for the user
+- Process CPU of the dry run: no measurable change at this noise (section 5). The saving is real per event (section 6: emit 2x, tee 3.7x, emit_gsd_omp 1.8x, stream 2.6x, swarm_dir 11x) but emission was about 20% of the process.
+- SwarmStateStore.update 594 -> 537 us and _drive_gsd_state 1486 -> 1089 us: dominated by two write_text_atomic (swarm/atomic_file.py: uuid4 + Path.write_text + replace); an os-level write there would help (file not in this unit's list).
+- redact: lru_cache on redact._name_tokens (pure, 1100 calls per 100 events) would cut part of the remaining 12%; redact.py not in the list. The Rust scanner stays opt-in.
+- log_phase once per pass only on change, and any skip of the gsd/omp streams, change events.jsonl: need your decision. Rust: nothing in this profile justifies it now (redaction is the one remaining emit cost and has the opt-in scanner).
+- AGENTS.md line needed (I may not edit it): under the state-dir rule add "swarm_dir() remembers one resolution per (SWARM_DIR, root, cwd-if-relative) input; run-log and audit lines are appended with one write(2) (swarm.paths.append_text)".
+- Known limit: a symlink re-pointed under an unchanged SWARM_DIR/root string is not seen by the swarm_dir cache (git toplevel was already cached by paths._resolve).

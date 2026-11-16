@@ -255,3 +255,29 @@ def test_run_ambiguous_correlation_exit2(tmp_path):
     states = {s for (s,) in con.execute("SELECT DISTINCT state FROM tasks WHERE task_id LIKE 'B-%'")}
     con.close()
     assert states == {"PLANNED"}
+
+def test_gate_paths_are_stored_and_absolute_paths_are_rejected(tmp_path):
+    env = _env(tmp_path)
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"tasks": [
+        {"id": "be", "capability": "code.backend", "agent": "A05"},
+        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
+         "gates": {"gate": "review", "for": ["be"], "paths": ["docs/GOAL.md"]}},
+    ]}))
+    r = _plan(env, "--plan", str(plan), "--pattern", "custom", "--prefix", "P")
+    assert r.returncode == 0, r.stdout + r.stderr
+    con = sqlite3.connect(tmp_path / ".swarm" / "tasks.db")
+    notes = json.loads(con.execute("SELECT notes FROM tasks WHERE task_id='P-rev'").fetchone()[0])
+    con.close()
+    assert notes["subject_paths"] == ["docs/GOAL.md"]
+    assert notes["gates"] == []
+    assert notes["gate_for"] == ["P-be"]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"tasks": [
+        {"id": "rev", "capability": "gate.review", "agent": "A09",
+         "gates": {"gate": "review", "for": ["be"], "paths": ["/etc/passwd"]}},
+    ]}))
+    refused = _plan(env, "--plan", str(bad), "--pattern", "custom", "--prefix", "Q")
+    assert refused.returncode == 2, refused.stdout + refused.stderr
+    assert "gates.paths" in refused.stdout + refused.stderr
+

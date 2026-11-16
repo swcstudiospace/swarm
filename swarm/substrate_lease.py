@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from . import substrate_client, substrate_tee, workspace as workspace_mod
 from .taskstore import TaskStore, TaskState as S
@@ -96,7 +96,7 @@ class Claim:
     status: str
     lease_s: int | None = None  # the granted TTL, when held
     reason: str = ""  # the claim action when held; why, otherwise
-    holder: dict | None = None  # who holds it, when denied
+    holder: dict[str, Any] | None = None  # who holds it, when denied
     expires_at: str | None = None  # until when, when denied
 
     @property
@@ -122,7 +122,7 @@ class Lease:
     workspace: str | Path | None = None  # whose agent env files hold the token every call on this lease carries
 
 
-def _call(tool: str, arguments: dict, agent_id: str, workspace: str | Path | None,
+def _call(tool: str, arguments: dict[str, Any], agent_id: str, workspace: str | Path | None,
           env: Mapping[str, str]) -> substrate_client.Outcome:
     """Every lease call, and every handoff call (substrate_handoff.py), goes through here, as agent `agent_id`'s
     surface, with that agent's own token from `workspace.credential`: its env file for `workspace` (INST-03), the same
@@ -179,7 +179,8 @@ def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int, worksp
     if got.status != "ok" or not isinstance(got.value, dict):
         return Claim(UNLEASED, reason=f"substrate error: {got.detail or 'no reply'}"[:300]), None
     reply = got.value
-    lease = reply.get("lease") if isinstance(reply.get("lease"), dict) else {}
+    lease_field = reply.get("lease")
+    lease = lease_field if isinstance(lease_field, dict) else {}
     # `action` is what the index did (granted, renewed, reclaimed, stolen, denied); `ttl_seconds` is the TTL the
     # hold was granted for after the server's clamping, null when no hold stands
     action = str(reply.get("action") or "")
@@ -249,17 +250,18 @@ def complete(lease: Lease, env: Mapping[str, str] | None = None) -> str:
 
 
 # --- the advisory mirror in the Task Store -------------------------------------------------------------------
-def _ident(lease: Lease) -> dict:
+def _ident(lease: Lease) -> dict[str, object]:
     return {"lease_id": lease.lease_id, "agent": lease.agent_id, "surface": lease.surface,
             "session_id": lease.session_id, "graph_id": lease.graph_id, "ttl_s": lease.ttl_s}
 
 
-def _mirror(store: TaskStore, task_id: str, **fields) -> None:
+def _mirror(store: TaskStore, task_id: str, **fields: object) -> None:
     """Replace notes.lease: the latest lease state only. The substrate trail and the run log hold the history."""
     store.set_notes(task_id, lease={**{k: v for k, v in fields.items() if v is not None}, "at": round(time.time(), 3)})
 
 
-def _close(store: TaskStore, lease: Lease, state: str, emit, env: Mapping[str, str]) -> str:
+def _close(store: TaskStore, lease: Lease, state: str, emit: Callable[[str, dict[str, object]], object],
+           env: Mapping[str, str]) -> str:
     """Complete (DONE) or release (any other state) a held lease and record what happened. Returns the outcome."""
     if state == S.DONE.value:
         outcome, op = complete(lease, env), "complete"
@@ -275,12 +277,13 @@ def _close(store: TaskStore, lease: Lease, state: str, emit, env: Mapping[str, s
     return outcome
 
 
-def _agent_of(task: dict) -> str | None:
+def _agent_of(task: dict[str, Any]) -> str | None:
     agent = (task["notes_json"].get("lease") or {}).get("agent") or task.get("agent_id")
     return agent if agent in substrate_tee.AGENT_SURFACES else None
 
 
-def settle_mirrored(store: TaskStore, task_id: str, *, emit, workspace: str | Path | None,
+def settle_mirrored(store: TaskStore, task_id: str, *, emit: Callable[[str, dict[str, object]], object],
+                    workspace: str | Path | None,
                     env: Mapping[str, str] | None = None) -> str:
     """For a process that does not hold the lease in memory (`orch_status --transition`): complete or release the lease
     mirrored in notes.lease when the task has left the holding states, with the token from the agent's env file for
@@ -321,7 +324,8 @@ class LeaseBridge:
     the workspace (the runner's --repo): every call is made with the token in the executing agent's env file for it.
     """
 
-    def __init__(self, store_path: str | Path, correlation_id: str, *, emit: Callable[[str, dict], object],
+    def __init__(self, store_path: str | Path, correlation_id: str, *,
+                 emit: Callable[[str, dict[str, object]], object],
                  root: str | Path | None = None, env: Mapping[str, str] | None = None,
                  clock: Callable[[], float] = time.monotonic):
         self.env = os.environ if env is None else env
@@ -394,7 +398,7 @@ class LeaseBridge:
         return lease.ttl_s if lease else None
 
     # -- claim
-    def acquire(self, task: dict, agent_id: str) -> Claim:
+    def acquire(self, task: dict[str, Any], agent_id: str) -> Claim:
         """Hold the task's node before it is dispatched (LEASE-05). A lease this process already holds (a rework
         re-claimed by `rework`) is reused. Denied, refused and unleased outcomes are recorded as a note and an event;
         local contention defers the task without changing its lease mirror."""
@@ -465,7 +469,7 @@ class LeaseBridge:
                 reason = lease.halted if stop is not None else None
             else:
                 reason = self._lost.pop(task_id, None) if stop is not None else None
-        if reason is not None:
+        if reason is not None and stop is not None:  # a reason exists only where a stop was attached
             stop(reason)
 
     def beat(self, task_id: str) -> str:
@@ -489,7 +493,7 @@ class LeaseBridge:
                     return "settled"
                 # The dispatch here may still be writing: stop it, and keep beating so the node stays ours until the
                 # dispatch has ended. execute_one's settle releases it then, once the session's process group is gone.
-                if first:
+                if first and lease.halted is not None:  # first is set only where a stop was attached, which sets halted
                     stop(lease.halted)
             got = heartbeat(lease, self.env)
             if got == OK:

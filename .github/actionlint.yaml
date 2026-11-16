@@ -1,0 +1,4 @@
+# actionlint config: declare the self-hosted runner pool labels so `runs-on: [self-hosted, linux, x64, omega-ci]` is known.
+self-hosted-runner:
+  labels:
+    - omega-ci

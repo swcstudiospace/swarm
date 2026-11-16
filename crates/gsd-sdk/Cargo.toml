@@ -1,0 +1,15 @@
+[package]
+name = "gsd-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swcstudiospace/agent-swarm"
+description = "Rust mirror of the omp host contract: bridge argv, exit mapping, process-group runner, constants and classifier pins"
+
+[dependencies]
+gsd-codes = { path = "../gsd-codes" }
+gsd-failure = { path = "../gsd-failure" }
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio = { workspace = true }

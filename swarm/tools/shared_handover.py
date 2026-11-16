@@ -15,11 +15,13 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 from swarm import handover as ho
-from swarm.clock import SYSTEM_CLOCK
+from swarm.clock import SYSTEM_CLOCK, Clock
 from swarm.paths import latest_correlation, swarm_dir
 from swarm.redact import redact_text
 from swarm.runlog import redact_leases
@@ -36,17 +38,18 @@ MAX_TRANSITIONS = 50
 MAX_QUESTIONS = 50
 LEASE_FIELDS = ("state", "agent", "surface", "graph_id", "ttl_s", "reason", "action", "holder", "at")
 _FAILED_TO = frozenset({"FAILED", "ESCALATED", "CHANGES_REQUESTED"})
+Report = dict[str, Any]  # a handover tool result: JSON-shaped, its values are validated where they are read
 
 
 # ---- shared helpers --------------------------------------------------------------------------------------------
-def _invalid(field: str, message: str, problems: list[str] | None = None) -> dict:
-    out = {"state": "INVALID_INPUT", "field": field, "message": message[:1000]}
+def _invalid(field: str, message: str, problems: list[str] | None = None) -> Report:
+    out: Report = {"state": "INVALID_INPUT", "field": field, "message": message[:1000]}
     if problems:
         out["problems"] = [p[:400] for p in problems[:20]]
     return out
 
 
-def _guarded(work):
+def _guarded(work: Callable[[], Report]) -> Report:
     """Run `work`; a refused handover or id becomes INVALID_INPUT naming the field, anything else propagates."""
     try:
         return work()
@@ -54,7 +57,13 @@ def _guarded(work):
         return _invalid(exc.field, "; ".join(exc.problems), exc.problems)
 
 
-def _task_id(payload: dict) -> str:
+def _reply(payload: Report, work: Callable[[], Report]) -> Report:
+    """`support.respond` is annotated to return Any; this keeps every handler's return type explicit."""
+    result: Report = respond(payload, work)
+    return result
+
+
+def _task_id(payload: Report) -> str:
     value = payload["task_id"]
     if not isinstance(value, str) or not ho._ID_RE.match(value):
         raise ho.HandoverInvalid([f"/task_id: {value!r} is not a valid task id (letters, digits, '.', '_', '-')"])
@@ -67,7 +76,7 @@ def _clip(value: object, limit: int = 300) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
-def _lease_ids(*rows: dict | None) -> set[str]:
+def _lease_ids(*rows: Report | None) -> set[str]:
     """Lease ids mirrored in the given task rows: the values that must never appear in an output."""
     found: set[str] = set()
     for row in rows:
@@ -77,13 +86,14 @@ def _lease_ids(*rows: dict | None) -> set[str]:
     return found
 
 
-def _scrub(value, secrets: set[str]):
+def _scrub(value: Report, secrets: set[str]) -> Report:
     """A copy of `value` without lease id keys and with every given lease id replaced in strings."""
-    value = redact_leases(value)
-    return _replace(value, secrets) if secrets else value
+    scrubbed = redact_leases(value)
+    # cast: redact_leases and _replace are annotated object, and both keep the dict shape of `value`
+    return cast(Report, _replace(scrubbed, secrets) if secrets else scrubbed)
 
 
-def _replace(value, secrets: set[str]):
+def _replace(value: object, secrets: set[str]) -> object:
     if isinstance(value, dict):
         return {k: _replace(v, secrets) for k, v in value.items()}
     if isinstance(value, list):
@@ -94,12 +104,12 @@ def _replace(value, secrets: set[str]):
     return value
 
 
-def _agent_of_row(row: dict | None) -> str:
+def _agent_of_row(row: Report | None) -> str:
     agent = ho.agent_id_of((row or {}).get("agent_id") or (row or {}).get("assigned_to"))
     return agent or ""
 
 
-def _acceptance(row: dict | None) -> list[str]:
+def _acceptance(row: Report | None) -> list[str]:
     out = []
     for item in (row or {}).get("acceptance") or []:
         if isinstance(item, str):
@@ -113,7 +123,7 @@ def _acceptance(row: dict | None) -> list[str]:
     return out
 
 
-def _questions(needs) -> list[str]:
+def _questions(needs: object) -> list[str]:
     """Plain question lines from a `needs` value (string, list or object such as `clarification_request`'s)."""
     if needs is None:
         return []
@@ -133,17 +143,17 @@ def _questions(needs) -> list[str]:
     return [str(needs)]
 
 
-def _upstream_questions(row: dict) -> list[str]:
+def _upstream_questions(row: Report) -> list[str]:
     result = (row.get("notes_json") or {}).get("result")
     return [_clip(q) for q in _questions(result.get("needs") if isinstance(result, dict) else None)]
 
 
-def _unresolved(row: dict) -> bool:
+def _unresolved(row: Report) -> bool:
     """A needs entry is still open while its task has not moved past the point of asking."""
     return row.get("state") not in SATISFIED_STATES and row.get("state") != "CANCELLED"
 
 
-def _lease_view(row: dict | None, clock) -> dict:
+def _lease_view(row: Report | None, clock: Clock) -> Report:
     lease = ((row or {}).get("notes_json") or {}).get("lease")
     if not isinstance(lease, dict) or not lease:
         return {"has_lease": False, "state": "none", "agent": "", "surface": "", "ttl_s": 0, "age_s": 0.0, "expired": False,
@@ -160,7 +170,7 @@ def _lease_view(row: dict | None, clock) -> dict:
             "graph_id": view.get("graph_id", "")}
 
 
-def _history_view(store: ho.StoreReader, task_id: str, row: dict, limit: int = MAX_TRANSITIONS) -> dict:
+def _history_view(store: ho.StoreReader, task_id: str, row: Report, limit: int = MAX_TRANSITIONS) -> Report:
     transitions = store.transitions(task_id)
     trimmed = [{"from": t.get("from_state") or "", "to": t.get("to_state") or "", "actor": _clip(t.get("actor") or "", 80),
                 "reason": _clip(t.get("reason") or "", 200), "ts": float(t.get("ts") or 0.0)} for t in transitions[-limit:]]
@@ -180,30 +190,31 @@ def _history_view(store: ho.StoreReader, task_id: str, row: dict, limit: int = M
             "transition_count": len(transitions), "transitions": trimmed, "last_error": last_error}
 
 
-def _task_view(row: dict) -> dict:
+def _task_view(row: Report) -> Report:
     return {"task_id": row["task_id"], "correlation_id": row.get("correlation_id") or "", "title": _clip(row.get("title") or "", 200),
             "state": row.get("state") or "", "agent": _agent_of_row(row), "attempt": int(row.get("attempt") or 0),
             "risk_class": row.get("risk_class") or "", "depends_on": [d for d in row.get("depends_on") or [] if isinstance(d, str)]}
 
 
 # ---- handover_write --------------------------------------------------------------------------------------------
-def _correlation(payload: dict, task_id: str) -> str:
+def _correlation(payload: Report, task_id: str) -> str:
     row = ho.read_task(task_id)
-    given = payload.get("correlation_id")
+    given: str | None = payload.get("correlation_id")
     if given is not None:
         if row and row.get("correlation_id") and row["correlation_id"] != given:
             raise ho.HandoverInvalid([f"/correlation_id: task {task_id} belongs to plan {row['correlation_id']!r}, not {given!r}"])
         return given
     if row and row.get("correlation_id"):
-        return row["correlation_id"]
+        correlation: str = row["correlation_id"]
+        return correlation
     latest = latest_correlation()
     if latest:
         return latest
     raise ho.HandoverInvalid([f"/correlation_id: task {task_id} is not in the Task Store and no swarm run is active; pass correlation_id"])
 
 
-def handover_write(payload: dict) -> dict:
-    def work() -> dict:
+def handover_write(payload: Report) -> Report:
+    def work() -> Report:
         caller = current_caller()
         if not caller:
             return _invalid("from_agent", "no authenticated caller: a handover can only be written through the registry")
@@ -226,13 +237,13 @@ def handover_write(payload: dict) -> dict:
                 "digest": written["digest"], "bytes": written["bytes"], "summarized": written["summarized"],
                 "duplicate": written["duplicate"], "redacted": written["redacted"], "status": status["status"]}
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- handover selection ----------------------------------------------------------------------------------------
-def _seq(payload: dict) -> int | None:
+def _seq(payload: Report) -> int | None:
     """The optional `seq` input: the exact handover of the task to act on (None: the caller's own, else the newest)."""
-    value = payload.get("seq")
+    value: object = payload.get("seq")
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -240,7 +251,7 @@ def _seq(payload: dict) -> int | None:
     return value
 
 
-def _inspect(payload: dict, task_id: str, **kw) -> tuple[dict, dict | None]:
+def _inspect(payload: Report, task_id: str, **kw: Any) -> tuple[Report, Report | None]:
     """`ho.inspect_handover` for the caller with the shared selection order: the explicit `seq`, else the newest handover
     addressed to the caller, else the newest as context (`context_only`). A `seq` the task does not have is `missing`
     (`found` false for a read), exactly like a task without handovers: a reader that scans `seq` upward ends on it. It is
@@ -249,8 +260,8 @@ def _inspect(payload: dict, task_id: str, **kw) -> tuple[dict, dict | None]:
 
 
 # ---- handover_read ---------------------------------------------------------------------------------------------
-def handover_read(payload: dict) -> dict:
-    def work() -> dict:
+def handover_read(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         status, doc = _inspect(payload, task_id, correlation_id=payload.get("correlation_id"))
         row = ho.read_task(task_id)
@@ -260,12 +271,12 @@ def handover_read(payload: dict) -> dict:
             out["context_only"] = True
         return _scrub(out, _lease_ids(row))
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- handover_validate -----------------------------------------------------------------------------------------
-def handover_validate(payload: dict) -> dict:
-    def work() -> dict:
+def handover_validate(payload: Report) -> Report:
+    def work() -> Report:
         doc = payload["document"]
         if payload.get("draft") is True:
             doc = ho._prepare(doc, SYSTEM_CLOCK)
@@ -280,16 +291,16 @@ def handover_validate(payload: dict) -> dict:
         return {"state": "SUCCESS", "valid": not problems, "errors": [p[:400] for p in problems[:50]],
                 "bytes": size, "cap": cap, "would_summarize": size > cap}
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- bundle / verify -------------------------------------------------------------------------------------------
-def _merge_artifacts(*sources: tuple[str, list[dict]]) -> list[dict]:
+def _merge_artifacts(*sources: tuple[str, list[Report]]) -> list[Report]:
     """Distinct (uri, digest) artifacts across the sources. An entry without a digest is dropped when another entry names
     the same uri WITH one (the final result's output next to the handover's artifact is one file, not two)."""
     digested = {str(i.get("uri") or "") for _t, items in sources for i in items if i.get("digest")}
     seen: set[tuple[str, str]] = set()
-    merged: list[dict] = []
+    merged: list[Report] = []
     for task_id, items in sources:
         for item in items:
             key = (str(item.get("uri") or ""), str(item.get("digest") or ""))
@@ -301,7 +312,7 @@ def _merge_artifacts(*sources: tuple[str, list[dict]]) -> list[dict]:
     return merged
 
 
-def _verdict_summaries(rows: list[dict], clock) -> list[dict]:
+def _verdict_summaries(rows: list[Report], clock: Clock) -> list[Report]:
     from swarm.envelope import verify_envelope  # lazy: only the bundle needs signature checks
 
     out = []
@@ -314,7 +325,8 @@ def _verdict_summaries(rows: list[dict], clock) -> list[dict]:
                 signature = "valid" if verify_envelope(envelope) else "unverified"
             except Exception:  # noqa: BLE001 - no key configured here: report it, never fail the bundle
                 signature = "unverified"
-        findings = row.get("findings") if isinstance(row.get("findings"), list) else []
+        raw_findings = row.get("findings")
+        findings: list[Any] = raw_findings if isinstance(raw_findings, list) else []
         blocking = sum(1 for f in findings if isinstance(f, dict) and f.get("severity") in BLOCKING)
         expires = row.get("expires_at")
         out.append({"gate": str(row.get("gate") or ""), "verdict": str(row.get("verdict") or ""),
@@ -324,7 +336,7 @@ def _verdict_summaries(rows: list[dict], clock) -> list[dict]:
     return out
 
 
-def _loads_obj(text) -> dict:
+def _loads_obj(text: object) -> Report:
     try:
         value = json.loads(text) if isinstance(text, str) and text else {}
     except ValueError:
@@ -332,12 +344,12 @@ def _loads_obj(text) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _bundle_size(out: dict) -> int:
+def _bundle_size(out: Report) -> int:
     return len(ho.canonical(out))
 
 
-def handover_bundle(payload: dict) -> dict:
-    def work() -> dict:
+def handover_bundle(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         clock = SYSTEM_CLOCK
         status, doc = _inspect(payload, task_id, clock=clock)
@@ -348,7 +360,7 @@ def handover_bundle(payload: dict) -> dict:
             upstream_artifacts = [(r["task_id"], store.artifacts(r["task_id"])) for r in upstream_rows]
             verdicts = _verdict_summaries(store.verdicts(task_id, row), clock) if row else []
             attempts = _history_view(store, task_id, row, limit=10) if row else {}
-        questions: list[dict] = []
+        questions: list[Report] = []
         for up in upstream_rows:
             questions += [{"task_id": up["task_id"], "origin": "upstream", "question": q} for q in _upstream_questions(up) if _unresolved(up)]
         if doc:
@@ -382,10 +394,10 @@ def handover_bundle(payload: dict) -> dict:
         out = _scrub(out, _lease_ids(row, *upstream_rows))
         return _bound_bundle(out, ho.max_bytes_default() * 2)
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
-def _bound_bundle(out: dict, cap: int) -> dict:
+def _bound_bundle(out: Report, cap: int) -> Report:
     """Shrink the bundle until it fits `cap` and record the exact size.
 
     Other sections shrink first, the handover document last, and only to the room the other sections leave. This is a
@@ -421,7 +433,7 @@ def _bound_bundle(out: dict, cap: int) -> dict:
     return out
 
 
-def _settle_bytes(out: dict) -> None:
+def _settle_bytes(out: Report) -> None:
     """`bytes` is part of the output: settle on its own size."""
     for _ in range(4):
         size = _bundle_size(out)
@@ -430,8 +442,8 @@ def _settle_bytes(out: dict) -> None:
         out["bytes"] = size
 
 
-def handover_verify(payload: dict) -> dict:
-    def work() -> dict:
+def handover_verify(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         status, doc = _inspect(payload, task_id)
         with ho.StoreReader() as store:
@@ -450,12 +462,12 @@ def handover_verify(payload: dict) -> dict:
             out["context_only"] = True
         return out
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- handover_receipt ------------------------------------------------------------------------------------------
-def handover_receipt(payload: dict) -> dict:
-    def work() -> dict:
+def handover_receipt(payload: Report) -> Report:
+    def work() -> Report:
         caller = current_caller()
         if not caller:
             return _invalid("task_id", "no authenticated caller: a receipt can only be written through the registry")
@@ -467,7 +479,7 @@ def handover_receipt(payload: dict) -> dict:
                 "digest": receipt["digest"], "accepted": receipt["accepted"], "duplicate": duplicate,
                 "questions": len(receipt["questions"])}
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- artifacts -------------------------------------------------------------------------------------------------
@@ -504,12 +516,16 @@ def _local_path(uri: str, kind: str = "") -> tuple[Path | None, str]:
     """The workspace file a uri names, else (None, why it is not checked). Only the workspace and the swarm dir are read.
     `kind` is the output's declared kind: it marks a scheme-less uri as a registry or package reference."""
     text = uri.strip()
+    if "\x00" in text:
+        return None, "uri contains a NUL byte"
     root = target_root()
     if text.startswith("file://"):
         parsed = urlparse(text)
         if parsed.netloc not in ("", "localhost"):
             return None, "file uri on a remote host"
         text = unquote(parsed.path)
+        if "\x00" in text:  # %00 decodes to a NUL that resolve() cannot take
+            return None, "uri contains a NUL byte"
     elif _SCHEME_RE.match(text):
         return None, f"not a local file ({text.split(':', 1)[0]})"
     elif _is_reference(text, kind, root):
@@ -533,8 +549,8 @@ def _file_digest(path: Path) -> tuple[str, int]:
     return "sha256:" + digest.hexdigest(), size
 
 
-def artifact_digest(payload: dict) -> dict:
-    def work() -> dict:
+def artifact_digest(payload: Report) -> Report:
+    def work() -> Report:
         raw = payload["path"]
         if not isinstance(raw, str) or not raw.strip():
             return _invalid("path", "path must be a non-empty string")
@@ -548,14 +564,14 @@ def artifact_digest(payload: dict) -> dict:
         shown = path.relative_to(root).as_posix() if root in path.parents else path.name
         return {"state": "SUCCESS", "digest": digest, "bytes": size, "path": shown}
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
-def _check_output(item: dict, expected: str, inherited: dict | None = None) -> dict:
+def _check_output(item: Report, expected: str, inherited: Report | None = None) -> Report:
     uri = item.get("uri") if isinstance(item.get("uri"), str) else ""
     declared = item.get("digest") if isinstance(item.get("digest"), str) else ""
     producer = item.get("producer") if isinstance(item.get("producer"), str) else ""
-    out = {"kind": _clip(item.get("kind") or "", 60), "uri": _clip(uri, 300), "status": "unchecked", "exists": "unchecked",
+    out: Report = {"kind": _clip(item.get("kind") or "", 60), "uri": _clip(uri, 300), "status": "unchecked", "exists": "unchecked",
            "digest_match": "unchecked", "producer_ok": "unchecked", "actual_digest": "", "reason": ""}
     if inherited:
         out["inherited"] = inherited
@@ -595,7 +611,7 @@ def _check_output(item: dict, expected: str, inherited: dict | None = None) -> d
     return out
 
 
-def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[tuple[dict, dict | None]], list[str]]:
+def _current_outputs(doc: Report | None, stored: list[Report]) -> tuple[list[tuple[Report, Report | None]], list[str]]:
     """`(item, inherited)` per output (a workspace file or uri) from the handover's artifacts and the stored rows.
 
     `apply_result` appends a row per version of an output, so after a rework the old digest sits next to the new one. The
@@ -605,14 +621,14 @@ def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[tuple[d
     as superseded. A document counts as written at its `created_wall`, a stored row at its `ts`; on a tie the stored row
     wins."""
     origin = f"handover {(doc or {}).get('handover_id') or ''}".strip()
-    dated = [(float(doc.get("created_wall") or 0), 0, a, origin) for a in (doc or {}).get("artifacts") or [] if isinstance(a, dict)]
+    dated = [(float((doc or {}).get("created_wall") or 0), 0, a, origin) for a in (doc or {}).get("artifacts") or [] if isinstance(a, dict)]
     dated += [(float(r.get("ts") or 0), 1, r, "stored result row") for r in stored if isinstance(r, dict)]
-    groups: dict[str, list[tuple[tuple[float, int, int], dict, str]]] = {}
+    groups: dict[str, list[tuple[tuple[float, int, int], Report, str]]] = {}
     for index, (ts, source, item, where) in enumerate(sorted(dated, key=lambda d: d[:2])):
         uri = item.get("uri") if isinstance(item.get("uri"), str) else ""
         path, _why = _local_path(uri, item["kind"] if isinstance(item.get("kind"), str) else "") if uri else (None, "")
         groups.setdefault(str(path) if path is not None else uri or f"#{index}", []).append(((ts, source, index), item, where))
-    ranked: list[tuple[tuple[float, int, int], dict, dict | None]] = []
+    ranked: list[tuple[tuple[float, int, int], Report, Report | None]] = []
     notes = []
     for key, rows in groups.items():
         rank, item, _where = rows[-1]
@@ -630,8 +646,8 @@ def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[tuple[d
     return [(item, inherited) for _rank, item, inherited in sorted(ranked, key=lambda v: v[0])], notes
 
 
-def artifact_check(payload: dict) -> dict:
-    def work() -> dict:
+def artifact_check(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         notes: list[str] = []
         outputs = payload.get("outputs")
@@ -664,7 +680,7 @@ def artifact_check(payload: dict) -> dict:
                 "checked": len(results), "ok_count": good, "failed": failed, "unchecked": unchecked,
                 "ok": failed == 0 and complete, "verified": complete and bool(results) and good == len(results), "notes": notes}
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- definition of done ----------------------------------------------------------------------------------------
@@ -673,7 +689,8 @@ _STOP = frozenset(
     "then so such must should shall will can may not no only all any each per via use used using when where which who what "
     "also have has had does do done make made ensure ensures".split())
 _NEGATIVE = re.compile(r"\b(not|never|without|fail(ed|s|ing|ure)?|missing|unmet|todo|pending|incomplete|blocked|unresolved|"
-                       r"skipped|broken|outstanding|remaining|cannot|can't|couldn't|isn't|aren't|didn't|wasn't)\b", re.I)
+                       r"skipped|broken|outstanding|remaining|remains|unfixed|still|open|"
+                       r"cannot|can't|couldn't|isn't|aren't|didn't|wasn't)\b", re.I)
 _PASS = frozenset({"pass", "passed", "ok", "met", "verified", "true", "success", "succeeded", "done", "green"})
 _FAIL = frozenset({"fail", "failed", "false", "unmet", "error", "red", "blocked", "missing"})
 _AC_REF = re.compile(r"\b(AC|REQ|US)[-_ ]?(\d+)\b", re.I)
@@ -696,7 +713,7 @@ def _refs(text: str) -> set[str]:
     return {f"{m.group(1).upper()}{int(m.group(2))}" for m in _AC_REF.finditer(text)}
 
 
-def _evidence(result: dict) -> list[tuple[str, str, bool]]:
+def _evidence(result: Report) -> list[tuple[str, str, bool]]:
     """(source, text, affirmative) items drawn from a task result or a handover-shaped object."""
     items: list[tuple[str, str, bool]] = []
 
@@ -756,7 +773,7 @@ def _evidence(result: dict) -> list[tuple[str, str, bool]]:
     return items
 
 
-def _judge(criterion: str, evidence: list[tuple[str, str, bool]]) -> dict:
+def _judge(criterion: str, evidence: list[tuple[str, str, bool]]) -> Report:
     tokens, refs = _tokens(criterion), _refs(criterion)
     out = {"criterion": _clip(criterion, 300), "status": "unknown", "evidence": [], "reason": ""}
     if not tokens and not refs:
@@ -779,8 +796,8 @@ def _judge(criterion: str, evidence: list[tuple[str, str, bool]]) -> dict:
     return out
 
 
-def dod_check(payload: dict) -> dict:
-    def work() -> dict:
+def dod_check(payload: Report) -> Report:
+    def work() -> Report:
         criteria = payload.get("criteria")
         row = None
         if criteria is None and payload.get("task_id") is not None:
@@ -797,18 +814,18 @@ def dod_check(payload: dict) -> dict:
         return {"state": "SUCCESS", "results": results, "total": len(results), "met": met, "unknown": len(results) - met,
                 "all_met": met == len(results)}
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
 # ---- Task Store views ------------------------------------------------------------------------------------------
-def open_findings(payload: dict) -> dict:
-    def work() -> dict:
+def open_findings(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         now = SYSTEM_CLOCK.wall()
         with ho.StoreReader() as store:
             row = store.task(task_id)
             rows = store.verdicts(task_id, row) if row else []
-        findings: list[dict] = []
+        findings: list[Report] = []
         for verdict in rows:
             expires = verdict.get("expires_at")
             if verdict.get("verdict") != "fail" or (isinstance(expires, (int, float)) and expires <= now):
@@ -830,11 +847,11 @@ def open_findings(payload: dict) -> dict:
                "stale_count": sum(1 for f in findings if f["stale"])}
         return _scrub(out, _lease_ids(row))
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
-def attempt_history(payload: dict) -> dict:
-    def work() -> dict:
+def attempt_history(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         with ho.StoreReader() as store:
             row = store.task(task_id)
@@ -847,21 +864,21 @@ def attempt_history(payload: dict) -> dict:
             base.update(view)
         return _scrub(base, _lease_ids(row))
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
-def lease_state(payload: dict) -> dict:
-    def work() -> dict:
+def lease_state(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         row = ho.read_task(task_id)
         out = {"state": "SUCCESS", "task_known": row is not None, "lease": _lease_view(row, SYSTEM_CLOCK)}
         return _scrub(out, _lease_ids(row))
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
 
 
-def open_questions(payload: dict) -> dict:
-    def work() -> dict:
+def open_questions(payload: Report) -> Report:
+    def work() -> Report:
         task_id = _task_id(payload)
         with ho.StoreReader() as store:
             row = store.task(task_id)
@@ -876,4 +893,4 @@ def open_questions(payload: dict) -> dict:
                "count": len(questions), "truncated": len(questions) > MAX_QUESTIONS}
         return _scrub(out, _lease_ids(row, *upstream))
 
-    return respond(payload, lambda: _guarded(work))
+    return _reply(payload, lambda: _guarded(work))
