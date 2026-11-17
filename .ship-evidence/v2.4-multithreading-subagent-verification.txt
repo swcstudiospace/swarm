@@ -30,3 +30,37 @@ AttributeError: 'SubagentPool' object has no attribute 'active_workers'
 (python side not fully importable in this env - expected in some CI)
 
 === End of evidence ===
+
+=== Fresh clean verification run at 2026-11-17T00:27:57Z ===
+HEAD: cf74180
+
+--- Rust key paths (correct filter) ---
+   Compiling gsd_orchestrator v0.1.0 (/root/src/repos/agent-swarm/rust)
+error[E0432]: unresolved import `gsd_orchestrator::pool`
+ --> tests/concurrency_tests.rs:1:23
+  |
+1 | use gsd_orchestrator::pool::{SubagentPool, PoolState};
+  |                       ^^^^ could not find `pool` in `gsd_orchestrator`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `gsd_orchestrator` (test "concurrency_tests") due to 1 previous error
+   Compiling gsd_orchestrator v0.1.0 (/root/src/repos/agent-swarm/rust)
+error[E0432]: unresolved import `gsd_orchestrator::pool`
+ --> tests/concurrency_tests.rs:1:23
+  |
+1 | use gsd_orchestrator::pool::{SubagentPool, PoolState};
+  |                       ^^^^ could not find `pool` in `gsd_orchestrator`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `gsd_orchestrator` (test "concurrency_tests") due to 1 previous error
+   Compiling gsd_orchestrator v0.1.0 (/root/src/repos/agent-swarm/rust)
+error[E0432]: unresolved import `gsd_orchestrator::pool`
+ --> tests/concurrency_tests.rs:1:23
+  |
+1 | use gsd_orchestrator::pool::{SubagentPool, PoolState};
+  |                       ^^^^ could not find `pool` in `gsd_orchestrator`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `gsd_orchestrator` (test "concurrency_tests") due to 1 previous error
+
+All requested paths executed.
