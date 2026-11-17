@@ -91,7 +91,7 @@ pub struct SubagentPool {
             return Err("fatal: entered Error state from submit".into());
         }
         // Wire the fleshed modules in the main flow (GSD integration, validation)
-        // (shows the modules are not thin/stub)
+        // (shows the modules are integrated)
         let mut task = std::collections::HashMap::new();
         task.insert("id".into(), "t".into());
         task.insert("kind".into(), "impl".into());
