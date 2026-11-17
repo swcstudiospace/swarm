@@ -59,6 +59,7 @@ pub struct SubagentPool {
                 for i in ids.len()..new_size {
                     ids.push(i);
                     // Worker spawn (represents a subagent worker)
+                    self.worker_work.fetch_add(1, Ordering::SeqCst);
                     let _h = std::thread::spawn(move || {
                         // worker loop (in real impl would run tasks)
                         std::thread::sleep(std::time::Duration::from_millis(1));
