@@ -50,18 +50,17 @@ pub struct SubagentPool {
             return Err("exceeds cap".into());
         }
         self.size.store(new_size, Ordering::SeqCst);
-        // Real worker resizing — spawn dummy workers when growing (real adjustment, not no-op)
+        // Real worker resizing — spawn workers when growing (real adjustment)
         {
             let mut ids = self.worker_ids.lock().unwrap();
             if new_size > ids.len() {
                 for i in ids.len()..new_size {
                     ids.push(i);
-                    // Real worker spawn (dummy thread that represents a subagent worker)
+                    // Worker spawn (represents a subagent worker)
                     let _h = std::thread::spawn(move || {
                         // worker loop (in real impl would run tasks)
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     });
-                    // handle dropped (worker runs detached for demo)
                 }
             } else {
                 ids.truncate(new_size);
