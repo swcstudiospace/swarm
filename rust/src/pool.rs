@@ -147,7 +147,7 @@ pub struct SubagentPool {
     pub fn recover_from_error(&self) {
         let mut s = self.state.lock().unwrap();
         if *s == PoolState::Error {
-            *s = PoolState::Idle;
+            *s = PoolState::Active;   // ready for real work again
         }
     }
 
@@ -158,9 +158,11 @@ pub struct SubagentPool {
         if task.state != TaskState::Pending {
             return Err("task must be Pending".into());
         }
-        // Use the real resized worker count (from worker_ids) for capacity
+        // Capacity = current configured workers (after scale)
+        // Load     = in-flight work (the 'active' atomic that submit bumps)
         let cap = self.worker_ids.lock().unwrap().len();
-        if self.active_workers() >= cap {
+        let current = self.active.load(Ordering::SeqCst);
+        if current >= cap {
             return Err("at worker capacity after scaling".into());
         }
         task.state = TaskState::Running;
