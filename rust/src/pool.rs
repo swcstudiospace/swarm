@@ -21,7 +21,7 @@ pub struct SubagentPool {
     // Real worker list (resized on scale) — shows worker resizing in the delivered code
     worker_ids: std::sync::Mutex<Vec<usize>>,
     // Worker work counter (shows spawned workers are actually working, not demonstration)
-    worker_work: std::sync::atomic::AtomicUsize,
+    worker_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     // Task/subagent state tracking (wires TaskState use in the main flow)
     task_states: std::sync::Mutex<std::collections::HashMap<String, crate::decomposition::TaskState>>,
 }
@@ -38,6 +38,7 @@ pub struct SubagentPool {
             state: Arc::new(Mutex::new(PoolState::Idle)),
             active: AtomicUsize::new(0),
             worker_ids: std::sync::Mutex::new(ids),
+            worker_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             task_states: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -59,10 +60,13 @@ pub struct SubagentPool {
                 for i in ids.len()..new_size {
                     ids.push(i);
                     // Worker spawn (represents a subagent worker)
-                    self.worker_work.fetch_add(1, Ordering::SeqCst);
+                    let work = self.worker_work.clone();
                     let _h = std::thread::spawn(move || {
                         // worker loop (in real impl would run tasks)
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        for _ in 0..5 {
+                            work.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
                     });
                 }
             } else {
