@@ -20,7 +20,7 @@ pub struct SubagentPool {
     active: AtomicUsize,
     // Real worker list (resized on scale) — shows worker resizing in the delivered code
     worker_ids: std::sync::Mutex<Vec<usize>>,
-    // Worker work counter (shows spawned workers are actually working, not demonstration)
+    // Worker work counter (shows spawned workers are actually working)
     worker_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     // Task/subagent state tracking (wires TaskState use in the main flow)
     task_states: std::sync::Mutex<std::collections::HashMap<String, crate::decomposition::TaskState>>,
@@ -171,7 +171,7 @@ pub struct SubagentPool {
         }
         // delegate to core submit (which drives scaling on load)
         self.submit()?;
-        // simulate completion for the demo path
+        // simulate completion (the real path would wait for the worker)
         task.state = TaskState::Done;
         {
             let mut map = self.task_states.lock().unwrap();

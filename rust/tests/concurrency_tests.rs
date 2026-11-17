@@ -82,27 +82,23 @@ fn decomposition_and_parallel_execution() {
      assert!(py_out.contains("create_pool ok") && py_out.contains("scale ok"), "python verification must pass");
  }
 
-#[test]
-#[test]
-fn real_event_paths_submit_scaling_error() {
-    // Real flow using delivered submit (drives scaling via worker count)
-    // and demonstrates real failure isolation + recovery (not test-only hooks).
-    let p = SubagentPool::new(30).unwrap();
-    p.create();
-    assert_eq!(p.state(), PoolState::Active);
+ #[test]
+ fn real_event_paths_submit_scaling_error() {
+     // Real dispatch (submit) drives scaling via the worker list.
+     // Error on a non-active pool triggers recovery + retry in the main submit path.
+     let p = SubagentPool::new(30).unwrap();
+     p.create();
+     assert_eq!(p.state(), PoolState::Active);
 
-    // Drive via high-load submits (real path)
-    for _ in 0..20 {
-        let _ = p.submit();
-    }
-    assert!(p.active_workers() <= 30, "real dispatch drove resizing within cap");
+     for _ in 0..20 {
+         let _ = p.submit();
+     }
+     assert!(p.active_workers() <= 30, "real dispatch drove resizing within cap");
 
-    // Force error then show submit on Error triggers recovery + retry in main flow
-    p.force_error();
-    assert_eq!(p.state(), PoolState::Error);
-    // submit() itself now recovers and retries (real isolation path)
-    let ok = p.submit();
-    assert!(ok.is_ok(), "submit after Error should recover and succeed");
-    assert_eq!(p.state(), PoolState::Active);
-}
- // (duplicate old body removed)
+     p.force_error();
+     assert_eq!(p.state(), PoolState::Error);
+
+     let ok = p.submit();
+     assert!(ok.is_ok(), "submit after Error should recover and succeed");
+     assert_eq!(p.state(), PoolState::Active);
+ }
