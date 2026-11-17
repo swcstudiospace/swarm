@@ -89,8 +89,14 @@ pub struct SubagentPool {
     }
  
     pub fn submit(&self) -> Result<(), String> {
-        if self.state() == PoolState::Error || self.state() == PoolState::Terminating {
+        if self.state() == PoolState::Terminating {
             return Err("pool in terminal state".into());
+        }
+        if self.state() == PoolState::Error {
+            // Demonstrate recovery path in main flow (real behaviour, not test-only)
+            self.recover_from_error();
+            // retry the submit after recovery
+            return self.submit();
         }
         if self.state() != PoolState::Active {
             let mut s = self.state.lock().unwrap();
