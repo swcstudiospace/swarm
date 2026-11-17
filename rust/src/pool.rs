@@ -88,19 +88,17 @@ pub struct SubagentPool {
     }
  
     pub fn submit(&self) -> Result<(), String> {
-        if self.state() == PoolState::Terminating {
-            return Err("pool in terminal state".into());
+        match self.state() {
+            PoolState::Terminating => return Err("pool in terminal state".into()),
+            // Recovery leaves the pool Idle; the activation below then serves this submit.
+            PoolState::Error => self.recover_from_error(),
+            _ => {}
         }
-        if self.state() == PoolState::Error {
-            // Demonstrate recovery path in main flow (real behaviour, not test-only)
-            self.recover_from_error();
-            // retry the submit after recovery
-            return self.submit();
+        if self.state() == PoolState::Idle {
+            self.create();
         }
         if self.state() != PoolState::Active {
-            let mut s = self.state.lock().unwrap();
-            *s = PoolState::Error;
-            return Err("fatal: entered Error state from submit".into());
+            return Err(format!("submit rejected: pool is {:?}", self.state()));
         }
         // Wire the fleshed modules in the main flow (GSD integration, validation)
         // (shows the modules are integrated)
@@ -146,7 +144,7 @@ pub struct SubagentPool {
     pub fn recover_from_error(&self) {
         let mut s = self.state.lock().unwrap();
         if *s == PoolState::Error {
-            *s = PoolState::Active;   // ready for real work again
+            *s = PoolState::Idle;   // recovered; the next submit activates the pool
         }
     }
 
