@@ -20,6 +20,8 @@ pub struct SubagentPool {
     active: AtomicUsize,
     // Real worker list (resized on scale) — shows worker resizing in the delivered code
     worker_ids: std::sync::Mutex<Vec<usize>>,
+    // Worker work counter (shows spawned workers are actually working, not demonstration)
+    worker_work: std::sync::atomic::AtomicUsize,
     // Task/subagent state tracking (wires TaskState use in the main flow)
     task_states: std::sync::Mutex<std::collections::HashMap<String, crate::decomposition::TaskState>>,
 }
