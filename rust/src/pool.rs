@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
-use std::time::Duration;
+// (thread and Duration imports removed - no longer used after spawn cleanup)
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PoolState {
