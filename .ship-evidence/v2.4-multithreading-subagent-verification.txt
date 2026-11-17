@@ -64,3 +64,11 @@ For more information about this error, try `rustc --explain E0432`.
 error: could not compile `gsd_orchestrator` (test "concurrency_tests") due to 1 previous error
 
 All requested paths executed.
+
+=== Verification after exposing pool module ===
+HEAD: 791d2dc
+error: unexpected argument 'real_event_paths_submit_scaling_error' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.
