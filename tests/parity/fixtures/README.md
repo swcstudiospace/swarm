@@ -42,4 +42,4 @@ Example (`tests/parity/fixtures/transition_legal_illegal.01.json`):
 
 ## Status
 
-`harness.py` constructs the same invocations in code. One on-disk record exists: `happy_path.00.json`, a hand-built mismatch-revert fixture (Phase 9 row 16). Its Python reply is not captured from `scripts/orch_status.py`, and its `provenance` field says so. Its Rust reply differs on purpose.
+`harness.py` constructs the same invocations in code. One on-disk record exists: `happy_path.00.json`, a mismatch-revert fixture (Phase 9 row 16). Its Python reply is the live output of `scripts/orch_status.py --history T-1` on a seeded store (captured 2026-11-18; see its `provenance`). Its Rust reply is a deliberate synthetic divergence.
