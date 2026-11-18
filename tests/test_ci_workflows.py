@@ -98,6 +98,17 @@ def test_real_workflow_passes_the_policy(filename: str, real: dict[str, Document
     assert check_workflow(WORKFLOWS / filename, real[filename]) == []
 
 
+def test_the_wheel_install_job_runs_the_smoke_gate_after_the_import_gate(real: dict[str, Document]) -> None:
+    steps = real["wheel.yml"]["jobs"]["install-and-gate"]["steps"]
+    names = [step.get("name") for step in steps]
+    smoke = "swarm_tool and swarm_run smoke gate (installed wheel)"
+    assert smoke in names
+    assert names.index("import gate") < names.index(smoke)
+    run = steps[names.index(smoke)]["run"]
+    assert "scripts/swarm_tool.py catalog" in run
+    assert "scripts/swarm_run.py --dry-run" in run
+
+
 @dataclass(frozen=True)
 class Mutation:
     """One way to break the policy: a change to a deep copy of a real workflow, and the rule that must report it."""

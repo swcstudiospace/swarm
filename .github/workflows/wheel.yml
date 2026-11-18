@@ -58,6 +58,20 @@ jobs:
             scripts/swarm_tool.py
             agents.json
           if-no-files-found: error
+      - name: upload the smoke gate sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-swarm-smoke-sources
+          path: |
+            scripts/swarm_tool.py
+            scripts/swarm_run.py
+            scripts/orch_plan.py
+            scripts/qa_gate.py
+            scripts/rev_gate.py
+            scripts/sec_gate.py
+            scripts/rel_plan.py
+            agents.json
+          if-no-files-found: error
 
   install-and-gate:
     needs: wheel
@@ -80,6 +94,27 @@ jobs:
         run: |
           cd /tmp
           python -c "import swarm._native"
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-swarm-smoke-sources
+          path: /tmp/smoke-src
+      # Smoke gate, run from /tmp/smoke outside the repository: swarm_tool.py, swarm_run.py, orch_plan.py, agents.json and the four gate scripts are
+      # copied out of the artifact, and the installed wheel supplies the swarm package. orch_plan.py seeds the plan into
+      # SWARM_DIR before the dry run, because swarm_run.py --dry-run reads its plan from the task store under SWARM_DIR.
+      # The four gate scripts (qa_gate.py, rev_gate.py, sec_gate.py, rel_plan.py) are copied because the seeded feature plan includes
+      # qa, review, security and release gate tasks, and each one runs its script.
+      - name: swarm_tool and swarm_run smoke gate (installed wheel)
+        run: |
+          export SWARM_DIR=/tmp/smoke/.swarm
+          export SWARM_AGENTS_FILE=/tmp/smoke/agents.json
+          rm -rf /tmp/smoke
+          mkdir -p /tmp/smoke/scripts
+          cp /tmp/smoke-src/scripts/swarm_tool.py /tmp/smoke-src/scripts/swarm_run.py /tmp/smoke-src/scripts/orch_plan.py /tmp/smoke-src/scripts/qa_gate.py /tmp/smoke-src/scripts/rev_gate.py /tmp/smoke-src/scripts/sec_gate.py /tmp/smoke-src/scripts/rel_plan.py /tmp/smoke/scripts/
+          cp /tmp/smoke-src/agents.json /tmp/smoke/
+          cd /tmp/smoke
+          SWARM_AGENTS_FILE=/tmp/smoke/agents.json python3 scripts/swarm_tool.py catalog --caller A05 --json
+          python3 scripts/orch_plan.py --brief-text 'wheel smoke gate' --pattern feature --risk-class low
+          python3 scripts/swarm_run.py --dry-run --max-parallel 2
       - name: stubtest gate
         run: |
           cd /tmp
