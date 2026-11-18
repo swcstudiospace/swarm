@@ -135,8 +135,12 @@ impl Default for DispatchConfig {
 pub struct DispatchReport {
     /// Task ids in the order they were dispatched.
     pub dispatch_order: Vec<String>,
+    /// Instant each task was handed to a worker, in dispatch order.
+    pub dispatched_at: Vec<(String, Instant)>,
     /// Final outcome per task, in completion order.
     pub outcomes: Vec<(String, TaskOutcome)>,
+    /// Instant each task's outcome was recorded, in completion order.
+    pub completed_at: Vec<(String, Instant)>,
     /// Ids of tasks that never became ready (for example, behind a failed dependency).
     pub undispatched: Vec<String>,
     /// Highest number of simultaneously running tasks observed.
@@ -364,8 +368,10 @@ where
             self.active_claims.insert(id.value.clone(), claims);
             *self.running_per_agent.entry(agent.clone()).or_insert(0) += 1;
             self.in_flight.insert(id.value.clone(), agent);
-            self.submitted_at.insert(id.value.clone(), Instant::now());
+            let dispatched = Instant::now();
+            self.submitted_at.insert(id.value.clone(), dispatched);
             self.report.dispatch_order.push(id.value.clone());
+            self.report.dispatched_at.push((id.value.clone(), dispatched));
             self.spawn_worker(id.value, task);
         }
         self.report.max_in_flight = self.report.max_in_flight.max(self.in_flight.len());
@@ -427,6 +433,7 @@ where
                 }
             }
         };
+        self.report.completed_at.push((id.clone(), now));
         self.report.outcomes.push((id, outcome));
     }
 }
@@ -1056,6 +1063,32 @@ mod tests {
         assert_eq!(log.iter().filter(|e| e.starts_with("dispatch:")).count(), 8);
         assert_eq!(report.max_in_flight, 8);
         assert_eq!(report.outcomes.len(), 8);
+        assert_eq!(report.dispatched_at.len(), 8);
+        assert_eq!(report.completed_at.len(), 8);
+        let last_dispatched_at = report
+            .dispatched_at
+            .iter()
+            .map(|(_, at)| *at)
+            .max()
+            .expect("dispatch instants");
+        let first_completed_at = report
+            .completed_at
+            .iter()
+            .map(|(_, at)| *at)
+            .min()
+            .expect("completion instants");
+        assert!(
+            last_dispatched_at < first_completed_at,
+            "dispatched_at must all precede completed_at"
+        );
+        for (id, dispatched) in &report.dispatched_at {
+            let (_, completed) = report
+                .completed_at
+                .iter()
+                .find(|(done, _)| done == id)
+                .expect("a completion instant per task");
+            assert!(dispatched < completed, "{id}: dispatched after it completed");
+        }
     }
 
     #[tokio::test]
