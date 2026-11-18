@@ -34,6 +34,7 @@ use std::time::Duration;
 use gsd_pool::thread_state_transition_table::{retry_reset, retry_reset_failed, ALL_PHASES};
 use gsd_pool::{transition, ThreadPhase};
 use gsd_proto::gsd::v1::{SessionState, Task, ThreadState, ThreadStateKind};
+use gsd_scheduler::join_affinity_guard::{Engine, JoinAffinityGuard};
 use gsd_scheduler::{
     run_matrix_join, CompletionLog, CompletionRecord, DispatchConfig, MatrixBatch, NexusJoinReport,
     NexusPlan, SchedulerError, SchedulerResult, SemaphoreManager, TaskFailure, TaskOutcome,
@@ -439,7 +440,7 @@ where
             Arc::clone(&shared),
         )
     };
-    let report = run_matrix_join(batch, config, semaphores, wrapped).await?;
+    let report = run_matrix_join(Engine::Rust, batch, config, semaphores, wrapped).await?;
 
     let skipped = take(&run.skipped);
     let started = take(&run.started);
@@ -514,6 +515,16 @@ where
     Fut: Future<Output = SchedulerResult<NexusJoinReport>>,
 {
     ctx.check()?;
+    let pin = Engine::Rust;
+    let guard = JoinAffinityGuard::new(format!("join-seq-{}", ctx.join_seq), pin);
+    guard
+        .check_steps(
+            plan.stages
+                .iter()
+                .flatten()
+                .map(|task| plan.engines.get(task_id_of(task)).copied().unwrap_or(pin)),
+        )
+        .map_err(SchedulerError::from)?;
     reject_repeated_across_stages(plan)?;
     let stage_count = u32::try_from(plan.stages.len())
         .map_err(|_| JoinError::TooManyStages(plan.stages.len()))?;
@@ -1062,6 +1073,7 @@ mod tests {
             stage,
             tasks: ids.iter().map(|id| task(id)).collect(),
             attempts: HashMap::new(),
+            engines: HashMap::new(),
         }
     }
 
@@ -1924,6 +1936,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: "j".to_string(),
             stages: vec![vec![task("t1"), task("t2")]],
+            engines: HashMap::new(),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let report = || {
@@ -1982,6 +1995,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: "j".to_string(),
             stages: vec![vec![task("t1")], vec![task("t2")]],
+            engines: HashMap::new(),
         };
         let request = async {
             sleep(Duration::from_millis(10)).await;
@@ -2129,6 +2143,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: String::new(),
             stages: vec![vec![task("t1"), task("t2")]],
+            engines: HashMap::new(),
         };
 
         let refused = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
@@ -2158,6 +2173,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: "j".to_string(),
             stages: vec![vec![task("t1")], vec![task("t1")]],
+            engines: HashMap::new(),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -2175,6 +2191,69 @@ mod tests {
             refused,
             Err(JoinError::Scheduler(SchedulerError::Other(_)))
         ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ledger.is_empty());
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matrix_step_on_another_engine_is_refused_before_any_write() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 14, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let mut mixed = batch(0, &["t1"]);
+        mixed.engines = HashMap::from([("t1".to_string(), Engine::Python)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let refused = collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            mixed,
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await;
+
+        let Err(JoinError::Scheduler(SchedulerError::Other(message))) = &refused else {
+            return Err(format!("expected an E-CONTRACT refusal, got {refused:?}").into());
+        };
+        assert!(message.contains("E-CONTRACT"), "{message}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ledger.is_empty());
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nexus_step_on_another_engine_is_refused_before_any_write() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 13, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let plan = NexusPlan {
+            join_id: "j".to_string(),
+            stages: vec![vec![task("t1")]],
+            engines: HashMap::from([("t1".to_string(), Engine::Python)]),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+
+        let refused = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok::<NexusJoinReport, SchedulerError>(stage_report(
+                0,
+                Vec::new(),
+            )))
+        })
+        .await;
+
+        let Err(JoinError::Scheduler(SchedulerError::Other(message))) = &refused else {
+            return Err(format!("expected an E-CONTRACT refusal, got {refused:?}").into());
+        };
+        assert!(message.contains("E-CONTRACT"), "{message}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(ledger.is_empty());
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
