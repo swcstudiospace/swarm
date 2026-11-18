@@ -399,7 +399,7 @@ mod tests {
         let p = PyThreadPool {
             inner: ThreadPool::new(cfg.inner.clone()).expect("cfg valid"),
         };
-        let st = Python::with_gil(|py| p.status(py));
+        let st = Python::attach(|py| p.status(py).map(|_| ()));
         assert!(st.is_ok());
         let _m = p.cancel().unwrap();
         let _ = p.shutdown(1);
