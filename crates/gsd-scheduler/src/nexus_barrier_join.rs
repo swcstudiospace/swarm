@@ -7,14 +7,17 @@
 //! A stage publishes one request per participant on `<join>/stage/<n>/request`, correlated by task
 //! id. Participants answer on `<join>/stage/<n>/reply` with a [`ParticipantReply`]. The barrier waits
 //! until every participant has answered or the stage deadline passes. A participant still silent at
-//! the deadline becomes a named partial-join timeout, whose session terminal is `CANCELLED_TIMED_OUT`.
-//! A failed participant becomes a failed input.
-//! Both are values in the stage log, so neither can stop the join. The stage is merged in
-//! [`CompletionKey`] order, the same log shape as [`crate::matrix_join`], and the next stage is
-//! released only after that merge.
+//! the deadline becomes a named partial-join timeout, whose session terminal is `FAILED` (`terminal_reason` `timed_out`).
 //!
-//! The join family is fixed by [`select_join_kind`] before dispatch. [`run_nexus_barrier_join`]
-//! refuses any kind other than [`JoinKind::Nexus`], so one run never mixes families.
+//! A participant that answers `FAILED` is a failed input of the join. It is not re-run, and its siblings carry on.
+//! The join is `PartialSuccess` once any participant has failed or timed out. Failures and timeouts are values in the
+//! stage log, so neither can stop the join. The stage is merged in [`CompletionKey`] order, the same log shape as
+//! [`crate::matrix_join`], and the next stage is released only after that merge.
+//!
+//! The join family is fixed by [`select_join_kind`] before dispatch. [`run_nexus_barrier_join`] refuses any kind other
+//! than [`JoinKind::Nexus`], so one run never mixes families. The join is pinned to the engine in
+//! [`NexusJoinConfig::engine`] through a [`JoinAffinityGuard`]. A participant declared on another engine in
+//! [`NexusPlan::engines`] is refused with `E-CONTRACT` before anything is published.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -25,6 +28,7 @@ use gsd_proto::gsd::v1::{SchedulingPolicy, Task, WorkflowDef};
 use tokio::time::{sleep, Instant};
 
 use crate::force_parallel_dispatch::TaskOutcome;
+use crate::join_affinity_guard::{Engine, JoinAffinityGuard};
 use crate::matrix_join::{
     CompletionKey, CompletionLog, CompletionRecord, Provenance, VerdictEnvelope,
 };
@@ -92,13 +96,16 @@ impl ParticipantReply {
     }
 }
 
-/// Timing bounds for a staged join.
+/// Timing bounds and engine for a staged join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NexusJoinConfig {
     /// Time a stage waits for its participants, measured from its fan-out. Must be non-zero.
     pub stage_deadline: Duration,
     /// Pause between reply checks while a stage waits. Must be non-zero.
     pub poll_interval: Duration,
+    /// The join's engine pin. A participant with no entry in [`NexusPlan::engines`] runs on it, and a participant
+    /// declared on any other engine is refused with `E-CONTRACT` before anything is published.
+    pub engine: Engine,
 }
 
 impl Default for NexusJoinConfig {
@@ -106,6 +113,7 @@ impl Default for NexusJoinConfig {
         Self {
             stage_deadline: Duration::from_secs(30),
             poll_interval: Duration::from_millis(10),
+            engine: Engine::Rust,
         }
     }
 }
@@ -117,6 +125,9 @@ pub struct NexusPlan {
     pub join_id: String,
     /// Participants of each stage in declared key order. Task ids are unique within a stage.
     pub stages: Vec<Vec<Task>>,
+    /// Engine each participant is declared to run on, keyed by task id. A participant with no entry runs on the
+    /// join's pin, [`NexusJoinConfig::engine`].
+    pub engines: HashMap<String, Engine>,
 }
 
 /// The Nexus endpoints a join runs over.
@@ -155,9 +166,10 @@ pub struct NexusJoinReport {
     /// Merged stages in release order.
     pub stages: Vec<StageMerge>,
     /// Task ids that missed a stage deadline, in merge order. Each is a named partial-join timeout that
-    /// ends `CANCELLED_TIMED_OUT` (`timed_out`) in the session join.
+    /// ends `FAILED` (`terminal_reason` `timed_out`) in the session join.
     pub partial_timeouts: Vec<String>,
-    /// Task ids whose participant failed, in merge order.
+    /// Task ids whose final outcome is a failure other than a timeout, in merge order. Timeouts are listed in
+    /// [`NexusJoinReport::partial_timeouts`].
     pub failed: Vec<String>,
     /// Terminal state of the join.
     pub terminal: JoinTerminal,
@@ -189,11 +201,13 @@ pub fn task_input_bytes(task: &Task) -> Vec<u8> {
 
 /// Runs `plan` as a staged fan-out and fan-in and returns the merged stages.
 ///
-/// `kind` must be [`JoinKind::Nexus`]; any other kind is refused before anything is published.
-/// `build_request` builds each participant's request payload from the task and the stages merged so
-/// far. Every stage waits behind a barrier bounded by `config.stage_deadline`. A straggler becomes a
-/// named partial-join timeout and a failed participant becomes a failed input. Neither stops the
-/// join, and the next stage is released after the merge.
+/// `kind` must be [`JoinKind::Nexus`]; any other kind is refused before anything is published. The join is pinned to
+/// `config.engine`. Each participant is checked against that pin before anything is published, on its declared engine
+/// in `plan.engines` or on the pin when it has none. Any other engine fails the whole join with `E-CONTRACT`.
+/// `build_request` builds each participant's request payload from the task and the stages merged so far. Every stage
+/// waits behind a barrier bounded by `config.stage_deadline`. A straggler becomes a named partial-join timeout, and a
+/// participant that fails becomes a failed input. Neither stops the join, and the next stage is released after the
+/// merge.
 pub async fn run_nexus_barrier_join<P, S, R, B>(
     kind: JoinKind,
     plan: &NexusPlan,
@@ -213,6 +227,16 @@ where
         ));
     }
     validate(plan, config)?;
+    // One join, one pin. Every participant's declared engine is checked against the pin before the first publish, so a
+    // straddling join runs nothing.
+    let pin = config.engine;
+    let guard = JoinAffinityGuard::new(plan.join_id.clone(), pin);
+    let declared = plan
+        .stages
+        .iter()
+        .flatten()
+        .map(|task| plan.engines.get(task_id_of(task)).copied().unwrap_or(pin));
+    guard.check_steps(declared)?;
 
     let mut stages: Vec<StageMerge> = Vec::with_capacity(plan.stages.len());
     for (index, tasks) in plan.stages.iter().enumerate() {
@@ -236,12 +260,16 @@ where
     let mut failed = Vec::new();
     for merge in &stages {
         for record in merge.log.records() {
-            match &record.outcome {
-                TaskOutcome::Failed { code, .. } if *code == timeout => {
-                    partial_timeouts.push(record.key.task_id.clone());
-                }
-                TaskOutcome::Failed { .. } => failed.push(record.key.task_id.clone()),
-                TaskOutcome::Completed | TaskOutcome::RateLimited { .. } => {}
+            let id = record.key.task_id.as_str();
+            let timed_out =
+                matches!(&record.outcome, TaskOutcome::Failed { code, .. } if *code == timeout);
+            let failed_outcome =
+                matches!(&record.outcome, TaskOutcome::Failed { code, .. } if *code != timeout);
+            if timed_out {
+                partial_timeouts.push(id.to_string());
+            }
+            if failed_outcome {
+                failed.push(id.to_string());
             }
         }
     }
@@ -264,7 +292,15 @@ struct Contribution {
     output: Option<Vec<u8>>,
 }
 
-/// Fans out one stage, waits behind its barrier, and returns one contribution per participant.
+/// The topics and bounds one stage runs under.
+struct StageWire {
+    stage: u32,
+    request_topic: String,
+    reply_topic: String,
+    config: NexusJoinConfig,
+}
+
+/// Fans out one stage behind its barrier and returns one contribution per participant.
 async fn run_stage<P, S, R, B>(
     stage: u32,
     tasks: &[Task],
@@ -280,38 +316,66 @@ where
     R: NexusInbox,
     B: Fn(&Task, &[StageMerge]) -> Vec<u8>,
 {
-    let request_topic = stage_request_topic(join_id, stage);
-    let reply_topic = stage_reply_topic(join_id, stage);
-    let mut contributions = Vec::with_capacity(tasks.len());
-    let mut pending: HashMap<String, (usize, &Task)> = HashMap::with_capacity(tasks.len());
+    let wire = StageWire {
+        stage,
+        request_topic: stage_request_topic(join_id, stage),
+        reply_topic: stage_reply_topic(join_id, stage),
+        config,
+    };
+    // Subscribe before fan-out so that no reply can be published unseen. Without a reply topic nothing is published.
+    if let Err(error) = transport.subscriber.subscribe(&wire.reply_topic) {
+        return tasks
+            .iter()
+            .enumerate()
+            .map(|(creation, task)| {
+                failure(
+                    stage,
+                    creation,
+                    task,
+                    1,
+                    ErrorCode::Internal.as_str(),
+                    format!("reply topic {} is unavailable: {error}", wire.reply_topic),
+                )
+            })
+            .collect();
+    }
+    run_round(&wire, transport, tasks, 1, build_request, merged).await
+}
 
-    // Subscribe before fan-out so that no reply can be published unseen.
-    let subscribed = transport.subscriber.subscribe(&reply_topic);
+/// Publishes one attempt for every participant of `tasks`, then waits behind the stage deadline. Returns one
+/// contribution per participant.
+async fn run_round<P, S, R, B>(
+    wire: &StageWire,
+    transport: &NexusTransport<'_, P, S, R>,
+    tasks: &[Task],
+    attempt: u32,
+    build_request: &B,
+    merged: &[StageMerge],
+) -> Vec<Contribution>
+where
+    P: NexusPublisher,
+    S: NexusSubscriber,
+    R: NexusInbox,
+    B: Fn(&Task, &[StageMerge]) -> Vec<u8>,
+{
+    let mut contributions = Vec::with_capacity(tasks.len());
+    let mut pending: HashMap<String, usize> = HashMap::with_capacity(tasks.len());
     for (creation, task) in tasks.iter().enumerate() {
-        if let Err(error) = &subscribed {
-            contributions.push(failure(
-                stage,
-                creation,
-                task,
-                ErrorCode::Internal.as_str(),
-                format!("reply topic {reply_topic} is unavailable: {error}"),
-            ));
-            continue;
-        }
         let id = task_id_of(task);
         let message = NexusMessage {
-            topic: request_topic.clone(),
+            topic: wire.request_topic.clone(),
             correlation_id: id.to_string(),
             payload: build_request(task, merged),
         };
         match transport.publisher.publish(message) {
             Ok(()) => {
-                pending.insert(id.to_string(), (creation, task));
+                pending.insert(id.to_string(), creation);
             }
             Err(error) => contributions.push(failure(
-                stage,
+                wire.stage,
                 creation,
                 task,
+                attempt,
                 ErrorCode::Internal.as_str(),
                 format!("request publish failed: {error}"),
             )),
@@ -319,7 +383,7 @@ where
     }
 
     // Fan-in. The deadline is checked on every pass, so a flood of replies cannot hold the barrier.
-    let deadline = Instant::now() + config.stage_deadline;
+    let deadline = Instant::now() + wire.config.stage_deadline;
     loop {
         if pending.is_empty() {
             break;
@@ -328,25 +392,32 @@ where
         if remaining.is_zero() {
             break;
         }
-        match transport.inbox.receive(&reply_topic) {
+        match transport.inbox.receive(&wire.reply_topic) {
             Some(message) => {
-                if let Some((creation, task)) = pending.remove(&message.correlation_id) {
-                    contributions.push(from_reply(stage, creation, task, &message.payload));
+                if let Some(creation) = pending.remove(&message.correlation_id) {
+                    contributions.push(from_reply(
+                        wire.stage,
+                        creation,
+                        &tasks[creation],
+                        attempt,
+                        &message.payload,
+                    ));
                 }
             }
-            None => sleep(remaining.min(config.poll_interval)).await,
+            None => sleep(remaining.min(wire.config.poll_interval)).await,
         }
     }
 
-    for (id, (creation, task)) in pending {
+    for (id, creation) in pending {
         contributions.push(failure(
-            stage,
+            wire.stage,
             creation,
-            task,
+            &tasks[creation],
+            attempt,
             ErrorCode::Timeout.as_str(),
             format!(
-                "partial-join timeout: task {id} missed the stage {stage} barrier deadline of {:?}",
-                config.stage_deadline
+                "partial-join timeout: task {id} missed the stage {} barrier deadline of {:?}",
+                wire.stage, wire.config.stage_deadline
             ),
         ));
     }
@@ -371,18 +442,35 @@ fn merge_stage(stage: u32, contributions: Vec<Contribution>) -> StageMerge {
 }
 
 /// Builds the contribution for a reply, treating a malformed reply as a failure.
-fn from_reply(stage: u32, creation: usize, task: &Task, payload: &[u8]) -> Contribution {
+fn from_reply(
+    stage: u32,
+    creation: usize,
+    task: &Task,
+    attempt: u32,
+    payload: &[u8],
+) -> Contribution {
     match ParticipantReply::decode(payload) {
-        Ok(ParticipantReply::Completed(output)) => {
-            contribution(stage, creation, task, TaskOutcome::Completed, Some(output))
-        }
-        Ok(ParticipantReply::Failed(message)) => {
-            failure(stage, creation, task, ErrorCode::Internal.as_str(), message)
-        }
+        Ok(ParticipantReply::Completed(output)) => contribution(
+            stage,
+            creation,
+            task,
+            attempt,
+            TaskOutcome::Completed,
+            Some(output),
+        ),
+        Ok(ParticipantReply::Failed(message)) => failure(
+            stage,
+            creation,
+            task,
+            attempt,
+            ErrorCode::Internal.as_str(),
+            message,
+        ),
         Err(detail) => failure(
             stage,
             creation,
             task,
+            attempt,
             ErrorCode::Internal.as_str(),
             format!("malformed reply: {detail}"),
         ),
@@ -394,6 +482,7 @@ fn failure(
     stage: u32,
     creation: usize,
     task: &Task,
+    attempt: u32,
     code: &'static str,
     message: String,
 ) -> Contribution {
@@ -401,6 +490,7 @@ fn failure(
         stage,
         creation,
         task,
+        attempt,
         TaskOutcome::Failed { code, message },
         None,
     )
@@ -412,6 +502,7 @@ fn contribution(
     stage: u32,
     creation: usize,
     task: &Task,
+    attempt: u32,
     outcome: TaskOutcome,
     output: Option<Vec<u8>>,
 ) -> Contribution {
@@ -427,7 +518,7 @@ fn contribution(
             outcome,
             provenance: Provenance {
                 producer: agent_of(task).to_string(),
-                attempt: 1,
+                attempt,
                 verdict,
             },
         },
@@ -576,27 +667,29 @@ mod tests {
                 // No participant is registered for this task: it stays silent.
                 return Ok(());
             };
-            if let Behaviour::Reply { delay, reply } = behaviour {
-                let shared = Arc::clone(&self.shared);
-                let correlation_id = message.correlation_id;
-                tokio::spawn(async move {
-                    sleep(delay).await;
-                    if !shared.subscribed.lock().contains(&reply_topic) {
-                        return;
-                    }
-                    shared.arrivals.lock().push(correlation_id.clone());
-                    shared
-                        .inbox
-                        .lock()
-                        .entry(reply_topic.clone())
-                        .or_default()
-                        .push_back(NexusMessage {
-                            topic: reply_topic,
-                            correlation_id,
-                            payload: reply.encode(),
-                        });
-                });
-            }
+            let (delay, reply) = match behaviour {
+                Behaviour::Reply { delay, reply } => (delay, reply),
+                Behaviour::Silent => return Ok(()),
+            };
+            let shared = Arc::clone(&self.shared);
+            let correlation_id = message.correlation_id;
+            tokio::spawn(async move {
+                sleep(delay).await;
+                if !shared.subscribed.lock().contains(&reply_topic) {
+                    return;
+                }
+                shared.arrivals.lock().push(correlation_id.clone());
+                shared
+                    .inbox
+                    .lock()
+                    .entry(reply_topic.clone())
+                    .or_default()
+                    .push_back(NexusMessage {
+                        topic: reply_topic,
+                        correlation_id,
+                        payload: reply.encode(),
+                    });
+            });
             Ok(())
         }
     }
@@ -634,13 +727,23 @@ mod tests {
         NexusJoinConfig {
             stage_deadline: Duration::from_millis(deadline_ms),
             poll_interval: Duration::from_millis(2),
+            engine: Engine::Rust,
         }
     }
 
     fn plan(stages: Vec<Vec<Task>>) -> NexusPlan {
+        plan_with_engines(stages, &[])
+    }
+
+    /// A plan whose participants are declared on `engines`, keyed by task id. Participants not listed run on the pin.
+    fn plan_with_engines(stages: Vec<Vec<Task>>, engines: &[(&str, Engine)]) -> NexusPlan {
         NexusPlan {
             join_id: "join".to_string(),
             stages,
+            engines: engines
+                .iter()
+                .map(|(id, engine)| (id.to_string(), *engine))
+                .collect(),
         }
     }
 
@@ -937,6 +1040,7 @@ mod tests {
         let refused = NexusJoinConfig {
             stage_deadline: Duration::ZERO,
             poll_interval: Duration::from_millis(2),
+            engine: Engine::Rust,
         };
         assert!(run(&fake, &plan, refused).await.is_err());
         assert_eq!(fake.published(), 0);
@@ -965,5 +1069,44 @@ mod tests {
         assert!(ParticipantReply::decode(&[]).is_err());
         assert!(ParticipantReply::decode(&[9, 1]).is_err());
         assert!(ParticipantReply::decode(&[TAG_FAILED, 0xff]).is_err());
+    }
+
+    #[tokio::test]
+    async fn step_on_another_engine_refuses_the_join_before_any_publish() {
+        let fake = FakeNexus::with(vec![("a", stage_reply_topic("join", 0), ok(1, "a"))], false);
+        let plan = plan_with_engines(vec![vec![task("a", "x")]], &[("a", Engine::Python)]);
+        let error = run(&fake, &plan, config(1_000)).await.expect_err("a python step is refused");
+        assert!(error.to_string().contains("E-CONTRACT"), "{error}");
+        assert_eq!(fake.published(), 0);
+    }
+
+    #[tokio::test]
+    async fn participant_declared_on_other_engine_refuses_the_join_before_stage_zero_publishes() {
+        let fake = FakeNexus::with(
+            vec![
+                ("a", stage_reply_topic("join", 0), ok(1, "a")),
+                ("b", stage_reply_topic("join", 1), ok(1, "b")),
+            ],
+            false,
+        );
+        // The join is pinned to Python. Stage 0 runs on the pin; stage 1 declares Rust and refuses the join.
+        let plan = plan_with_engines(
+            vec![vec![task("a", "x")], vec![task("b", "x")]],
+            &[("b", Engine::Rust)],
+        );
+        let python = NexusJoinConfig {
+            engine: Engine::Python,
+            ..config(1_000)
+        };
+        let error = run(&fake, &plan, python)
+            .await
+            .expect_err("a rust step in a python join is refused");
+        assert!(error.to_string().contains("E-CONTRACT"), "{error}");
+        assert_eq!(fake.published(), 0);
+    }
+
+    #[test]
+    fn join_is_pinned_to_rust_by_default() {
+        assert_eq!(NexusJoinConfig::default().engine, Engine::Rust);
     }
 }

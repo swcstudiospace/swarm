@@ -12,6 +12,7 @@ pub mod dynamic;
 pub mod execution;
 pub mod force_parallel_dispatch;
 pub mod hitl;
+pub mod join_affinity_guard;
 pub mod matrix_join;
 pub mod nexus_barrier_join;
 mod panic_text;

@@ -21,6 +21,7 @@ use crate::dag_build::{build_dag_from, BuiltDag};
 use crate::force_parallel_dispatch::{
     run_force_parallel, DispatchConfig, DispatchMode, TaskFailure, TaskOutcome, WORKER_FAILURE_CODE,
 };
+use crate::join_affinity_guard::{Engine, JoinAffinityGuard};
 use crate::panic_text::panic_message;
 use crate::semaphore::SemaphoreManager;
 use crate::{MatrixScheduler, SchedulerError, SchedulerResult};
@@ -34,6 +35,8 @@ pub struct MatrixBatch {
     pub tasks: Vec<Task>,
     /// Attempt number per task id. A task absent from this map runs as attempt 1.
     pub attempts: HashMap<String, u32>,
+    /// Engine per task id. A task absent from this map runs on the join's pin.
+    pub engines: HashMap<String, Engine>,
 }
 
 /// Verdict recorded for one attempt, derived from its outcome.
@@ -152,7 +155,12 @@ struct TaskMeta {
 /// Every task holds one permit of the global pool in `semaphores` while it runs, so concurrent joins
 /// that share a pool stay within its size. `config.mode` must be [`DispatchMode::Continuous`]; the
 /// round barrier is rejected because this join path never waits for a round to finish.
+///
+/// `engine` is the join's pin. A task runs on `batch.engines[task id]` when that entry exists and on
+/// `engine` otherwise. A task on another engine refuses the whole batch with `E-CONTRACT` before any
+/// task is dispatched.
 pub async fn run_matrix_join<W, Fut>(
+    engine: Engine,
     batch: MatrixBatch,
     config: DispatchConfig,
     semaphores: Arc<SemaphoreManager>,
@@ -168,6 +176,15 @@ where
                 .to_string(),
         ));
     }
+    let guard = JoinAffinityGuard::new(format!("matrix-stage-{}", batch.stage), engine);
+    let step_engines = batch.tasks.iter().map(|task| {
+        batch
+            .engines
+            .get(task_id_of(task))
+            .copied()
+            .unwrap_or(engine)
+    });
+    guard.check_steps(step_engines)?;
     let built = build_dag_from(&batch.tasks, &[])?;
     let metas = join_metadata(&batch, &built)?;
 
@@ -281,6 +298,7 @@ impl MatrixScheduler {
     /// Runs a flat fan-out batch on this scheduler's global permit pool. See [`run_matrix_join`].
     pub async fn run_matrix_join<W, Fut>(
         &self,
+        engine: Engine,
         batch: MatrixBatch,
         config: DispatchConfig,
         worker: W,
@@ -289,7 +307,7 @@ impl MatrixScheduler {
         W: Fn(Task) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), TaskFailure>> + Send + 'static,
     {
-        run_matrix_join(batch, config, Arc::clone(&self.semaphores), worker).await
+        run_matrix_join(engine, batch, config, Arc::clone(&self.semaphores), worker).await
     }
 }
 
@@ -480,6 +498,7 @@ mod tests {
             stage,
             tasks,
             attempts: HashMap::new(),
+            engines: HashMap::new(),
         }
     }
 
@@ -551,13 +570,13 @@ mod tests {
     async fn arrival_order_shuffle_yields_identical_log() {
         let forward: [u64; 6] = [50, 40, 30, 20, 10, 0];
         let reversed: [u64; 6] = [0, 10, 20, 30, 40, 50];
-        let a = run_matrix_join(fixture(), config(), permits(), move |t: Task| {
+        let a = run_matrix_join(Engine::Rust, fixture(), config(), permits(), move |t: Task| {
             let ms = forward[index(&t)];
             mixed(t, ms)
         })
         .await
         .expect("forward run");
-        let b = run_matrix_join(fixture(), config(), permits(), move |t: Task| {
+        let b = run_matrix_join(Engine::Rust, fixture(), config(), permits(), move |t: Task| {
             let ms = reversed[index(&t)];
             mixed(t, ms)
         })
@@ -581,11 +600,17 @@ mod tests {
             task("c", &["a"]),
             task("d", &[]),
         ];
-        let report = run_matrix_join(batch(0, tasks), config(), permits(), |t: Task| async move {
-            let slow = t.id.as_ref().is_some_and(|id| id.value == "a");
-            tokio::time::sleep(Duration::from_millis(if slow { 30 } else { 0 })).await;
-            Ok(())
-        })
+        let report = run_matrix_join(
+            Engine::Rust,
+            batch(0, tasks),
+            config(),
+            permits(),
+            |t: Task| async move {
+                let slow = t.id.as_ref().is_some_and(|id| id.value == "a");
+                tokio::time::sleep(Duration::from_millis(if slow { 30 } else { 0 })).await;
+                Ok(())
+            },
+        )
         .await
         .expect("run");
         assert_eq!(ids(&report.log), vec!["a", "b", "d", "c"]);
@@ -596,9 +621,15 @@ mod tests {
     async fn every_record_carries_provenance() {
         let mut fx = fixture();
         fx.attempts.insert("t2".to_string(), 2);
-        let report = run_matrix_join(fx, config(), permits(), move |t: Task| mixed(t, 0))
-            .await
-            .expect("run");
+        let report = run_matrix_join(
+            Engine::Rust,
+            fx,
+            config(),
+            permits(),
+            move |t: Task| mixed(t, 0),
+        )
+        .await
+        .expect("run");
         for rec in report.log.records() {
             assert_eq!(rec.provenance.producer, "w");
             assert!(rec.provenance.attempt >= 1);
@@ -630,10 +661,16 @@ mod tests {
     #[tokio::test]
     async fn replay_of_recorded_dispatch_order_reproduces_log() {
         let forward: [u64; 6] = [50, 40, 30, 20, 10, 0];
-        let original = run_matrix_join(fixture(), config(), permits(), move |t: Task| {
-            let ms = forward[index(&t)];
-            mixed(t, ms)
-        })
+        let original = run_matrix_join(
+            Engine::Rust,
+            fixture(),
+            config(),
+            permits(),
+            move |t: Task| {
+                let ms = forward[index(&t)];
+                mixed(t, ms)
+            },
+        )
         .await
         .expect("original run");
         let reversed: [u64; 6] = [0, 10, 20, 30, 40, 50];
@@ -675,6 +712,7 @@ mod tests {
         let mut rounds = config();
         rounds.mode = DispatchMode::Rounds;
         assert!(run_matrix_join(
+            Engine::Rust,
             batch(0, vec![task("a", &[])]),
             rounds,
             permits(),
@@ -685,6 +723,7 @@ mod tests {
         let mut producerless = task("a", &[]);
         producerless.subagent_type = None;
         assert!(run_matrix_join(
+            Engine::Rust,
             batch(0, vec![producerless]),
             config(),
             permits(),
@@ -692,6 +731,29 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_on_other_engine_refuses_batch_before_dispatch() {
+        let mut fx = batch(0, vec![task("a", &[]), task("b", &[])]);
+        fx.engines.insert("b".to_string(), Engine::Python);
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dispatched);
+        let result = run_matrix_join(Engine::Rust, fx, config(), permits(), move |_t: Task| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<(), TaskFailure>(()) }
+        })
+        .await;
+        match result {
+            Err(SchedulerError::Other(message)) => {
+                assert!(
+                    message.starts_with("E-CONTRACT"),
+                    "unexpected refusal: {message}"
+                );
+            }
+            other => panic!("expected E-CONTRACT refusal, got {other:?}"),
+        }
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0, "no task may dispatch");
     }
 
     #[test]
@@ -766,7 +828,13 @@ mod tests {
 
         let first = tokio::time::timeout(
             Duration::from_millis(100),
-            run_matrix_join(thirty(0), wide(), Arc::clone(&semaphores), worker.clone()),
+            run_matrix_join(
+                Engine::Rust,
+                thirty(0),
+                wide(),
+                Arc::clone(&semaphores),
+                worker.clone(),
+            ),
         )
         .await;
         assert!(first.is_err(), "first join should still be blocked");
@@ -778,7 +846,7 @@ mod tests {
 
         let second = tokio::time::timeout(
             Duration::from_millis(200),
-            run_matrix_join(thirty(1), wide(), Arc::clone(&semaphores), worker),
+            run_matrix_join(Engine::Rust, thirty(1), wide(), Arc::clone(&semaphores), worker),
         )
         .await;
         assert!(second.is_err(), "second join should still be blocked");
