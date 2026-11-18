@@ -1084,6 +1084,6 @@ mod ship_visibility_tests {
         let pool = ThreadPool::new(cfg).unwrap();
         let st = pool.scale_within_cap(10).unwrap();
         assert_eq!(st, PoolState::Scaling);
-        assert!(pool.with_subagent_cap(ConcurrencyConfig { workers: 31, ..Default::default() }).is_err());
+        assert!(ThreadPool::with_subagent_cap(ConcurrencyConfig { workers: 31, ..Default::default() }).is_err());
     }
 }
