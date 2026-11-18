@@ -3,6 +3,8 @@
 //! This module deliberately depends on no scheduler or pool crate: those crates depend on this one,
 //! so the kinds are defined here and the callers convert their own errors into `ErrorKind`.
 
+use std::time::Duration;
+
 use crate::taxonomy::ErrorCode;
 
 /// Failure kinds emitted by the host-native scheduler and pool.
@@ -44,22 +46,63 @@ impl ErrorKind {
 
     /// Returns the shared taxonomy code this kind maps to.
     pub fn error_code(self) -> ErrorCode {
-        match self {
-            ErrorKind::Exhausted => ErrorCode::Capacity,
-            ErrorKind::CycleDetected => ErrorCode::Dep,
-            ErrorKind::Timeout => ErrorCode::Timeout,
-            ErrorKind::Dependency => ErrorCode::Dep,
-            ErrorKind::Contract => ErrorCode::Contract,
-            ErrorKind::Policy => ErrorCode::Policy,
-            ErrorKind::Input => ErrorCode::Input,
-            ErrorKind::Internal => ErrorCode::Internal,
-            ErrorKind::Capacity => ErrorCode::Capacity,
-        }
+        classify(self)
     }
 
     /// Returns the Python-side wire code string, e.g. `"E-CAPACITY"`.
     pub fn as_python_code(self) -> &'static str {
         self.error_code().as_str()
+    }
+}
+
+/// Maps a Rust-side failure kind onto its shared taxonomy code.
+///
+/// This is the Rust counterpart of Python's `swarm.errors.classify()`: the Python side
+/// dispatches on exception classes, while here the caller has already chosen the kind.
+pub fn classify(kind: ErrorKind) -> ErrorCode {
+    match kind {
+        ErrorKind::Exhausted => ErrorCode::Capacity,
+        ErrorKind::CycleDetected => ErrorCode::Dep,
+        ErrorKind::Timeout => ErrorCode::Timeout,
+        ErrorKind::Dependency => ErrorCode::Dep,
+        ErrorKind::Contract => ErrorCode::Contract,
+        ErrorKind::Policy => ErrorCode::Policy,
+        ErrorKind::Input => ErrorCode::Input,
+        ErrorKind::Internal => ErrorCode::Internal,
+        ErrorKind::Capacity => ErrorCode::Capacity,
+    }
+}
+
+/// Retry backoff data for one taxonomy code.
+///
+/// Delays double from `base` up to `cap`; each attempt adds up to `jitter` on top.
+/// At most `max_attempts` attempts are made. Behavior lives in the callers; this is data only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    /// Delay before the first retry.
+    pub base: Duration,
+    /// Upper bound on the exponential delay.
+    pub cap: Duration,
+    /// Maximum random jitter added to each delay.
+    pub jitter: Duration,
+    /// Maximum number of attempts, including the first.
+    pub max_attempts: u32,
+}
+
+/// Backoff for `E-DEP`: 1 s doubling to 60 s with jitter, max 5 attempts
+/// (`plan/rust-wasmer-omp-options.md` §2; `swarm/errors.py` `_exp_backoff_err` jitter of 0.3 s).
+pub const DEPENDENCY_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(1),
+    cap: Duration::from_secs(60),
+    jitter: Duration::from_millis(300),
+    max_attempts: 5,
+};
+
+/// Returns the backoff data for a taxonomy code, or `None` when the code has no exponential retry.
+pub fn backoff_for(code: ErrorCode) -> Option<Backoff> {
+    match code {
+        ErrorCode::Dep => Some(DEPENDENCY_BACKOFF),
+        _ => None,
     }
 }
 
@@ -104,6 +147,13 @@ mod tests {
     }
 
     #[test]
+    fn classify_agrees_with_error_code_for_all_kinds() {
+        for kind in ErrorKind::ALL {
+            assert_eq!(classify(kind), kind.error_code(), "{kind:?}");
+        }
+    }
+
+    #[test]
     fn python_code_round_trips_for_all_kinds() {
         for kind in ErrorKind::ALL {
             let wire = kind.as_python_code();
@@ -139,5 +189,32 @@ mod tests {
     fn unknown_wire_code_is_rejected() {
         assert_eq!(error_code_from_python("E-UNKNOWN"), None);
         assert_eq!(error_code_from_python(""), None);
+    }
+
+    #[test]
+    fn dependency_backoff_matches_plan_values() {
+        assert_eq!(
+            backoff_for(ErrorCode::Dep),
+            Some(Backoff {
+                base: Duration::from_secs(1),
+                cap: Duration::from_secs(60),
+                jitter: Duration::from_millis(300),
+                max_attempts: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn backoff_is_absent_for_codes_without_exponential_retry() {
+        for code in [
+            ErrorCode::Input,
+            ErrorCode::Timeout,
+            ErrorCode::Capacity,
+            ErrorCode::Contract,
+            ErrorCode::Policy,
+            ErrorCode::Internal,
+        ] {
+            assert_eq!(backoff_for(code), None, "{code}");
+        }
     }
 }
