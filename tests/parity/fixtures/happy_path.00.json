@@ -3,10 +3,10 @@
   "argv": ["orch_status.py", "--history", "T-1"],
   "stdin": "",
   "expected_exit": 0,
-  "expected_json_keys": ["status", "agent", "script", "task"],
+  "expected_json_keys": ["status", "task_id", "history", "verdicts", "missing_gate_reasons", "summary", "agent", "script"],
   "python": {
     "exit_code": 0,
-    "stdout": "{\n  \"status\": \"ok\",\n  \"agent\": \"A01\",\n  \"script\": \"orch_status\",\n  \"task\": {\n    \"task_id\": \"T-1\",\n    \"state\": \"CREATED\"\n  }\n}\n"
+    "stdout": "{\n  \"status\": \"ok\",\n  \"task_id\": \"T-1\",\n  \"history\": [\n    {\n      \"id\": 1,\n      \"task_id\": \"T-1\",\n      \"from_state\": null,\n      \"to_state\": \"CREATED\",\n      \"actor\": \"system\",\n      \"reason\": \"created\",\n      \"ts\": 1794988543.7279267\n    }\n  ],\n  \"verdicts\": {},\n  \"missing_gate_reasons\": {\n    \"review\": \"absent\"\n  },\n  \"summary\": \"history for T-1\",\n  \"agent\": \"A01\",\n  \"script\": \"orch_status\"\n}\n"
   },
   "rust": {
     "exit_code": 0,
@@ -16,5 +16,5 @@
     "returned": "python",
     "mismatch_recorded": true
   },
-  "provenance": "Hand-built for the mismatch-revert test (Phase 9 row 16). The Python reply is not captured from scripts/orch_status.py; no Python run was made for this record. The Rust reply differs on purpose (task state)."
+  "provenance": "Python leg: the live output of scripts/orch_status.py --history T-1, captured 2026-11-18 on a seeded store (one task T-1 created in state CREATED through TaskStore.create, correlation C-1, capability code.backend, agent A05). The ts value is the capture-time timestamp. Rust leg: a deliberate synthetic divergence (state DONE) so that the mismatch test has two different replies; it is not a captured gsd_engine reply."
 }
