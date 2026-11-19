@@ -129,7 +129,7 @@ async fn insert_rows(path: &Path, rows: &[(&str, Fields)]) {
                 other => panic!("column {name}: no SQL value for {other:?}"),
             };
         }
-        insert.execute(&mut conn).await.expect(&sql);
+        insert.execute(&mut conn).await.expect("insert rows");
     }
     sqlx::query("COMMIT")
         .execute(&mut conn)
