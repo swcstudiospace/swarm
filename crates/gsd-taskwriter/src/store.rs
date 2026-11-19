@@ -473,7 +473,8 @@ impl Tx {
             sql.push_str("=?");
         }
         sql.push_str(", updated_at=? WHERE task_id=? AND state=?");
-        let mut update = sqlx::query(&sql).bind(change.to);
+        // Audited: `sql` is fixed fragments plus PlanColumn::column() enum names only; no user input.
+        let mut update = sqlx::query(sqlx::AssertSqlSafe(&sql)).bind(change.to);
         for column in change.columns {
             update = match column {
                 PlanColumn::Attempt(value) | PlanColumn::ReworkLoops(value) => update.bind(*value),
@@ -577,7 +578,8 @@ impl Tx {
             "UPDATE tasks SET {}=?, updated_at=? WHERE task_id=?",
             column.column()
         );
-        let done = sqlx::query(&sql)
+        // Audited: `sql` is a fixed fragment plus the TextColumn::column() enum name only; no user input.
+        let done = sqlx::query(sqlx::AssertSqlSafe(&sql))
             .bind(text)
             .bind(updated_at)
             .bind(task_id)
