@@ -21,7 +21,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn, TypeGuard
 
 LEDGER_KEY_FIELDS = ("task_id", "stage", "join_seq", "attempt")
 RECORD_KEY_FIELDS = ("stage", "depth", "creation", "task_id")
@@ -39,7 +39,7 @@ def ledger_path_for(swarm_dir: Path, correlation: str) -> Path:
     return Path(swarm_dir) / "joins" / f"{correlation}.jsonl"
 
 
-def emit(ledger_path: Path, key: dict, log: list[dict]) -> str:
+def emit(ledger_path: Path, key: dict[Any, Any], log: list[dict[Any, Any]]) -> str:
     """Append one join line unless its key is already present. Returns ``"collected"`` or ``"deduplicated"``."""
     path = Path(ledger_path)
     _check_ledger_key(key, "key")
@@ -75,7 +75,7 @@ def emit(ledger_path: Path, key: dict, log: list[dict]) -> str:
     return "collected"
 
 
-def read_ledger(ledger_path: Path) -> list[tuple[dict, list[dict]]]:
+def read_ledger(ledger_path: Path) -> list[tuple[dict[Any, Any], list[dict[Any, Any]]]]:
     """Return the ``(key, log)`` pairs in file order; an absent file reads as an empty ledger."""
     path = Path(ledger_path)
     try:
@@ -91,12 +91,12 @@ def read_ledger(ledger_path: Path) -> list[tuple[dict, list[dict]]]:
     return _parse(data, str(path))
 
 
-def _parse(data: bytes, where: str) -> list[tuple[dict, list[dict]]]:
+def _parse(data: bytes, where: str) -> list[tuple[dict[Any, Any], list[dict[Any, Any]]]]:
     if not data:
         return []
     if not data.endswith(b"\n"):
         _fail(where, "final line is not newline-terminated")
-    entries: list[tuple[dict, list[dict]]] = []
+    entries: list[tuple[dict[Any, Any], list[dict[Any, Any]]]] = []
     for lineno, raw in enumerate(data.split(b"\n")[:-1], start=1):
         line_where = f"{where}:{lineno}"
         try:
@@ -110,7 +110,7 @@ def _parse(data: bytes, where: str) -> list[tuple[dict, list[dict]]]:
     return entries
 
 
-def _record_sort_key(record: dict) -> tuple:
+def _record_sort_key(record: dict[Any, Any]) -> tuple[Any, ...]:
     k = record["key"]
     return (k["stage"], k["depth"], k["creation"], k["task_id"])
 
@@ -134,28 +134,28 @@ def _check(value: object, kind: str, where: str) -> None:
         _fail(where, f"expected {kind.replace('|', ' or ')}")
 
 
-def _exact(obj: object, names: tuple[str, ...], where: str) -> None:
-    if not isinstance(obj, dict):
-        _fail(where, "expected an object")
+def _exact(obj: object, names: tuple[str, ...], where: str) -> TypeGuard[dict[Any, Any]]:
+    _fail(where, "expected an object")
     if set(obj) != set(names):
         _fail(where, f"expected fields {sorted(names)}, got {sorted(obj)}")
+    return True
 
 
-def _check_ledger_key(key: object, where: str) -> None:
+def _check_ledger_key(key: dict[Any, Any], where: str) -> None:
     _exact(key, LEDGER_KEY_FIELDS, where)
     _check(key["task_id"], "str", f"{where}.task_id")
     for name in ("stage", "join_seq", "attempt"):
         _check(key[name], "int", f"{where}.{name}")
 
 
-def _check_record_key(key: object, where: str) -> None:
+def _check_record_key(key: dict[Any, Any], where: str) -> None:
     _exact(key, RECORD_KEY_FIELDS, where)
     _check(key["task_id"], "str", f"{where}.task_id")
     for name in ("stage", "depth", "creation"):
         _check(key[name], "int", f"{where}.{name}")
 
 
-def _check_outcome(outcome: object, where: str) -> None:
+def _check_outcome(outcome: dict[Any, Any], where: str) -> None:
     if not isinstance(outcome, dict):
         _fail(where, "expected an object")
     kind = outcome.get("kind")
@@ -172,7 +172,7 @@ def _check_outcome(outcome: object, where: str) -> None:
         _fail(where, f"unknown outcome kind {kind!r}; expected one of {list(OUTCOME_KINDS)}")
 
 
-def _check_record(record: object, where: str) -> None:
+def _check_record(record: dict[Any, Any], where: str) -> None:
     _exact(record, ("key", "outcome", "provenance"), where)
     _check_record_key(record["key"], f"{where}.key")
     _check_outcome(record["outcome"], f"{where}.outcome")
