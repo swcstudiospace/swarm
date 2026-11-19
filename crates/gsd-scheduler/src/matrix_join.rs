@@ -570,16 +570,28 @@ mod tests {
     async fn arrival_order_shuffle_yields_identical_log() {
         let forward: [u64; 6] = [50, 40, 30, 20, 10, 0];
         let reversed: [u64; 6] = [0, 10, 20, 30, 40, 50];
-        let a = run_matrix_join(Engine::Rust, fixture(), config(), permits(), move |t: Task| {
-            let ms = forward[index(&t)];
-            mixed(t, ms)
-        })
+        let a = run_matrix_join(
+            Engine::Rust,
+            fixture(),
+            config(),
+            permits(),
+            move |t: Task| {
+                let ms = forward[index(&t)];
+                mixed(t, ms)
+            },
+        )
         .await
         .expect("forward run");
-        let b = run_matrix_join(Engine::Rust, fixture(), config(), permits(), move |t: Task| {
-            let ms = reversed[index(&t)];
-            mixed(t, ms)
-        })
+        let b = run_matrix_join(
+            Engine::Rust,
+            fixture(),
+            config(),
+            permits(),
+            move |t: Task| {
+                let ms = reversed[index(&t)];
+                mixed(t, ms)
+            },
+        )
         .await
         .expect("reversed run");
         assert_ne!(
@@ -621,13 +633,9 @@ mod tests {
     async fn every_record_carries_provenance() {
         let mut fx = fixture();
         fx.attempts.insert("t2".to_string(), 2);
-        let report = run_matrix_join(
-            Engine::Rust,
-            fx,
-            config(),
-            permits(),
-            move |t: Task| mixed(t, 0),
-        )
+        let report = run_matrix_join(Engine::Rust, fx, config(), permits(), move |t: Task| {
+            mixed(t, 0)
+        })
         .await
         .expect("run");
         for rec in report.log.records() {
@@ -846,7 +854,13 @@ mod tests {
 
         let second = tokio::time::timeout(
             Duration::from_millis(200),
-            run_matrix_join(Engine::Rust, thirty(1), wide(), Arc::clone(&semaphores), worker),
+            run_matrix_join(
+                Engine::Rust,
+                thirty(1),
+                wide(),
+                Arc::clone(&semaphores),
+                worker,
+            ),
         )
         .await;
         assert!(second.is_err(), "second join should still be blocked");

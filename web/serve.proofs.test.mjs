@@ -33,9 +33,9 @@ async function closeServer(server) {
   });
 }
 
-// W-06 (NOT-REPRODUCED control): normalize() collapses a decoded "/../" before the lexical check, so
-// no request path reaches the 403 branch. A decoded traversal must stay inside web/ and be answered
-// from there, with the isolation headers.
+// W-06 (control): a decoded traversal that normalize() keeps inside web/ is answered from there, with the
+// isolation headers. The lexical 403 branch is reached by a path that decodes to "/" (for example "/%2F",
+// which decodes to "//" and normalizes to the root); its headers are proved in quality-L21.test.mjs.
 test("W-06 control: decoded traversal stays inside web/ and keeps isolation headers", async () => {
   const { server, url } = await startServer({ isolated: true, port: 0 });
   try {

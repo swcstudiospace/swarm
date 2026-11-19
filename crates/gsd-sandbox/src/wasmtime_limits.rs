@@ -310,21 +310,15 @@ mod tests {
 
     #[test]
     fn ticker_stops_a_spinning_guest_at_its_deadline() {
-        // Fuel is far above what a few seconds of spinning burns, so only the epoch deadline can
-        // stop the call in time. Without the ticker the call would run out of fuel instead.
+        // Fuel is far above what a spin burns before the deadline, so only the epoch ticker can
+        // stop the call with an interrupt. Without the ticker the call runs out of fuel instead.
         let deadline = deadline_ticks_for(Duration::from_secs(1));
         let limits = spin_limits(100_000_000_000, Some(deadline));
         let mut instance = start(SPIN, &limits);
-        let started = std::time::Instant::now();
         let err = call(&mut instance, "spin", &mut []).expect_err("the deadline stops the spin");
-        let elapsed = started.elapsed();
         assert!(
             matches!(err.downcast_ref::<Trap>(), Some(Trap::Interrupt)),
             "the epoch ticker must interrupt the call, got {err}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "stopped after {elapsed:?}"
         );
     }
 

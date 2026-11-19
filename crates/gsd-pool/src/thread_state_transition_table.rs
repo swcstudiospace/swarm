@@ -121,8 +121,7 @@ pub fn retry_reset(from: ThreadPhase) -> PoolResult<ThreadPhase> {
 ///
 /// The join path applies it only to a thread that ended by a join timeout (`terminal_reason` `timed_out`). It is
 /// kept out of [`allowed_successors`] for the same reason as [`RETRY_RESET`].
-pub const RETRY_RESET_FAILED: (ThreadPhase, ThreadPhase) =
-    (ThreadPhase::Failed, ThreadPhase::Idle);
+pub const RETRY_RESET_FAILED: (ThreadPhase, ThreadPhase) = (ThreadPhase::Failed, ThreadPhase::Idle);
 
 /// Applies the failed-thread retry reset to `from` and returns `IDLE`.
 /// Every other phase is refused with `PoolError::InvalidState`.
@@ -224,7 +223,10 @@ mod tests {
 
     #[test]
     fn retry_reset_stays_out_of_the_general_table() {
-        assert!(!is_legal_transition(ThreadPhase::CancelledTimedOut, ThreadPhase::Idle));
+        assert!(!is_legal_transition(
+            ThreadPhase::CancelledTimedOut,
+            ThreadPhase::Idle
+        ));
         assert!(allowed_successors(ThreadPhase::CancelledTimedOut).is_empty());
     }
 

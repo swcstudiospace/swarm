@@ -41,7 +41,6 @@ pub use ready_frontier::*;
 pub use scheduler::{DispatchDecision, Scheduler, SchedulerConfig, ValidatedGraph};
 pub use semaphore::*;
 
-
 use gsd_proto::gsd::v1::TaskId;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};

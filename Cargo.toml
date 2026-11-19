@@ -64,7 +64,7 @@ config = { version = "0.14", features = ["yaml", "toml"] }
 figment = { version = "0.10", features = ["yaml", "toml"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 aws-sdk-s3 = "1.6"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "json", "uuid", "chrono"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "uuid", "chrono"] }
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager", "script", "streams"] }
 minijinja = { version = "2.9", features = ["serde", "loader"] }
 termtree = "0.5"

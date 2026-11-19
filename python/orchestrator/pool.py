@@ -40,12 +40,11 @@ ORCH_DIR = Path(__file__).parent
 if str(ORCH_DIR) not in sys.path:
     sys.path.insert(0, str(ORCH_DIR))
 
-from swarm.errors import ErrorCode, SwarmError  # type: ignore  # python truth
+from swarm.errors import ErrorCode, SwarmError  # type: ignore  # noqa: E402
 
-from decomposer import (  # type: ignore  # sibling load for integration
+from decomposer import (  # type: ignore  # noqa: E402  # sibling load for integration
     DecomposerState,
     StructuredTask,
-    SubTask,
     TaskDecomposer,
 )
 

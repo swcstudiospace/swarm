@@ -1251,7 +1251,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_past_the_cooperative_window_ends_failed_timed_out() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1290,14 +1290,11 @@ mod tests {
                 .map(String::as_str),
             Some("timed_out")
         );
-        assert_eq!(
-            state_kind(&session, "th1"),
-            ThreadStateKind::Failed as i32
-        );
+        assert_eq!(state_kind(&session, "th1"), ThreadStateKind::Failed as i32);
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_that_stops_inside_the_window_ends_cancelled_with_reason() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1368,7 +1365,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_join_retried_under_the_same_key_applies_its_completion_once() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1457,7 +1454,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_join_retried_under_the_same_key_applies_its_completion_once() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1542,7 +1539,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_attempt_is_reset_and_retried_once_per_key() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1672,13 +1669,19 @@ mod tests {
             "one worker run per attempt; replays run none"
         );
         assert_eq!(ledger.len(), 2);
-        assert_eq!(ledger.log(&attempt_1).map(|log| log.records().len()), Some(1));
-        assert_eq!(ledger.log(&attempt_2).map(|log| log.records().len()), Some(1));
+        assert_eq!(
+            ledger.log(&attempt_1).map(|log| log.records().len()),
+            Some(1)
+        );
+        assert_eq!(
+            ledger.log(&attempt_2).map(|log| log.records().len()),
+            Some(1)
+        );
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_thread_is_refused_by_a_join_that_is_not_a_retry() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1724,7 +1727,10 @@ mod tests {
         )
         .await;
         match refused {
-            Err(JoinError::NotIdle { thread, phase: found }) => {
+            Err(JoinError::NotIdle {
+                thread,
+                phase: found,
+            }) => {
                 assert_eq!(thread, "th1");
                 assert_eq!(found, "CANCELLED_TIMED_OUT");
             }
@@ -1736,7 +1742,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_attempt_is_reset_and_retried_once_per_key() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1869,8 +1875,14 @@ mod tests {
             "one worker run per attempt; replays run none"
         );
         assert_eq!(ledger.len(), 2);
-        assert_eq!(ledger.log(&attempt_1).map(|log| log.records().len()), Some(1));
-        assert_eq!(ledger.log(&attempt_2).map(|log| log.records().len()), Some(1));
+        assert_eq!(
+            ledger.log(&attempt_1).map(|log| log.records().len()),
+            Some(1)
+        );
+        assert_eq!(
+            ledger.log(&attempt_2).map(|log| log.records().len()),
+            Some(1)
+        );
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
         Ok(())
     }
@@ -1884,7 +1896,9 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         // Attempt 1 fails outright with no cancel, so the thread ends FAILED with no terminal reason.
         let failing = |_task: Task, _cancel: CancelSignal| {
-            std::future::ready(Err::<(), TaskFailure>(TaskFailure::Exception("boom".to_string())))
+            std::future::ready(Err::<(), TaskFailure>(TaskFailure::Exception(
+                "boom".to_string(),
+            )))
         };
         let first = collect_matrix_completions(
             &ctx,
@@ -1915,7 +1929,10 @@ mod tests {
         )
         .await;
         match refused {
-            Err(JoinError::NotIdle { thread, phase: found }) => {
+            Err(JoinError::NotIdle {
+                thread,
+                phase: found,
+            }) => {
                 assert_eq!(thread, "th1");
                 assert_eq!(found, "FAILED");
             }
@@ -1983,7 +2000,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn nexus_cancel_past_the_window_stops_every_started_thread() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1"), ("th2", "t2")], 1).await?);
         let (control, signal) = cancel_channel();

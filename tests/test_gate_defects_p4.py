@@ -179,7 +179,6 @@ def test_malformed_allow_list_is_e_input(tmp_path):
     assert exc.value.code is ErrorCode.E_INPUT
 
 
-@pytest.mark.xfail(strict=True, reason="BLOCKED P4-21: Rust mirror crates/gsd-adapter/src/gates/rel_plan.rs read_freeze must reject a non-object record (RS-02)")
 @pytest.mark.parametrize("body", ["[]", "7"])
 def test_release_freeze_non_dict_is_unreadable(body, tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))

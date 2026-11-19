@@ -384,8 +384,8 @@ def _bind_graph(args, ctx, corr: str, brief: str, tasks: list[dict]) -> None:
                 "graph_id": graph_id, "repo": substrate_tee.repo_slug(ctx.root), "surface": substrate_tee.ORCH_SURFACE,
                 "status": "planned",
                 "nodes": [{"node_id": t["task_id"]} for t in tasks]}, surface=substrate_tee.ORCH_SURFACE)
-    except Exception:  # noqa: BLE001 - substrate never changes the plan's outcome
-        pass
+    except Exception as exc:  # noqa: BLE001 - substrate never changes the plan's outcome
+        _LOG.warning("orch_plan: substrate graph binding failed (%s)", type(exc).__name__)
 
 
 def run(args, ctx) -> dict:

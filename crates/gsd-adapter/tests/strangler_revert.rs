@@ -8,7 +8,10 @@ use gsd_adapter::strangler_seam::{invoke_python_truth, CoreBackend, Invocation};
 use gsd_route::{Reply, SeamError};
 use serde_json::Value;
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/parity/fixtures/happy_path.00.json");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/parity/fixtures/happy_path.00.json"
+);
 
 /// A backend that answers every entrypoint with one canned reply and touches nothing else.
 struct Canned(Reply);
@@ -71,17 +74,25 @@ fn strings(value: &Value, field: &str) -> Vec<String> {
 
 fn reply_of(value: &Value) -> Reply {
     Reply {
-        exit_code: value["exit_code"].as_i64().expect("reply.exit_code is an integer") as i32,
-        stdout: value["stdout"].as_str().expect("reply.stdout is a string").to_string(),
+        exit_code: value["exit_code"]
+            .as_i64()
+            .expect("reply.exit_code is an integer") as i32,
+        stdout: value["stdout"]
+            .as_str()
+            .expect("reply.stdout is a string")
+            .to_string(),
     }
 }
 
 fn load_fixture() -> Fixture {
     let text = std::fs::read_to_string(FIXTURE).unwrap_or_else(|e| panic!("read {FIXTURE}: {e}"));
-    let value: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {FIXTURE}: {e}"));
+    let value: Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {FIXTURE}: {e}"));
     Fixture {
         argv: strings(&value, "argv"),
-        expected_exit: value["expected_exit"].as_i64().expect("expected_exit is an integer"),
+        expected_exit: value["expected_exit"]
+            .as_i64()
+            .expect("expected_exit is an integer"),
         expected_json_keys: strings(&value, "expected_json_keys"),
         python: reply_of(&value["python"]),
         rust: reply_of(&value["rust"]),
@@ -97,8 +108,13 @@ fn load_fixture() -> Fixture {
 
 /// The seam call of the fixture: `argv[0]` names the script, the rest are its flags.
 fn invocation(fixture: &Fixture) -> Invocation {
-    let (script, flags) = fixture.argv.split_first().expect("fixture argv is not empty");
-    let script = script.strip_suffix(".py").expect("fixture argv[0] names a .py script");
+    let (script, flags) = fixture
+        .argv
+        .split_first()
+        .expect("fixture argv is not empty");
+    let script = script
+        .strip_suffix(".py")
+        .expect("fixture argv[0] names a .py script");
     Invocation {
         agent: "A01".to_string(),
         script: script.to_string(),
@@ -113,7 +129,10 @@ fn invocation(fixture: &Fixture) -> Invocation {
 #[test]
 fn mismatch_returns_python_reply_and_records_the_difference() {
     let fixture = load_fixture();
-    assert_ne!(fixture.python, fixture.rust, "the fixture must hold two different replies");
+    assert_ne!(
+        fixture.python, fixture.rust,
+        "the fixture must hold two different replies"
+    );
     let call = invocation(&fixture);
     let python = Canned(fixture.python.clone());
     let rust = Canned(fixture.rust.clone());
@@ -122,7 +141,8 @@ fn mismatch_returns_python_reply_and_records_the_difference() {
 
     // The fixture's own sanity: its exit code and keys describe its Python reply.
     assert_eq!(i64::from(fixture.python.exit_code), fixture.expected_exit);
-    let python_json: Value = serde_json::from_str(&fixture.python.stdout).expect("Python stdout is JSON");
+    let python_json: Value =
+        serde_json::from_str(&fixture.python.stdout).expect("Python stdout is JSON");
     let mut keys: Vec<String> = python_json
         .as_object()
         .expect("Python stdout is a JSON object")

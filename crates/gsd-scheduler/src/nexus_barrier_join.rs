@@ -1075,7 +1075,9 @@ mod tests {
     async fn step_on_another_engine_refuses_the_join_before_any_publish() {
         let fake = FakeNexus::with(vec![("a", stage_reply_topic("join", 0), ok(1, "a"))], false);
         let plan = plan_with_engines(vec![vec![task("a", "x")]], &[("a", Engine::Python)]);
-        let error = run(&fake, &plan, config(1_000)).await.expect_err("a python step is refused");
+        let error = run(&fake, &plan, config(1_000))
+            .await
+            .expect_err("a python step is refused");
         assert!(error.to_string().contains("E-CONTRACT"), "{error}");
         assert_eq!(fake.published(), 0);
     }

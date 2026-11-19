@@ -110,16 +110,19 @@ pub fn backoff_for(code: ErrorCode) -> Option<Backoff> {
 ///
 /// Returns `None` for any string that is not one of the seven codes.
 pub fn error_code_from_python(code: &str) -> Option<ErrorCode> {
-    match code {
-        "E-INPUT" => Some(ErrorCode::Input),
-        "E-TIMEOUT" => Some(ErrorCode::Timeout),
-        "E-DEP" => Some(ErrorCode::Dep),
-        "E-CAPACITY" => Some(ErrorCode::Capacity),
-        "E-CONTRACT" => Some(ErrorCode::Contract),
-        "E-POLICY" => Some(ErrorCode::Policy),
-        "E-INTERNAL" => Some(ErrorCode::Internal),
-        _ => None,
-    }
+    // The wire strings come from `ErrorCode::as_str` in gsd-codes, the one table; this list names the variants only.
+    const SHARED_CODES: [ErrorCode; 7] = [
+        ErrorCode::Input,
+        ErrorCode::Timeout,
+        ErrorCode::Dep,
+        ErrorCode::Capacity,
+        ErrorCode::Contract,
+        ErrorCode::Policy,
+        ErrorCode::Internal,
+    ];
+    SHARED_CODES
+        .into_iter()
+        .find(|known| known.as_str() == code)
 }
 
 #[cfg(test)]

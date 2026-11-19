@@ -2,8 +2,9 @@
 
 Supported keywords: type, required, enum, const, properties, items, additionalProperties, minimum, maximum,
 exclusiveMinimum, minItems, minLength, allOf, if/then. (const, minimum, maximum, minLength, allOf and if/then serve the v2.2
-event, live and handover schemas; `if` is matched by "validates with no errors".) Annotation keywords are ignored; an
-unknown type name raises ValueError.
+event, live and handover schemas; `if` is matched by "validates with no errors".) Annotation keywords (title, description,
+$schema, $id, $comment, default, examples, deprecated, readOnly, writeOnly) are ignored. Any other keyword and an unknown
+type name raise ValueError: an assertion this validator does not implement must not pass silently.
 Schemas are read-only at runtime; nothing in the swarm writes them.
 """
 from __future__ import annotations
@@ -24,6 +25,14 @@ _TYPES: dict[str, Callable[[object], bool]] = {
     "null": lambda v: v is None,
 }
 
+_KEYWORDS = frozenset({
+    "type", "required", "enum", "const", "properties", "items", "additionalProperties",
+    "minimum", "maximum", "exclusiveMinimum", "minItems", "minLength", "allOf", "if", "then",
+})
+_ANNOTATIONS = frozenset({
+    "$schema", "$id", "$comment", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
+})
+
 
 def load_schema(name: str) -> dict[str, Any]:
     with open(SCHEMA_DIR / f"{name}.json", encoding="utf-8") as f:
@@ -34,6 +43,9 @@ def load_schema(name: str) -> dict[str, Any]:
 def validate(obj: object, schema: dict[str, Any], path: str = "") -> list[str]:
     """Return a list of "<json-pointer>: message" errors; empty means valid."""
     where = path or "/"
+    unsupported = sorted(k for k in schema if k not in _KEYWORDS and k not in _ANNOTATIONS)
+    if unsupported:
+        raise ValueError(f"unsupported schema keyword {unsupported[0]!r} at {where}")
     if "type" in schema:
         types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
         unknown = [t for t in types if t not in _TYPES]

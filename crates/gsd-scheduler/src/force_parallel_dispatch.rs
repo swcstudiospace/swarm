@@ -371,7 +371,9 @@ where
             let dispatched = Instant::now();
             self.submitted_at.insert(id.value.clone(), dispatched);
             self.report.dispatch_order.push(id.value.clone());
-            self.report.dispatched_at.push((id.value.clone(), dispatched));
+            self.report
+                .dispatched_at
+                .push((id.value.clone(), dispatched));
             self.spawn_worker(id.value, task);
         }
         self.report.max_in_flight = self.report.max_in_flight.max(self.in_flight.len());
@@ -1087,7 +1089,10 @@ mod tests {
                 .iter()
                 .find(|(done, _)| done == id)
                 .expect("a completion instant per task");
-            assert!(dispatched < completed, "{id}: dispatched after it completed");
+            assert!(
+                dispatched < completed,
+                "{id}: dispatched after it completed"
+            );
         }
     }
 

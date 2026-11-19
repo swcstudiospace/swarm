@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -23,6 +24,8 @@ from swarm.paths import swarm_dir  # noqa: E402
 from swarm.script_base import AgentScript, Ctx, check_task_id  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState  # noqa: E402
 from scripts.swarm_run import assignment_prompt  # noqa: E402
+
+_LOG = logging.getLogger("swarm.orch_assign")
 
 
 class ReadOnlyTaskStore(TaskStore):
@@ -113,7 +116,8 @@ def run(args, ctx: Ctx) -> dict:
             raise SwarmError(ErrorCode.E_CONTRACT, "task requires a matching specialist capability")
         try:
             prompt = assignment_prompt(store, task, agent, ctx.root)
-        except Exception:
+        except Exception as exc:
+            _LOG.warning("orch_assign: canonical specialist prompt unavailable (%s)", type(exc).__name__)
             raise SwarmError(ErrorCode.E_CONTRACT, "canonical specialist prompt is unavailable") from None
         assignment = _assignment(prompt, task, agent)
         if not real_key_configured():
@@ -148,9 +152,10 @@ class AssignmentScript(AgentScript):
             return self.EXIT_OK
         except SwarmError as error:
             failure = error.to_dict()
-        except Exception:
+        except Exception as exc:
             # Persisted resource/manifest errors must not echo contents, private
-            # references or exception traces into stdout or a runlog.
+            # references or exception traces into stdout or a runlog; only the class name reaches stderr.
+            _LOG.warning("orch_assign: specialist assignment failed (%s)", type(exc).__name__)
             failure = SwarmError(ErrorCode.E_CONTRACT, "specialist assignment could not be produced safely").to_dict()
         self._print({"agent": self.agent_id, "script": self.name, "status": "error",
                      "error": failure}, as_json)

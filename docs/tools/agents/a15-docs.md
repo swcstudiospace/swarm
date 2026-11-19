@@ -18,7 +18,7 @@ Capabilities: `docs.bundle`, `docs.api`, `docs.runbook`, `docs.changelog`.
 
 Consumes: `requirements.spec`, `architecture.blueprint`, `api.contract`, `code.patch`, `release.record`, `slo.manifest`, `dr.runbook`, `service.catalog.entry`, `event.schema.set`, `audit.report`, `promotion.record`, `dapp.integration.spec`.
 
-Produces: `docs.bundle`, `api.reference`, `runbook`, `changelog`.
+Produces: `docs.bundle`, `api.reference`, `runbook`, `changelog`, `doc.coverage.report`.
 
 ## Lane tools
 

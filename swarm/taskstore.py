@@ -572,11 +572,12 @@ class TaskStore:
     # ---- artifacts --------------------------------------------------------
     def add_artifact(self, task_id: str, *, kind: str, uri: str, version: str = "1",
                      digest: str = "", producer: str = "") -> None:
-        self.conn.execute("INSERT INTO artifacts (task_id, kind, uri, version, digest, producer, ts)"
-                          " VALUES (?,?,?,?,?,?,?)", (task_id, kind, uri, version, digest, producer, time.time()))
-        task = self.get(task_id)
-        outputs = task["outputs"] + [{"kind": kind, "uri": uri, "version": version, "digest": digest}]
-        self.update(task_id, outputs=outputs)
+        with self.transaction():
+            self.conn.execute("INSERT INTO artifacts (task_id, kind, uri, version, digest, producer, ts)"
+                              " VALUES (?,?,?,?,?,?,?)", (task_id, kind, uri, version, digest, producer, time.time()))
+            task = self.get(task_id)
+            outputs = task["outputs"] + [{"kind": kind, "uri": uri, "version": version, "digest": digest}]
+            self.update(task_id, outputs=outputs)
 
     # ---- DAG helpers ------------------------------------------------------
     def deps_satisfied(self, task: TaskRow, tasks: builtins.list[TaskRow] | None = None) -> bool:

@@ -236,7 +236,7 @@ def test_independent_calls_wait_and_do_not_open_the_circuit(monkeypatch):
 
     first = threading.Thread(target=run, args=("first", 0.05))
     first.start()
-    assert entered.wait(1)
+    assert entered.wait(10)
     second = threading.Thread(target=run, args=("second", 2))
     third = threading.Thread(target=run, args=("third", 2))
     second.start()

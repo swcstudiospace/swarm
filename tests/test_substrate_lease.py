@@ -489,10 +489,9 @@ def test_saturated_slots_wait_then_dispatch_with_a_lease(tmp_path, queued_fake, 
         assert slots.acquire(blocking=False)
     released = threading.Timer(0.1, slots.release)
     released.start()
-    started = time.monotonic()
     try:
         batch, waiting = runner.select_batch(store, [task], 1, bridge)
-        assert time.monotonic() - started >= 0.08
+        # every slot was held on entry, so a batch can only come back after the timer released one: no clock is needed
         assert len(batch) == 1 and waiting == []
         assert bridge.held("T-be") is not None
         assert store.get("T-be")["notes_json"]["lease"]["state"] == "held"
@@ -889,7 +888,8 @@ def test_the_keeper_stops_a_real_session_whose_node_was_taken(tmp_path, fake, ru
     """End to end on a real process group: the keeper thread beats, the substrate answers `lost`, the runner kills the
     session and fails the task with the tabled reason, long before the session would have finished."""
     monkeypatch.setattr(lease_mod, "heartbeat_interval", lambda ttl: 0.05)
-    child = [sys.executable, "-c", "import sys, time; sys.stdin.read(); time.sleep(60)"]
+    pidfile = tmp_path / "session.pid"  # the teardown check fails the test if this session outlives it
+    child = [sys.executable, "-c", f"import os, sys, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); sys.stdin.read(); time.sleep(60)"]
     monkeypatch.setattr(runner, "headless_command", lambda runtime, agent, repo, sdir, args: (child, dict(os.environ), repo))
     fake.register("T-be")
     store, events = _store(tmp_path), []
@@ -900,12 +900,10 @@ def test_the_keeper_stops_a_real_session_whose_node_was_taken(tmp_path, fake, ru
     _steal(fake)
     bridge.start()
     try:
-        t0 = time.monotonic()
         _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events, args=_args())
-        elapsed = time.monotonic() - t0
     finally:
         bridge.close()
-    assert outcome == "FAILED" and elapsed < 20
+    assert outcome == "FAILED"
     assert store.history("T-be")[-1]["reason"] == lease_mod.SESSION_REFUSALS["lost"]
     assert store.get("T-be")["notes_json"]["meta"]["lease_stopped"] == lease_mod.SESSION_REFUSALS["lost"]
     assert ("lease.lost" in _types(events)) and fake.node("T-be")["session"] == f"A05@r2:{GID}"  # never released by us

@@ -8,7 +8,7 @@
 //! Bidirectional: python callables passed as work fns are invoked from rust worker threads under attach GIL.
 //! Tests: roundtrips, concurrent submit/status/cancel, no deadlock under gil. Wave4: pool creation, submit, status, dispatch exposed so Python can call Rust ThreadPool (direct ctor + dispatch()).
 //!
-//! cargo check -p pyo3-bindings && (maturin develop -m pyo3/bindings/Cargo.toml || echo maturin may need py setup) && python -c 'import sys; sys.path.insert(0,"."); exec(open("tests/test_pyo3_binding.py").read() if False else "print(\"pytest side would import swarm_pyo3_pool and call bidirectional\")") ' 
+//! cargo check -p pyo3-bindings && (maturin develop -m pyo3/bindings/Cargo.toml || echo maturin may need py setup) && python -c 'import sys; sys.path.insert(0,"."); exec(open("tests/test_pyo3_binding.py").read() if False else "print(\"pytest side would import swarm_pyo3_pool and call bidirectional\")") '
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +70,9 @@ impl PyConcurrencyConfig {
         }
     }
     #[getter]
-    fn workers(&self) -> usize { self.inner.workers }
+    fn workers(&self) -> usize {
+        self.inner.workers
+    }
 }
 
 /// Metrics py view
@@ -121,7 +123,7 @@ impl PySubTask {
 }
 
 /// SubResult py view
- #[pyclass(name = "SubResult", module = "swarm._pool", get_all)]
+#[pyclass(name = "SubResult", module = "swarm._pool", get_all)]
 #[derive(Clone)]
 struct PySubResult {
     kind: String,
@@ -133,11 +135,17 @@ struct PySubResult {
 impl PySubResult {
     // getters provided by get_all + explicit for safety
     #[getter]
-    fn kind(&self) -> String { self.kind.clone() }
+    fn kind(&self) -> String {
+        self.kind.clone()
+    }
     #[getter]
-    fn value(&self) -> Option<String> { self.value.clone() }
+    fn value(&self) -> Option<String> {
+        self.value.clone()
+    }
     #[getter]
-    fn error(&self) -> Option<String> { self.error.clone() }
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
 }
 
 fn subresult_to_py(r: SubResult<String>) -> PySubResult {
@@ -236,11 +244,11 @@ impl PyThreadPool {
             let py_callable = work_obj;
             let work = move || -> Result<String, TaskError> {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Python::attach(|py| {
-                        match py_callable.bind(py).call0() {
-                            Ok(v) => v.extract::<String>().map_err(|e| TaskError::Other(e.to_string())),
-                            Err(e) => Err(TaskError::Other(e.to_string())),
-                        }
+                    Python::attach(|py| match py_callable.bind(py).call0() {
+                        Ok(v) => v
+                            .extract::<String>()
+                            .map_err(|e| TaskError::Other(e.to_string())),
+                        Err(e) => Err(TaskError::Other(e.to_string())),
                     })
                 }));
                 let r: Result<String, TaskError> = match res {

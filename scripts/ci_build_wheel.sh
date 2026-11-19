@@ -12,6 +12,10 @@
 # provide it on the host with rustup, e.g. `rustup toolchain install <channel> --profile minimal`,
 # so that ${RUSTUP_HOME:-$HOME/.rustup}/toolchains/<channel>-x86_64-unknown-linux-gnu exists.
 # That directory is mounted read-only into the container. The script fails if it is missing.
+#
+# The gsd-proto crate's build.rs invokes protoc (via prost-build) at compile time, so the
+# container must provide protoc before maturin runs. The script installs protobuf-compiler
+# with dnf/yum inside the manylinux container (see ensure_protoc and the docker branch).
 set -euo pipefail
 
 MANYLINUX_IMAGE="${SWARM_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_x86_64}"
@@ -34,7 +38,22 @@ out_dir="$(cd "$out_dir" && pwd)"
 
 in_manylinux() { [[ "${SWARM_WHEEL_IN_CONTAINER:-}" == "1" ]]; }
 
+ensure_protoc() {
+  if command -v protoc >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y protobuf-compiler
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y protobuf-compiler
+  else
+    echo "ci_build_wheel: protoc not found and no dnf/yum available; install protobuf-compiler on this host." >&2
+    return 1
+  fi
+}
+
 if in_manylinux || [[ "${SWARM_WHEEL_NO_DOCKER:-}" == "1" ]]; then
+  ensure_protoc
   maturin build \
     --release \
     --locked \
@@ -48,6 +67,8 @@ fi
 # /opt/python/cp312-cp312; maturin is pinned there so the wheel tooling is reproducible.
 # Rust: the pinned toolchain comes from the host rustup directory, mounted into the container.
 # Rust's Linux std binaries target glibc 2.17, so they run in the 2.28 image.
+# protoc: gsd-proto's build.rs needs protoc at compile time, so dnf installs
+# protobuf-compiler in the container before maturin (no protoc in the manylinux image).
 cargo_mounts=()
 host_registry="${CARGO_HOME:-$HOME/.cargo}/registry"
 if [[ -d "$host_registry" ]]; then
@@ -69,4 +90,4 @@ exec docker run --rm \
   "${cargo_mounts[@]}" \
   -w /io \
   "$MANYLINUX_IMAGE" \
-  bash -c "set -euo pipefail; export PATH=/opt/rust-toolchain/bin:\$PATH; /opt/python/cp312-cp312/bin/python -m pip install --quiet maturin==${MATURIN_VERSION}; /opt/python/cp312-cp312/bin/maturin build --release --locked --manifest-path crates/gsd-python/Cargo.toml --compatibility manylinux_2_28 --out /out"
+  bash -c "set -euo pipefail; export PATH=/opt/rust-toolchain/bin:\$PATH; if ! command -v protoc >/dev/null 2>&1; then dnf install -y protobuf-compiler || yum install -y protobuf-compiler; fi; /opt/python/cp312-cp312/bin/python -m pip install --quiet maturin==${MATURIN_VERSION}; /opt/python/cp312-cp312/bin/maturin build --release --locked --manifest-path crates/gsd-python/Cargo.toml --compatibility manylinux_2_28 --out /out"
