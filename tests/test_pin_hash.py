@@ -53,7 +53,7 @@ def test_workspace_wasmtime_dependency_matches_the_exact_security_pin():
     workspace = cargo["workspace"]
     runtime = workspace["dependencies"]["wasmtime"]
     version = workspace["metadata"]["gsd-pins"]["wasmtime"]
-    assert version == "50.0.1"
+    assert version == "50.0.2"
     assert runtime["version"] == f"={version}"
     assert "component-model" in runtime["features"]
 
