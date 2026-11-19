@@ -575,7 +575,8 @@ impl Tx {
         let mut qb = sqlx::QueryBuilder::new("UPDATE tasks SET ");
         qb.push(column.column());
         qb.push("=?, updated_at=? WHERE task_id=?");
-        let done = qb.build()
+        let done = qb
+            .build()
             .bind(text)
             .bind(updated_at)
             .bind(task_id)
