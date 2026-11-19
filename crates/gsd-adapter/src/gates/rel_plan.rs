@@ -246,8 +246,8 @@ fn freeze_present(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// The freeze record at `path`, or `None` when no freeze file is present. A file that cannot be statted is an active
-/// freeze with an unreadable record.
+/// The freeze record at `path`, or `None` when no freeze file is present. A file that cannot be statted, is not UTF-8, or does
+/// not parse to a JSON object is an active freeze with an unreadable record.
 fn read_freeze(path: &Path) -> Option<Json> {
     match freeze_present(path) {
         Ok(false) => None,
@@ -255,6 +255,7 @@ fn read_freeze(path: &Path) -> Option<Json> {
             fs::read_to_string(path)
                 .ok()
                 .and_then(|text| parse_json(&text).ok())
+                .filter(|record| matches!(record, Json::Obj(_)))
                 .unwrap_or_else(unreadable_freeze),
         ),
         Err(_) => Some(unreadable_freeze()),
@@ -1135,6 +1136,28 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("b"), dir.path().join("a")).expect("symlink");
         std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("b")).expect("symlink");
         assert!(read_freeze(&dir.path().join("a")).is_none());
+    }
+
+    /// P4-21 (RS-02): valid JSON that is not an object is an unreadable freeze, as the Python mirror reads it.
+    #[test]
+    fn a_freeze_record_that_is_not_an_object_is_unreadable() {
+        for body in ["[]", "7"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("release.freeze");
+            std::fs::write(&path, body).expect("write");
+            let record = read_freeze(&path).expect("a present freeze file is a freeze");
+            assert_eq!(record, super::unreadable_freeze(), "body {body}");
+        }
+    }
+
+    /// P4-21: a freeze file that is not UTF-8 is an unreadable freeze, as the Python mirror reads it.
+    #[test]
+    fn a_freeze_file_that_is_not_utf8_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("release.freeze");
+        std::fs::write(&path, [0xff_u8, 0xfe, b'{']).expect("write");
+        let record = read_freeze(&path).expect("a present freeze file is a freeze");
+        assert_eq!(record, super::unreadable_freeze());
     }
 
     /// ADG-07: a freeze file whose stat fails with EACCES is an active freeze, not an absent one. The freeze file is a symlink

@@ -338,7 +338,7 @@ open({str(marker)!r}, "w").close()
 
 def test_extension_load_failure_stops_before_any_tool(tmp_path):
     """The stderr line is the signal. The session's process group is stopped before the sleep that stands in
-    for a tool call, and the task fails E-DEP once."""
+    for a tool call, and the task fails E-POLICY once."""
     swarm = tmp_path / ".swarm"
     env = _env(swarm)
     work = _plan(tmp_path, env)
@@ -355,7 +355,7 @@ def test_extension_load_failure_stops_before_any_tool(tmp_path):
     assert launches.read_text().count("1") == 1
     assert _states(swarm)["T-one"] == "FAILED"
     reasons = _failed(swarm, "T-one")
-    assert len(reasons) == 1 and reasons[0].startswith("E-DEP") and "Failed to load extension" in reasons[0]
+    assert len(reasons) == 1 and reasons[0].startswith("E-POLICY") and "Failed to load extension" in reasons[0]
 
 
 def test_extension_load_failure_does_not_start_the_next_task(tmp_path):

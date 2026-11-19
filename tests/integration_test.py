@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -30,14 +29,14 @@ if str(ROOT) not in sys.path:
 # pure for swarm
 os.environ.setdefault("SWARM_PURE_PYTHON", "1")
 
-from python.orchestrator.decomposer import TaskDecomposer, SubTask as DecompSub  # type: ignore
-from python.orchestrator.pool import (  # type: ignore
+from python.orchestrator.decomposer import TaskDecomposer  # type: ignore  # noqa: E402
+from python.orchestrator.pool import (  # type: ignore  # noqa: E402
     OrchestrationPool,
     PoolConfig,
     TaskPhase,
     classify_error,
 )
-from swarm.errors import ErrorCode, SwarmError  # type: ignore
+from swarm.errors import ErrorCode, SwarmError  # type: ignore  # noqa: E402
 
 # Binding setup (safe: avoid submit if it would hang on current build; use create/status/cancel/config)
 PYO3_MODDIR = "/tmp/s_pyo3"
@@ -125,7 +124,7 @@ def test_rust_binding_layer_safe_paths_and_metrics():
     pool.shutdown(50)
     # config validate via new
     try:
-        bad = _rust_pool.ConcurrencyConfig(0, 1, 100, 1, 10)
+        _bad = _rust_pool.ConcurrencyConfig(0, 1, 100, 1, 10)
         assert False, "should validate"
     except Exception:
         pass  # E- or Value

@@ -9,7 +9,7 @@ Dispatch actually executes the work and waits for result.
 Wave 5: validation + security + graceful fallback wired (input validation, failure isolation, size configurable).
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import concurrent.futures
 from states import PoolState, SubagentState
 from decomposition import decompose_task
@@ -28,7 +28,7 @@ try:
         ValidationConfig,
     )
 except Exception:
-    get_configurable_pool_size = lambda s=30: max(1, min(s, 30))
+    def get_configurable_pool_size(s=30): return max(1, min(s, 30))
     def validate_subtask(s, c=None): return dict(s) if isinstance(s, dict) else {"id":"0", "description":str(s)}
     def security_validate(s, c=None): pass
     class ValidationConfig:

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{bounded, Receiver, Sender, TryRecvError, RecvTimeoutError};
+use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
 
@@ -25,8 +25,8 @@ use thiserror::Error;
 /// - WORKER_POLL: idle recv poll for shutdown/coop cancel; 100ms balances latency/CPU.
 /// - JOIN_WAIT: collection timeout in join (5s safe default matching prior behavior; task inner timeouts enforce per-task limits; hung worker may block join up to this - callers can use try_recv for non-blocking if needed).
 /// Wave 5 extension: MAX_WORKERS=30 (configurable default/cap; security + size per python_tools/validation + clarif q1).
- const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
- const JOIN_WAIT: Duration = Duration::from_secs(5);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const JOIN_WAIT: Duration = Duration::from_secs(5);
 const MAX_WORKERS: usize = 30;
 
 /// Pool lifecycle states per BUILD_PROMPT spec (state machine for multithreading subagent).
@@ -219,7 +219,10 @@ impl SubTask {
 #[derive(Debug, Clone)]
 pub enum SubResult<T> {
     Success(T),
-    Partial { partial: Option<T>, error: TaskError },
+    Partial {
+        partial: Option<T>,
+        error: TaskError,
+    },
     Failure(TaskError),
 }
 
@@ -268,9 +271,7 @@ impl<T: Send + 'static> SubTicket<T> {
                 Ok(res) => return res,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
-                    return SubResult::Failure(TaskError::Other(
-                        "worker disconnected".into(),
-                    ))
+                    return SubResult::Failure(TaskError::Other("worker disconnected".into()))
                 }
             }
         }
@@ -317,29 +318,29 @@ pub struct ConcurrencyConfig {
     pub backoff_cap_ms: u64,
 }
 
- impl Default for ConcurrencyConfig {
-     fn default() -> Self {
-         Self {
-             workers: 4,  // keep existing default; cap at MAX_WORKERS=30 (configurable max per clarifs q1)
-             queue_bound: 128,
-             default_timeout: Duration::from_secs(10),
-             backoff_base_ms: 10,
-             backoff_cap_ms: 500,
-         }
-     }
- }
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            workers: 4, // keep existing default; cap at MAX_WORKERS=30 (configurable max per clarifs q1)
+            queue_bound: 128,
+            default_timeout: Duration::from_secs(10),
+            backoff_base_ms: 10,
+            backoff_cap_ms: 500,
+        }
+    }
+}
 
- impl ConcurrencyConfig {
-     pub fn validate(&self) -> Result<(), TaskError> {
-         if self.workers == 0 {
-             return Err(TaskError::InvalidConfig("workers must be >0".into()));
-         }
-         if self.queue_bound == 0 {
-             return Err(TaskError::InvalidConfig("queue_bound must be >0".into()));
-         }
-         Ok(())
-     }
- }
+impl ConcurrencyConfig {
+    pub fn validate(&self) -> Result<(), TaskError> {
+        if self.workers == 0 {
+            return Err(TaskError::InvalidConfig("workers must be >0".into()));
+        }
+        if self.queue_bound == 0 {
+            return Err(TaskError::InvalidConfig("queue_bound must be >0".into()));
+        }
+        Ok(())
+    }
+}
 
 /// Internal job for the dispatch loop.
 struct Job {
@@ -364,7 +365,9 @@ pub struct ThreadPool {
 impl ThreadPool {
     pub fn new(config: ConcurrencyConfig) -> Result<Self, TaskError> {
         if config.workers > 30 {
-            return Err(TaskError::InvalidConfig("workers exceeds 30-subagent cap".into()));
+            return Err(TaskError::InvalidConfig(
+                "workers exceeds 30-subagent cap".into(),
+            ));
         }
         config.validate()?;
         let (work_tx, work_rx) = bounded(config.queue_bound);
@@ -407,7 +410,14 @@ impl ThreadPool {
                     .name(format!("concurrency-worker-{}", i))
                     .spawn(move || {
                         Self::worker_loop(
-                            i, rx, active, state, shutdown, progress, backoff_base, backoff_cap,
+                            i,
+                            rx,
+                            active,
+                            state,
+                            shutdown,
+                            progress,
+                            backoff_base,
+                            backoff_cap,
                         );
                     })
                     .map_err(|e| TaskError::Other(format!("spawn failed: {e}")))?;
@@ -551,7 +561,8 @@ impl ThreadPool {
                 }
             }
 
-            if matches!(&result_to_send, SubResult::Failure(TaskError::Other(msg)) if msg == "uninit") {
+            if matches!(&result_to_send, SubResult::Failure(TaskError::Other(msg)) if msg == "uninit")
+            {
                 result_to_send = SubResult::Failure(
                     last_err.unwrap_or_else(|| TaskError::Other("unknown worker error".into())),
                 );
@@ -561,7 +572,6 @@ impl ThreadPool {
 
             active.fetch_sub(1, Ordering::SeqCst);
             progress.notify_all();
-
         }
         progress.notify_all();
     }
@@ -582,11 +592,7 @@ impl ThreadPool {
     /// Non-blocking submit: dispatch to queue (bounded), returns ticket immediately.
     /// Uses the core primitives: constructs Job, dispatches via work_tx channel to worker threads
     /// (the subagent execution pool). Triggers Idle->Active if needed.
-    pub fn submit<F>(
-        &self,
-        mut task: SubTask,
-        work: F,
-    ) -> Result<SubTicket<String>, TaskError>
+    pub fn submit<F>(&self, mut task: SubTask, work: F) -> Result<SubTicket<String>, TaskError>
     where
         F: Fn() -> Result<String, TaskError> + Send + Sync + 'static,
     {
@@ -615,7 +621,15 @@ impl ThreadPool {
                 // Idle -> Active transition on submit (pool mgmt for subagent pool)
                 {
                     let mut s = self.state.lock();
-                    if !s.is_terminal() && matches!(*s, PoolState::Idle | PoolState::Active | PoolState::Initializing | PoolState::Scaling) {
+                    if !s.is_terminal()
+                        && matches!(
+                            *s,
+                            PoolState::Idle
+                                | PoolState::Active
+                                | PoolState::Initializing
+                                | PoolState::Scaling
+                        )
+                    {
                         *s = PoolState::Active;
                     }
                 }
@@ -629,11 +643,7 @@ impl ThreadPool {
     }
     /// Submits work fn (returning result), waits for completion and returns the SubResult.
     /// Non-async blocking wait for the ticket. Complements the non-blocking submit.
-    pub fn submit_wait<F>(
-        &self,
-        task: SubTask,
-        work: F,
-    ) -> SubResult<String>
+    pub fn submit_wait<F>(&self, task: SubTask, work: F) -> SubResult<String>
     where
         F: Fn() -> Result<String, TaskError> + Send + Sync + 'static,
     {
@@ -642,7 +652,6 @@ impl ThreadPool {
             Err(e) => SubResult::Failure(e),
         }
     }
-
 
     /// Batch dispatch for parallel execution of many subtasks.
     pub fn submit_batch<F>(
@@ -660,8 +669,7 @@ impl ThreadPool {
             return Err(TaskError::Shutdown);
         }
 
-        self.batch_inflight
-            .fetch_add(items.len(), Ordering::SeqCst);
+        self.batch_inflight.fetch_add(items.len(), Ordering::SeqCst);
 
         let mut tickets = Vec::with_capacity(items.len());
         for (mut task, work) in items {
@@ -695,7 +703,6 @@ impl ThreadPool {
             }
             results.push(r);
         }
-
 
         (successes, results)
     }
@@ -746,18 +753,20 @@ impl Drop for ThreadPool {
 }
 
 /// Top-level parallel execution helper: creates transient pool, dispatches, aggregates.
-pub fn execute_parallel<F>(tasks: Vec<(SubTask, F)>) -> Result<(usize, Vec<SubResult<String>>), TaskError>
+pub fn execute_parallel<F>(
+    tasks: Vec<(SubTask, F)>,
+) -> Result<(usize, Vec<SubResult<String>>), TaskError>
 where
     F: Fn() -> Result<String, TaskError> + Send + Sync + 'static,
 {
     if tasks.is_empty() {
         return Err(TaskError::Empty);
     }
-     let cfg = ConcurrencyConfig {
-        workers: std::cmp::min(MAX_WORKERS, tasks.len().max(1)),  // Wave 5: use configurable cap not hard 16
-         queue_bound: tasks.len().max(1) * 2,
-         ..Default::default()
-     };
+    let cfg = ConcurrencyConfig {
+        workers: std::cmp::min(MAX_WORKERS, tasks.len().max(1)), // Wave 5: use configurable cap not hard 16
+        queue_bound: tasks.len().max(1) * 2,
+        ..Default::default()
+    };
     let pool = ThreadPool::new(cfg)?;
     let tickets = pool.submit_batch(tasks)?;
     let (succ, res) = pool.join_batch(tickets);
@@ -785,7 +794,12 @@ pub mod tests {
         }
     }
 
-    fn failing_work(attempts_before_success: usize) -> (Arc<AtomicUsize>, impl Fn() -> Result<String, TaskError> + Send + Sync + 'static) {
+    fn failing_work(
+        attempts_before_success: usize,
+    ) -> (
+        Arc<AtomicUsize>,
+        impl Fn() -> Result<String, TaskError> + Send + Sync + 'static,
+    ) {
         let counter = Arc::new(AtomicUsize::new(0));
         let c2 = counter.clone();
         let work = move || {
@@ -819,7 +833,11 @@ pub mod tests {
             tickets.push(tk);
         }
         let enqueue_time = start.elapsed();
-        assert!(enqueue_time < Duration::from_millis(50), "dispatch blocked caller: {:?}", enqueue_time);
+        assert!(
+            enqueue_time < Duration::from_millis(50),
+            "dispatch blocked caller: {:?}",
+            enqueue_time
+        );
 
         // Check progress during
         let m = pool.metrics();
@@ -906,14 +924,24 @@ pub mod tests {
             )
             .unwrap();
         let r = tk.wait(Duration::from_millis(10));
-        assert!(matches!(r, SubResult::Partial { error: TaskError::Timeout(_), .. }));
+        assert!(matches!(
+            r,
+            SubResult::Partial {
+                error: TaskError::Timeout(_),
+                ..
+            }
+        ));
 
         pool.cancel_all();
         let tk2 = pool.submit(SubTask::new("c1"), slow_work(1000)).unwrap();
         let r2 = tk2.wait(Duration::from_millis(50));
         assert!(matches!(
             r2,
-            SubResult::Partial { error: TaskError::Cancelled, .. } | SubResult::Failure(TaskError::Cancelled) | SubResult::Failure(TaskError::Shutdown)
+            SubResult::Partial {
+                error: TaskError::Cancelled,
+                ..
+            } | SubResult::Failure(TaskError::Cancelled)
+                | SubResult::Failure(TaskError::Shutdown)
         ));
 
         pool.shutdown(Duration::from_millis(50));
@@ -928,7 +956,10 @@ pub mod tests {
         };
         let pool = ThreadPool::new(cfg).unwrap();
 
-        let batch: Vec<(SubTask, Box<dyn Fn() -> Result<String, TaskError> + Send + Sync>)> = (0..5)
+        let batch: Vec<(
+            SubTask,
+            Box<dyn Fn() -> Result<String, TaskError> + Send + Sync>,
+        )> = (0..5)
             .map(|i| {
                 let st = SubTask::new(format!("b{}", i));
                 if i == 3 {
@@ -988,7 +1019,11 @@ pub mod tests {
         };
         let pool = ThreadPool::new(cfg).unwrap();
         // in-file style assert + test: initializes to Active post transition
-        assert_eq!(pool.state(), PoolState::Active, "pool(30) must initialize and reach Active");
+        assert_eq!(
+            pool.state(),
+            PoolState::Active,
+            "pool(30) must initialize and reach Active"
+        );
         assert_eq!(pool.metrics().active_threads, 0);
 
         // dispatch via submit primitive exercises Active state (Idle path covered in new+worker)
@@ -1001,7 +1036,9 @@ pub mod tests {
         assert!(r.is_success());
         assert_eq!(r.into_result().unwrap(), "thirty");
 
-        let tk2 = pool.submit(SubTask::new("p30-2"), quick_work("ok30")).unwrap();
+        let tk2 = pool
+            .submit(SubTask::new("p30-2"), quick_work("ok30"))
+            .unwrap();
         let r2 = tk2.wait(Duration::from_secs(1));
         assert!(r2.is_success());
 
@@ -1023,7 +1060,12 @@ pub mod tests {
         // Submit many to exercise concurrency at 30 scale
         let mut tickets = vec![];
         for i in 0..30 {
-            let tk = pool.submit(SubTask::new(format!("sim{}", i)), quick_work(&format!("ok{}", i))).unwrap();
+            let tk = pool
+                .submit(
+                    SubTask::new(format!("sim{}", i)),
+                    quick_work(&format!("ok{}", i)),
+                )
+                .unwrap();
             tickets.push(tk);
         }
         let (succ, ress) = pool.join_batch(tickets);
@@ -1031,7 +1073,11 @@ pub mod tests {
 
         // Force Error via a fatal-path simulation (shutdown error + state set)
         let _ = pool.shutdown(Duration::from_millis(1));
-        assert!(pool.state().is_terminal() || pool.state() == PoolState::Error || pool.state() == PoolState::Terminating);
+        assert!(
+            pool.state().is_terminal()
+                || pool.state() == PoolState::Error
+                || pool.state() == PoolState::Terminating
+        );
     }
 }
 // === Wave 5 / ship visibility: explicit 30 cap + Scaling/Error reachability ===
@@ -1042,7 +1088,8 @@ impl ThreadPool {
     pub fn with_subagent_cap(config: ConcurrencyConfig) -> Result<Self, TaskError> {
         if config.workers > SUBAGENT_CAP {
             return Err(TaskError::InvalidConfig(format!(
-                "workers {} exceeds SUBAGENT_CAP={}", config.workers, SUBAGENT_CAP
+                "workers {} exceeds SUBAGENT_CAP={}",
+                config.workers, SUBAGENT_CAP
             )));
         }
         Self::new(config)
@@ -1080,10 +1127,17 @@ mod ship_visibility_tests {
     use super::*;
     #[test]
     fn scaling_is_assigned_and_30_cap_enforced() {
-        let cfg = ConcurrencyConfig { workers: 4, ..Default::default() };
+        let cfg = ConcurrencyConfig {
+            workers: 4,
+            ..Default::default()
+        };
         let pool = ThreadPool::new(cfg).unwrap();
         let st = pool.scale_within_cap(10).unwrap();
         assert_eq!(st, PoolState::Scaling);
-        assert!(ThreadPool::with_subagent_cap(ConcurrencyConfig { workers: 31, ..Default::default() }).is_err());
+        assert!(ThreadPool::with_subagent_cap(ConcurrencyConfig {
+            workers: 31,
+            ..Default::default()
+        })
+        .is_err());
     }
 }

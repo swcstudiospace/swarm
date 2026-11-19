@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,6 +38,7 @@ use gsd_taskwriter::{
 use regex::Regex;
 use serde_json::Value;
 
+use super::is_executable_candidate;
 use crate::strangler_seam::{
     after_commit, before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
 };
@@ -786,11 +786,9 @@ fn which(binary: &str) -> Result<bool, SeamError> {
     let path = path
         .to_str()
         .ok_or_else(|| decline("PATH is not UTF-8; Python answers"))?;
-    Ok(path.split(':').any(|dir| {
-        fs::metadata(Path::new(dir).join(binary))
-            .map(|meta| !meta.is_dir() && meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }))
+    Ok(path
+        .split(':')
+        .any(|dir| is_executable_candidate(&Path::new(dir).join(binary))))
 }
 
 /// `manifest` glob match of `dep_audit`: a literal name must exist (`Path.exists`, following links); a name with one

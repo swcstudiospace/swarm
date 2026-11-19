@@ -318,14 +318,27 @@ test("escalation: no SIGKILL reaches the group after a SIGTERM'd child has exite
   const { cwd, root } = setup();
   const file = join(root, "pids.json");
   const ac = new AbortController();
+  const scheduled: FakeTimer[] = [];
+  const timers: BridgeTimers = {
+    setTimeout: (fn, ms) => {
+      const handle = new FakeTimer(ms, fn);
+      scheduled.push(handle);
+      return handle;
+    },
+    clearTimeout: (handle) => {
+      if (handle instanceof FakeTimer) handle.cleared = true;
+    },
+  };
   const kill = spyOn(process, "kill");
   try {
-    const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, signal: ac.signal });
+    const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, signal: ac.signal, timers });
     const pids = await pidsFrom(file);
     ac.abort();
     await rejection(p);
     await expectGroupDead(pids);
-    await Bun.sleep(3_300); // past the 3 s SIGTERM → SIGKILL grace
+    // the escalation timer is cleared once the child has exited, so no SIGKILL can fire later; read off the timer
+    // rather than by waiting out the real 3 s grace
+    expect(scheduled.find((t) => t.ms === 3_000)?.cleared).toBe(true);
     const toGroup = kill.mock.calls.filter(([target]) => target === -pids.child).map(([, sig]) => sig);
     expect(toGroup).toEqual(["SIGTERM"]);
   } finally {
@@ -359,10 +372,16 @@ test("sweep: a session's shutdown group-kills only its own in-flight children (W
   const [a, b] = sessions;
   const pidsA = await pidsFrom(a.file);
   const pidsB = await pidsFrom(b.file);
-  a.handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
+  const kill = spyOn(process, "kill");
+  try {
+    a.handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
+    // the sibling's group is never signalled; checked at the kill itself, so no sleep is needed to see one
+    expect(kill.mock.calls.some(([target]) => target === -pidsB.child)).toBe(false);
+  } finally {
+    kill.mockRestore();
+  }
   expect((await rejection(a.call)).code).toBe("E-INTERNAL");
   await expectGroupDead(pidsA);
-  await Bun.sleep(200);
   expect(alive(pidsB.child) && alive(pidsB.grandchild)).toBe(true); // the sibling session's child is untouched
   b.handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
   expect((await rejection(b.call)).code).toBe("E-INTERNAL");

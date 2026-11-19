@@ -116,7 +116,7 @@ def docs_link_targets(payload: dict[str, Any]) -> dict[str, Any]:
             "broken": broken,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("files", "links"))
 
 
 def _slug(text: str) -> str:
@@ -151,7 +151,7 @@ def docs_anchor_check(payload: dict[str, Any]) -> dict[str, Any]:
             "broken": broken,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("headings", "references"))
 
 
 def docs_changelog_section_order(payload: dict[str, Any]) -> dict[str, Any]:
@@ -177,7 +177,7 @@ def docs_changelog_section_order(payload: dict[str, Any]) -> dict[str, Any]:
             "out_of_order": out_of_order,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("sections",))
 
 
 def docs_conventional_groups(payload: dict[str, Any]) -> dict[str, Any]:
@@ -204,7 +204,7 @@ def docs_conventional_groups(payload: dict[str, Any]) -> dict[str, Any]:
             "unparsed": unparsed,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("subjects",))
 
 
 def _endpoint_key(text: str) -> tuple[str, str] | None:
@@ -247,7 +247,7 @@ def docs_api_endpoint_coverage(payload: dict[str, Any]) -> dict[str, Any]:
             "unmatched_documented": [text for key, text in documented.items() if key not in total],
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("total_endpoints",))
 
 
 def _syllables(word: str) -> int:
@@ -280,7 +280,7 @@ def docs_flesch_grade(payload: dict[str, Any]) -> dict[str, Any]:
             "within_target": grade <= payload.get("max_grade", 9),
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("text",))
 
 
 def docs_stale_doc_age(payload: dict[str, Any]) -> dict[str, Any]:
@@ -313,7 +313,7 @@ def docs_stale_doc_age(payload: dict[str, Any]) -> dict[str, Any]:
             "oldest_days": max(ages, default=0),
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("as_of", "max_age_days", "docs"))
 
 
 def docs_runbook_verified_ratio(payload: dict[str, Any]) -> dict[str, Any]:
@@ -346,7 +346,7 @@ def docs_runbook_verified_ratio(payload: dict[str, Any]) -> dict[str, Any]:
             "unverified": unverified,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("as_of", "runbooks", "max_age_days"))
 
 
 def docs_adr_render_coverage(payload: dict[str, Any]) -> dict[str, Any]:
@@ -374,7 +374,7 @@ def docs_adr_render_coverage(payload: dict[str, Any]) -> dict[str, Any]:
             "excluded": len(ids) - len(in_scope),
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("adrs", "rendered"))
 
 
 # --- v2.2 additions: runbook schema, digest staleness, terminology drift -----------------------------
@@ -451,7 +451,7 @@ def docs_runbook_schema_check(payload: dict[str, Any]) -> dict[str, Any]:
             "non_reversible_whitelisted": flagged,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("runbooks",))
 
 
 def docs_digest_staleness(payload: dict[str, Any]) -> dict[str, Any]:
@@ -500,7 +500,7 @@ def docs_digest_staleness(payload: dict[str, Any]) -> dict[str, Any]:
             "stale_scopes": sorted(scopes),
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("current", "docs"))
 
 
 def _prose_lines(text: str) -> list[tuple[int, str]]:
@@ -613,4 +613,4 @@ def docs_terminology_drift(payload: dict[str, Any]) -> dict[str, Any]:
             "pass_pct": round(clean * 100 / len(paths), 2),
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("glossary", "files"))

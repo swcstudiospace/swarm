@@ -4,7 +4,6 @@
 //! with configurable fan-out/fan-in and dynamic restructuring.
 //!
 //! See `docs/assumptions.md` for n6 ambiguity resolutions with defaults (GSD-Core contracts, decomposition rules=generic keyword based for independent/ordered, execution model, result aggregation=q2 flat list of per-subtask results, q1=structured (id, description, phase?, priority?, deps list), q3 goal=inline only no separate doc; pool 30). Refs SPE-33068 n6.8 etc; n7 synthesize; plans; Notion from graph.
-mod semaphore;
 pub mod aimd_limiter;
 pub mod clock;
 pub mod dag;
@@ -19,6 +18,7 @@ mod panic_text;
 pub mod policy;
 pub mod policy_config;
 pub mod ready_frontier;
+mod semaphore;
 
 pub use aimd_limiter::AimdLimiter;
 pub use dag::*;
@@ -33,7 +33,6 @@ pub use policy::*;
 pub use policy_config::*;
 pub use ready_frontier::*;
 pub use semaphore::*;
-
 
 use gsd_proto::gsd::v1::TaskId;
 use parking_lot::RwLock;

@@ -3,7 +3,7 @@
 //!
 //! It reads one JSON object from stdin, `{agent, script, argv, root, env}` plus, for a write call, the
 //! `effects_path` of the manifest the caller replays after the commit, passes `argv` through
-//! unchanged (the SDK runner appends `--json` to the child), and answers through [`invoke_routed`].
+//! unchanged (the SDK runner appends `--json` to the child), and answers on the Rust engine through `answer_on_rust`.
 //! `GSD_RUST_BACKEND` names the backend: `host` is host Rust, `sandbox` is [`SandboxEngine`] (OD-5),
 //! and unset or empty is [`DEFAULT_BACKEND`]; any other value is `E-INPUT`. Stdout is the reply and
 //! the exit code is the reply's exit code. When the sandbox fails over to host Rust (a read, or a write
@@ -24,9 +24,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use gsd_adapter::route_table::invoke_routed;
+use gsd_adapter::route_table::select_engine;
 use gsd_adapter::sandbox_engine::{failover_notice, SandboxEngine};
-use gsd_adapter::strangler_seam::{error_reply, CoreBackend, Invocation, PythonEngine, RustEngine};
+use gsd_adapter::strangler_seam::{
+    error_reply, invoke, CoreBackend, Entrypoint, Invocation, RustEngine,
+};
 use gsd_failure::ErrorCode;
 use gsd_route::{jstr, obj_get, parse_json, Json, Reply, SeamError};
 
@@ -168,16 +170,28 @@ fn answer_with<R: CoreBackend>(
     call: &Invocation,
     notice_of: impl Fn(&R) -> Option<String>,
 ) -> Answer {
-    let python = PythonEngine::new("python3");
     match rust {
         Ok(rust) => {
-            let reply = invoke_routed(Some("rust"), &python, &rust, call);
+            let reply = answer_on_rust(&rust, call);
             Answer {
                 reply,
                 notice: notice_of(&rust),
             }
         }
         Err(err) => plain(error_reply(&call.agent, &call.script, &err)),
+    }
+}
+
+/// Answers `call` on the Rust engine. This binary serves `GSD_ENGINE=rust` only, so it makes the route check `invoke_routed` makes for
+/// `rust`: a route Rust does not serve is the same `E-DEP` refusal. No Python engine is built, because `rust` never reaches it.
+fn answer_on_rust(rust: &impl CoreBackend, call: &Invocation) -> Reply {
+    match select_engine(
+        Some("rust"),
+        Entrypoint::from_script(&call.script),
+        &call.argv,
+    ) {
+        Ok(_) => invoke(rust, call),
+        Err(err) => error_reply(&call.agent, &call.script, &err),
     }
 }
 
@@ -365,6 +379,28 @@ mod tests {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let code = emit(answer, &mut stdout, &mut stderr);
         (stdout, stderr, code)
+    }
+
+    /// The binary answers a Rust-served route on the Rust engine itself, and refuses a route Rust does not serve with the `E-DEP`
+    /// refusal of the route check, with no Python engine in reach.
+    #[test]
+    fn answer_on_rust_serves_rust_routes_and_refuses_the_rest() -> Result<(), String> {
+        let rust = RustEngine::new().map_err(|e| e.message().to_string())?;
+        let call = |script: &str| {
+            invocation_from(&format!(
+                r#"{{"agent": "A01", "script": "{script}", "argv": ["--json"], "root": "/nonexistent-gsd-root", "env": {{}}}}"#
+            ))
+            .map_err(|e| e.message().to_string())
+        };
+        let served = call("orch_status")?;
+        assert_eq!(
+            answer_on_rust(&rust, &served).stdout,
+            invoke(&rust, &served).stdout
+        );
+        let refused = answer_on_rust(&rust, &call("swarm_run")?);
+        assert_eq!(refused.exit_code, 2);
+        assert!(refused.stdout.contains("E-DEP"), "{}", refused.stdout);
+        Ok(())
     }
 
     #[test]

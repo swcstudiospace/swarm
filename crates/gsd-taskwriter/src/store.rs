@@ -90,7 +90,7 @@ const REQUIRED_SCHEMA: [(&str, &[&str]); 4] = [
 ];
 
 /// JSON text columns of `tasks` and the text `TaskStore._row` parses when the stored value is empty.
-const JSON_COLUMNS: [(&str, &str); 5] = [
+pub(crate) const JSON_COLUMNS: [(&str, &str); 5] = [
     ("inputs", "[]"),
     ("outputs", "[]"),
     ("acceptance", "[]"),

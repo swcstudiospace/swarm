@@ -660,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_bucket() {
-        let bucket = TokenBucket::new(10, 10.0, Arc::new(RealClock::new())); // 10 tokens, refill 10/s
+        let bucket = TokenBucket::new(10, 10.0, Arc::new(SimClock::new())); // 10 tokens, refill 10/s; virtual time never moves, so nothing refills
         assert!(bucket.take(5).await);
         assert!(bucket.take(5).await);
         assert!(!bucket.take(1).await);

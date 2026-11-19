@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from swarm.errors import ErrorCode, SwarmError  # type: ignore  # authoritative error taxonomy; python truth
+from swarm.errors import ErrorCode, SwarmError  # type: ignore  # noqa: E402
 
 
 class DecomposerState(Enum):

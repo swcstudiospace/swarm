@@ -145,13 +145,8 @@ impl Default for SimClock {
 
 impl Clock for SimClock {
     fn now(&self) -> Instant {
-        if self.sim_mode.load(Ordering::SeqCst) {
-            // In sim mode, return a fake instant based on virtual time
-            // This is only for API compatibility - actual time operations use virtual time
-            Instant::now()
-        } else {
-            Instant::now()
-        }
+        // Real monotonic time in every mode; virtual time is read via now_nanos and now_system.
+        Instant::now()
     }
 
     fn now_system(&self) -> std::time::SystemTime {
