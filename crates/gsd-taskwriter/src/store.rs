@@ -466,21 +466,19 @@ impl Tx {
                 ));
             }
         }
-        let mut sql = String::from("UPDATE tasks SET state=?");
+        let mut qb = sqlx::QueryBuilder::new("UPDATE tasks SET state=");
+        qb.push_bind(change.to);
         for column in change.columns {
-            sql.push_str(", ");
-            sql.push_str(column.column());
-            sql.push_str("=?");
-        }
-        sql.push_str(", updated_at=? WHERE task_id=? AND state=?");
-        // Audited: `sql` is fixed fragments plus PlanColumn::column() enum names only; no user input.
-        let mut update = sqlx::query(sqlx::AssertSqlSafe(&sql)).bind(change.to);
-        for column in change.columns {
-            update = match column {
-                PlanColumn::Attempt(value) | PlanColumn::ReworkLoops(value) => update.bind(*value),
-                PlanColumn::Notes(text) => update.bind(*text),
+            qb.push(", ");
+            qb.push(column.column());
+            qb.push("=?");
+            match column {
+                PlanColumn::Attempt(value) | PlanColumn::ReworkLoops(value) => qb.push_bind(*value),
+                PlanColumn::Notes(text) => qb.push_bind(*text),
             };
         }
+        qb.push(", updated_at=? WHERE task_id=? AND state=?");
+        let update = qb.build();
         self.wrote = true;
         let done = update
             .bind(change.updated_at)
@@ -574,12 +572,10 @@ impl Tx {
         updated_at: f64,
     ) -> Result<(), WriterError> {
         self.wrote = true;
-        let sql = format!(
-            "UPDATE tasks SET {}=?, updated_at=? WHERE task_id=?",
-            column.column()
-        );
-        // Audited: `sql` is a fixed fragment plus the TextColumn::column() enum name only; no user input.
-        let done = sqlx::query(sqlx::AssertSqlSafe(&sql))
+        let mut qb = sqlx::QueryBuilder::new("UPDATE tasks SET ");
+        qb.push(column.column());
+        qb.push("=?, updated_at=? WHERE task_id=?");
+        let done = qb.build()
             .bind(text)
             .bind(updated_at)
             .bind(task_id)
