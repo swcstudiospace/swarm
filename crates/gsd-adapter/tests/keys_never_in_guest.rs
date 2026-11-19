@@ -1194,7 +1194,11 @@ fn column_of(world: &World, sql: &str) -> Vec<String> {
             .connect()
             .await
             .expect("connect");
-        let rows = sqlx::query(sql).fetch_all(&mut conn).await.expect(sql);
+        let rows = sqlx::QueryBuilder::new(sql)
+            .build()
+            .fetch_all(&mut conn)
+            .await
+            .expect(sql);
         let found = rows.iter().map(|row| row.get::<String, _>(0)).collect();
         conn.close().await.expect("close");
         found
