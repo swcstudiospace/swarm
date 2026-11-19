@@ -471,28 +471,27 @@ impl Tx {
         for column in change.columns {
             qb.push(", ");
             qb.push(column.column());
-            qb.push("=?");
+            qb.push("=");
             match column {
                 PlanColumn::Attempt(value) | PlanColumn::ReworkLoops(value) => qb.push_bind(*value),
                 PlanColumn::Notes(text) => qb.push_bind(*text),
             };
         }
-        qb.push(", updated_at=? WHERE task_id=? AND state=?");
+        qb.push(", updated_at=");
+        qb.push_bind(change.updated_at);
+        qb.push(" WHERE task_id=");
+        qb.push_bind(change.task_id);
+        qb.push(" AND state=");
+        qb.push_bind(change.from);
         let update = qb.build();
         self.wrote = true;
-        let done = update
-            .bind(change.updated_at)
-            .bind(change.task_id)
-            .bind(change.from)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(|error| {
-                failure(
-                    true,
-                    ErrorKind::Database,
-                    format!("task store state update: {error}"),
-                )
-            })?;
+        let done = update.execute(&mut *self.tx).await.map_err(|error| {
+            failure(
+                true,
+                ErrorKind::Database,
+                format!("task store state update: {error}"),
+            )
+        })?;
         if done.rows_affected() != 1 {
             return Err(WriterError::final_error(
                 ErrorKind::ConcurrentTransition,
@@ -574,21 +573,19 @@ impl Tx {
         self.wrote = true;
         let mut qb = sqlx::QueryBuilder::new("UPDATE tasks SET ");
         qb.push(column.column());
-        qb.push("=?, updated_at=? WHERE task_id=?");
-        let done = qb
-            .build()
-            .bind(text)
-            .bind(updated_at)
-            .bind(task_id)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(|error| {
-                failure(
-                    true,
-                    ErrorKind::Database,
-                    format!("task store update of {}: {error}", column.column()),
-                )
-            })?;
+        qb.push("=");
+        qb.push_bind(text);
+        qb.push(", updated_at=");
+        qb.push_bind(updated_at);
+        qb.push(" WHERE task_id=");
+        qb.push_bind(task_id);
+        let done = qb.build().execute(&mut *self.tx).await.map_err(|error| {
+            failure(
+                true,
+                ErrorKind::Database,
+                format!("task store update of {}: {error}", column.column()),
+            )
+        })?;
         if done.rows_affected() != 1 {
             return Err(WriterError::final_error(
                 ErrorKind::Database,
