@@ -154,7 +154,7 @@ finally:
 _RUNNER = ROOT / "scripts" / "swarm_run.py"
 # the named refusals of validate_runtime_approval: (name, the option, the code the python engine keeps)
 _UNSUPPORTED = [
-    ("grok-transport", {"runtime": "grok"}, ErrorCode.E_DEP),
+    ("grok-bypass", {"runtime": "grok", "permission_mode": "bypassPermissions"}, ErrorCode.E_INPUT),
     ("omp-approval", {"runtime": "omp", "approval_mode": "yolo"}, ErrorCode.E_INPUT),
     ("claude-bypass", {"permission_mode": "bypassPermissions"}, ErrorCode.E_INPUT),
 ]
