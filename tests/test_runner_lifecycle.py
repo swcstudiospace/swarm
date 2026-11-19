@@ -184,6 +184,39 @@ def test_gate_dispatch_deadline_covers_session_and_script(tmp_path, monkeypatch)
     assert abs(seen["span"] - (2 * 90 + 30)) < 1e-6
 
 
+def test_assignment_file_is_written_atomically_with_attempt_name(tmp_path, monkeypatch):
+    """D11: the dispatch prompt lands via write_text_atomic, in a created assignments/ dir, under the attempt name."""
+    mod = _runner()
+    db = tmp_path / "tasks.db"
+    store = _store_with(db, tid="T-one")
+    task = store.get("T-one")
+    written = {}
+    real_atomic = mod.write_text_atomic
+
+    def recording_atomic(path, text, **kwargs):
+        written["path"] = path
+        written["text"] = text
+        return real_atomic(path, text, **kwargs)
+
+    def headless(agent, prompt, repo, args, on_session=None):
+        raise mod.AgentTimeout(["omp"], args.task_timeout, "", {"timed_out": True})
+
+    monkeypatch.setattr(mod, "assignment_prompt", lambda *a, **k: "prompt-body")
+    monkeypatch.setattr(mod, "write_text_atomic", recording_atomic)
+    monkeypatch.setattr(mod, "run_agent_headless", headless)
+
+    class Ctx:
+        def emit(self, *args, **kwargs):
+            return None
+
+    mod._execute_one(db, task, {"id": "A05", "slug": "a05-backend"},
+                     type("A", (), {"task_timeout": 90, "dry_run": False})(), Ctx(), tmp_path, None, None)
+    assignment = tmp_path / "assignments" / f"T-one.a{task['attempt']}.md"
+    assert written["path"] == assignment
+    assert written["text"] == "prompt-body"
+    assert assignment.read_text() == "prompt-body"
+
+
 def test_recover_stranded_leaves_a_restarted_attempt(tmp_path, monkeypatch):
     """The attempt can change after the list and before the write. The fresh IN_PROGRESS row keeps its deadline."""
     mod = _runner()
