@@ -1372,7 +1372,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         prompt = assignment_prompt(store, task, agent, workspace, lease_s=leases.lease_s(tid) if leases is not None else None,
                                    handoffs=context)
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
-        (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
+        write_text_atomic(sdir / "assignments" / f"{tid}.a{task['attempt']}.md", prompt)
         if args.dry_run:
             if handle is not None:
                 handle.started("dry-run")

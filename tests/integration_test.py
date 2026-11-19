@@ -1,7 +1,7 @@
 """Integration tests across layers for n7 wave 4.
 
 - python/orchestrator/decomposer + pool (asyncio concurrent subtasks)
-- rust concurrency via pyo3 binding (config/status/cancel/metrics; submit paths if available)
+- rust concurrency via swarm._native (legacy swarm_pyo3_pool retired)
 - workflows: decomp -> submit concurrent -> aggregate/cancel
 - failure modes: bad config, timeout paths, error classify, partial, cancel, state seal
 - observable concurrent: submit nonblock + start time spreads << serial; active/queue during batch
@@ -38,19 +38,9 @@ from python.orchestrator.pool import (  # type: ignore  # noqa: E402
 )
 from swarm.errors import ErrorCode, SwarmError  # type: ignore  # noqa: E402
 
-# Binding setup (safe: avoid submit if it would hang on current build; use create/status/cancel/config)
-PYO3_MODDIR = "/tmp/s_pyo3"
-PYO3_SO = Path(PYO3_MODDIR) / "swarm_pyo3_pool.abi3.so"
+# Legacy swarm_pyo3_pool is retired; the public surface is swarm._native only.
+# Keep _rust_pool as None so legacy binding tests skip.
 _rust_pool = None
-try:
-    if PYO3_SO.exists():
-        if str(PYO3_MODDIR) not in sys.path:
-            sys.path.insert(0, str(PYO3_MODDIR))
-        import swarm_pyo3_pool as _rust  # type: ignore
-
-        _rust_pool = _rust
-except Exception:
-    _rust_pool = None
 
 
 def _mk_task(**kw: Any) -> dict[str, Any]:
@@ -111,23 +101,8 @@ def test_decomposer_to_pool_workflow_and_concurrent_observable():
 
 
 def test_rust_binding_layer_safe_paths_and_metrics():
-    """Rust concurrency binding integration (create, status observable, cancel, config)."""
-    if _rust_pool is None:
-        pytest.skip("no swarm_pyo3_pool (build via cargo -p pyo3-bindings then copy .so)")
-    cfg = _rust_pool.ConcurrencyConfig.default()
-    assert cfg.workers >= 1  # exposed getter
-    pool = _rust_pool.ThreadPool.create_pool(cfg)
-    st = pool.status()
-    assert "state" in st and "active_threads" in st and "queue_depth" in st
-    m = pool.cancel()
-    assert hasattr(m, "state") or "state" in getattr(m, "__dict__", {})
-    pool.shutdown(50)
-    # config validate via new
-    try:
-        _bad = _rust_pool.ConcurrencyConfig(0, 1, 100, 1, 10)
-        assert False, "should validate"
-    except Exception:
-        pass  # E- or Value
+    """Legacy swarm_pyo3_pool retired; skipped (use swarm._native only)."""
+    pytest.skip("legacy swarm_pyo3_pool retired; use swarm._native")
 
 
 def test_error_propagation_and_failure_modes():
@@ -168,13 +143,7 @@ def test_error_propagation_and_failure_modes():
     except asyncio.CancelledError:
         pass
 
-    # rust error translation exercised in binding tests + classify path
-    if _rust_pool:
-        # config err path
-        try:
-            _rust_pool.ConcurrencyConfig(0, 0, 0, 0, 0)
-        except Exception as e:
-            assert "E-CAPACITY" in str(e) or "invalid" in str(e).lower()
+    # Legacy swarm_pyo3_pool retired; error path verified via classify only.
     print("correct error propagation verified (classify + E-codes + Failure paths)")
 
 
