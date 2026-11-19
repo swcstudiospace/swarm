@@ -230,7 +230,7 @@ impl PyThreadPool {
             return Err(PyValueError::new_err("len(tasks) == len(works) required"));
         }
         let mut out = Vec::with_capacity(tasks.len());
-        for (pt, work_obj) in tasks.into_iter().zip(works.into_iter()) {
+        for (pt, work_obj) in tasks.into_iter().zip(works) {
             let st = SubTask {
                 id: pt.borrow().id.clone(),
                 timeout: pt.borrow().timeout_ms.map(Duration::from_millis),
@@ -387,7 +387,6 @@ mod tests {
         // status (this binding requires explicit Python<'py> token via attach; elided in pure-rust unit test skeleton)
         p.cancel().unwrap();
         let _ = p.shutdown(10);
-        assert!(true);
     }
 
     #[test]
@@ -395,7 +394,6 @@ mod tests {
         // The wait/cancel/status paths use attach and no long critical under lock that holds gil caller.
         // submit is non blocking.
         // Py<PyAny> Send verified by compile.
-        assert!(true);
     }
 
     #[test]
@@ -412,6 +410,5 @@ mod tests {
         let _m = p.cancel().unwrap();
         let _ = p.shutdown(1);
         // dispatch method present for python call
-        assert!(true, "wave4 apis exposed: creation/submit/status/dispatch");
     }
 }
