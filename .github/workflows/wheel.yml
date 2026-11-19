@@ -106,6 +106,7 @@ jobs:
       - name: swarm_tool and swarm_run smoke gate (installed wheel)
         run: |
           export SWARM_DIR=/tmp/smoke/.swarm
+          export SWARM_SIGNING_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
           export SWARM_AGENTS_FILE=/tmp/smoke/agents.json
           rm -rf /tmp/smoke
           mkdir -p /tmp/smoke/scripts
