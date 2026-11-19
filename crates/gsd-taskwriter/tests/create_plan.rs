@@ -85,10 +85,10 @@ async fn connect(path: &Path) -> SqliteConnection {
 /// Every row of `table` in rowid order, every cell rendered with its storage class, the clock columns masked.
 async fn dump(path: &Path, table: &str) -> Vec<Vec<(String, String)>> {
     let mut conn = connect(path).await;
-    let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY rowid"))
-        .fetch_all(&mut conn)
-        .await
-        .expect("dump");
+    let mut qb = sqlx::QueryBuilder::new("SELECT * FROM ");
+    qb.push(table);
+    qb.push(" ORDER BY rowid");
+    let rows = qb.build().fetch_all(&mut conn).await.expect("dump");
     let mut out = Vec::new();
     for row in &rows {
         let mut line = Vec::new();
@@ -120,10 +120,9 @@ async fn dump(path: &Path, table: &str) -> Vec<Vec<(String, String)>> {
 
 async fn count(path: &Path, table: &str) -> i64 {
     let mut conn = connect(path).await;
-    let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-        .fetch_one(&mut conn)
-        .await
-        .expect("count");
+    let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM ");
+    qb.push(table);
+    let n: i64 = qb.build_scalar().fetch_one(&mut conn).await.expect("count");
     conn.close().await.expect("close");
     n
 }
