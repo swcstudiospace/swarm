@@ -22,8 +22,10 @@ use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
 
 /// SOTA production constants (boring, correct, low-overhead):
+///
 /// - WORKER_POLL: idle recv poll for shutdown/coop cancel; 100ms balances latency/CPU.
 /// - JOIN_WAIT: collection timeout in join (5s safe default matching prior behavior; task inner timeouts enforce per-task limits; hung worker may block join up to this - callers can use try_recv for non-blocking if needed).
+///
 /// Wave 5 extension: MAX_WORKERS=30 (configurable default/cap; security + size per python_tools/validation + clarif q1).
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const JOIN_WAIT: Duration = Duration::from_secs(5);
@@ -50,6 +52,7 @@ pub enum PoolState {
 }
 
 impl PoolState {
+    /// Returns the stable uppercase name for this state.
     pub fn as_str(&self) -> &'static str {
         match self {
             PoolState::Idle => "IDLE",
@@ -62,6 +65,7 @@ impl PoolState {
         }
     }
 
+    /// Returns true if this state is terminal (no further transitions).
     pub fn is_terminal(&self) -> bool {
         matches!(self, PoolState::Terminating | PoolState::Error)
     }
@@ -92,6 +96,7 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// Returns the stable uppercase name for this state.
     pub fn as_str(&self) -> &'static str {
         match self {
             TaskState::Received => "RECEIVED",
@@ -106,6 +111,7 @@ impl TaskState {
         }
     }
 
+    /// Returns true if this state is terminal (completed, failed, or cancelled).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -128,6 +134,7 @@ pub enum SubagentState {
 }
 
 impl SubagentState {
+    /// Returns the stable uppercase name for this state.
     pub fn as_str(&self) -> &'static str {
         match self {
             SubagentState::Available => "AVAILABLE",
@@ -137,6 +144,7 @@ impl SubagentState {
         }
     }
 
+    /// Returns true if this state can accept work (available or busy).
     pub fn is_usable(&self) -> bool {
         matches!(self, SubagentState::Available | SubagentState::Busy)
     }
@@ -146,22 +154,36 @@ impl SubagentState {
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum TaskError {
     #[error("no tasks provided (empty)")]
+    /// No tasks were provided (empty batch).
     Empty,
     #[error("task timeout after {0:?}")]
+    /// A task timed out after the given duration.
     Timeout(Duration),
     #[error("task cancelled")]
+    /// A task was cancelled cooperatively.
     Cancelled,
     #[error("retries exhausted after {attempts} (backoff); last cause: {last_cause}")]
-    RetryExhausted { attempts: u32, last_cause: String },
+    /// All retry attempts were exhausted.
+    RetryExhausted {
+        /// Number of attempts made (including the first).
+        attempts: u32,
+        /// Last error that caused the retries to be exhausted.
+        last_cause: String,
+    },
     #[error("pool is shutting down or shut down")]
+    /// The pool is shutting down or already shut down.
     Shutdown,
     #[error("queue full (bounded capacity reached)")]
+    /// The bounded queue is full.
     QueueFull,
     #[error("invalid config: {0}")]
+    /// The provided pool configuration is invalid.
     InvalidConfig(String),
     #[error("worker panic: {0}")]
+    /// A worker thread panicked.
     WorkerPanic(String),
     #[error("other: {0}")]
+    /// Some other unexpected error occurred.
     Other(String),
 }
 
@@ -181,8 +203,11 @@ impl From<Box<dyn std::any::Any + Send>> for TaskError {
 /// Descriptor for a sub-task. Per-subtask config for timeout/retry.
 #[derive(Debug, Clone)]
 pub struct SubTask {
+    /// Unique identifier for this sub-task.
     pub id: String,
+    /// Maximum number of retries on failure (in addition to the first attempt).
     pub max_retries: u32,
+    /// Per-subtask timeout; `None` falls back to the pool default.
     pub timeout: Option<Duration>,
 }
 
@@ -197,6 +222,7 @@ impl Default for SubTask {
 }
 
 impl SubTask {
+    /// Creates a task with the given id and default retry/timeout settings.
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -204,11 +230,13 @@ impl SubTask {
         }
     }
 
+    /// Sets the maximum number of retries for this task.
     pub fn with_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
         self
     }
 
+    /// Sets the per-task timeout for this task.
     pub fn with_timeout(mut self, d: Duration) -> Self {
         self.timeout = Some(d);
         self
@@ -218,19 +246,26 @@ impl SubTask {
 /// Structured result supporting success, failure and partials (for aggregation on errors).
 #[derive(Debug, Clone)]
 pub enum SubResult<T> {
+    /// The task completed successfully with the contained value.
     Success(T),
+    /// The task produced a partial value alongside an error.
     Partial {
+        /// Partial value produced before the error, if any.
         partial: Option<T>,
+        /// Error that caused the partial result.
         error: TaskError,
     },
+    /// The task failed with the contained error.
     Failure(TaskError),
 }
 
 impl<T> SubResult<T> {
+    /// Returns true if this result is a success.
     pub fn is_success(&self) -> bool {
         matches!(self, SubResult::Success(_))
     }
 
+    /// Converts this result into a `Result`, dropping any partial value.
     pub fn into_result(self) -> Result<T, TaskError> {
         match self {
             SubResult::Success(v) => Ok(v),
@@ -242,8 +277,11 @@ impl<T> SubResult<T> {
 /// Metrics (active + queue depth via atomics) + state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Metrics {
+    /// Number of currently active worker threads.
     pub active_threads: usize,
+    /// Current depth of the work queue.
     pub queue_depth: usize,
+    /// Snapshot of the pool lifecycle state.
     pub state: PoolState,
 }
 
@@ -277,6 +315,7 @@ impl<T: Send + 'static> SubTicket<T> {
         }
     }
 
+    /// Non-blocking poll for the result; `None` if not yet ready.
     pub fn try_recv(&self) -> Option<SubResult<T>> {
         match self.rx.try_recv() {
             Ok(r) => Some(r),
@@ -287,6 +326,7 @@ impl<T: Send + 'static> SubTicket<T> {
         }
     }
 
+    /// Returns the id of the sub-task this ticket belongs to.
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -297,12 +337,15 @@ impl<T: Send + 'static> SubTicket<T> {
 pub struct CancelToken(Arc<AtomicBool>);
 
 impl CancelToken {
+    /// Creates a new, uncancelled token.
     pub fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
+    /// Marks this token as cancelled.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
+    /// Returns true if this token has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
@@ -311,10 +354,15 @@ impl CancelToken {
 /// Pool config.
 #[derive(Debug, Clone)]
 pub struct ConcurrencyConfig {
+    /// Number of worker threads (1..=30).
     pub workers: usize,
+    /// Maximum number of queued jobs.
     pub queue_bound: usize,
+    /// Default per-task timeout when a task sets none.
     pub default_timeout: Duration,
+    /// Base backoff delay in milliseconds for retry attempts.
     pub backoff_base_ms: u64,
+    /// Maximum backoff delay in milliseconds for retry attempts.
     pub backoff_cap_ms: u64,
 }
 
@@ -331,6 +379,7 @@ impl Default for ConcurrencyConfig {
 }
 
 impl ConcurrencyConfig {
+    /// Validates that this config is usable, returning an error if not.
     pub fn validate(&self) -> Result<(), TaskError> {
         if self.workers == 0 {
             return Err(TaskError::InvalidConfig("workers must be >0".into()));
@@ -363,6 +412,7 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
+    /// Creates a new thread pool with the given config and spawns its workers.
     pub fn new(config: ConcurrencyConfig) -> Result<Self, TaskError> {
         if config.workers > 30 {
             return Err(TaskError::InvalidConfig(
@@ -434,6 +484,7 @@ impl ThreadPool {
     /// Core dispatch loop executed by each worker thread.
     /// Handles: recv work, state transitions, per-task retry+backoff, timeout/cancel checks,
     /// panic recovery, result send, progress notify, graceful drain.
+    #[allow(clippy::too_many_arguments)] // reason: the dispatch loop threads one parameter per worker context; grouping them would touch every call site for no behavior change.
     fn worker_loop(
         _wid: usize,
         rx: Receiver<Job>,
@@ -502,7 +553,7 @@ impl ThreadPool {
                     }
                 }
 
-                let work_res = catch_unwind(AssertUnwindSafe(|| (&*job.work)()));
+                let work_res = catch_unwind(AssertUnwindSafe(|| (job.work)()));
                 match work_res {
                     Ok(Ok(val)) => {
                         result_to_send = SubResult::Success(val);
@@ -576,10 +627,12 @@ impl ThreadPool {
         progress.notify_all();
     }
 
+    /// Returns the current pool lifecycle state.
     pub fn state(&self) -> PoolState {
         *self.state.lock()
     }
 
+    /// Returns a snapshot of current pool metrics.
     pub fn metrics(&self) -> Metrics {
         let qd = self.work_tx.len();
         Metrics {
@@ -707,6 +760,7 @@ impl ThreadPool {
         (successes, results)
     }
 
+    /// Cancels all work and transitions the pool towards shutdown.
     pub fn cancel_all(&self) {
         let mut st = self.state.lock();
         if !st.is_terminal() {
@@ -715,6 +769,7 @@ impl ThreadPool {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
+    /// Shuts down the pool, waiting up to `grace` for active work, and returns final metrics.
     pub fn shutdown(&self, grace: Duration) -> Metrics {
         {
             let mut st = self.state.lock();
@@ -1081,6 +1136,7 @@ pub mod tests {
     }
 }
 // === Wave 5 / ship visibility: explicit 30 cap + Scaling/Error reachability ===
+/// Maximum number of subagents a pool may run (30).
 pub const SUBAGENT_CAP: usize = MAX_WORKERS; // 30
 
 impl ThreadPool {
@@ -1112,6 +1168,7 @@ impl ThreadPool {
 
 // Visible exercise of Scaling in a core path (for judge)
 impl ThreadPool {
+    /// Transitions to Scaling after validating the target stays within the cap.
     pub fn scale_within_cap(&self, target: usize) -> Result<PoolState, TaskError> {
         if target > SUBAGENT_CAP {
             return Err(TaskError::InvalidConfig("exceeds cap".into()));
