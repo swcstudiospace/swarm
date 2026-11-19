@@ -122,7 +122,11 @@ async fn count(path: &Path, table: &str) -> i64 {
     let mut conn = connect(path).await;
     let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM ");
     qb.push(table);
-    let n: i64 = qb.build_scalar().fetch_one(&mut conn).await.expect("count");
+    let n: i64 = qb
+        .build_query_scalar()
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
     conn.close().await.expect("close");
     n
 }

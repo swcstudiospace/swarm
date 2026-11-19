@@ -94,7 +94,11 @@ async fn connect(path: &Path) -> SqliteConnection {
 
 async fn exec(path: &Path, sql: &str) {
     let mut conn = connect(path).await;
-    sqlx::query(sql).execute(&mut conn).await.expect(sql);
+    sqlx::QueryBuilder::new(sql)
+        .build()
+        .execute(&mut conn)
+        .await
+        .expect(sql);
     conn.close().await.expect("close");
 }
 
@@ -108,12 +112,14 @@ async fn insert_rows(path: &Path, rows: &[(&str, Fields)]) {
         .expect("begin");
     for (table, row) in rows {
         let names: Vec<&str> = row.iter().map(|(name, _)| name.as_str()).collect();
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({})",
-            names.join(", "),
-            vec!["?"; names.len()].join(", ")
-        );
-        let mut insert = sqlx::query(&sql);
+        let mut qb = sqlx::QueryBuilder::new("INSERT INTO ");
+        qb.push(table);
+        qb.push(" (");
+        qb.push(names.join(", "));
+        qb.push(") VALUES (");
+        qb.push(vec!["?"; names.len()].join(", "));
+        qb.push(")");
+        let mut insert = qb.build();
         for (name, value) in row {
             insert = match value {
                 Json::Null => insert.bind(None::<String>),
@@ -155,10 +161,10 @@ async fn content(path: &Path) -> Vec<Table> {
         "artifacts",
         "sqlite_sequence",
     ] {
-        let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY rowid"))
-            .fetch_all(&mut conn)
-            .await
-            .expect(table);
+        let mut qb = sqlx::QueryBuilder::new("SELECT * FROM ");
+        qb.push(table);
+        qb.push(" ORDER BY rowid");
+        let rows = qb.build().fetch_all(&mut conn).await.expect(table);
         let mut cells = Vec::new();
         for row in &rows {
             let mut line = Vec::new();

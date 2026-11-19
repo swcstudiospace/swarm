@@ -1396,7 +1396,7 @@ async fn state_of(path: &Path, task_id: &str) -> String {
 async fn fixture_text(path: &Path, sql: &str) -> String {
     let mut conn = connect(path).await;
     let value: String = sqlx::QueryBuilder::new(sql)
-        .build_scalar()
+        .build_query_scalar()
         .fetch_one(&mut conn)
         .await
         .expect(sql);
@@ -1407,7 +1407,7 @@ async fn fixture_text(path: &Path, sql: &str) -> String {
 async fn count(path: &Path, sql: &str) -> i64 {
     let mut conn = connect(path).await;
     let value: i64 = sqlx::QueryBuilder::new(sql)
-        .build_scalar()
+        .build_query_scalar()
         .fetch_one(&mut conn)
         .await
         .expect(sql);
