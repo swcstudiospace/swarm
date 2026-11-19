@@ -306,8 +306,8 @@ def plan_graph(nodes: Iterable[Any]) -> Plan:
                 start=makespan,
                 finish=makespan + duration,
                 duration=duration,
-                files=node.files,
-                dependencies=node.dependencies,
+                files=tuple(node.files),
+                dependencies=tuple(node.dependencies),
             )
         makespan += wave_span
     return Plan(
