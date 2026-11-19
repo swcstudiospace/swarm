@@ -884,7 +884,11 @@ mod tests {
             "INSERT INTO tasks (task_id, correlation_id, capability, state) VALUES ('T-1', 'C-1', 'build', 'DONE')",
         ];
         for sql in seed.into_iter().chain(extra.iter().copied()) {
-            sqlx::query(sql).execute(&mut conn).await.expect(sql);
+            sqlx::QueryBuilder::new(sql)
+                .build()
+                .execute(&mut conn)
+                .await
+                .expect(sql);
         }
         conn.close().await.expect("close");
         db
