@@ -84,6 +84,9 @@ describe("fixture negatives are silent except the gsd-autonomous handoff", () =>
 test("gsd-autonomous handoff text does not name the retired policy token", () => {
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join("-"));
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join(""));
+  expect(GSD_HANDOFF).toContain("If A01 cannot dispatch");
+  expect(GSD_HANDOFF).toContain("Do not hand off with every node blocked");
+  expect(GSD_HANDOFF).toContain("finish them inline");
 });
 
 test("auto-steer dispatches A01 with the brief and has A01 plan it", () => {
