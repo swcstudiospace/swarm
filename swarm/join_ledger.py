@@ -135,7 +135,8 @@ def _check(value: object, kind: str, where: str) -> None:
 
 
 def _exact(obj: object, names: tuple[str, ...], where: str) -> TypeGuard[dict[Any, Any]]:
-    _fail(where, "expected an object")
+    if not isinstance(obj, dict):
+        _fail(where, "expected an object")
     if set(obj) != set(names):
         _fail(where, f"expected fields {sorted(names)}, got {sorted(obj)}")
     return True
