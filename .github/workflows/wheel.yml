@@ -70,6 +70,7 @@ jobs:
             scripts/rev_gate.py
             scripts/sec_gate.py
             scripts/rel_plan.py
+            scripts/_dotnet_quality.py
             agents.json
           if-no-files-found: error
 
@@ -111,6 +112,7 @@ jobs:
           rm -rf /tmp/smoke
           mkdir -p /tmp/smoke/scripts
           cp /tmp/smoke-src/scripts/swarm_tool.py /tmp/smoke-src/scripts/swarm_run.py /tmp/smoke-src/scripts/orch_plan.py /tmp/smoke-src/scripts/qa_gate.py /tmp/smoke-src/scripts/rev_gate.py /tmp/smoke-src/scripts/sec_gate.py /tmp/smoke-src/scripts/rel_plan.py /tmp/smoke/scripts/
+          cp /tmp/smoke-src/scripts/_dotnet_quality.py /tmp/smoke/scripts/
           cp /tmp/smoke-src/agents.json /tmp/smoke/
           cd /tmp/smoke
           SWARM_AGENTS_FILE=/tmp/smoke/agents.json python3 scripts/swarm_tool.py catalog --caller A05 --json
