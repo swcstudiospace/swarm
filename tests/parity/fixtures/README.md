@@ -14,6 +14,8 @@ invocations therefore has several files.
 | `expected_exit` | integer | Exit code the Python script returned. Python is the truth; the comparison is exact. |
 | `expected_json_keys` | array of strings | Top-level keys that must be present in the single JSON object printed on stdout. |
 
+A mismatch-revert record (`happy_path.00.json`) also carries `python` and `rust`, each an `exit_code` and `stdout`; `expected`, with `returned` and `mismatch_recorded`; and `provenance`.
+
 Example (`tests/parity/fixtures/transition_legal_illegal.01.json`):
 
 ```json
@@ -40,5 +42,4 @@ Example (`tests/parity/fixtures/transition_legal_illegal.01.json`):
 
 ## Status
 
-This directory currently holds only this document. `harness.py` constructs the same invocations in code; no on-disk
-records are committed yet.
+`harness.py` constructs the same invocations in code. One on-disk record exists: `happy_path.00.json`, a mismatch-revert fixture (Phase 9 row 16). Its Python reply is the live output of `scripts/orch_status.py --history T-1` on a seeded store (captured 2026-11-18; see its `provenance`). Its Rust reply is a deliberate synthetic divergence.

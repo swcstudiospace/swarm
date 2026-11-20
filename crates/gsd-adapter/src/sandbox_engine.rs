@@ -1315,7 +1315,11 @@ mod tests {
 
         // An error the guest reports is its answer too, and is not failed over.
         let unknown = call(root.path(), &swarm, &["--history", "T-9999", "--json"]);
-        let _ = sandbox.orch_status(&unknown);
+        let host_error = host()?
+            .orch_status(&unknown)
+            .err()
+            .ok_or("host answered an unknown task")?;
+        assert_eq!(sandbox.orch_status(&unknown).err(), Some(host_error));
         assert_eq!(sandbox.failover(), None);
         Ok(())
     }

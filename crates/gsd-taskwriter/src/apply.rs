@@ -33,10 +33,7 @@ use gsd_route::{jstr, obj_get, Fields, Json, SeamError};
 use crate::approval::{self, ApprovalKeys, ApprovalSource, ApprovalVerifier};
 use crate::error::{ErrorKind, WriteState, WriterError};
 use crate::plan::{PlanValidator, PlanViolation, ValidatedPlan};
-use crate::store::{PlanColumn, StateChange, Tx, WriteStore};
-
-/// The JSON text columns of `tasks`. [`Facts`] holds them as stored (text); the store's Python-shaped row has them parsed.
-const JSON_COLUMNS: [&str; 5] = ["inputs", "outputs", "acceptance", "budget", "depends_on"];
+use crate::store::{PlanColumn, StateChange, Tx, WriteStore, JSON_COLUMNS};
 
 /// The decision step of a transition: pure, runs inside the write lock, and writes nothing.
 ///
@@ -439,15 +436,43 @@ pub(crate) async fn write_validated(
 ///
 /// The store hands over `TaskStore._row`'s shape (JSON columns parsed). Dumping a parsed value gives text that parses back
 /// to the same value, which is all the decision reads of those columns.
-fn decision_row(row: Fields) -> Fields {
+pub(crate) fn decision_row(row: Fields) -> Fields {
     row.into_iter()
         .filter(|(name, _)| name != "notes_json")
         .map(|(name, value)| {
-            if JSON_COLUMNS.contains(&name.as_str()) {
+            if JSON_COLUMNS.iter().any(|(column, _)| *column == name) {
                 (name, Json::Str(to_python_dumps(&value)))
             } else {
                 (name, value)
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use gsd_route::{jstr, obj_get, Fields, Json};
+
+    use super::decision_row;
+    use crate::store::JSON_COLUMNS;
+
+    #[test]
+    fn decision_row_dumps_every_store_json_column_and_drops_notes_json() {
+        let mut row: Fields = JSON_COLUMNS
+            .iter()
+            .map(|(column, _)| (column.to_string(), Json::Arr(Vec::new())))
+            .collect();
+        row.push(("notes_json".to_string(), Json::Obj(Vec::new())));
+        row.push(("state".to_string(), jstr("PLANNED")));
+        let shaped = decision_row(row);
+        for (column, _) in JSON_COLUMNS {
+            assert_eq!(
+                obj_get(&shaped, column),
+                Some(&Json::Str("[]".to_string())),
+                "{column} is text again"
+            );
+        }
+        assert_eq!(obj_get(&shaped, "notes_json"), None);
+        assert_eq!(obj_get(&shaped, "state"), Some(&jstr("PLANNED")));
+    }
 }

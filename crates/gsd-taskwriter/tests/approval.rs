@@ -857,7 +857,7 @@ async fn the_verdict_rows_are_read_in_the_transaction_that_writes_not_before_the
         .expect("the holder takes the write lock");
 
     let writer = writer_with(&seeded.db, source.clone()).await;
-    let call = tokio::spawn(async move {
+    let mut call = tokio::spawn(async move {
         let outcome = writer
             .transition(&request("APPROVED"), NOW, &HostDecider)
             .await;
@@ -868,10 +868,13 @@ async fn the_verdict_rows_are_read_in_the_transaction_that_writes_not_before_the
         .await
         .expect("join")
         .expect("the writer asked for its keys");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The writer cannot finish before the holder commits: its verdict read comes after the lock. A writer that finished in
+    // this window read the rows before it took the lock.
     assert!(
-        !call.is_finished(),
-        "the writer is waiting for the lock the holder has"
+        tokio::time::timeout(Duration::from_secs(2), &mut call)
+            .await
+            .is_err(),
+        "the writer finished while the holder held the lock"
     );
     sqlx::query(
         "INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1134,7 +1137,7 @@ async fn call_that_waits_for_the_lock(
         .await
         .expect("the holder takes the write lock");
     let writer = writer_with(&seeded.db, source.clone()).await;
-    let call = tokio::spawn(async move {
+    let mut call = tokio::spawn(async move {
         let outcome = writer
             .transition(&request("APPROVED"), NOW, &HostDecider)
             .await;
@@ -1145,10 +1148,13 @@ async fn call_that_waits_for_the_lock(
         .await
         .expect("join")
         .expect("the writer asked for its keys");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The writer cannot finish before the holder commits: its verdict read comes after the lock. A writer that finished in
+    // this window read the rows before it took the lock.
     assert!(
-        !call.is_finished(),
-        "the writer is waiting for the lock the holder has"
+        tokio::time::timeout(Duration::from_secs(2), &mut call)
+            .await
+            .is_err(),
+        "the writer finished while the holder held the lock"
     );
     assert_eq!(
         source.clock_calls.load(Ordering::SeqCst),

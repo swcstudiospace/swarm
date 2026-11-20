@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linear tracking</title>
+<link rel="stylesheet" href="../src/tokens.css">
+</head>
+<body>
+<main>
+  <h1>Linear tracking</h1>
+  <section aria-labelledby="phase-list-h">
+    <h2 id="phase-list-h">Phase list</h2>
+    <ul>
+      <li>Outstanding phases: 8</li>
+    </ul>
+  </section>
+  <section aria-labelledby="issue-tree-h">
+    <h2 id="issue-tree-h">Issue tree</h2>
+    <p>No results yet.</p>
+  </section>
+  <section aria-labelledby="parent-link-h">
+    <h2 id="parent-link-h">Parent link</h2>
+    <div>
+      <label for="parent-link-input">Parent issue link</label>
+      <input id="parent-link-input" name="parent-link" type="text">
+    </div>
+  </section>
+  <section aria-labelledby="actions-h">
+    <h2 id="actions-h">Actions</h2>
+    <button type="button" data-variant="ghost" data-action="check-duplicates">Check duplicates</button>
+    <button type="button" data-action="sync-linear">Sync Linear</button>
+  </section>
+</main>
+</body>
+</html>

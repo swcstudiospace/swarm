@@ -19,19 +19,13 @@ gsd-failure = { path = "../gsd-failure" }
 gsd-nexus = { path = "../gsd-nexus" }
 gsd-sched-core = { path = "../gsd-sched-core" }
 petgraph = { workspace = true }
-topo = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
-ulid = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 tracing = { workspace = true }
-crossbeam = { workspace = true }
-itertools = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

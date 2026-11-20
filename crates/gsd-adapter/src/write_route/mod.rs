@@ -183,7 +183,7 @@ pub(crate) async fn transition_reply_with(
     // The transaction is committed: from here on nothing is refused and nothing is re-run. The store closes and the post-commit
     // hold runs under the call deadline less POST_COMMIT_RESERVE, so the reply goes out before the caller's own timer drops the
     // route. A manifest that cannot be written is a lost effect, the window Python has between its commit and its emit; the
-    // caller finds the file missing and says so.
+    // caller finds the file missing, and the notice on stderr names the loss.
     #[cfg(test)]
     let db = swarm.join("tasks.db");
     let settled = tokio::time::timeout_at(
@@ -196,7 +196,9 @@ pub(crate) async fn transition_reply_with(
     )
     .await
     .is_ok();
-    write_manifest(call, &effects_manifest(args, &applied)).ok();
+    if let Err(error) = write_manifest(call, &effects_manifest(args, &applied)) {
+        lost_effects_notice(&args.task_id, &error, &mut std::io::stderr());
+    }
     if !settled {
         return Err(after_commit(SeamError::new(
             ErrorCode::Timeout,
@@ -360,6 +362,17 @@ pub(crate) fn write_manifest(call: &Invocation, manifest: &Json) -> Result<(), S
             Err(fail(error))
         }
     }
+}
+
+/// Writes the one-line notice that a committed transition's effects manifest was not written. The commit stands and the reply is
+/// still `ok`; this line is the only trace of the lost effects on the process side. As with the binary's notice, a stderr that cannot
+/// be written is ignored: the notice must not turn a committed transition into a failure.
+fn lost_effects_notice(task_id: &str, error: &SeamError, stderr: &mut impl Write) {
+    let _ = writeln!(
+        stderr,
+        "{task_id}: the transition committed, but its post-commit effects were lost: {}",
+        error.message()
+    );
 }
 
 /// A name for the temporary file beside `path`, unique to this write: the process id and a time nonce, so a leftover under the same
@@ -565,6 +578,35 @@ mod tests {
         assert_eq!(effective_reason(&args("T", "DONE", "")), "manual");
         assert_eq!(effective_reason(&args("T", "DONE", "why")), "why");
         assert_eq!(effective_reason(&args("T", "DONE", " ")), " ");
+    }
+
+    /// A manifest that cannot be written after the COMMIT is named on stderr with its reason.
+    #[test]
+    fn a_lost_manifest_after_the_commit_is_named_on_stderr() -> Result<(), String> {
+        let dir = tempfile::TempDir::new().map_err(|e| e.to_string())?;
+        let call = Invocation {
+            agent: "A01".to_string(),
+            script: "orch_status".to_string(),
+            argv: Vec::new(),
+            root: dir.path().to_path_buf(),
+            env: Vec::new(),
+            deadline: std::time::Duration::from_secs(5),
+            effects_path: Some(dir.path().join("gone").join("effects.json")),
+        };
+        let error = write_manifest(&call, &no_effects())
+            .err()
+            .ok_or("wrote a manifest into a missing directory")?;
+        let mut stderr = Vec::new();
+        lost_effects_notice("T-1", &error, &mut stderr);
+        let line = String::from_utf8(stderr).map_err(|e| e.to_string())?;
+        assert!(
+            line.starts_with(
+                "T-1: the transition committed, but its post-commit effects were lost: E-DEP: effects manifest not written: "
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with('\n'), "{line}");
+        Ok(())
     }
 
     #[test]

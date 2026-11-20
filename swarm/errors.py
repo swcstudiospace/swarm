@@ -65,7 +65,7 @@ def classify(exc: BaseException) -> ErrorCode:
 
 def _exp_backoff_err(attempt: int, base: float = 1.0) -> float:
     """1s base + jitter for ErrorHandler 5 att retries."""
-    sleep = min(base * 2.0 ** attempt, 30.0)
+    sleep = min(base * 2.0 ** attempt, 60.0)
     jitter = random.uniform(0, 0.3)
     return sleep + jitter
 

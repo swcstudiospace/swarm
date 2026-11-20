@@ -42,7 +42,7 @@ from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.manifest import by_capability, get_agent  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
-from swarm import substrate_client, substrate_tee  # noqa: E402
+from swarm import atomic_file, substrate_client, substrate_tee  # noqa: E402
 from swarm.blast_radius import lane_notes, load_slices, parallel_rows  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope, verify_envelope, real_key_configured, signing_config_error  # noqa: E402
 
@@ -384,8 +384,8 @@ def _bind_graph(args, ctx, corr: str, brief: str, tasks: list[dict]) -> None:
                 "graph_id": graph_id, "repo": substrate_tee.repo_slug(ctx.root), "surface": substrate_tee.ORCH_SURFACE,
                 "status": "planned",
                 "nodes": [{"node_id": t["task_id"]} for t in tasks]}, surface=substrate_tee.ORCH_SURFACE)
-    except Exception:  # noqa: BLE001 - substrate never changes the plan's outcome
-        pass
+    except Exception as exc:  # noqa: BLE001 - substrate never changes the plan's outcome
+        _LOG.warning("orch_plan: substrate graph binding failed (%s)", type(exc).__name__)
 
 
 def run(args, ctx) -> dict:
@@ -490,7 +490,8 @@ def run(args, ctx) -> dict:
     plans = sdir / "plans"
     plans.mkdir(parents=True, exist_ok=True)
     _write_text_atomic(plans / f"{corr}.json", json.dumps(plan, indent=2))
-    (sdir / "latest_correlation").write_text(corr)
+    sdir.mkdir(parents=True, exist_ok=True)
+    atomic_file.write_text_atomic(sdir / "latest_correlation", corr)
     ctx.correlation_id = corr
     _bind_graph(args, ctx, corr, brief, plan["tasks"])  # before plan.updated, so that event and the exit record are tee'd
     ctx.emit("plan.updated", {"pattern": args.pattern, "task_count": len(created)})

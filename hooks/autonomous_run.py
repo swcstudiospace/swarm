@@ -207,7 +207,10 @@ def main() -> int:
             log.write_text((log.read_text() if log.exists() else "") + f"skip duplicate {digest}\n")
             return 0
         log.touch()  # created before the run starts writing it; the run overwrites it with the result
-        env = {**os.environ, "SWARM_DIR": str(swarm_dir), "SWARM_CHILD": "1", "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
+        # The children start a new run, so they must not bind to the caller's task or correlation (T-06-19).
+        # scripts/swarm_run.py strips the same two names from its agent sessions.
+        inherited = {k: v for k, v in os.environ.items() if k not in ("SWARM_TASK_ID", "SWARM_CORRELATION_ID")}
+        env = {**inherited, "SWARM_DIR": str(swarm_dir), "SWARM_CHILD": "1", "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
         key_ref = os.environ.get("SWARM_ED25519_KEY_FILE", "")
         if key_ref and not os.path.isabs(key_ref):
             # A relative reference names the kickoff workspace's file; the signer refuses relative refs, so export it absolute.

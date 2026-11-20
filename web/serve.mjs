@@ -61,7 +61,7 @@ export function startServer({ isolated = true, port = 0 } = {}) {
       }
       const target = resolve(here, `.${normalize(path)}`);
       if (!target.startsWith(here + sep)) {
-        response.writeHead(403);
+        response.writeHead(403, extra);
         response.end();
         return;
       }

@@ -1,0 +1,150 @@
+/* Design tokens — design/tokens.json v1.0.0 (A04 PROVISIONAL, WCAG 2.2 AA).
+   Single source for colour/spacing/size literals; components use var() only. */
+:root {
+  --color-background: #ffffff;
+  --color-surface: #f3f4f6;
+  --color-text: #111111;
+  --color-text-muted: #595959;
+  --color-success: #166534;
+  --color-error: #b91c1c;
+  --color-warning: #92400e;
+  --color-focus-ring: #1a56db;
+  --space-base: 4px;
+  --space-scale-1: 4px;
+  --space-scale-2: 8px;
+  --space-scale-3: 12px;
+  --space-scale-4: 16px;
+  --space-scale-6: 24px;
+  --space-scale-10: 40px;
+  --size-target-min: 24px;
+  --size-target-comfort: 44px;
+  --motion-fast: 150ms;
+  --motion-standard: 200ms;
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+main {
+  max-width: var(--breakpoint-lg);
+  padding: var(--space-scale-6);
+}
+
+section {
+  margin-bottom: var(--space-scale-6);
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.25;
+}
+
+.surface {
+  background: var(--color-surface);
+  padding: var(--space-scale-4);
+  border-radius: var(--space-base);
+}
+
+.text-muted {
+  color: var(--color-text-muted);
+}
+
+.text-success {
+  color: var(--color-success);
+}
+
+.text-error {
+  color: var(--color-error);
+}
+
+.text-warning {
+  color: var(--color-warning);
+}
+
+:focus-visible {
+  outline: var(--space-scale-1) solid var(--color-focus-ring);
+  outline-offset: var(--space-scale-1);
+}
+
+button,
+input,
+select,
+textarea,
+a {
+  min-height: var(--size-target-comfort);
+  min-width: var(--size-target-comfort);
+}
+
+button {
+  background: var(--color-text);
+  color: var(--color-background);
+  border: 0;
+  border-radius: var(--space-base);
+  padding: var(--space-scale-2) var(--space-scale-4);
+  cursor: pointer;
+}
+
+button[data-variant="ghost"] {
+  background: transparent;
+  color: var(--color-text);
+  border: 1px solid var(--color-text-muted);
+}
+
+button:disabled {
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+input,
+select,
+textarea {
+  border: 1px solid var(--color-text-muted);
+  border-radius: var(--space-base);
+  padding: var(--space-scale-2) var(--space-scale-3);
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  border: 1px solid var(--color-surface);
+  padding: var(--space-scale-2) var(--space-scale-3);
+  text-align: left;
+}
+
+.alert {
+  border-left: var(--space-scale-1) solid var(--color-error);
+  padding: var(--space-scale-3) var(--space-scale-4);
+}
+
+.badge {
+  display: inline-block;
+  padding: var(--space-scale-1) var(--space-scale-2);
+  border-radius: var(--space-base);
+  background: var(--color-surface);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none;
+  }
+}

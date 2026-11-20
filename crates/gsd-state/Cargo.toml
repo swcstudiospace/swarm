@@ -35,8 +35,8 @@ futures = { workspace = true }
 crossbeam = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = "0.4"
 proptest = "1.2"
 tempfile = { workspace = true }
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "sqlite"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite"] }

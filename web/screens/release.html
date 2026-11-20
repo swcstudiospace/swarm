@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Release</title>
+<link rel="stylesheet" href="../src/tokens.css">
+</head>
+<body>
+<main>
+  <h1>Release</h1>
+  <section aria-labelledby="engine-indicator-h">
+    <h2 id="engine-indicator-h">Engine indicator</h2>
+    <p>Default engine: <span class="badge">python</span></p>
+  </section>
+  <section aria-labelledby="checklist-h">
+    <h2 id="checklist-h">Evidence checklist</h2>
+    <ul>
+      <li><input type="checkbox" id="check-ship-assess" disabled> <label for="check-ship-assess">Ship assess</label></li>
+      <li><input type="checkbox" id="check-cleanup-approval" disabled> <label for="check-cleanup-approval">Cleanup approval</label></li>
+      <li><input type="checkbox" id="check-real-host-matrix" disabled> <label for="check-real-host-matrix">Real-host matrix</label></li>
+      <li><input type="checkbox" id="check-audit-14-7-01" disabled> <label for="check-audit-14-7-01">Audit 14.7-01</label></li>
+    </ul>
+  </section>
+  <section aria-labelledby="approval-record-h">
+    <h2 id="approval-record-h">Approval record</h2>
+    <p>No approval record on file.</p>
+  </section>
+  <section aria-labelledby="merge-button-h">
+    <h2 id="merge-button-h">Merge</h2>
+    <button type="button" data-action="merge" disabled>Merge to main</button>
+    <p class="text-muted">Merge is disabled until all required CI jobs are green (AC-15).</p>
+  </section>
+</main>
+</body>
+</html>

@@ -94,7 +94,7 @@ def read_events(*, correlation_id: str | None = None, task_id: str | None = None
         return []
     out: list[dict[str, Any]] = []
     skipped = 0
-    for line in log_file.read_text(encoding="utf-8").splitlines():
+    for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
         try:

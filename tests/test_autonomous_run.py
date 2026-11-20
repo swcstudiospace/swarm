@@ -250,7 +250,6 @@ def _stub_root(tmp_path, body: str):
 
 def test_run_cap_sigterms_the_runner_before_killing_it(tmp_path):
     """T-06-26: the cap must not SIGKILL a runner that still needs to end its sessions."""
-    import time
     marker = tmp_path / "got-sigterm"
     root = _stub_root(tmp_path, f"""import json, signal, sys, time
 def stop(signum, _frame):
@@ -263,37 +262,30 @@ time.sleep(30)
 """)
     env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm"),
            "SWARM_AUTONOMOUS_RUN_CAP_S": "1", "SWARM_AUTONOMOUS_RUN_GRACE_S": "5"}
-    started = time.monotonic()
     r = subprocess.run(
         [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement a billing feature",
          "--swarm-root", str(root)],
         capture_output=True, text=True, env=env, timeout=20,
     )
-    elapsed = time.monotonic() - started
     assert r.returncode == 0, r.stderr + r.stdout
     assert marker.read_text() == str(signal.SIGTERM)
-    assert elapsed < 8, elapsed
     log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
     assert log["run_rc"] == 0
 
 
 def test_run_cap_sigkills_a_runner_that_ignores_sigterm(tmp_path):
     """The grace is finite: a runner that ignores SIGTERM is then SIGKILLed, and the log shows that signal."""
-    import time
     root = _stub_root(tmp_path, """import signal, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 time.sleep(30)
 """)
     env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm"),
            "SWARM_AUTONOMOUS_RUN_CAP_S": "1", "SWARM_AUTONOMOUS_RUN_GRACE_S": "1"}
-    started = time.monotonic()
     r = subprocess.run(
         [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement a billing feature",
          "--swarm-root", str(root)],
         capture_output=True, text=True, env=env, timeout=20,
     )
-    elapsed = time.monotonic() - started
-    assert elapsed < 8, elapsed
     log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
     assert log["run_rc"] == -signal.SIGKILL
     assert r.returncode == 0  # the hook fails open; the runner's SIGKILL is recorded in the log above

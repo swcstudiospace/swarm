@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -20,6 +19,7 @@ use gsd_taskwriter::{
     open_for_write, Decline, GateIssueRequest, SystemIds, TaskStoreWriter, WriterConfig,
 };
 
+use super::is_executable_candidate;
 use crate::strangler_seam::{
     after_commit, before_any_write, canonical_or, env_value, resolve_swarm_dir, Invocation,
 };
@@ -156,23 +156,17 @@ fn which(name: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
         return false;
     };
-    path.split(':').any(|dir| {
-        let candidate = Path::new(dir).join(name);
-        candidate.is_file()
-            && candidate
-                .metadata()
-                .map(|meta| meta.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-    })
+    path.split(':')
+        .any(|dir| is_executable_candidate(&Path::new(dir).join(name)))
 }
 
-fn pytest_importable(env: &[(String, String)]) -> bool {
-    Command::new(python_bin(env))
-        .arg("-c")
-        .arg("import pytest")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+/// `import pytest` in the interpreter, under the runner deadline. It runs in the process working directory, as the probe
+/// always has, since `python -c` puts that directory on `sys.path`. A spawn failure or a timeout is a refusal: the pytest
+/// runner cannot be ruled out, so Python answers.
+fn pytest_importable(env: &[(String, String)], timeout: u64) -> Result<bool, SeamError> {
+    let cmd = vec![python_bin(env), "-c".into(), "import pytest".into()];
+    let (code, _, _) = run_cmd_streams(&cmd, Path::new("."), timeout)?;
+    Ok(code == 0)
 }
 
 /// Deliberately not a shell parser: only literal simple commands joined by unquoted `&&`.
@@ -355,7 +349,11 @@ fn is_node_test_script(script: &str) -> bool {
     test
 }
 
-fn detect_runners(root: &Path, env: &[(String, String)]) -> Vec<Runner> {
+fn detect_runners(
+    root: &Path,
+    env: &[(String, String)],
+    timeout: u64,
+) -> Result<Vec<Runner>, SeamError> {
     let mut runners = Vec::new();
     let pytest_marker = root.join("pyproject.toml").exists()
         || root.join("pytest.ini").exists()
@@ -367,7 +365,7 @@ fn detect_runners(root: &Path, env: &[(String, String)]) -> Vec<Runner> {
                 })
             })
         });
-    if pytest_marker && pytest_importable(env) {
+    if pytest_marker && pytest_importable(env, timeout)? {
         runners.push(Runner {
             name: "pytest",
             cmd: vec![
@@ -426,7 +424,7 @@ fn detect_runners(root: &Path, env: &[(String, String)]) -> Vec<Runner> {
             node_test: false,
         });
     }
-    runners
+    Ok(runners)
 }
 
 /// Workload suffixes `scripts/_dotnet_quality.py` detects (`_SUFFIXES`), lowercase with the dot.
@@ -875,7 +873,7 @@ async fn answer_with_keys<E>(
                 "a .NET project is under the gate root; the host route does not serve .NET, Python answers",
             )));
         }
-        let runners = detect_runners(&root, &call.env);
+        let runners = detect_runners(&root, &call.env, args.timeout)?;
         if runners.is_empty() {
             let severity = if risk == "low" { "minor" } else { "major" };
             findings.push(finding(
@@ -1266,7 +1264,7 @@ fn load_per_target(
 mod tests {
     use super::{
         committed, count, has_dotnet_project, is_node_test_script, literal_commands, node_evidence,
-        node_ok, run_cmd, write_plan_file, NodeEvidence,
+        node_ok, pytest_importable, run_cmd, write_plan_file, NodeEvidence,
     };
     use gsd_envelope::{KeyFilePresence, KeyMaterial};
     use gsd_failure::ErrorCode;
@@ -1550,6 +1548,28 @@ mod tests {
             run_cmd(&cmd, dir.path(), 10).expect("a runner that exits 0 is not a timeout");
         assert_eq!(code, 0);
         assert_eq!(text.len(), 262_144);
+    }
+
+    #[test]
+    fn a_hung_interpreter_is_refused_at_the_runner_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interpreter = dir.path().join("sleepy-python");
+        std::fs::write(&interpreter, "#!/bin/sh\nexec sleep 30\n").expect("write");
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let env = vec![(
+            "GSD_QA_PYTHON".to_string(),
+            interpreter.display().to_string(),
+        )];
+        let started = std::time::Instant::now();
+        let outcome = pytest_importable(&env, 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the probe waited past its one-second deadline"
+        );
+        let error = outcome.expect_err("a probe that exceeds the deadline is a refusal");
+        assert_eq!(error.code(), ErrorCode::Dep);
     }
 
     #[test]

@@ -137,14 +137,22 @@ async fn connect(path: &Path) -> SqliteConnection {
 /// Runs one raw statement on a separate connection (test setup only).
 async fn exec(path: &Path, sql: &str) {
     let mut conn = connect(path).await;
-    sqlx::query(sql).execute(&mut conn).await.expect(sql);
+    sqlx::QueryBuilder::new(sql)
+        .build()
+        .execute(&mut conn)
+        .await
+        .expect(sql);
     conn.close().await.expect("close");
 }
 
 /// One text line per result row of a `SELECT` that builds its own text with `quote()`.
 async fn lines(path: &Path, sql: &str) -> Vec<String> {
     let mut conn = connect(path).await;
-    let rows = sqlx::query(sql).fetch_all(&mut conn).await.expect(sql);
+    let rows = sqlx::QueryBuilder::new(sql)
+        .build()
+        .fetch_all(&mut conn)
+        .await
+        .expect(sql);
     conn.close().await.expect("close");
     rows.iter().map(|row| row.get::<String, _>(0)).collect()
 }
