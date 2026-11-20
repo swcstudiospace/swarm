@@ -76,7 +76,7 @@ use gsd_route::transition_plan::{
 };
 use gsd_route::{is_safe_id, jstr, obj_get, Fields, Json};
 
-use crate::apply::write_validated;
+use crate::apply::{decision_row, write_validated};
 use crate::approval::{self, gather, ApprovalKeys, ApprovalSource};
 use crate::error::{ErrorKind, WriteState, WriterError};
 use crate::plan::{has_non_finite, PlanValidator, PlanViolation, ValidatedPlan};
@@ -555,22 +555,6 @@ impl<'a> ApprovalGuard<'a> {
     pub(crate) fn new(source: &'a dyn ApprovalSource, keys: &'a ApprovalKeys) -> Self {
         Self { source, keys }
     }
-}
-
-/// The row as [`Facts`] holds it: `dict(sqlite3.Row)`, so the JSON columns are text again and `notes_json` is gone. (The same
-/// reshaping as `apply.rs` does for a single transition; that module is not this unit's to export from.)
-fn decision_row(row: Fields) -> Fields {
-    const JSON_COLUMNS: [&str; 5] = ["inputs", "outputs", "acceptance", "budget", "depends_on"];
-    row.into_iter()
-        .filter(|(name, _)| name != "notes_json")
-        .map(|(name, value)| {
-            if JSON_COLUMNS.contains(&name.as_str()) {
-                (name, Json::Str(to_python_dumps(&value)))
-            } else {
-                (name, value)
-            }
-        })
-        .collect()
 }
 
 /// F-7: an APPROVED step is written only if the host's own approval facts, read now inside the transaction, give exactly this plan.

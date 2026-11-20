@@ -146,8 +146,12 @@ def script(stem: str) -> ModuleType:
         return module
 
 
-def respond(payload: dict[str, Any], work: Callable[[], _Result]) -> dict[str, Any] | _Result:
-    """Contract-test probe, then the real call. Probe values never reach the lane function."""
+def respond(payload: dict[str, Any], work: Callable[[], _Result], required: tuple[str, ...] = ()) -> dict[str, Any] | _Result:
+    """Contract-test probe, then the real call. Probe values never reach the lane function.
+
+    `required` lists the top-level payload keys the call reads unconditionally. The registry schema enforces them for
+    registry calls; a direct call missing one gets INVALID_INPUT naming it instead of a KeyError.
+    """
     probe = payload.get("probe")
     if probe == "sleep":
         sleep_until_cancelled(0.2)
@@ -156,4 +160,7 @@ def respond(payload: dict[str, Any], work: Callable[[], _Result]) -> dict[str, A
         raise OSError("declared dependency is unavailable")
     if probe == "partial":
         return {"state": "PARTIAL_SUCCESS", "completed_fraction": 0.5}
+    missing = next((key for key in required if key not in payload), None)
+    if missing is not None:
+        return {"state": "INVALID_INPUT", "field": missing, "message": f"{missing} is required"}
     return work()

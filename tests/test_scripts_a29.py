@@ -479,10 +479,8 @@ def test_long_minified_lines_scan_in_linear_time(tmp_path):
     # unbounded `[^)]*` rules were quadratic: one 1 MiB line of repeated calls took minutes
     line = ("localStorage.setItem(x," * 45000)[:300_000] + "\nconsole.log(x," * 1 + ("console.log(x," * 60000)[:100_000] + "\n"
     write(tmp_path, "public/vendor.min.js", line + ("signMessage({" * 60000)[:100_000] + "\n")
-    import time
-    start = time.monotonic()
     code, report, _ = scan(tmp_path)
-    assert time.monotonic() - start < 20 and code == 0 and report["files_scanned"] == 1
+    assert code == 0 and report["status"] == "ok" and report["files_scanned"] == 1  # the work budget fails a quadratic reader with status fail
     write(tmp_path, "public/hit.js", "console.log('privateKey', k); localStorage.setItem('mnemonic', m); signMessage({ raw: h });\n")
     ids = {f["id"] for f in scan(tmp_path)[1]["findings"]}
     assert {"DAPP-KEY-LOG", "DAPP-KEY-STORAGE", "DAPP-BLIND-SIGN"} <= ids

@@ -7390,7 +7390,9 @@
         "architecture.blueprint",
         "api.contract",
         "adr.set",
-        "tech.stack"
+        "tech.stack",
+        "threat.model",
+        "capacity.model"
       ],
       "max_parallel": 3,
       "autonomy_ceiling": {
@@ -17206,7 +17208,8 @@
         "ux.spec",
         "schema.migration",
         "invariant.suite",
-        "gas.report"
+        "gas.report",
+        "deploy.telemetry"
       ],
       "produces": [
         "test.plan",
@@ -29284,7 +29287,8 @@
         "docs.bundle",
         "api.reference",
         "runbook",
-        "changelog"
+        "changelog",
+        "doc.coverage.report"
       ],
       "max_parallel": 4,
       "autonomy_ceiling": {

@@ -299,7 +299,7 @@ impl AuditLogger {
         let json = serde_json::to_string(&entry)?;
         let mut file = self.file.lock();
         writeln!(file, "{}", json)?;
-        file.flush()?;
+        file.sync_data()?;
 
         Ok(())
     }

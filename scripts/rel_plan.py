@@ -25,6 +25,7 @@ from swarm.gates import make_finding  # noqa: E402
 from swarm.verdicts import issue_gate, resolve_targets  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
+from swarm.atomic_file import write_text_atomic  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 RISK_ORDER = ["low", "medium", "high"]
@@ -42,9 +43,12 @@ def read_freeze(root: Path) -> dict | None:
     if not f.exists():
         return None
     try:
-        return json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
+        frozen = json.loads(f.read_text())
+    except (OSError, ValueError):  # ValueError covers a non-UTF-8 file as well as invalid JSON
+        frozen = None
+    if not isinstance(frozen, dict):  # P4-21: valid JSON that is not an object (a list, a number) is an unreadable freeze too
         return {"reason": "unreadable freeze file", "frozen_at": None, "by": "unknown"}
+    return frozen
 
 
 def freeze_finding(root: Path, frozen: dict, fid: str) -> dict:
@@ -78,7 +82,7 @@ def run(args, ctx) -> dict:
     if args.freeze and not ctx.dry_run:
         rec = {"reason": args.freeze, "frozen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "by": "A12@local", "correlation_id": ctx.correlation_id}
-        freeze_file(ctx.root).write_text(json.dumps(rec, indent=2))
+        write_text_atomic(freeze_file(ctx.root), json.dumps(rec, indent=2))
     if args.unfreeze and not ctx.dry_run and freeze_file(ctx.root).exists():
         freeze_file(ctx.root).unlink()
     frozen = read_freeze(ctx.root)  # read only; the dry-run honours an active freeze too (T-01-35)
@@ -161,7 +165,7 @@ def run(args, ctx) -> dict:
     rdir = swarm_dir(ctx.root) / "releases"
     rdir.mkdir(parents=True, exist_ok=True)
     plan["gate_verdict"] = verdict
-    (rdir / f"{release_id}.plan.json").write_text(json.dumps(plan, indent=2))
+    write_text_atomic(rdir / f"{release_id}.plan.json", json.dumps(plan, indent=2))
     return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "frozen": bool(frozen), "freeze": frozen,
             "release_id": release_id, "tasks": per_task, "plan": plan, "findings": findings, "envelope": env,
             "summary": f"release gate {verdict.upper()} for {release_id} ({len(ids)} task(s), risk={risk}"

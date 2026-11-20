@@ -2,6 +2,8 @@
 //! This table is the single source of truth for legal thread transitions. Nothing else
 //! in the crate may encode transition legality.
 
+use crate::{PoolError, PoolResult};
+
 /// Thread metadata key that carries the reason a thread is `BLOCKED`.
 pub const BLOCK_REASON_KEY: &str = "block_reason";
 
@@ -94,6 +96,47 @@ pub fn is_legal_transition(from: ThreadPhase, to: ThreadPhase) -> bool {
     allowed_successors(from).contains(&to)
 }
 
+/// The retry reset: the one edge out of [`ThreadPhase::CancelledTimedOut`], back to [`ThreadPhase::Idle`].
+///
+/// It is kept out of [`allowed_successors`], so [`crate::transition`] still refuses every edge out of a
+/// terminal phase. Only the join retry path in `gsd-state` applies it, through [`retry_reset`].
+pub const RETRY_RESET: (ThreadPhase, ThreadPhase) =
+    (ThreadPhase::CancelledTimedOut, ThreadPhase::Idle);
+
+/// Applies the retry reset to `from` and returns the phase it reaches, `IDLE`.
+/// Every other phase is refused with `PoolError::InvalidState`.
+pub fn retry_reset(from: ThreadPhase) -> PoolResult<ThreadPhase> {
+    let (edge_from, to) = RETRY_RESET;
+    if from == edge_from {
+        Ok(to)
+    } else {
+        Err(PoolError::InvalidState(format!(
+            "{} has no retry reset to IDLE",
+            from.as_str()
+        )))
+    }
+}
+
+/// The failed-thread retry reset: the edge out of [`ThreadPhase::Failed`] back to [`ThreadPhase::Idle`].
+///
+/// The join path applies it only to a thread that ended by a join timeout (`terminal_reason` `timed_out`). It is
+/// kept out of [`allowed_successors`] for the same reason as [`RETRY_RESET`].
+pub const RETRY_RESET_FAILED: (ThreadPhase, ThreadPhase) = (ThreadPhase::Failed, ThreadPhase::Idle);
+
+/// Applies the failed-thread retry reset to `from` and returns `IDLE`.
+/// Every other phase is refused with `PoolError::InvalidState`.
+pub fn retry_reset_failed(from: ThreadPhase) -> PoolResult<ThreadPhase> {
+    let (edge_from, to) = RETRY_RESET_FAILED;
+    if from == edge_from {
+        Ok(to)
+    } else {
+        Err(PoolError::InvalidState(format!(
+            "{} has no failed retry reset to IDLE",
+            from.as_str()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +203,52 @@ mod tests {
     #[test]
     fn block_reason_metadata_key_is_stable() {
         assert_eq!(BLOCK_REASON_KEY, "block_reason");
+    }
+
+    #[test]
+    fn retry_reset_only_returns_cancelled_timed_out_to_idle() {
+        for from in ALL_PHASES {
+            let result = retry_reset(from);
+            if from == ThreadPhase::CancelledTimedOut {
+                assert_eq!(result.ok(), Some(ThreadPhase::Idle));
+            } else {
+                assert!(
+                    matches!(result, Err(PoolError::InvalidState(_))),
+                    "{} must have no retry reset",
+                    from.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_reset_stays_out_of_the_general_table() {
+        assert!(!is_legal_transition(
+            ThreadPhase::CancelledTimedOut,
+            ThreadPhase::Idle
+        ));
+        assert!(allowed_successors(ThreadPhase::CancelledTimedOut).is_empty());
+    }
+
+    #[test]
+    fn failed_retry_reset_is_the_only_edge_from_failed_to_idle() {
+        for from in ALL_PHASES {
+            let result = retry_reset_failed(from);
+            if from == ThreadPhase::Failed {
+                assert_eq!(result.ok(), Some(ThreadPhase::Idle));
+            } else {
+                assert!(
+                    matches!(result, Err(PoolError::InvalidState(_))),
+                    "{} must have no failed retry reset",
+                    from.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_retry_reset_stays_out_of_the_general_table() {
+        assert!(!is_legal_transition(ThreadPhase::Failed, ThreadPhase::Idle));
+        assert!(allowed_successors(ThreadPhase::Failed).is_empty());
     }
 }

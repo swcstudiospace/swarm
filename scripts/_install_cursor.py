@@ -218,10 +218,11 @@ def _stamp_is_ours(stamp: dict | None, target: Path, sources: dict[str, str]) ->
         require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
-        if not dest.exists():
+        blob = _open_nofollow_read(dest, target)
+        if blob is None:
             continue
         prev = recorded.get(rel)
-        if not isinstance(prev, str) or prev != _sha(dest.read_text(encoding="utf-8")):
+        if not isinstance(prev, str) or prev != _sha(blob.decode("utf-8")):
             return False
     return True
 
@@ -254,10 +255,11 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
         require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
-        if not dest.exists():
+        blob = _open_nofollow_read(dest, target)
+        if blob is None:
             writes[rel] = content
             continue
-        current = dest.read_text(encoding="utf-8")
+        current = blob.decode("utf-8")
         if current == content:
             continue
         prev = recorded.get(rel) if isinstance(recorded, dict) else None
@@ -289,7 +291,10 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
             if not dest.is_file():
                 continue
             # byte hash: matches _sha() for unchanged UTF-8, and treats non-UTF-8 as a local edit
-            if hashlib.sha256(dest.read_bytes()).hexdigest() == prev:
+            blob = _open_nofollow_read(dest, target)
+            if blob is None:
+                continue
+            if hashlib.sha256(blob).hexdigest() == prev:
                 removals.append(rel)
             else:
                 kept.append(rel)
@@ -410,9 +415,7 @@ def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]], r
     the install succeeds.
     """
     require_real_dirs(root, dest.parent)
-    prev = dest.read_bytes() if dest.is_file() and not dest.is_symlink() else None
-    if dest.exists() and (dest.is_symlink() or not dest.is_file()):
-        raise UnsafeDestination(f"{dest} is a symlink") if dest.is_symlink() else OSError(f"{dest} is not a regular file")
+    prev = _open_nofollow_read(dest, root)  # None when absent; a symlink or a non-regular file is refused
     if prev is not None:
         _save_backup(dest, prev, root)
     try:
@@ -441,7 +444,8 @@ def _restore_one(path: Path, data: bytes | None, root: Path) -> Path | None:
             if path.is_file():
                 path.unlink()
         else:
-            blob = bak.read_bytes() if bak.is_file() and not bak.is_symlink() else data
+            saved = _open_nofollow_read(bak, root) if bak.is_file() and not bak.is_symlink() else None
+            blob = data if saved is None else saved
             _replace_bytes(path, blob, root)
     except (OSError, UnsafeDestination):
         return bak
@@ -505,7 +509,9 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
             require_real_dirs(dest_root, path.parent)
             if path.is_symlink() or not path.is_file():
                 continue
-            data = path.read_bytes()
+            data = _open_nofollow_read(path, dest_root)
+            if data is None:
+                continue
             _save_backup(path, data, dest_root)
             try:
                 path.unlink()

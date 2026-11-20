@@ -641,7 +641,40 @@ pub fn missing_gate_reasons(
             out.push((gate, CheckOutcome::Fail));
         }
     }
+    refuse_owned_target_signature(task, rows)?;
     Ok(out)
+}
+
+/// Python's `_owned_target_fail` also counts a fail on another target this gate task owns, when the gate task issued the verdict
+/// (the envelope's `gate_task`). Whether that verdict decides the gate depends on its signature, which this engine does not
+/// verify. So a gate task with a signed verdict on another owned target that it may have issued refuses, and Python answers.
+fn refuse_owned_target_signature(
+    task: &TaskFacts,
+    rows: &[VerdictFacts],
+) -> Result<(), Unsupported> {
+    let (Some(gate), Some(targets)) = (&task.gate, &task.gate_for) else {
+        return Ok(());
+    };
+    let may_be_issued_here = rows.iter().any(|facts| {
+        facts.row.gate == *gate
+            && facts.row.task_id != task.task_id
+            && targets.contains(&facts.row.task_id)
+            && match &facts.envelope {
+                EnvelopeState::Valid(envelope) => match &envelope.gate_task {
+                    GateTask::Task(issuer) => issuer == &task.task_id,
+                    GateTask::Unsupported => true,
+                    GateTask::None => false,
+                },
+                EnvelopeState::Unsupported => true,
+                EnvelopeState::Invalid => false,
+            }
+    });
+    if may_be_issued_here {
+        return Err(Unsupported(
+            "a signed verdict this gate task may have issued on another owned target decides the gate, and the rust engine does not verify that signature; use GSD_ENGINE=python",
+        ));
+    }
+    Ok(())
 }
 
 /// Gate name when a verified current fail sits on this gate task itself (`notes.gate_for` contains `task_id`).

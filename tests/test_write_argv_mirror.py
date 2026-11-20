@@ -94,7 +94,12 @@ def test_argparse_agrees_with_the_committed_verdicts(script: ModuleType, cases: 
         assert generator.argparse_result(script, case["argv"]) == case["argparse"], case["name"]
 
 
-@pytest.mark.parametrize("argv", [
+# The argv a lenient grammar must never serve: abbreviations (`allow_abbrev=False`), arity slips, an explicit value on a
+# flag that takes none, and a stray positional. This list is a candidate pool only: whether argparse rejects one of
+# them is argparse's verdict, not this list's, so the test below filters the pool (plus the rejected corpus, which
+# the oracle generated) through the live parser instead of asserting a hard-coded verdict that a prefix/arity change
+# would stale. Pinning the verdicts themselves stays with `test_argparse_agrees_with_the_committed_verdicts`.
+TEETH_TRAPS: list[list[str]] = [
     ["--trans", "T-1", "DONE", "--json"],
     ["--tran", "T-1", "DONE", "--json"],
     ["--transition", "T-1", "DONE", "--js"],
@@ -104,16 +109,28 @@ def test_argparse_agrees_with_the_committed_verdicts(script: ModuleType, cases: 
     ["--transition", "T-1", "DONE", "--reason", "--json"],
     ["--transition=T-1", "DONE", "--json"],
     ["--transition", "T-1", "DONE", "--json=1"],
-])
-def test_the_checker_has_teeth_against_a_grammar_that_serves_what_argparse_rejects(argv: list[str], script: ModuleType) -> None:
-    """A served function that accepts the argv under test (the shape of an abbreviation or arity bug) is caught by `mirror_violations`."""
+]
+
+
+def test_the_checker_has_teeth_against_a_grammar_that_serves_what_argparse_rejects(script: ModuleType, cases: list[dict[str, Any]]) -> None:
+    """A served function that accepts what argparse rejects (the shape of an abbreviation or arity bug) is caught by `mirror_violations`."""
+    candidates = TEETH_TRAPS + [case["argv"] for case in cases if not case["argparse"]["ok"]]
+    seen: set[tuple[str, ...]] = set()
+    unique: list[list[str]] = []
+    for argv in candidates:
+        if tuple(argv) not in seen:
+            seen.add(tuple(argv))
+            unique.append(argv)
+    rejected = [argv for argv in unique if not generator.argparse_result(script, argv)["ok"]]
+    assert len(rejected) >= 50, "the corpus holds more traps than this; a parser that accepts them all is itself the drift"
+    canonical = generator.reference_served(["--transition", "T-1", "DONE", "--json"])
+    assert canonical is not None
+    rejected_set = {tuple(argv) for argv in rejected}
 
     def lenient(candidate: list[str]) -> dict[str, Any] | None:
-        fields = generator.reference_served(["--transition", "T-1", "DONE", "--json"])
-        return fields if candidate == argv else generator.reference_served(candidate)
+        return canonical if tuple(candidate) in rejected_set else generator.reference_served(candidate)
 
-    assert generator.argparse_result(script, argv)["ok"] is False
-    assert len(mirror_violations(lenient, [argv], script)) == 1
+    assert len(mirror_violations(lenient, rejected, script)) == len(rejected)
 
 
 def test_the_checker_catches_a_served_argv_that_argparse_parses_to_other_values(script: ModuleType) -> None:

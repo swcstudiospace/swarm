@@ -10,13 +10,13 @@
 
 use gsd_failure::ErrorCode;
 
-use crate::join_affinity_guard::Engine;
 use crate::strangler_seam::{
     before_any_write, error_reply, invoke, CoreBackend, Entrypoint, Invocation,
 };
 use gsd_route::ingest_args::parse_ingest_args;
 use gsd_route::transition_args::parse_transition_args;
 use gsd_route::{parse_orch_status_read, Reply, SeamError};
+use gsd_scheduler::join_affinity_guard::Engine;
 
 /// Environment variable that selects the engine for each invocation.
 pub const ENGINE_ENV: &str = "GSD_ENGINE";

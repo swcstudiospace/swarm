@@ -633,6 +633,8 @@ def _end_group(pgid: int, deadline: float) -> None:
         settle = time.monotonic() + 2  # SIGKILL cannot be caught; what is left is the init process reaping orphans
         while _group_alive(pgid) and time.monotonic() < settle:
             time.sleep(0.05)
+        if _group_alive(pgid):
+            _LOG.error("process group %s still alive after SIGKILL; left running", pgid)
 
 
 def kill_sessions(grace: float = 5, reason: str = SHUTDOWN_REASON) -> None:
@@ -807,9 +809,11 @@ def _write_stdin(proc: subprocess.Popen, prompt: str) -> None:
                 pass
 
 
-def _drain(stream, parts: list[str], scan: StderrScan | None, tap: OmpActivity | None = None) -> None:
+def _drain(stream, parts: list[str], scan: StderrScan | None, tap: OmpActivity | None = None,
+           read_faults: list[str] | None = None) -> None:
     """Read an unbuffered binary pipe and append decoded text as it arrives, not when the child exits. `scan` and
-    `tap` see each piece as it lands; a fault in `tap` (a display feed) never stops the drain."""
+    `tap` see each piece as it lands; a fault in `tap` (a display feed) never stops the drain. A read fault ends the
+    drain and is recorded in `read_faults`."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def seen(piece: str) -> None:
@@ -835,6 +839,8 @@ def _drain(stream, parts: list[str], scan: StderrScan | None, tap: OmpActivity |
             seen(tail)
     except (ValueError, OSError) as exc:
         _LOG.warning("session output read failed after %d characters, so it is truncated: %s", sum(map(len, parts)), exc)
+        if read_faults is not None:
+            read_faults.append(str(exc))
 
 
 def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
@@ -890,6 +896,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
     proc = group.proc
     out_parts: list[str] = []
     err_parts: list[str] = []
+    read_faults: list[str] = []  # P3-18: a drain that failed mid-read; the output it returns is partial
     # omp only: a load failure is a stderr line while the session keeps going. Read it as it arrives and stop the
     # group then, so the unguarded session does not get as far as a tool call (T-06-27).
     scan = StderrScan() if runtime == "omp" else None
@@ -903,8 +910,8 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         tap = OmpActivity(handle.activity) if runtime == "omp" else None
     pumps = [
         threading.Thread(target=_write_stdin, args=(proc, stdin_prompt), daemon=True),
-        threading.Thread(target=_drain, args=(proc.stdout, out_parts, None, tap), daemon=True),
-        threading.Thread(target=_drain, args=(proc.stderr, err_parts, scan), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stdout, out_parts, None, tap, read_faults), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err_parts, scan, None, read_faults), daemon=True),
     ]
     timed_out = False
     drains = pumps[1:]  # stdout and stderr; the leader's exit does not finish either while a tool holds the pipe
@@ -916,7 +923,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         deadline = time.monotonic() + args.task_timeout
         while True:
             if scan is not None and scan.hit.is_set():
-                group.kill()  # not stop(): this is not a lost lease, and the result is refused as E-DEP below
+                group.kill()  # not stop(): this is not a lost lease, and the result is refused as E-POLICY below
                 break
             if group.stopped:  # the lease keeper already signalled the group
                 break
@@ -955,6 +962,8 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
     # T-06-10: the live path records the producing runtime and argv like --dry-run does, so a stored
     # result names what produced it. Last so a session payload can never clobber the runner's own keys.
     live = {"runtime": runtime, "argv": cmd}
+    if read_faults:  # a drain lost its pipe mid-read: what the session wrote is partial
+        live["truncated"] = True
     if timed_out:
         text, meta = session_output(runtime, out, err, proc.returncode)
         raise AgentTimeout(cmd, args.task_timeout, text, {**meta, **live, "timed_out": True})
@@ -1041,7 +1050,9 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
     if per_target_findings is not None:
         cmd += ["--per-target-findings", str(per_target_findings)]
     # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record
-    env = {k: v for k, v in os.environ.items() if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD")}
+    # T-06-19: the gate's own --task-id and --correlation-id are passed below; an inherited default must not name the parent's task
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_TASK_ID", "SWARM_CORRELATION_ID")}
     env["SWARM_DIR"] = str(Path(sdir).resolve())
     group = ChildGroup(cmd, cwd=None, env=env, stdin=subprocess.DEVNULL)
     try:
@@ -1361,7 +1372,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         prompt = assignment_prompt(store, task, agent, workspace, lease_s=leases.lease_s(tid) if leases is not None else None,
                                    handoffs=context)
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
-        (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
+        write_text_atomic(sdir / "assignments" / f"{tid}.a{task['attempt']}.md", prompt)
         if args.dry_run:
             if handle is not None:
                 handle.started("dry-run")
@@ -1401,8 +1412,10 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
                 result, err = None, SwarmError(ErrorCode.E_CAPACITY, "provider rate limit or overload"
                                                + (f" (retry after {hit:g}s)" if hit else ""), task_id=tid)
         if meta.get("extension_error"):  # T-06-06: an unguarded session's result is never applied, nor its gate recorded
-            result, err = None, SwarmError(ErrorCode.E_DEP, "omp ran the session without the swarm guard: "
-                                           f"{meta['extension_error']}"[:500], task_id=tid)
+            # E-POLICY is permanent: is_transient never schedules a re-dispatch, so the session is not run again unguarded
+            msg = ("guard extension failed to load; the session was stopped before it could act: "
+                   f"{meta['extension_error']}")[:500]
+            result, err = None, SwarmError(ErrorCode.E_POLICY, msg, task_id=tid)
         # CR-04: record a gate only for a session that completed and asked to finish it — a crashed, errored or
         # BLOCKED/FAILED gate session gets no script run, so its targets keep the gate absent
         if (not args.dry_run and task["notes_json"].get("gate") and result is not None
@@ -1601,7 +1614,7 @@ def scheduler_engine() -> str:
     is not echoed. SWARM_PURE_PYTHON=1 forces python and wins over rust, with one warning on stderr."""
     if os.environ.get("SWARM_PURE_PYTHON") == "1":
         if os.environ.get("GSD_ENGINE") == "rust":
-            print("SWARM_PURE_PYTHON=1 forces the python scheduler; GSD_ENGINE=rust is not used", file=sys.stderr, flush=True)
+            _LOG.warning("SWARM_PURE_PYTHON=1 forces the python scheduler; GSD_ENGINE=rust is not used")
         return "python"
     requested = os.environ.get("GSD_ENGINE", "") or SCHEDULER_DEFAULT_ENGINE
     if requested not in ("python", "rust"):
@@ -2312,6 +2325,7 @@ class Scheduler:
         _LOG.warning("task %s worker failed: %s", tid, reason, exc_info=True)
         self._internal[tid] = self._internal.get(tid, 0) + 1
         outcome = S.FAILED.value
+        store = None
         try:
             store = TaskStore(self.store_path)
             with store.transaction():
@@ -2326,6 +2340,9 @@ class Scheduler:
                 store.set_notes(tid, running=None, running_deadline=None)
         except Exception:  # noqa: BLE001 - the store itself is the fault: the failure is reported, not recorded
             _LOG.warning("task %s failure could not be recorded", tid, exc_info=True)
+        finally:
+            if store is not None:
+                store.close()
         self.ctx.emit("task.result.rejected", {"task_id": tid, "mode": "headless", "reason": reason})
         if self.leases is not None:
             try:
