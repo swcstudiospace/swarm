@@ -2,9 +2,11 @@
 
 The stub declares exactly the names the extension exports: the error-code, retry, ``orch_status`` and redaction functions, and the
 scheduler primitives and runtime of Phase 14.4 (``sched_*``, ``ClaimTable``, ``AimdLimiter``, ``run_scheduler``; logic in
-crates/gsd-sched-core, wrappers in crates/gsd-python/src/{sched,sched_run}.rs). ``tests/typecheck`` and stubtest against the installed wheel
-keep it in step. Every scheduler call that is given an invalid value raises ``ValueError`` whose message starts with the wire code
-(``E-INPUT: <operation> failed: ...``); a Rust panic is ``E-INTERNAL`` and never a ``PanicException``.
+crates/gsd-sched-core, wrappers in crates/gsd-python/src/{sched,sched_run}.rs) plus the additive graph family
+(``graph_*``, ``GraphReport``, ``registry_lookup``, ``error_from_py``; wrappers in crates/gsd-python/src/pyo3/module.rs).
+``tests/typecheck`` and stubtest against the installed wheel keep it in step. Every scheduler call that is given
+an invalid value raises ``ValueError`` whose message starts with the wire code (``E-INPUT: <operation> failed: ...``);
+a Rust panic is ``E-INTERNAL`` and never a ``PanicException``.
 """
 
 from types import TracebackType
@@ -29,6 +31,13 @@ __all__ = [
     "Governor",
     "ChatPool",
     "ChatTicket",
+    "graph_api_version",
+    "graph_validate",
+    "graph_schedule",
+    "graph_submit",
+    "registry_lookup",
+    "error_from_py",
+    "GraphReport",
 ]
 
 def wire_codes() -> list[str]: ...
@@ -247,3 +256,44 @@ class ChatTicket:
         ``code`` None), ``"failed"`` (``code`` the wire code), ``"cancelled"`` or ``"pending"``. A timeout does not cancel
         the message. Releases the GIL while it waits."""
         ...
+
+@final
+class GraphReport:
+    """Validated graph report returned by ``graph_validate``. Frozen; every field is read-only."""
+
+    @property
+    def node_count(self) -> int: ...
+    @property
+    def edge_count(self) -> int: ...
+    @property
+    def order(self) -> list[str]: ...
+    @property
+    def legacy_fallback(self) -> bool: ...
+    @property
+    def api_version(self) -> str: ...
+    @property
+    def submission_id(self) -> str: ...
+
+def graph_api_version() -> str:
+    """The graph family version (``"graph/1"``)."""
+    ...
+
+def graph_validate(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = True) -> GraphReport:
+    """Validate the graph and return the topological order in a ``GraphReport``."""
+    ...
+
+def graph_schedule(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = True) -> list[str]:
+    """The topological dispatch order of the graph."""
+    ...
+
+def graph_submit(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = True) -> str:
+    """Validate the graph and return the deterministic submission receipt."""
+    ...
+
+def registry_lookup(name: str) -> str | None:
+    """The version of a known registry family, or ``None`` for an unknown name."""
+    ...
+
+def error_from_py(exc: BaseException) -> str:
+    """The wire string for a Python exception, mapped via the bridge error table."""
+    ...

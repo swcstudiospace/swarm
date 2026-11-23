@@ -313,12 +313,12 @@ class TaskStore:
         now = time.time()
         written = 0
         for node_id, predecessor_id, priority in edges:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 "INSERT OR IGNORE INTO graph_edges (correlation_id, node_id, predecessor_id, priority, ts)"
                 " VALUES (?,?,?,?,?)",
                 (correlation_id, node_id, predecessor_id, float(priority), now),
             )
-            written += 1
+            written += cursor.rowcount
         self._commit()
         return written
 

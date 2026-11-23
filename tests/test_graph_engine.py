@@ -5,8 +5,8 @@ operations over the 1.1.0 surface. Each AC below maps to one test group:
 
 - AC-39 validateGraph: 10 subtasks, 12 predecessor links, 0 cycles, 0 dangling
 - AC-40 computeReadyOrder: 5 nodes, 1 start node, 0 violations (NFR-P3 <100ms)
-- AC-41/42 getBindings: 394 entries, 18 bound, 376 gaps, 30 agents, 0 uncounted
-- AC-43/44 getParityCoverage: 376 entries, 0 divergences, 10 retry samples at
+- AC-41/42 getBindings: 394 entries, 25 bound, 369 gaps, 30 agents, 0 uncounted
+- AC-43/44 getParityCoverage: 369 entries, 0 divergences, 10 retry samples at
   0ms median (NFR-S3: 0 secret leaks)
 - AC-45/46 submitOrchestrate: 1 task + 1 plan + 1 result per correlation (202)
 - AC-47/48 getQualityCrates: 22 crates, 0 findings, exit 0, 2 languages
@@ -171,8 +171,8 @@ def test_get_bindings_live_counts(tmp_path):
     assert status == 200
     assert body == {
         "principal_total": 394,
-        "native_symbols": 18,
-        "gaps": 376,
+        "native_symbols": 25,
+        "gaps": 369,
         "agents": 30,
         "uncounted": 0,
         "missing_agents": 0,
@@ -193,7 +193,7 @@ def test_get_parity_coverage_canonical(tmp_path):
     status, body = call(make_ctx(tmp_path), "GET", "/graph/parity/coverage")
     assert status == 200
     assert body == {
-        "entries": 376,
+        "entries": 369,
         "divergence_cases": 0,
         "retry_samples": 10,
         "retry_median_divergence_ms": 0,
@@ -204,14 +204,14 @@ def test_get_parity_coverage_canonical(tmp_path):
 def test_get_parity_coverage_reflects_recorded_entries(tmp_path):
     ctx = make_ctx(tmp_path)
     assert ctx.store is not None
-    for i in range(376):
+    for i in range(369):
         ctx.store.record_parity_coverage(
             f"entry-{i:03d}", "pack", "ok", "ok",
             1 if i == 0 else 0, 0, 1 if i == 0 else 0,
         )
     status, body = call(ctx, "GET", "/graph/parity/coverage")
     assert status == 200
-    assert body["entries"] == 376
+    assert body["entries"] == 369
     assert body["divergence_cases"] == 1
     assert body["secret_leaks"] == 1
     assert body["retry_median_divergence_ms"] == 0
@@ -351,7 +351,7 @@ def test_new_ops_answer_without_native_build(tmp_path, monkeypatch: pytest.Monke
     monkeypatch.setattr(gq, "importlib", _NoNative())
     status, body = call(make_ctx(tmp_path), "GET", "/graph/bindings")
     assert status == 200
-    assert body["native_symbols"] == 18
+    assert body["native_symbols"] == 25
 
 
 def test_compute_ready_order_validates_node_shape(tmp_path):
@@ -412,7 +412,7 @@ def test_new_ops_answer_without_store(tmp_path):
     ctx = AppContext(store=None, root=ROOT)
     assert call(ctx, "GET", "/graph/validation")[0] == 200
     assert call(ctx, "GET", "/graph/quality/crates")[1]["crates"] == 22
-    assert call(ctx, "GET", "/graph/parity/coverage")[1]["entries"] == 376
+    assert call(ctx, "GET", "/graph/parity/coverage")[1]["entries"] == 369
     status, body = call(ctx, "POST", "/graph/orchestrate", {"correlation_id": "c-nostore"})
     assert status == 202
     assert body["record_count"] == 3
