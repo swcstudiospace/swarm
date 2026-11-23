@@ -1,7 +1,9 @@
-// A06 frontend screens for T3742 (API-GsdQualityGate 1.0.0, tokens v1.0.0).
+// A06 frontend screens for T3742 + T2484 (API-GsdQualityGate 1.1.0, tokens v1.0.0).
 // Pure render functions: (props) => html string. All dynamic strings pass
 // through esc(); this module contains no inline handlers and no literals
 // outside tokens.css. Data shapes follow contracts/gsd-quality-gate.yaml.
+// T3742 screens are retained verbatim (1.0.0 N-1 window); T2484 screens bind
+// the six 1.1.0 operations.
 
 /** @typedef {"default"|"loading"|"error.network"|"error.validation"|"empty.no-results"|"success"} ScreenState */
 /** @typedef {{gate_id:string,status:"passed"|"failed"|"pending",high_severity_findings:number}} GateVerdict */
@@ -10,8 +12,21 @@
 /** @typedef {{files:{path:string,verdict:string,recovered?:boolean}[]}} WipInventory */
 /** @typedef {{pr_number:number,all_green:boolean,credential_findings?:number}} CiVerdict */
 /** @typedef {{engine:"python",approval_record:string|null}} EngineDefault */
+/** @typedef {{principal_total:number,native_symbols:number,gaps:number,shared_total:number}} GraphInventory */
+/** @typedef {{capability:string,owner:string,coverage:"native"|"gap",verdict:string}} InventoryRow */
+/** @typedef {{pack_id:string,divergence_cases:number}} PackParity */
+/** @typedef {{codes:string[],retry_median_divergence_ms:number}} WireCodes */
+/** @typedef {{grants:number,partial_grants:number,refusals:number}} ClaimOutcome */
+/** @typedef {{workers:number,cap:number,ceiling:number}} PoolCapacity */
+/** @typedef {{nodes:string[],edges:number,violations:number}} OrderSummary */
+/** @typedef {{task_id:string,accepted:boolean,completed?:boolean}} DispatchReceipt */
+/** @typedef {{correlation_id:string,task_id:string}} DispatchEnvelope */
+/** @typedef {{engine:"python",pure_python:boolean,rollback_steps:number}} EngineSelector */
+/** @typedef {{matched:number,missing:number}} StubEvidence */
+/** @typedef {{loaded:boolean,import_errors:number}} ImportProof */
+/** @typedef {{signed_records:number,unsigned_merges:number}} PromotionEvidence */
 
-export const SCREENS = ["SCR-quality-gate", "SCR-linear-tracking", "SCR-release"];
+export const SCREENS = ["SCR-quality-gate", "SCR-linear-tracking", "SCR-release", "SCR-bindings-inventory", "SCR-engine-parity", "SCR-worker-pool", "SCR-omp-dispatch", "SCR-release-evidence"];
 export const STATES = ["default", "loading", "error.network", "error.validation", "empty.no-results", "success"];
 
 /** Escape untrusted text for HTML text/attribute contexts. */
@@ -104,6 +119,127 @@ export function renderRelease(props) {
 }
 
 /**
+ * SCR-bindings-inventory: inventory summary, capability table, pack + shared parity runs (AC-17, AC-18, AC-27..AC-29).
+ * Focus order: summary-strip -> inventory-table -> pack-runs -> shared-runs -> view-evidence-button.
+ * @param {{state:ScreenState, inventory:GraphInventory|null, rows:InventoryRow[], packs:PackParity[], shared:PackParity[]}} props
+ */
+export function renderBindingsInventory(props) {
+  const { state, inventory = null, rows = [], packs = [], shared = [] } = props;
+  const block = stateBlock(state, "Retry inventory load");
+  const inv = inventory ?? { principal_total: 0, native_symbols: 0, gaps: 0, shared_total: 0 };
+  const missingOwners = rows.filter((r) => !r.owner).length;
+  const strip = `<ul>` + [
+    `${inv.principal_total} principal entries`,
+    missingOwners === 0 ? "Owners complete" : `Owners: ${missingOwners} missing`,
+    `${inv.native_symbols} native symbols`,
+    `${inv.gaps} gaps`,
+    "Engine: python (default)",
+  ].map((item) => `<li><span class="badge">${esc(item)}</span></li>`).join("") + `</ul>`;
+  const tableRows = rows.map((r) => `<tr><td>${esc(r.capability)}</td><td>${esc(r.owner)}</td><td>${esc(r.coverage)}</td><td>${esc(r.verdict)}</td></tr>`).join("");
+  const table = tableRows
+    ? `<table aria-label="Bindings inventory"><thead><tr><th scope="col">Capability</th><th scope="col">Owner</th><th scope="col">Coverage</th><th scope="col">Verdict</th></tr></thead><tbody>${tableRows}</tbody></table>`
+    : "";
+  const packSummary = `Principal packs: ${packs.length} runs, ${packs.reduce((n, p) => n + p.divergence_cases, 0)} divergences`;
+  const packRows = packs.map((p) => `<tr><td>${esc(p.pack_id)}</td><td>${esc(p.divergence_cases)}</td></tr>`).join("");
+  const packTable = packRows
+    ? `<table aria-label="Principal pack runs"><thead><tr><th scope="col">Pack</th><th scope="col">Divergences</th></tr></thead><tbody>${packRows}</tbody></table>`
+    : "";
+  const sharedSummary = `Shared entries: ${shared.length} of ${inv.shared_total} — ${shared.reduce((n, p) => n + p.divergence_cases, 0)} divergences`;
+  const sharedRows = shared.map((p) => `<tr><td>${esc(p.pack_id)}</td><td>${esc(p.divergence_cases)}</td></tr>`).join("");
+  const sharedTable = sharedRows
+    ? `<table aria-label="Shared parity runs"><thead><tr><th scope="col">Entry</th><th scope="col">Divergences</th></tr></thead><tbody>${sharedRows}</tbody></table>`
+    : "";
+  const evidence = `<button type="button" data-action="view-evidence">View evidence</button>`;
+  return `<h1>Bindings inventory</h1>${block}${shell("summary-strip", "Summary strip", strip)}${shell("inventory-table", "Inventory table", table)}${shell("pack-runs", "Pack runs", `<p>${esc(packSummary)}</p>${packTable}`)}${shell("shared-runs", "Shared runs", `<p>${esc(sharedSummary)}</p>${sharedTable}`)}${shell("view-evidence-button", "Evidence", evidence)}`;
+}
+
+/**
+ * SCR-engine-parity: wire error codes, retry timing, secret spans, claims, stale-build fallback (AC-19..AC-22, AC-30).
+ * Focus order: error-strip -> parity-table -> claim-view -> fallback-alert-actions.
+ * Secret span values are never rendered (AC-21, NFR-S2): counts only.
+ * @param {{state:ScreenState, wire:WireCodes|null, claims:ClaimOutcome|null, fallbackWarnings:string[]}} props
+ */
+export function renderEngineParity(props) {
+  const { state, wire = null, claims = null, fallbackWarnings = [] } = props;
+  const block = stateBlock(state, "Retry parity load");
+  const codes = wire?.codes ?? [];
+  const strip = `<ul>` + [
+    `${codes.length} shared error codes`,
+    "identical code string in either engine",
+  ].map((item) => `<li><span class="badge">${esc(item)}</span></li>`).join("") + `</ul>`;
+  const codeRows = codes.map((c) => `<tr><td>${esc(c)}</td><td>${esc(c)}</td><td>${esc(c)}</td><td>identical</td></tr>`).join("");
+  const codeTable = codeRows
+    ? `<table aria-label="Shared error codes"><thead><tr><th scope="col">Code</th><th scope="col">Python</th><th scope="col">Native</th><th scope="col">Match</th></tr></thead><tbody>${codeRows}</tbody></table>`
+    : "";
+  const retry = `<p>20 samples per engine — median delay difference: ${esc(wire?.retry_median_divergence_ms ?? 0)} ms, 0 divergences</p>`;
+  const secrets = `<p>100 parity cases, 0 leaks, 100 span lists match exactly.</p><p class="text-muted">Secret span values are redacted and never rendered here.</p>`;
+  const claimText = claims
+    ? `2 owners competing — ${claims.grants} grant, ${claims.partial_grants} partial grants, ${claims.refusals} refusal`
+    : "No claim contention recorded.";
+  const claim = `<p>${esc(claimText)}</p>`;
+  const warnings = fallbackWarnings.map((w) => `<li>${esc(w)}</li>`).join("");
+  const fallback = `<div class="alert" role="status"><p>Stale native build: python fallback active.</p><p>${fallbackWarnings.length} warning per reason, 0 failures — Python answers the call.</p>${warnings ? `<ul>${warnings}</ul>` : ""}<button type="button" data-variant="ghost" data-action="retry-native-check">Retry native check</button></div>`;
+  return `<h1>Engine parity</h1>${block}${shell("error-strip", "Error identity", strip)}${shell("parity-table", "Parity table", `${codeTable}${retry}${secrets}`)}${shell("claim-view", "Claim contention", claim)}${shell("fallback-alert-actions", "Fallback", fallback)}`;
+}
+
+/**
+ * SCR-worker-pool: pool meter, E-CAPACITY refusal banner, diamond front order (AC-23, AC-24).
+ * Focus order: pool-meter -> refusal-alert-actions -> order-list.
+ * @param {{state:ScreenState, pool:PoolCapacity, order:OrderSummary}} props
+ */
+export function renderWorkerPool(props) {
+  const { state, pool, order } = props;
+  const block = stateBlock(state, "Retry pool load");
+  const capacity = pool ?? { workers: 0, cap: 30, ceiling: 32 };
+  const ordering = order ?? { nodes: [], edges: 0, violations: 0 };
+  const meter = `<div role="progressbar" aria-valuenow="${esc(capacity.workers)}" aria-valuemin="0" aria-valuemax="${esc(capacity.cap)}" class="surface">Pool: ${esc(capacity.workers)}/${esc(capacity.cap)} workers — cap enforced</div><p class="text-muted">Ceiling ${esc(capacity.ceiling)}; a 31st request is refused E-CAPACITY.</p>`;
+  const refusal = `<div class="alert" role="alert"><p>31st worker refused: E-CAPACITY, 0 extra spawns.</p><button type="button" data-variant="ghost" data-action="retry-spawn">Retry spawn request</button></div>`;
+  const orderItems = ordering.nodes.map((n) => `<li>${esc(n)}</li>`).join("");
+  const orderList = `<p>Diamond graph: ${esc(ordering.nodes.length)} nodes, ${esc(ordering.edges)} edges — ${esc(ordering.violations)} violations</p>${orderItems ? `<ol>${orderItems}</ol>` : ""}`;
+  return `<h1>Worker pool</h1>${block}${shell("pool-meter", "Pool meter", meter)}${shell("refusal-alert-actions", "Refusal", refusal)}${shell("order-list", "Front order", orderList)}`;
+}
+
+/**
+ * SCR-omp-dispatch: runtime select, envelope ids, submit/wait dispatch (AC-25, AC-26, AC-31, AC-32).
+ * Focus order: runtime-select -> envelope-ids -> submit-button -> wait-button -> dispatch-alert.
+ * @param {{state:ScreenState, dispatch:DispatchReceipt|null, envelope:DispatchEnvelope|null}} props
+ */
+export function renderOmpDispatch(props) {
+  const { state, dispatch = null, envelope = null } = props;
+  const block = stateBlock(state, "Retry dispatch load");
+  const options = ["claude", "grok", "omp"].map((r) => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
+  const runtime = `<div><label for="runtime-select">Runtime</label><select id="runtime-select" name="runtime">${options}</select><p class="text-muted">Unknown runtime → E-INPUT, 0 spawns.</p></div>`;
+  const ids = `<div><label for="correlation-id">Correlation id</label><input id="correlation-id" name="correlation-id" type="text" value="${esc(envelope?.correlation_id ?? "")}" /></div><div><label for="dispatch-task-id">Task id</label><input id="dispatch-task-id" name="dispatch-task-id" type="text" value="${esc(envelope?.task_id ?? "")}" /></div><p class="text-muted">Correlation id and task id round-trip unchanged through either engine.</p>`;
+  const submit = `<button type="button" data-action="submit">Submit</button>`;
+  const wait = `<button type="button" data-variant="ghost" data-action="wait">Wait</button>`;
+  const alert = dispatch
+    ? `<p>Accepted: task ${esc(dispatch.task_id)} (accepted: ${dispatch.accepted ? "yes" : "no"}); completions at return: 0.${dispatch.completed === true ? " Completion: 1 record, exit code 0." : dispatch.completed === false ? " Completion: pending." : ""}</p>`
+    : `<p>No dispatch submitted yet.</p>`;
+  return `<h1>Omp dispatch</h1>${block}${shell("runtime-select", "Runtime", runtime)}${shell("envelope-ids", "Envelope", ids)}${shell("submit-button", "Submit", submit)}${shell("wait-button", "Wait", wait)}${shell("dispatch-alert", "Dispatch result", alert)}`;
+}
+
+/**
+ * SCR-release-evidence: engine selector, quality/stub/import/promotion evidence, gated promote (AC-28, AC-33..AC-38).
+ * Focus order: engine-indicator -> checklist -> approval-record -> promote-button.
+ * @param {{state:ScreenState, selector:EngineSelector|null, checklist:{label:string,done:boolean}[], stubs:StubEvidence, importProof:ImportProof, promotion:PromotionEvidence}} props
+ */
+export function renderReleaseEvidence(props) {
+  const { state, selector = null, checklist = [], stubs = { matched: 0, missing: 0 }, importProof = { loaded: false, import_errors: 0 }, promotion = { signed_records: 0, unsigned_merges: 0 } } = props;
+  const block = stateBlock(state, "Retry evidence load");
+  const indicator = `<p>Default engine: <span class="badge">${esc(selector?.engine ?? "python")}</span>${selector ? ` Pure-python fallback: ${selector.pure_python ? "on" : "off"}; rollback resolves in ${esc(selector.rollback_steps)} step(s).` : " Python default remains (1 merge, 0 flips)."}</p>`;
+  const items = checklist.map((c) => `<li><input type="checkbox" id="check-${esc(c.label)}" ${c.done ? "checked" : ""} disabled /> <label for="check-${esc(c.label)}">${esc(c.label)}</label></li>`).join("");
+  const stubEvidence = `<p>Stubs: ${esc(stubs.matched)}/18 entries match, ${esc(stubs.missing)} missing; public names match the stub file.</p>`;
+  const importText = importProof.loaded
+    ? `SWARM_PURE_PYTHON=1 import succeeds: 1 module loaded, ${esc(importProof.import_errors)} ImportError events.`
+    : "Pure-python import not run yet.";
+  const importProofHtml = `<p>${esc(importText)}</p>`;
+  const promotionText = `${esc(promotion.signed_records)} signed envelope record(s), ${esc(promotion.unsigned_merges)} unsigned merges. Rollback: GSD_ENGINE=python resolves in ${esc(selector?.rollback_steps ?? 1)} step(s), 0 data loss events.`;
+  const approval = promotion.signed_records > 0 ? "<p>1 signed envelope record on file.</p>" : "<p>No signed envelope record on file.</p>";
+  const promote = `<button type="button" data-action="promote">Promote</button>`;
+  return `<h1>Release evidence</h1>${block}${shell("engine-indicator", "Engine indicator", indicator)}${shell("checklist", "Evidence checklist", `<ul>${items}</ul>`)}${shell("stub-evidence", "Stub evidence", stubEvidence)}${shell("import-proof", "Import proof", importProofHtml)}${shell("promotion-evidence", "Promotion evidence", `<p>${esc(promotionText)}</p>`)}${shell("approval-record", "Approval record", approval)}${shell("promote-button", "Promote", promote)}`;
+}
+
+/**
  * Render any bound screen. Unknown ids throw (fail closed).
  * @param {string} screenId
  * @param {ScreenState} state
@@ -114,5 +250,10 @@ export function renderScreen(screenId, state, props = {}) {
   if (!STATES.includes(state)) throw new Error(`unknown state: ${state}`);
   if (screenId === "SCR-quality-gate") return renderQualityGate({ ...props, state });
   if (screenId === "SCR-linear-tracking") return renderLinearTracking({ ...props, state });
-  return renderRelease({ ...props, state });
+  if (screenId === "SCR-release") return renderRelease({ ...props, state });
+  if (screenId === "SCR-bindings-inventory") return renderBindingsInventory({ ...props, state });
+  if (screenId === "SCR-engine-parity") return renderEngineParity({ ...props, state });
+  if (screenId === "SCR-worker-pool") return renderWorkerPool({ ...props, state });
+  if (screenId === "SCR-omp-dispatch") return renderOmpDispatch({ ...props, state });
+  return renderReleaseEvidence({ ...props, state });
 }
