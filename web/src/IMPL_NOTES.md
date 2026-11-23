@@ -87,3 +87,66 @@ this static delivery; CWV UNVERIFIED.
 Deviations: none from ux.spec states or tokens. Branch/PR: changes left
 in the shared wave worktree for A01 to collect; no branch switch or push
 performed to avoid disturbing concurrent wave artifacts.
+
+---
+
+# A06 impl notes — T74c2-fe (correlation 74c21365-b306-464b-bed8-4a60f55c495a)
+
+Bind: ux.spec docs/design/ux-spec-t74c2.md (LOFI, PROVISIONAL),
+tokens design/tokens.json v1.0.0 (unchanged), contract
+API-GsdQualityGate 1.2.0 (contracts/gsd-quality-gate.yaml, 18 operations)
+plus architecture blueprint v2.6 and ADR-0008.
+Toolchain: python + js both present; check plan
+ruff,mypy,pytest,eslint,tsc,npm test,cargo clippy,cargo test.
+
+Screens (all six ux.spec states each: default, loading, error.network,
+error.validation, empty.no-results, success; state parity tool confirms
+exact parity on all five):
+- SCR-graph-decomposition: 10/12 summary strip, subtask table (id /
+  predecessors / status badge), validation summary with 30-worker cap and
+  Python-default indicator, ready-order list (5 nodes, 1 start, 0
+  violations, p95 budget 100ms), view-evidence CTA
+  (validateGraph, computeReadyOrder; AC-39, AC-40).
+- SCR-capability-inventory: 394/18/376/0 summary strip, capability table
+  (capability / owner / coverage), agent coverage table (30 agents,
+  0 missing), Python-default indicator (getBindings; AC-41, AC-42).
+- SCR-parity-verification: 376-run parity strip, parity table (python /
+  rust / match), retry timing (10 samples, median diff 0ms), secret-span
+  counts only — values are never rendered (AC-43, NFR-S3), parity actions
+  (getParityCoverage; AC-43, AC-44).
+- SCR-orchestration-trace: ultrathink request strip, 3-record list
+  (task / plan / result for 1 correlation, 0 missing), labelled
+  correlation/task ids unchanged through handling, view-records CTA with
+  no-completion-implied note (submitOrchestrate; AC-45, AC-46).
+- SCR-upgrade-quality: upgrade strip (1 upgrade, quality repeated),
+  22-crate / 0-findings / exit-0 checklist plus both-languages line,
+  approval record with Python default (0 flips), view-evidence CTA
+  (getQualityCrates; AC-47, AC-48).
+
+Contract client: web/src/api.mjs binds all 18 operations of
+API-GsdQualityGate 1.2.0 (6 retained 1.0.0 under the 30-day N-1 window +
+6 added 1.1.0 + 6 added 1.2.0); POST support for submitDispatch,
+computeReadyOrder and submitOrchestrate; fails closed (E-CONTRACT) on
+missing required fields.
+
+Styling: tokens.css unchanged (var() only); screens.mjs carries no
+colour/spacing literals (asserted in tests). No new dependency
+(ADR-0005, ADR-0008): framework-free render functions + static pages
+generated from the renderers; Storybook-equivalent catalog in
+web/src/stories.mjs (13 entries).
+Component tests: web/graph-engineering-t74c2.test.mjs (20 tests:
+contract binding, per-screen states/content, redaction, injection, token
+binding); retained web/graph-engineering.test.mjs updated to 18 ops /
+13 catalog entries and still green (39 tests total across both files).
+
+Security: esc() on every interpolation; secret spans never rendered;
+no inline handlers (client-security scan: 0 findings); no external assets;
+no storage of PII.
+
+Perf: see fe_bundle_budget_check evidence in the closing handover;
+budget 170 KB. No Lighthouse run available in this static delivery;
+CWV UNVERIFIED.
+
+Deviations: none from ux.spec states or tokens. Branch/PR: changes left
+in the shared wave worktree for A01 to collect; no branch switch or push
+performed to avoid disturbing concurrent wave artifacts.

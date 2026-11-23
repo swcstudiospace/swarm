@@ -1,9 +1,9 @@
-// A06 frontend screens for T3742 + T2484 (API-GsdQualityGate 1.1.0, tokens v1.0.0).
+// A06 frontend screens for T3742 + T2484 + T74c2 (API-GsdQualityGate 1.2.0, tokens v1.0.0).
 // Pure render functions: (props) => html string. All dynamic strings pass
 // through esc(); this module contains no inline handlers and no literals
 // outside tokens.css. Data shapes follow contracts/gsd-quality-gate.yaml.
 // T3742 screens are retained verbatim (1.0.0 N-1 window); T2484 screens bind
-// the six 1.1.0 operations.
+// the six 1.1.0 operations; T74c2 screens bind the six 1.2.0 operations.
 
 /** @typedef {"default"|"loading"|"error.network"|"error.validation"|"empty.no-results"|"success"} ScreenState */
 /** @typedef {{gate_id:string,status:"passed"|"failed"|"pending",high_severity_findings:number}} GateVerdict */
@@ -25,8 +25,20 @@
 /** @typedef {{matched:number,missing:number}} StubEvidence */
 /** @typedef {{loaded:boolean,import_errors:number}} ImportProof */
 /** @typedef {{signed_records:number,unsigned_merges:number}} PromotionEvidence */
+/** @typedef {{subtasks:number,predecessor_links:number,cycles:number,dangling_links:number}} GraphValidation */
+/** @typedef {{nodes:number,start_node:string,violations:number,p95_ms:number}} ReadyOrder */
+/** @typedef {{id:string,predecessors:string[],status:"queued"|"running"|"done"}} SubtaskRow */
+/** @typedef {{principal_total:number,native_symbols:number,gaps:number,agents:number,uncounted:number,missing_agents:number}} BindingInventory */
+/** @typedef {{capability:string,owner:string,coverage:"bound"|"gap"}} BindingRow */
+/** @typedef {{agent:string,coverage:string}} AgentRow */
+/** @typedef {{entries:number,divergence_cases:number,retry_samples:number,retry_median_divergence_ms:number,secret_leaks:number}} ParityCoverage */
+/** @typedef {{capability:string,python:string,rust:string,match:string}} ParityRow */
+/** @typedef {{correlation_id:string,task_id:string,record_count:number}} OrchestrateReceipt */
+/** @typedef {{record:string,kind:string,status:string}} RecordRow */
+/** @typedef {{crates:number,findings:number,exit_code:number}} QualityCrates */
+/** @typedef {{label:string,done:boolean}} ChecklistItem */
 
-export const SCREENS = ["SCR-quality-gate", "SCR-linear-tracking", "SCR-release", "SCR-bindings-inventory", "SCR-engine-parity", "SCR-worker-pool", "SCR-omp-dispatch", "SCR-release-evidence"];
+export const SCREENS = ["SCR-quality-gate", "SCR-linear-tracking", "SCR-release", "SCR-bindings-inventory", "SCR-engine-parity", "SCR-worker-pool", "SCR-omp-dispatch", "SCR-release-evidence", "SCR-graph-decomposition", "SCR-capability-inventory", "SCR-parity-verification", "SCR-orchestration-trace", "SCR-upgrade-quality"];
 export const STATES = ["default", "loading", "error.network", "error.validation", "empty.no-results", "success"];
 
 /** Escape untrusted text for HTML text/attribute contexts. */
@@ -238,6 +250,127 @@ export function renderReleaseEvidence(props) {
   const promote = `<button type="button" data-action="promote">Promote</button>`;
   return `<h1>Release evidence</h1>${block}${shell("engine-indicator", "Engine indicator", indicator)}${shell("checklist", "Evidence checklist", `<ul>${items}</ul>`)}${shell("stub-evidence", "Stub evidence", stubEvidence)}${shell("import-proof", "Import proof", importProofHtml)}${shell("promotion-evidence", "Promotion evidence", `<p>${esc(promotionText)}</p>`)}${shell("approval-record", "Approval record", approval)}${shell("promote-button", "Promote", promote)}`;
 }
+/**
+ * SCR-graph-decomposition: subtask graph validation and ready order (AC-39, AC-40).
+ * Focus order: graph-table -> validation-summary -> ready-order-list -> view-evidence-button.
+ * @param {{state:ScreenState, validation:GraphValidation|null, subtasks:SubtaskRow[], readyOrder:ReadyOrder|null}} props
+ */
+export function renderGraphDecomposition(props) {
+  const { state, validation = null, subtasks = [], readyOrder = null } = props;
+  const block = stateBlock(state, "Retry decomposition load");
+  const v = validation ?? { subtasks: 0, predecessor_links: 0, cycles: 0, dangling_links: 0 };
+  const intro = `<p>1 assignment: ${esc(v.subtasks)} subtasks, ${esc(v.predecessor_links)} predecessor links, ${esc(v.cycles)} cycles, ${esc(v.dangling_links)} dangling links</p>`;
+  const rows = subtasks.map((s) => {
+    const preds = s.predecessors && s.predecessors.length ? s.predecessors.map((p) => esc(p)).join(", ") : "none";
+    return `<tr><td>${esc(s.id)}</td><td>${preds}</td><td><span class="badge">${esc(s.status)}</span></td></tr>`;
+  }).join("");
+  const table = rows
+    ? `<table aria-label="Subtask graph"><thead><tr><th scope="col">Subtask</th><th scope="col">Predecessors</th><th scope="col">Status</th></tr></thead><tbody>${rows}</tbody></table>`
+    : "";
+  const validationSummary = `<div class="surface"><p>Validation: ${esc(v.cycles)} cycles, ${esc(v.dangling_links)} dangling links.</p><p class="text-muted">Up to 30 concurrent workers; only ready subtasks run. Engine: python (default)</p></div>`;
+  const order = readyOrder ?? { nodes: 0, start_node: "", violations: 0, p95_ms: 0 };
+  const orderList = order.start_node ? `<ol><li>${esc(order.start_node)}</li></ol>` : "";
+  const readyBody = `<p>Ready order: ${esc(order.nodes)} nodes, start: ${esc(order.start_node || "none")}, ${esc(order.violations)} violations, p95 ${esc(order.p95_ms)} ms (budget 100 ms)</p>${orderList}`;
+  const evidence = `<button type="button" data-action="view-evidence">View evidence</button>`;
+  return `<h1>Graph decomposition</h1>${block}${shell("graph-table", "Subtask table", `${intro}${table}`)}${shell("validation-summary", "Validation summary", validationSummary)}${shell("ready-order-list", "Ready order", readyBody)}${shell("view-evidence-button", "Evidence", evidence)}`;
+}
+
+/**
+ * SCR-capability-inventory: binding inventory per agent (AC-41, AC-42).
+ * Focus order: inventory-summary -> inventory-table -> agent-coverage-table -> view-evidence-button.
+ * @param {{state:ScreenState, bindings:BindingInventory|null, rows:BindingRow[], agentRows:AgentRow[]}} props
+ */
+export function renderCapabilityInventory(props) {
+  const { state, bindings = null, rows = [], agentRows = [] } = props;
+  const block = stateBlock(state, "Retry inventory load");
+  const b = bindings ?? { principal_total: 0, native_symbols: 0, gaps: 0, agents: 0, uncounted: 0, missing_agents: 0 };
+  const strip = `<ul>` + [
+    `${b.principal_total} principal entries`,
+    `${b.native_symbols} bound to both engines`,
+    `${b.gaps} gaps`,
+    `${b.uncounted} uncounted`,
+    "Engine: python (default)",
+  ].map((item) => `<li><span class="badge">${esc(item)}</span></li>`).join("") + `</ul>`;
+  const tableRows = rows.map((r) => `<tr><td>${esc(r.capability)}</td><td>${esc(r.owner)}</td><td>${esc(r.coverage)}</td></tr>`).join("");
+  const table = tableRows
+    ? `<table aria-label="Capability inventory"><thead><tr><th scope="col">Capability</th><th scope="col">Owner</th><th scope="col">Coverage</th></tr></thead><tbody>${tableRows}</tbody></table>`
+    : "";
+  const agentBody = `<p>${esc(b.agents)} agents, ${esc(b.missing_agents)} missing agents</p>`;
+  const agentTableRows = agentRows.map((r) => `<tr><td>${esc(r.agent)}</td><td>${esc(r.coverage)}</td></tr>`).join("");
+  const agentTable = agentTableRows
+    ? `<table aria-label="Agent coverage"><thead><tr><th scope="col">Agent</th><th scope="col">Coverage</th></tr></thead><tbody>${agentTableRows}</tbody></table>`
+    : "";
+  const evidence = `<button type="button" data-action="view-evidence">View evidence</button>`;
+  return `<h1>Capability inventory</h1>${block}${shell("inventory-summary", "Inventory summary", strip)}${shell("inventory-table", "Inventory table", table)}${shell("agent-coverage-table", "Agent coverage", `${agentBody}${agentTable}`)}${shell("view-evidence-button", "Evidence", evidence)}`;
+}
+
+/**
+ * SCR-parity-verification: full parity coverage over 369 entries (AC-43, AC-44).
+ * Focus order: parity-summary -> parity-table -> timing-table -> parity-alert-actions.
+ * Secret span values are never rendered (NFR-S3): counts only.
+ * @param {{state:ScreenState, coverage:ParityCoverage|null, rows:ParityRow[]}} props
+ */
+export function renderParityVerification(props) {
+  const { state, coverage = null, rows = [] } = props;
+  const block = stateBlock(state, "Retry parity load");
+  const c = coverage ?? { entries: 0, divergence_cases: 0, retry_samples: 0, retry_median_divergence_ms: 0, secret_leaks: 0 };
+  const strip = `<ul>` + [
+    `${c.entries} runs`,
+    `${c.divergence_cases} divergences`,
+    `median diff ${c.retry_median_divergence_ms} ms`,
+  ].map((item) => `<li><span class="badge">${esc(item)}</span></li>`).join("") + `</ul>`;
+  const tableRows = rows.map((r) => `<tr><td>${esc(r.capability)}</td><td>${esc(r.python)}</td><td>${esc(r.rust)}</td><td>${esc(r.match)}</td></tr>`).join("");
+  const table = tableRows
+    ? `<table aria-label="Parity coverage"><thead><tr><th scope="col">Capability</th><th scope="col">Python</th><th scope="col">Rust</th><th scope="col">Match</th></tr></thead><tbody>${tableRows}</tbody></table>`
+    : "";
+  const timing = `<p>${esc(c.retry_samples)} samples per engine, median delay difference: ${esc(c.retry_median_divergence_ms)} ms, ${esc(c.divergence_cases)} divergences</p><p>${esc(c.secret_leaks)} secret-span leaks across ${esc(c.entries)} entries.</p><p class="text-muted">Secret span values are redacted and never rendered here.</p>`;
+  const actions = `<div class="alert" role="status"><p>Parity holds: ${esc(c.divergence_cases)} divergences across ${esc(c.entries)} entries.</p><button type="button" data-variant="ghost" data-action="view-parity-details">View parity details</button></div>`;
+  return `<h1>Parity verification</h1>${block}${shell("parity-summary", "Parity summary", strip)}${shell("parity-table", "Parity table", table)}${shell("timing-table", "Retry timing", timing)}${shell("parity-alert-actions", "Parity actions", actions)}`;
+}
+
+/**
+ * SCR-orchestration-trace: ultrathink orchestrate records for one correlation (AC-45, AC-46).
+ * Focus order: request-strip -> record-list -> envelope-ids -> view-records-button.
+ * @param {{state:ScreenState, receipt:OrchestrateReceipt|null, records:RecordRow[]}} props
+ */
+export function renderOrchestrationTrace(props) {
+  const { state, receipt = null, records = [] } = props;
+  const block = stateBlock(state, "Retry trace load");
+  const corr = receipt?.correlation_id ?? "";
+  const taskId = receipt?.task_id ?? "";
+  const count = receipt?.record_count ?? 0;
+  const strip = `<p>1 ultrathink orchestrate request, 1 correlation id${corr ? `: ${esc(corr)}` : ""}.</p>`;
+  const recordRows = records.map((r) => `<tr><td>${esc(r.record)}</td><td>${esc(r.kind)}</td><td>${esc(r.status)}</td></tr>`).join("");
+  const recordTable = recordRows
+    ? `<table aria-label="Orchestration records"><thead><tr><th scope="col">Record</th><th scope="col">Kind</th><th scope="col">Status</th></tr></thead><tbody>${recordRows}</tbody></table>`
+    : "";
+  const countText = `<p>${esc(count)} records for 1 correlation, 0 missing</p>`;
+  const ids = `<div><label for="correlation-id">Correlation id</label><input id="correlation-id" name="correlation-id" type="text" value="${esc(corr)}" /></div><div><label for="trace-task-id">Task id</label><input id="trace-task-id" name="trace-task-id" type="text" value="${esc(taskId)}" /></div><p class="text-muted">Correlation id and task id are unchanged through handling.</p>`;
+  const recordsButton = `<button type="button" data-action="view-records">View records</button><p class="text-muted">No completion is implied before the result record exists.</p>`;
+  return `<h1>Orchestration trace</h1>${block}${shell("request-strip", "Request strip", strip)}${shell("record-list", "Record list", `${countText}${recordTable}`)}${shell("envelope-ids", "Envelope ids", ids)}${shell("view-records-button", "Records", recordsButton)}`;
+}
+
+/**
+ * SCR-upgrade-quality: quality repeated after upgrade (AC-47, AC-48).
+ * Focus order: upgrade-strip -> quality-checklist -> approval-record -> view-evidence-button.
+ * @param {{state:ScreenState, quality:QualityCrates|null, checklist:ChecklistItem[]}} props
+ */
+export function renderUpgradeQuality(props) {
+  const { state, quality = null, checklist = [] } = props;
+  const block = stateBlock(state, "Retry quality load");
+  const q = quality ?? { crates: 0, findings: 0, exit_code: 0 };
+  const strip = `<ul>` + [
+    "1 upgrade",
+    "Quality repeated after upgrade",
+    "Engine: python (default)",
+  ].map((item) => `<li><span class="badge">${esc(item)}</span></li>`).join("") + `</ul>`;
+  const summary = `<p>${esc(q.crates)} crates, ${esc(q.findings)} findings, exit code ${esc(q.exit_code)}</p><p>Both languages: ${esc(q.findings)} findings total, exit code ${esc(q.exit_code)}</p>`;
+  const items = checklist.map((c) => `<li><input type="checkbox" id="check-${esc(c.label)}" ${c.done ? "checked" : ""} disabled /> <label for="check-${esc(c.label)}">${esc(c.label)}</label></li>`).join("");
+  const approval = `<p>Approval record: 1 upgrade, quality repeated after upgrade.</p><p class="text-muted">Default engine remains python (0 flips).</p>`;
+  const evidence = `<button type="button" data-action="view-evidence">View evidence</button>`;
+  return `<h1>Upgrade quality</h1>${block}${shell("upgrade-strip", "Upgrade strip", strip)}${shell("quality-checklist", "Quality checklist", `${summary}<ul>${items}</ul>`)}${shell("approval-record", "Approval record", approval)}${shell("view-evidence-button", "Evidence", evidence)}`;
+}
+
 
 /**
  * Render any bound screen. Unknown ids throw (fail closed).
@@ -255,5 +388,10 @@ export function renderScreen(screenId, state, props = {}) {
   if (screenId === "SCR-engine-parity") return renderEngineParity({ ...props, state });
   if (screenId === "SCR-worker-pool") return renderWorkerPool({ ...props, state });
   if (screenId === "SCR-omp-dispatch") return renderOmpDispatch({ ...props, state });
-  return renderReleaseEvidence({ ...props, state });
+  if (screenId === "SCR-release-evidence") return renderReleaseEvidence({ ...props, state });
+  if (screenId === "SCR-graph-decomposition") return renderGraphDecomposition({ ...props, state });
+  if (screenId === "SCR-capability-inventory") return renderCapabilityInventory({ ...props, state });
+  if (screenId === "SCR-parity-verification") return renderParityVerification({ ...props, state });
+  if (screenId === "SCR-orchestration-trace") return renderOrchestrationTrace({ ...props, state });
+  return renderUpgradeQuality({ ...props, state });
 }

@@ -1,9 +1,11 @@
-// Typed client for API-GsdQualityGate 1.1.0 (contracts/gsd-quality-gate.yaml).
+// Typed client for API-GsdQualityGate 1.2.0 (contracts/gsd-quality-gate.yaml).
 // Every method maps 1:1 to a contract operationId: getQualityGate,
 // getParityStatus, getSweepStatus, getWipInventory, getCiVerdict,
 // getEngineDefault (1.0.0, retained for the 30-day N-1 window) plus
 // getGraphInventory, getWireCodes, submitDispatch, waitDispatch,
-// getPackParity, getEngineSelector (1.1.0 Graph Engineering surface).
+// getPackParity, getEngineSelector (1.1.0 Graph Engineering surface) plus
+// validateGraph, computeReadyOrder, getBindings, getParityCoverage,
+// submitOrchestrate, getQualityCrates (1.2.0 graph-engine specialization).
 // Response shape validation fails closed (E-CONTRACT).
 
 const OPS = {
@@ -19,6 +21,12 @@ const OPS = {
   waitDispatch: { method: "GET", path: (id) => `/graph/dispatch/${encodeURIComponent(id)}`, required: ["task_id", "accepted"] },
   getPackParity: { method: "GET", path: (id) => `/graph/packs/${encodeURIComponent(id)}/parity`, required: ["pack_id", "divergence_cases"] },
   getEngineSelector: { method: "GET", path: () => "/graph/engine/selector", required: ["engine", "pure_python", "rollback_steps"] },
+  validateGraph: { method: "GET", path: () => "/graph/validation", required: ["subtasks", "predecessor_links", "cycles", "dangling_links"] },
+  computeReadyOrder: { method: "POST", path: () => "/graph/order", required: ["nodes", "start_node", "violations"] },
+  getBindings: { method: "GET", path: () => "/graph/bindings", required: ["principal_total", "native_symbols", "gaps", "agents", "uncounted", "missing_agents"] },
+  getParityCoverage: { method: "GET", path: () => "/graph/parity/coverage", required: ["entries", "divergence_cases", "retry_samples", "retry_median_divergence_ms", "secret_leaks"] },
+  submitOrchestrate: { method: "POST", path: () => "/graph/orchestrate", required: ["correlation_id", "task_id", "record_count"] },
+  getQualityCrates: { method: "GET", path: () => "/graph/quality/crates", required: ["crates", "findings", "exit_code"] },
 };
 
 export class ContractError extends Error {
@@ -62,6 +70,12 @@ export function createQualityGateClient({ baseUrl, fetchImpl = fetch }) {
     waitDispatch: (taskId) => call("waitDispatch", taskId),
     getPackParity: (packId) => call("getPackParity", packId),
     getEngineSelector: () => call("getEngineSelector"),
+    validateGraph: () => call("validateGraph"),
+    computeReadyOrder: (payload) => call("computeReadyOrder", payload),
+    getBindings: () => call("getBindings"),
+    getParityCoverage: () => call("getParityCoverage"),
+    submitOrchestrate: (payload) => call("submitOrchestrate", payload),
+    getQualityCrates: () => call("getQualityCrates"),
   };
 }
 
