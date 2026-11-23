@@ -314,6 +314,26 @@ def test_graph_fact_roundtrips(tmp_path):
     assert store.quality_snapshots()[0]["findings"] == 3
 
 
+def test_record_graph_edges_counts_only_written(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    assert store.record_graph_edges("c-row", [("b", "a", 0.0), ("c", "b", 0.0)]) == 2
+    assert store.record_graph_edges("c-row", [("b", "a", 0.0)]) == 0
+    assert len(store.graph_edges("c-row")) == 2
+
+
+def test_store_read_failure_logs_and_falls_back(tmp_path, caplog: Any) -> None:
+    import logging
+
+    ctx = make_ctx(tmp_path)
+    assert ctx.store is not None
+    ctx.store.conn.execute("DROP TABLE graph_edges")
+    with caplog.at_level(logging.WARNING, logger="swarm.graph_quality"):
+        status, body = call(ctx, "GET", "/graph/validation", None)
+    assert status == 200
+    assert body == {"subtasks": 10, "predecessor_links": 12, "cycles": 0, "dangling_links": 0}
+    assert "graph_validation store read failed" in caplog.text
+
+
 def test_method_status_allowlist_for_new_ops(tmp_path):
     ctx = make_ctx(tmp_path)
     allowed = {
