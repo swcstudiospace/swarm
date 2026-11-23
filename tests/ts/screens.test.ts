@@ -75,11 +75,11 @@ test("no hard-coded colours or spacing in screen modules (token binding)", () =>
   }
 });
 
-test("contract client exposes all six API-GsdQualityGate operations", () => {
+test("contract client exposes all eighteen API-GsdQualityGate operations", () => {
   const client = createQualityGateClient({ baseUrl: "http://localhost:0/v1" });
   for (const op of OPERATIONS) expect(typeof client[op]).toBe("function");
   expect([...OPERATIONS].sort()).toEqual(
-    ["getCiVerdict", "getEngineDefault", "getParityStatus", "getQualityGate", "getSweepStatus", "getWipInventory"].sort(),
+    ["computeReadyOrder", "getBindings", "getCiVerdict", "getEngineDefault", "getEngineSelector", "getGraphInventory", "getPackParity", "getParityCoverage", "getParityStatus", "getQualityCrates", "getQualityGate", "getSweepStatus", "getWipInventory", "getWireCodes", "submitDispatch", "submitOrchestrate", "validateGraph", "waitDispatch"].sort(),
   );
 });
 
