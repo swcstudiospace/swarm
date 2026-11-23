@@ -18,10 +18,11 @@
 //! * bounded queues: a graph larger than `max_queue_len` is refused
 //!   (`Capacity`) instead of buffered without bound.
 //! * cooperative cancellation via [`crate::execution::CancellationToken`],
-//!   and distinct per-node / per-tool / whole-graph timeouts.
 //! * bounded retries (exp backoff + jitter) only for classified, idempotent,
-//!   allow-listed failures — unclassified means *no retry*.
-//! * deterministic join in dependency (topological) order with per-node
+//!   allow-listed failures — unclassified means *no retry* — and never past
+//!   the node's total retry deadline (`retry_budget`): attempts and backoff
+//!   sleeps both stop at it. Every attempt carries the same root+node
+//!   idempotency key (`{graph_id}/{node_id}`) for deduplication.
 //!   provenance; partial success preserves completed branches and names
 //!   failed / skipped branches; [`Scheduler::retry_failed_subgraph`] re-runs
 //!   only the failed subgraph and preserves completed work.
@@ -60,6 +61,11 @@ pub struct SchedulerConfig {
     pub jitter_fraction: f64,
     /// Per-attempt node timeout.
     pub node_timeout: std::time::Duration,
+    /// Total per-node deadline covering every attempt plus the backoff
+    /// sleeps between them. Retries stop at this deadline even when
+    /// `max_attempts` still allows more; each attempt's effective timeout
+    /// is the node timeout capped by what of this budget remains.
+    pub retry_budget: std::time::Duration,
     /// Per-tool-call timeout, handed to executors via the context.
     pub tool_timeout: std::time::Duration,
     /// Whole-graph deadline.
@@ -83,6 +89,10 @@ impl Default for SchedulerConfig {
             max_delay: std::time::Duration::from_secs(5),
             jitter_fraction: 0.25,
             node_timeout: std::time::Duration::from_secs(30),
+            // Worst case at defaults is ~3 x 30 s attempts + backoff,
+            // rounded up: the total deadline, never the attempt count
+            // alone, bounds a node's lifetime.
+            retry_budget: std::time::Duration::from_secs(120),
             tool_timeout: std::time::Duration::from_secs(10),
             graph_timeout: std::time::Duration::from_secs(300),
             retryable_codes: Vec::new(),
@@ -121,6 +131,9 @@ impl SchedulerConfig {
         }
         if self.node_timeout.is_zero() {
             return Err(bad("node_timeout", "must be > 0"));
+        }
+        if self.retry_budget.is_zero() {
+            return Err(bad("retry_budget", "must be > 0"));
         }
         if self.tool_timeout > self.node_timeout {
             return Err(bad("tool_timeout", "must not exceed node_timeout"));

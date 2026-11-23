@@ -16,3 +16,7 @@ opentelemetry = { workspace = true }
 opentelemetry-sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 dashmap = { workspace = true }
+
+[[bench]]
+name = "graph_bench"
+harness = false

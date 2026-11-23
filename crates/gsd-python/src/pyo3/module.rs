@@ -61,10 +61,10 @@ pub fn topo_order(
             }
         }
     }
-    if legacy_fallback {
-        // Legacy Python behaviour: insertion order, still fully validated.
-        return Ok(nodes.to_vec());
-    }
+    // Fallback only selects the emitted order. Validation is identical on
+    // both routes (duplicate/unknown/cycle refuse everywhere), matching the
+    // registry dispatcher's contract: fallback never launders an invalid
+    // graph as success.
     // Deterministic Kahn topological sort: ties broken by insertion order,
     // so the same input always yields the same output.
     let index: HashMap<&str, usize> = nodes
@@ -76,7 +76,11 @@ pub fn topo_order(
     let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
     for (from, to) in edges {
         outgoing.entry(from.as_str()).or_default().push(to.as_str());
-        *indegree.get_mut(to.as_str()).expect("validated") += 1;
+        match indegree.get_mut(to.as_str()) {
+            Some(degree) => *degree += 1,
+            // Unreachable: every edge endpoint was validated above.
+            None => return Err(BridgeError::Internal { op }),
+        }
     }
     let mut ready: Vec<&str> = nodes
         .iter()
@@ -94,10 +98,15 @@ pub fn topo_order(
         order.push(node.to_owned());
         if let Some(nexts) = outgoing.get(node) {
             for next in nexts {
-                let degree = indegree.get_mut(next).expect("validated");
-                *degree -= 1;
-                if *degree == 0 {
-                    ready.push(next);
+                match indegree.get_mut(next) {
+                    Some(degree) => {
+                        *degree -= 1;
+                        if *degree == 0 {
+                            ready.push(next);
+                        }
+                    }
+                    // Unreachable: every edge endpoint was validated above.
+                    None => return Err(BridgeError::Internal { op }),
                 }
             }
         }
@@ -105,7 +114,13 @@ pub fn topo_order(
     if order.len() != nodes.len() {
         return Err(BridgeError::Cycle { op });
     }
-    Ok(order)
+    // Legacy fallback emits insertion order; native emits the Kahn order.
+    // Both were fully validated above, cycles included.
+    Ok(if legacy_fallback {
+        nodes.to_vec()
+    } else {
+        order
+    })
 }
 
 /// Deterministic FNV-1a receipt for a validated graph. Pure, no I/O.
@@ -370,12 +385,11 @@ mod tests {
     /// the legacy report the insertion order, and both are stamped `graph/1`
     /// with the same counts the registry handlers enumerate.
     ///
-    /// Note the axis split: the pyo3 boundary's `legacy_fallback` selects
-    /// only the *ordering* mode, and native mode (not legacy) is what
-    /// refuses cycles here (see `duplicate_unknown_and_cycle_are_rejected`).
-    /// The registry's legacy handler is a separate, fully-validating path
-    /// that mirrors the legacy planner (`swarm/graph_planner.py`), which
-    /// refuses cycles on every route.
+    /// The axis split: the pyo3 boundary's `legacy_fallback` selects only the
+    /// *ordering* mode; duplicate/unknown/cycle refuse on both routes,
+    /// exactly like the registry handlers and the legacy planner
+    /// (`swarm/graph_planner.py`) — fallback never launders an invalid
+    /// graph as success (see `duplicate_unknown_and_cycle_are_rejected`).
     #[test]
     fn graph_validate_report_matches_registry_contract() {
         let checked_nodes = CheckedIdList(nodes(&["c", "a", "b"]));
