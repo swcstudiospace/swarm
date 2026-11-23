@@ -1,4 +1,4 @@
-"""Stdlib HTTP server for API-GsdQualityGate 1.1.0 (local harness).
+"""Stdlib HTTP server for API-GsdQualityGate 1.2.0 (local harness).
 
 Contract ``servers`` is ``http://localhost:0/v1``: the harness is local-only
 and the contract declares no ``securityScheme``, so routes are intentionally
@@ -101,7 +101,7 @@ def build_context(taskstore_path: str | None, root: Path) -> AppContext:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="API-GsdQualityGate 1.1.0 local harness")
+    parser = argparse.ArgumentParser(description="API-GsdQualityGate 1.2.0 local harness")
     parser.add_argument("--host", default="127.0.0.1", help="bind host (loopback by default)")
     parser.add_argument("--port", type=int, default=0, help="bind port (0 = ephemeral)")
     parser.add_argument("--taskstore", default=None, help="path to tasks.db (optional)")

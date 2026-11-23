@@ -54,7 +54,7 @@ def create_active_task(store: TaskStore, task_id: str, *, state: str = "IN_PROGR
 # --- Contract route surface (be_contract_conformance + route hygiene) -------
 
 
-def test_router_exposes_all_12_contract_routes():
+def test_router_exposes_all_18_contract_routes():
     routes = {(m, p) for m, p in build_router().routes}
     assert routes == {
         ("GET", "/graph/inventory"),
@@ -63,6 +63,12 @@ def test_router_exposes_all_12_contract_routes():
         ("GET", "/graph/dispatch/{taskId}"),
         ("GET", "/graph/packs/{packId}/parity"),
         ("GET", "/graph/engine/selector"),
+        ("GET", "/graph/validation"),
+        ("POST", "/graph/order"),
+        ("GET", "/graph/bindings"),
+        ("GET", "/graph/parity/coverage"),
+        ("POST", "/graph/orchestrate"),
+        ("GET", "/graph/quality/crates"),
         ("GET", "/quality/gates/{gateId}"),
         ("GET", "/quality/parity/{module}"),
         ("GET", "/quality/sweep/{sweepId}"),
@@ -70,7 +76,7 @@ def test_router_exposes_all_12_contract_routes():
         ("GET", "/quality/ci/{prNumber}"),
         ("GET", "/quality/engine"),
     }
-    assert len(build_router().routes) == 12
+    assert len(build_router().routes) == 18
 
 
 def test_method_status_allowlist_per_contract():
