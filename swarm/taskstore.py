@@ -11,7 +11,7 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
@@ -89,6 +89,34 @@ CREATE TABLE IF NOT EXISTS verdicts (
 CREATE TABLE IF NOT EXISTS artifacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, uri TEXT,
   version TEXT, digest TEXT, producer TEXT, ts REAL
+);
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, correlation_id TEXT NOT NULL,
+  node_id TEXT NOT NULL, predecessor_id TEXT NOT NULL,
+  priority REAL DEFAULT 0, ts REAL,
+  UNIQUE (correlation_id, node_id, predecessor_id)
+);
+CREATE TABLE IF NOT EXISTS capability_bindings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL,
+  capability TEXT NOT NULL, engine TEXT NOT NULL, native_symbol TEXT,
+  bound INTEGER DEFAULT 0, ts REAL,
+  UNIQUE (agent_id, capability, engine)
+);
+CREATE TABLE IF NOT EXISTS parity_coverage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, entry_id TEXT NOT NULL,
+  pack_id TEXT, native_outcome TEXT, python_outcome TEXT,
+  diverged INTEGER DEFAULT 0, retry_divergence_ms INTEGER DEFAULT 0,
+  secret_leak INTEGER DEFAULT 0, ts REAL,
+  UNIQUE (entry_id, pack_id)
+);
+CREATE TABLE IF NOT EXISTS orchestrate_receipts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, correlation_id TEXT NOT NULL UNIQUE,
+  task_id TEXT, plan_uri TEXT, result_uri TEXT, ts REAL
+);
+CREATE TABLE IF NOT EXISTS quality_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, crate_id TEXT NOT NULL,
+  language TEXT NOT NULL, findings INTEGER DEFAULT 0, ts REAL,
+  UNIQUE (crate_id, language)
 );
 """
 
@@ -278,6 +306,135 @@ class TaskStore:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY dag_depth, created_at"
         return [self._row(r) for r in self.conn.execute(q, args)]
+
+    # ---- graph-engine facts (M-2026-002, SC-GraphEngine) ----------------
+    def record_graph_edges(self, correlation_id: str, edges: Iterable[tuple[str, str, float]]) -> int:
+        """Idempotently record predecessor edges; returns rows written."""
+        now = time.time()
+        written = 0
+        for node_id, predecessor_id, priority in edges:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO graph_edges (correlation_id, node_id, predecessor_id, priority, ts)"
+                " VALUES (?,?,?,?,?)",
+                (correlation_id, node_id, predecessor_id, float(priority), now),
+            )
+            written += 1
+        self._commit()
+        return written
+
+    def graph_edges(self, correlation_id: str | None = None) -> builtins.list[dict[str, Any]]:
+        """Recorded predecessor edges, oldest first."""
+        q = "SELECT node_id, predecessor_id, priority FROM graph_edges"
+        args: builtins.list[Any] = []
+        if correlation_id is not None:
+            q += " WHERE correlation_id=?"
+            args.append(correlation_id)
+        q += " ORDER BY id"
+        return [
+            {"node_id": str(r["node_id"]), "predecessor_id": str(r["predecessor_id"]), "priority": float(r["priority"] or 0)}
+            for r in self.conn.execute(q, args)
+        ]
+
+    def record_capability_binding(
+        self, agent_id: str, capability: str, engine: str,
+        native_symbol: str | None, bound: int,
+    ) -> None:
+        """Upsert one capability binding row (one row per agent/capability/engine)."""
+        self.conn.execute(
+            "INSERT INTO capability_bindings (agent_id, capability, engine, native_symbol, bound, ts)"
+            " VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(agent_id, capability, engine) DO UPDATE SET"
+            " native_symbol=excluded.native_symbol, bound=excluded.bound, ts=excluded.ts",
+            (agent_id, capability, engine, native_symbol, int(bound), time.time()),
+        )
+        self._commit()
+
+    def capability_bindings(self) -> builtins.list[dict[str, Any]]:
+        """All recorded capability bindings, oldest first."""
+        return [
+            {
+                "agent_id": str(r["agent_id"]), "capability": str(r["capability"]), "engine": str(r["engine"]),
+                "native_symbol": r["native_symbol"], "bound": int(r["bound"] or 0),
+            }
+            for r in self.conn.execute("SELECT agent_id, capability, engine, native_symbol, bound FROM capability_bindings ORDER BY id")
+        ]
+
+    def record_parity_coverage(
+        self, entry_id: str, pack_id: str | None, native_outcome: str, python_outcome: str,
+        diverged: int, retry_divergence_ms: int, secret_leak: int,
+    ) -> None:
+        """Upsert one parity-coverage row (one row per entry/pack)."""
+        self.conn.execute(
+            "INSERT INTO parity_coverage (entry_id, pack_id, native_outcome, python_outcome, diverged, retry_divergence_ms, secret_leak, ts)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(entry_id, pack_id) DO UPDATE SET"
+            " native_outcome=excluded.native_outcome, python_outcome=excluded.python_outcome,"
+            " diverged=excluded.diverged, retry_divergence_ms=excluded.retry_divergence_ms,"
+            " secret_leak=excluded.secret_leak, ts=excluded.ts",
+            (entry_id, pack_id, native_outcome, python_outcome, int(diverged),
+             int(retry_divergence_ms), int(secret_leak), time.time()),
+        )
+        self._commit()
+
+    def parity_coverage(self) -> builtins.list[dict[str, Any]]:
+        """All recorded parity-coverage rows, oldest first."""
+        return [
+            {
+                "entry_id": str(r["entry_id"]), "pack_id": r["pack_id"],
+                "native_outcome": r["native_outcome"], "python_outcome": r["python_outcome"],
+                "diverged": int(r["diverged"] or 0),
+                "retry_divergence_ms": int(r["retry_divergence_ms"] or 0),
+                "secret_leak": int(r["secret_leak"] or 0),
+            }
+            for r in self.conn.execute(
+                "SELECT entry_id, pack_id, native_outcome, python_outcome, diverged, retry_divergence_ms, secret_leak"
+                " FROM parity_coverage ORDER BY id")
+        ]
+
+    def record_orchestrate_receipt(
+        self, correlation_id: str, task_id: str | None, plan_uri: str | None, result_uri: str | None,
+    ) -> dict[str, Any]:
+        """Upsert the one orchestrate receipt per correlation id (AC-45/46)."""
+        self.conn.execute(
+            "INSERT INTO orchestrate_receipts (correlation_id, task_id, plan_uri, result_uri, ts)"
+            " VALUES (?,?,?,?,?)"
+            " ON CONFLICT(correlation_id) DO UPDATE SET"
+            " task_id=excluded.task_id, plan_uri=excluded.plan_uri, result_uri=excluded.result_uri, ts=excluded.ts",
+            (correlation_id, task_id, plan_uri, result_uri, time.time()),
+        )
+        self._commit()
+        receipt = self.orchestrate_receipt(correlation_id)
+        assert receipt is not None  # the row just written; keeps the interface non-optional
+        return receipt
+
+    def orchestrate_receipt(self, correlation_id: str) -> dict[str, Any] | None:
+        """The recorded orchestrate receipt for one correlation id, if any."""
+        row = self.conn.execute(
+            "SELECT correlation_id, task_id, plan_uri, result_uri FROM orchestrate_receipts WHERE correlation_id=?",
+            (correlation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "correlation_id": str(row["correlation_id"]), "task_id": row["task_id"],
+            "plan_uri": row["plan_uri"], "result_uri": row["result_uri"],
+        }
+
+    def record_quality_snapshot(self, crate_id: str, language: str, findings: int) -> None:
+        """Upsert one quality snapshot row (one row per crate/language)."""
+        self.conn.execute(
+            "INSERT INTO quality_snapshots (crate_id, language, findings, ts) VALUES (?,?,?,?)"
+            " ON CONFLICT(crate_id, language) DO UPDATE SET findings=excluded.findings, ts=excluded.ts",
+            (crate_id, language, int(findings), time.time()),
+        )
+        self._commit()
+
+    def quality_snapshots(self) -> builtins.list[dict[str, Any]]:
+        """All recorded quality snapshots, by crate then language."""
+        return [
+            {"crate_id": str(r["crate_id"]), "language": str(r["language"]), "findings": int(r["findings"] or 0)}
+            for r in self.conn.execute("SELECT crate_id, language, findings FROM quality_snapshots ORDER BY crate_id, language")
+        ]
 
     def update(self, task_id: str, **fields: object) -> TaskRow:
         cols: list[str] = []
