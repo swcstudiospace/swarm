@@ -4,12 +4,12 @@
 //! with configurable fan-out/fan-in and dynamic restructuring.
 //!
 //! See `docs/assumptions.md` for n6 ambiguity resolutions with defaults (GSD-Core contracts, decomposition rules=generic keyword based for independent/ordered, execution model, result aggregation=q2 flat list of per-subtask results, q1=structured (id, description, phase?, priority?, deps list), q3 goal=inline only no separate doc; pool 30). Refs SPE-33068 n6.8 etc; n7 synthesize; plans; Notion from graph.
-:
 pub mod aimd_limiter;
 pub mod clock;
 pub mod dag;
 pub mod dag_build;
 pub mod dynamic;
+pub mod execution;
 pub mod force_parallel_dispatch;
 pub mod hitl;
 pub mod matrix_join;
@@ -18,10 +18,16 @@ mod panic_text;
 pub mod policy;
 pub mod policy_config;
 pub mod ready_frontier;
+pub mod scheduler;
+mod semaphore;
 
 pub use aimd_limiter::AimdLimiter;
 pub use dag::*;
 pub use dag_build::*;
+pub use execution::{
+    CancellationToken, ClassifiedError, ExecutionCtx, ExecutionReport, NodeExecutor, NodeOutput,
+    NodeResult, NodeStatus,
+};
 pub use force_parallel_dispatch::{
     effective_global_cap, run_force_parallel, sort_dispatch_order, DispatchConfig, DispatchMode,
     DispatchReport, TaskFailure, TaskOutcome,
@@ -31,6 +37,7 @@ pub use nexus_barrier_join::*;
 pub use policy::*;
 pub use policy_config::*;
 pub use ready_frontier::*;
+pub use scheduler::{DispatchDecision, Scheduler, SchedulerConfig, ValidatedGraph};
 pub use semaphore::*;
 
 
@@ -63,6 +70,8 @@ pub enum SchedulerError {
     Deadlock(String),
     #[error("Invalid DAG: {0}")]
     InvalidDag(String),
+    #[error("Concurrency/queue capacity reached: {0}")]
+    Capacity(String),
     #[error("Other: {0}")]
     Other(String),
 }

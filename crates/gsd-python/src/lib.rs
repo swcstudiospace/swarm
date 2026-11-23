@@ -12,6 +12,12 @@
 //! The chat-thread binding (`chat`, Phase 14.6 CR-04) adds `Governor`, `ChatPool` and `ChatTicket`.
 
 mod chat;
+#[path = "pyo3/conversion.rs"]
+pub mod pyo3_conversion;
+#[path = "pyo3/errors.rs"]
+pub mod pyo3_errors;
+#[path = "pyo3/module.rs"]
+pub mod pyo3_module;
 pub mod sched;
 mod sched_run;
 
@@ -373,6 +379,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<chat::PyGovernor>()?;
     m.add_class::<chat::PyChatPool>()?;
     m.add_class::<chat::PyChatTicket>()?;
+    pyo3_module::register(m)?;
     Ok(())
 }
 

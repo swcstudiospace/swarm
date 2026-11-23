@@ -1,6 +1,18 @@
 //! Security Sandbox for GSD-Core
 //!
 //! Thread isolation, capability tokens, audit logging, PII redaction.
+pub mod registry;
+pub mod registry_dispatch;
+
+pub use registry::{
+    is_conventional_name, is_known_owner, prefix_for_owner, Idempotency, LegacyFallback,
+    OwnerScope, Registry, RegistryError, RetryPolicy, SideEffectClass, Tool,
+};
+pub use registry_dispatch::{
+    graph_validate_dispatcher, graph_validate_tool, legacy_graph_validate, native_graph_validate,
+    register_graph_validate, AuditKind, DispatchError, DispatchOutcome, Dispatcher, Handler, Route,
+    SharedLimits, GRAPH_API_VERSION, GRAPH_FAMILY, GRAPH_VALIDATE_TOOL,
+};
 
 use dashmap::DashMap;
 use gsd_failure::ErrorCode;

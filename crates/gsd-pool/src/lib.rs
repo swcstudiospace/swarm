@@ -7,7 +7,6 @@
 //! The public surface is the chat facade in [`chat`], its data types, the thread state machine,
 //! and [`PoolError`], [`PoolConfig`] and [`PoolResult`]. The pool machinery (`ThreadPool`, the warm
 //! pool and the handle registry) is crate-private.
-:
 use std::time::{Duration, Instant};
 
 use dashmap::mapref::entry::Entry;
