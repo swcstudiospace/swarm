@@ -2,7 +2,8 @@
 
 Single-writer backend for T2484-be/T74c2-be (A05). Python is the canonical
 oracle (blueprint v2.6, ADR-0007/0008); the Rust PyO3 surface
-``swarm._native`` keeps its 18 symbols unchanged and is used only for parity
+``swarm._native`` keeps its 25 symbols (the original 18 scheduler/redaction
+symbols plus the additive graph family) and is used only for parity
 evidence, with a pure-Python fallback that warns (AC-30). No new
 third-party dependency is introduced (L3 blocked by A02 constraints); the
 HTTP server in ``swarm/graph_quality_server.py`` is stdlib-only.
@@ -17,7 +18,7 @@ flagged provisional here: it covers only inputs the contract cannot describe.
 
 Honesty notes (no fabricated green):
 - Inventory counts the live tool registry (394 total: 369 principal + 25
-  shared) and the live ``swarm._native`` public names (18 when built).
+  shared) and the live ``swarm._native`` public names (25 when built).
 - Retry median divergence is measured live over matched-jitter samples;
   without the native build the single-engine value is 0 by definition.
 - Gate/parity/sweep/CI handlers never invent a pass: no stored verdict
@@ -30,7 +31,7 @@ Honesty notes (no fabricated green):
   through ``swarm.graph_planner`` (AC-39: 10 subtasks, 12 links;
   AC-40: 5 nodes). ``p95_ms`` is the measured elapsed time of the ready
   order computation (NFR-P3 budget 100 ms).
-- Bindings count the live registry (394) with the 18 bound PyO3 symbols
+- Bindings count the live registry (394) with the 25 bound PyO3 symbols
   from the runtime module when built, else from the ``swarm/_native.pyi``
   honest-import stub (AC-34/35); 30 agents are the distinct lane owners.
 - Orchestrate persists 1 task + 1 receipt carrying 1 plan + 1 result
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import logging
 import os
 import random
 import re
@@ -53,8 +55,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import ErrorCode
+from .errors import ErrorCode, SwarmError
 from .taskstore import SATISFIED_STATES, TaskStore
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Contract pins and constants (blueprint v2.6, contract 1.2.0)
@@ -87,7 +91,7 @@ _GATE_ID_TO_TASK_GATE = {"AC-11": "quality", "AC-12": "quality", "AC-15": "relea
 _SEVERITIES = ("info", "minor", "major", "critical", "blocker")
 _HIGH_SEVERITIES = frozenset({"major", "critical", "blocker"})
 
-# Parity modules whose live parity is measured in this backend (18-symbol
+# Parity modules whose live parity is measured in this backend (25-symbol
 # native surface). Any other known crate is reported blocked (fail-closed):
 # no parity evidence exists for it until its wave closes (ADR-0006).
 _LIVE_PARITY_MODULES = frozenset(
@@ -269,7 +273,7 @@ def registry_counts(registry_doc: dict[str, Any] | None = None) -> tuple[int, in
 
 
 def graph_inventory(ctx: AppContext) -> dict[str, Any]:
-    """GraphInventory: 394 total, 18 native, 376 gaps, 25 shared (AC-17/18)."""
+    """GraphInventory: 394 total, 25 native, 369 gaps, 25 shared (AC-17/18)."""
     total, shared = registry_counts(ctx.registry_doc)
     native_count = len(native_public_names(native_module(ctx)))
     return {
@@ -652,7 +656,8 @@ def graph_validation_body(ctx: AppContext) -> dict[str, Any]:
     if store is not None:
         try:
             edges = store.graph_edges()
-        except Exception:
+        except Exception as exc:
+            _logger.warning("graph_validation store read failed; canonical fixture: %s", exc)
             edges = []
         if edges:
             return graph_validation_counts(_nodes_from_edges(edges))
@@ -687,7 +692,8 @@ def ready_order_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]
         if isinstance(correlation_id, str) and ctx.store is not None:
             try:
                 edges = ctx.store.graph_edges(correlation_id)
-            except Exception:
+            except Exception as exc:
+                _logger.warning("ready_order store read failed; canonical fixture: %s", exc)
                 edges = []
         nodes = _nodes_from_edges(edges) if edges else canonical_order_nodes()
 
@@ -711,7 +717,7 @@ def ready_order_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]
 
 
 def binding_inventory(ctx: AppContext) -> dict[str, Any]:
-    """BindingInventory: 394 total, 18 bound, 376 gaps, 30 agents (AC-41/42)."""
+    """BindingInventory: 394 total, 25 bound, 369 gaps, 30 agents (AC-41/42)."""
     from .tool_registry import iter_entries, load_document
 
     doc = ctx.registry_doc if ctx.registry_doc is not None else load_document()
@@ -737,12 +743,13 @@ def binding_inventory(ctx: AppContext) -> dict[str, Any]:
 
 
 def parity_coverage_body(ctx: AppContext) -> dict[str, Any]:
-    """ParityCoverage over 376 entries (AC-43/44, NFR-S3)."""
+    """ParityCoverage over 369 entries (AC-43/44, NFR-S3)."""
     store = ctx.store
     if store is not None:
         try:
             rows = store.parity_coverage()
-        except Exception:
+        except Exception as exc:
+            _logger.warning("parity_coverage store read failed; canonical gaps: %s", exc)
             rows = []
         if rows:
             retries = sorted(int(r["retry_divergence_ms"]) for r in rows)
@@ -771,7 +778,8 @@ def quality_crates_body(ctx: AppContext) -> dict[str, Any]:
     if ctx.store is not None:
         try:
             snapshots = ctx.store.quality_snapshots()
-        except Exception:
+        except Exception as exc:
+            _logger.warning("quality_crates store read failed; workspace members: %s", exc)
             snapshots = []
         if snapshots:
             crates = len(snapshots)
@@ -790,7 +798,7 @@ def orchestrate_receipt_body(ctx: AppContext, payload: dict[str, Any]) -> dict[s
     if store is not None:
         try:
             store.get(task_id)
-        except Exception:
+        except SwarmError:
             store.create(
                 task_id=task_id, correlation_id=correlation_id,
                 capability="ultrathink.orchestrate", title=f"orchestrate {correlation_id}",

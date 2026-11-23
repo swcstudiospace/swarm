@@ -49,8 +49,8 @@
 use std::fmt;
 
 use crate::gate_facts::{
-    missing_gate_reasons, unaccepted_gates, verified_latest_rows, IssuerState, TaskFacts,
-    Unsupported, VerdictFacts,
+    check_row, missing_gate_reasons, unaccepted_gates, verified_latest_rows, CheckOutcome,
+    EnvelopeState, GateTask, IssuerState, TaskFacts, Unsupported, VerdictFacts,
 };
 use crate::pydumps::to_python_dumps;
 use crate::transition_plan::{decide_transition, ApprovalFacts, Facts, Request, TransitionPlan};
@@ -494,6 +494,85 @@ impl<'a> Sim<'a> {
         )?)
     }
 
+    /// Verdict rows as `missing_gate_reasons` should see them for `task`.
+    ///
+    /// Python's `_owned_target_fail` for another owned target reads the target's
+    /// latest row through the target's own `verdicts_since`, correlation and
+    /// `dry_run` (`_check_row`) and counts it only when the verdict is `fail`
+    /// and this task issued it. `gate_facts` cannot do that from the gate
+    /// task's facts alone, so it refuses (see `refuse_owned_target_signature`).
+    /// This simulation does hold every target's current facts, so owned rows
+    /// that Python would ignore (a `pass`, a stale or bad-signature row, a
+    /// fail issued by someone else) are dropped and only a proven current
+    /// `fail` issued here is kept to let the refusal fire. Own rows are kept
+    /// untouched.
+    fn owned_verdict_rows(&self, task: &TaskFacts) -> Vec<VerdictFacts> {
+        let (Some(gate), Some(targets)) = (task.gate.clone(), task.gate_for.clone()) else {
+            return self.verdicts.to_vec();
+        };
+        // Latest owned-other row per target, using that target's current facts.
+        let mut keep_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut candidates: std::collections::HashMap<String, Vec<&VerdictFacts>> =
+            std::collections::HashMap::new();
+        for facts in self.verdicts.iter() {
+            if facts.row.task_id != task.task_id
+                && facts.row.gate == gate
+                && targets.contains(&facts.row.task_id)
+            {
+                candidates
+                    .entry(facts.row.task_id.clone())
+                    .or_default()
+                    .push(facts);
+            }
+        }
+        for (target_id, rows) in candidates {
+            let Ok(target) = self.task_facts(&target_id) else {
+                continue;
+            };
+            let mut mine: Vec<&VerdictFacts> = rows
+                .into_iter()
+                .filter(|facts| facts.row.ts >= target.verdicts_since)
+                .collect();
+            mine.sort_by_key(|facts| facts.row.id);
+            let Some(latest) = mine.last() else {
+                continue;
+            };
+            let issued_here = match &latest.envelope {
+                EnvelopeState::Valid(envelope) => matches!(
+                    &envelope.gate_task,
+                    GateTask::Task(issuer) if issuer == &task.task_id
+                ),
+                _ => false,
+            };
+            if !issued_here {
+                continue;
+            }
+            match check_row(&target, &gate, Some(latest), self.now) {
+                Ok(CheckOutcome::Fail) => {
+                    keep_ids.insert(latest.row.id);
+                }
+                Ok(_) => {}
+                Err(Unsupported(_)) => {
+                    keep_ids.insert(latest.row.id);
+                }
+            }
+        }
+        self.verdicts
+            .iter()
+            .filter(|facts| {
+                if facts.row.task_id != task.task_id
+                    && facts.row.gate == gate
+                    && targets.contains(&facts.row.task_id)
+                {
+                    keep_ids.contains(&facts.row.id)
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The state of every task a verdict may name: the simulated ones first, then the ones outside the correlation.
     fn issuer_states(&self) -> Vec<IssuerState> {
         let own = self.tasks.iter().map(|task| IssuerState {
@@ -576,8 +655,9 @@ impl<'a> Sim<'a> {
         if leased {
             return Ok(());
         }
-        let missing = missing_gate_reasons(&task, verdicts, self.now)?;
-        let unaccepted = unaccepted_gates(&task, verdicts, &missing, &self.issuer_states())?;
+        let owned = self.owned_verdict_rows(&task);
+        let missing = missing_gate_reasons(&task, &owned, self.now)?;
+        let unaccepted = unaccepted_gates(&task, &owned, &missing, &self.issuer_states())?;
         let mut reasons: Vec<(String, String)> = missing
             .iter()
             .map(|(gate, outcome)| (gate.clone(), outcome.as_str().to_string()))
