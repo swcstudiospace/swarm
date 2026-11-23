@@ -3,10 +3,11 @@
 //! [`ValidationError`]s.
 //!
 //! Checks run in a fixed order and the first failure is returned:
-//! size, duplicate ids, dangling deps, missing contracts, fan-out, cycles,
-//! depth, unreachable required nodes. Every iteration is over sorted
-//! [`NodeId`]s, so the error reported for a given graph is deterministic and
-//! input-order independent.
+//! size, duplicate ids, dangling deps, missing contracts, unproducible
+//! inputs (a node listing its own id as an input: it can never produce its
+//! own input before running), fan-out, cycles, depth, unreachable required
+//! nodes. Every iteration is over sorted [`NodeId`]s, so the error reported
+//! for a given graph is deterministic and input-order independent.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
@@ -65,6 +66,13 @@ pub enum ValidationError {
         /// The capability with no contract.
         capability: String,
     },
+    /// A node lists its own id as an input, so it can never be fed.
+    UnproducibleInput {
+        /// The node with the self-input.
+        node: NodeId,
+        /// The unproducible input (the node's own id).
+        input: String,
+    },
     /// A node has more dependents than the fan-out limit.
     FanOutExceeded {
         /// The node with the excessive fan-out.
@@ -102,6 +110,9 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::MissingContract { node, capability } => {
                 write!(f, "node {node} has no contract for capability {capability}")
+            }
+            ValidationError::UnproducibleInput { node, input } => {
+                write!(f, "node {node} has unproducible input {input}")
             }
             ValidationError::FanOutExceeded {
                 node,
@@ -182,6 +193,14 @@ pub fn validate_with_limits(
             return Err(ValidationError::MissingContract {
                 node: id.clone(),
                 capability: node.capability.clone(),
+            });
+        }
+    }
+    for (&id, &node) in &by_id {
+        if node.inputs.iter().any(|input| input == id.as_str()) {
+            return Err(ValidationError::UnproducibleInput {
+                node: id.clone(),
+                input: id.to_string(),
             });
         }
     }

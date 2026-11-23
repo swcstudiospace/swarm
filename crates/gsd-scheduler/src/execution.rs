@@ -9,6 +9,9 @@
 //! Reliability rules (Graph Engineering decisions):
 //! * at-least-once: retries only for classified, idempotent,
 //!   allow-listed failures; unclassified (or non-idempotent) failure => no retry.
+//!   Retries also stop at the node's total retry deadline (`retry_budget`),
+//!   which covers attempts and backoff sleeps; each attempt carries the
+//!   node idempotency key (`{graph_id}/{node_id}`).
 //! * per-node, per-tool and whole-graph timeouts are distinct; none of them
 //!   is a retry budget.
 //! * partial success: a failed branch blocks only its dependents; disjoint
@@ -21,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use gsd_proto::gsd::v1::Task;
@@ -65,8 +69,15 @@ pub struct ExecutionCtx {
     pub node_id: String,
     /// Subagent the node is routed to (`Task.subagent_type`).
     pub subagent: String,
+    /// Deduplication key for this node: `{graph_id}/{node_id}` (root + node).
+    /// Identical on every attempt of the node, so the executor (or an
+    /// idempotency store) can deduplicate retries of the same node while
+    /// never confusing two nodes of one graph.
+    pub idempotency_key: String,
     /// Remaining budget for this single node attempt; the executor (or the
-    /// runner's `tokio::time::timeout`) must honour it.
+    /// runner's `tokio::time::timeout`) must honour it. This is the
+    /// *effective* attempt budget: the configured node timeout capped by
+    /// whatever of the node's total retry budget remains.
     pub node_timeout: Duration,
     /// Budget for a single tool call inside the node; distinct from the
     /// node budget — a long node may need several tool calls.
@@ -213,6 +224,35 @@ impl ExecutionReport {
             .collect()
     }
 
+    /// Cancelled node ids, in report order (root cancel stopped them
+    /// before they could finish).
+    pub fn cancelled(&self) -> Vec<&str> {
+        self.nodes
+            .iter()
+            .filter(|n| n.status == NodeStatus::Cancelled)
+            .map(|n| n.node_id.as_str())
+            .collect()
+    }
+
+    /// Nodes that hit a typed attempt or retry-budget timeout, in report
+    /// order: failed nodes whose final error code is `E-TIMEOUT`.
+    pub fn timed_out(&self) -> Vec<&str> {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                n.status == NodeStatus::Failed && n.error_code.as_deref() == Some("E-TIMEOUT")
+            })
+            .map(|n| n.node_id.as_str())
+            .collect()
+    }
+
+    /// Whether every node succeeded. A partial report (any failed,
+    /// skipped or cancelled node) is never a full success: callers must
+    /// read the per-node lists, never assume the run completed.
+    pub fn is_full_success(&self) -> bool {
+        self.nodes.iter().all(|n| n.status == NodeStatus::Succeeded)
+    }
+
     /// Nodes that did not succeed: the targeted failed-subgraph, ready for
     /// [`crate::scheduler::Scheduler::retry_failed_subgraph`].
     pub fn failed_subgraph(&self) -> Vec<String> {
@@ -273,6 +313,11 @@ pub(crate) struct Runner {
     graph_id: String,
     correlation_id: String,
     token: CancellationToken,
+    /// Attempts started per node, shared across spawned tasks. When the
+    /// runner aborts a task (root cancel / graph deadline) the join yields
+    /// no outcome, so this map is how the aborted node is still reported
+    /// with the attempts it actually made instead of being dropped.
+    attempts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl Runner {
@@ -287,6 +332,7 @@ impl Runner {
             graph_id,
             correlation_id,
             token,
+            attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -296,6 +342,7 @@ impl Runner {
             graph_id: self.graph_id.clone(),
             correlation_id: self.correlation_id.clone(),
             token: self.token.clone(),
+            attempts: Arc::clone(&self.attempts),
         }
     }
 }
@@ -303,6 +350,41 @@ impl Runner {
 /// Outcome collected from one spawned node task.
 struct NodeTaskOutcome {
     result: NodeResult,
+}
+/// Reports started nodes whose task was aborted (root cancel or graph
+/// deadline) so the join yields no outcome. Without this they would fall
+/// through to the never-started branch and be misreported as
+/// skipped-before-launch with zero attempts: no zombie, no orphan, and
+/// the attempts they actually made are preserved from the runner map.
+fn synthesize_aborted(
+    started: &HashSet<String>,
+    results: &mut HashMap<String, NodeResult>,
+    subagent_by_id: &HashMap<String, String>,
+    attempts: &Arc<Mutex<HashMap<String, u32>>>,
+    status: NodeStatus,
+    message: &str,
+) {
+    let attempts_map = attempts.lock().expect("attempts mutex");
+    for id in started {
+        if results.contains_key(id) {
+            continue;
+        }
+        results.insert(
+            id.clone(),
+            NodeResult {
+                node_id: id.clone(),
+                subagent: subagent_by_id
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string()),
+                status,
+                attempts: attempts_map.get(id).copied().unwrap_or(0),
+                duration: Duration::ZERO,
+                error_code: None,
+                message: Some(message.to_string()),
+            },
+        );
+    }
 }
 
 /// Work-conserving run of `graph`.
@@ -341,6 +423,18 @@ pub(crate) async fn run_graph<E: NodeExecutor + 'static>(
             })
         })
         .collect();
+    let subagent_by_id: HashMap<String, String> = pending
+        .iter()
+        .map(|t| {
+            (
+                t.id.as_ref().map(|i| i.value.clone()).unwrap_or_default(),
+                t.subagent_type
+                    .as_ref()
+                    .map(|s| s.value.clone())
+                    .unwrap_or_else(|| "default".to_string()),
+            )
+        })
+        .collect();
 
     let mut succeeded: HashSet<String> = pre_succeeded.clone();
     let mut results: HashMap<String, NodeResult> = HashMap::new();
@@ -370,6 +464,14 @@ pub(crate) async fn run_graph<E: NodeExecutor + 'static>(
                     );
                 }
             }
+            synthesize_aborted(
+                &started,
+                &mut results,
+                &subagent_by_id,
+                &runner.attempts,
+                NodeStatus::Cancelled,
+                "cancelled while running",
+            );
             break;
         }
         if Instant::now() >= graph_deadline {
@@ -385,6 +487,14 @@ pub(crate) async fn run_graph<E: NodeExecutor + 'static>(
                     );
                 }
             }
+            synthesize_aborted(
+                &started,
+                &mut results,
+                &subagent_by_id,
+                &runner.attempts,
+                NodeStatus::Failed,
+                "graph deadline exceeded while running",
+            );
             break;
         }
 
@@ -441,28 +551,37 @@ pub(crate) async fn run_graph<E: NodeExecutor + 'static>(
         if join_set.is_empty() {
             break;
         }
-        // Wait for at least one completion, bounded by the graph deadline.
-        let remaining = graph_deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, join_set.join_next()).await {
-            Ok(Some(Ok(outcome))) => {
-                if outcome.result.status == NodeStatus::Succeeded {
-                    succeeded.insert(outcome.result.node_id.clone());
-                }
-                if let Some(sub) = running_per_subagent.get_mut(&outcome.result.subagent) {
-                    *sub = sub.saturating_sub(1);
-                }
-                let node_id = outcome.result.node_id.clone();
-                results.insert(node_id, outcome.result);
+        // Wait for at least one completion. The wait ticks every 10 ms so
+        // a root cancel (or the graph deadline) is observed promptly even
+        // while an executor ignores the token; a single long wait would
+        // block on the slowest node for its whole node timeout.
+        loop {
+            if runner.token.is_cancelled() || Instant::now() >= graph_deadline {
+                break;
             }
-            Ok(Some(Err(joined))) => {
-                tracing::warn!(
-                    correlation_id = %runner.correlation_id,
-                    error = %joined,
-                    "scheduler: node task panicked; recorded as failed"
-                );
+            match tokio::time::timeout(Duration::from_millis(10), join_set.join_next()).await {
+                Ok(Some(Ok(outcome))) => {
+                    if outcome.result.status == NodeStatus::Succeeded {
+                        succeeded.insert(outcome.result.node_id.clone());
+                    }
+                    if let Some(sub) = running_per_subagent.get_mut(&outcome.result.subagent) {
+                        *sub = sub.saturating_sub(1);
+                    }
+                    let node_id = outcome.result.node_id.clone();
+                    results.insert(node_id, outcome.result);
+                    break;
+                }
+                Ok(Some(Err(joined))) => {
+                    tracing::warn!(
+                        correlation_id = %runner.correlation_id,
+                        error = %joined,
+                        "scheduler: node task panicked; recorded as failed"
+                    );
+                    break;
+                }
+                Ok(None) => break,
+                Err(_elapsed) => {}
             }
-            Ok(None) => break,
-            Err(_elapsed) => {}
         }
     }
 
@@ -561,21 +680,39 @@ async fn run_node<E: NodeExecutor>(runner: &Runner, task: &Task, executor: &E) -
         .map(|s| s.value.clone())
         .unwrap_or_else(|| "default".to_string());
     let retries_allowed = config.max_attempts.saturating_sub(1);
+    // Root + node: stable across every attempt of this node.
+    let idempotency_key = format!("{}/{}", runner.graph_id, node_id);
     let mut attempts = 0u32;
     let mut last_err: Option<ClassifiedError> = None;
     let node_started = Instant::now();
+    // Total deadline for this node's attempts plus backoff sleeps: retries
+    // never outlive it, no matter what max_attempts says.
+    let retry_deadline = node_started + config.retry_budget;
 
     loop {
         if runner.token.is_cancelled() {
             break;
         }
+        let budget_left = retry_deadline.saturating_duration_since(Instant::now());
+        if budget_left.is_zero() {
+            break;
+        }
         attempts += 1;
+        {
+            let mut map = runner.attempts.lock().expect("attempts mutex");
+            map.insert(node_id.clone(), attempts);
+        }
+        // Effective attempt budget: node timeout capped by what the total
+        // retry deadline still has left.
+        let attempt_timeout = config.node_timeout.min(budget_left);
+        let budget_capped = budget_left < config.node_timeout;
         let ctx = ExecutionCtx {
             correlation_id: runner.correlation_id.clone(),
             graph_id: runner.graph_id.clone(),
             node_id: node_id.clone(),
             subagent: subagent.clone(),
-            node_timeout: config.node_timeout,
+            idempotency_key: idempotency_key.clone(),
+            node_timeout: attempt_timeout,
             tool_timeout: config.tool_timeout,
             token: runner.token.clone(),
         };
@@ -587,13 +724,17 @@ async fn run_node<E: NodeExecutor>(runner: &Runner, task: &Task, executor: &E) -
             attempt = attempts,
             "scheduler: launching node"
         );
-        let attempt_future = tokio::time::timeout(config.node_timeout, executor.execute(ctx));
+        let attempt_future = tokio::time::timeout(attempt_timeout, executor.execute(ctx));
         let outcome = match attempt_future.await {
             Ok(result) => result,
             Err(_elapsed) => Err(ClassifiedError::classified(
                 "E-TIMEOUT",
                 false,
-                format!("node {node_id} exceeded its node timeout"),
+                if budget_capped {
+                    format!("node {node_id} exceeded its total retry budget")
+                } else {
+                    format!("node {node_id} exceeded its node timeout")
+                },
             )),
         };
         match outcome {
@@ -633,6 +774,11 @@ async fn run_node<E: NodeExecutor>(runner: &Runner, task: &Task, executor: &E) -
                     attempts,
                     &node_id,
                 );
+                // A backoff that would cross the total retry deadline is
+                // not slept: the node fails with its last error instead.
+                if Instant::now() + delay >= retry_deadline {
+                    break;
+                }
                 // Cooperative sleep: sleep `delay` in small slices, bailing
                 // early when the token is cancelled (never sleep through it).
                 let mut remaining = delay;
@@ -1019,5 +1165,306 @@ mod tests {
         assert_eq!(calls.get("c"), None, "completed branch must not re-execute");
         assert_eq!(calls.get("a"), Some(&1));
         assert_eq!(calls.get("b"), Some(&1));
+    }
+
+    /// Retry-then-fail: a classified, idempotent, allow-listed failure is
+    /// retried up to `max_attempts` and then fails; the dependent is
+    /// skipped (never run without its inputs) and the partial report is
+    /// never a full success.
+    #[tokio::test]
+    async fn retry_then_fail_exhausts_attempts_and_skips_dependent() {
+        let config = crate::scheduler::SchedulerConfig {
+            retryable_codes: vec!["E-DEP".to_string()],
+            max_attempts: 3,
+            ..test_config()
+        };
+        let scheduler = crate::scheduler::Scheduler::new(config);
+        let graph = scheduler
+            .validate(vec![task("a", &[], "s1"), task("b", &["a"], "s1")])
+            .expect("valid");
+        let executor = Arc::new(ScriptExecutor {
+            fail_ids: HashMap::from([(
+                "a".to_string(),
+                ClassifiedError::classified("E-DEP", true, "still down"),
+            )]),
+            fast_fail_assign_count: Mutex::new(HashMap::new()),
+        });
+        let report = scheduler
+            .run(
+                &graph,
+                executor,
+                CancellationToken::new(),
+                "corr-retry-fail",
+            )
+            .await
+            .expect("runs");
+        assert_eq!(report.failed(), vec!["a"]);
+        assert_eq!(report.skipped(), vec!["b"]);
+        assert!(report.cancelled().is_empty());
+        assert!(!report.is_full_success(), "partial is not full success");
+        let a = report
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "a")
+            .expect("a named");
+        assert_eq!(a.attempts, 3, "bounded retries: max_attempts total");
+        assert_eq!(a.error_code.as_deref(), Some("E-DEP"));
+        let b = report
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "b")
+            .expect("b named");
+        assert_eq!(b.attempts, 0, "dependent never ran without inputs");
+    }
+
+    /// The total retry deadline caps retries below `max_attempts`: a
+    /// backoff that would cross the deadline is never slept.
+    #[tokio::test]
+    async fn retry_budget_caps_retries_below_max_attempts() {
+        let config = crate::scheduler::SchedulerConfig {
+            retryable_codes: vec!["E-DEP".to_string()],
+            max_attempts: 10,
+            // First retry would sleep 50 ms, which alone crosses the
+            // 30 ms total budget, so no retry happens at all.
+            retry_budget: Duration::from_millis(30),
+            base_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(50),
+            jitter_fraction: 0.0,
+            ..test_config()
+        };
+        let scheduler = crate::scheduler::Scheduler::new(config);
+        let graph = scheduler
+            .validate(vec![task("a", &[], "s1")])
+            .expect("valid");
+        let executor = Arc::new(ScriptExecutor {
+            fail_ids: HashMap::from([(
+                "a".to_string(),
+                ClassifiedError::classified("E-DEP", true, "still down"),
+            )]),
+            fast_fail_assign_count: Mutex::new(HashMap::new()),
+        });
+        let report = scheduler
+            .run(
+                &graph,
+                executor,
+                CancellationToken::new(),
+                "corr-retry-budget",
+            )
+            .await
+            .expect("runs");
+        assert_eq!(report.failed(), vec!["a"]);
+        assert_eq!(
+            report.nodes[0].attempts, 1,
+            "total deadline, not attempt count, bounded the retries"
+        );
+    }
+
+    /// Timeout-cancel: a hanging executor that ignores the token is cut
+    /// off by the typed per-attempt timeout (E-TIMEOUT) — no zombie.
+    #[tokio::test]
+    async fn node_timeout_aborts_hanging_executor_without_zombie() {
+        struct HangingExecutor;
+        impl NodeExecutor for HangingExecutor {
+            async fn execute(&self, _ctx: ExecutionCtx) -> Result<NodeOutput, ClassifiedError> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(NodeOutput {
+                    payload: "never".to_string(),
+                })
+            }
+        }
+        let config = crate::scheduler::SchedulerConfig {
+            node_timeout: Duration::from_millis(30),
+            tool_timeout: Duration::from_millis(10),
+            ..test_config()
+        };
+        let scheduler = crate::scheduler::Scheduler::new(config);
+        let graph = scheduler
+            .validate(vec![task("a", &[], "s1"), task("b", &["a"], "s1")])
+            .expect("valid");
+        let started_at = Instant::now();
+        let report = scheduler
+            .run(
+                &graph,
+                Arc::new(HangingExecutor),
+                CancellationToken::new(),
+                "corr-timeout",
+            )
+            .await
+            .expect("runs");
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "run returned instead of waiting for the hanging node"
+        );
+        assert_eq!(report.failed(), vec!["a"]);
+        assert_eq!(report.timed_out(), vec!["a"]);
+        assert_eq!(report.skipped(), vec!["b"]);
+        assert!(!report.is_full_success());
+        assert_eq!(
+            report.nodes[0].error_code.as_deref(),
+            Some("E-TIMEOUT"),
+            "typed timeout, distinct from cancel and failure"
+        );
+    }
+
+    /// Mid-graph root cancel aborts a running node that ignores the token:
+    /// it is reported Cancelled with the attempts it made (no orphan with
+    /// dropped provenance), the queue is never launched, and an already
+    /// finished disjoint node stays Succeeded.
+    #[tokio::test]
+    async fn mid_graph_cancel_aborts_token_ignoring_node_with_provenance() {
+        struct IgnoringExecutor {
+            started: Arc<AtomicBool>,
+            finished_c: Arc<AtomicBool>,
+        }
+        impl NodeExecutor for IgnoringExecutor {
+            async fn execute(&self, ctx: ExecutionCtx) -> Result<NodeOutput, ClassifiedError> {
+                if ctx.node_id == "a" {
+                    self.started.store(true, Ordering::SeqCst);
+                    // Ignores ctx.token entirely: only the runner's abort
+                    // can stop this.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                if ctx.node_id == "c" {
+                    self.finished_c.store(true, Ordering::SeqCst);
+                }
+                Ok(NodeOutput {
+                    payload: ctx.node_id.clone(),
+                })
+            }
+        }
+        let config = crate::scheduler::SchedulerConfig {
+            node_timeout: Duration::from_secs(30),
+            ..test_config()
+        };
+        let scheduler = crate::scheduler::Scheduler::new(config);
+        let graph = scheduler
+            .validate(vec![
+                task("a", &[], "s1"),
+                task("b", &["a"], "s1"),
+                task("c", &[], "s1"),
+            ])
+            .expect("valid");
+        let token = CancellationToken::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let finished_c = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(IgnoringExecutor {
+            started: Arc::clone(&started),
+            finished_c: Arc::clone(&finished_c),
+        });
+        let run_token = token.clone();
+        let running = tokio::spawn(async move {
+            scheduler
+                .run(&graph, executor, run_token, "corr-cancel-ignoring")
+                .await
+        });
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) && finished_c.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.load(Ordering::SeqCst), "a must be in flight");
+        assert!(finished_c.load(Ordering::SeqCst), "c must be done");
+        token.cancel();
+        let started_at = Instant::now();
+        let report = running
+            .await
+            .expect("run task")
+            .expect("report even when cancelled");
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "abort returned without waiting 30 s"
+        );
+        let status = |id: &str| {
+            report
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .map(|n| (n.status, n.attempts))
+        };
+        assert_eq!(status("a"), Some((NodeStatus::Cancelled, 1)));
+        assert_eq!(status("b"), Some((NodeStatus::Cancelled, 0)));
+        assert_eq!(status("c"), Some((NodeStatus::Succeeded, 1)));
+        assert_eq!(report.cancelled(), vec!["a", "b"]);
+        assert!(!report.is_full_success());
+    }
+
+    /// The idempotency key is root + node and identical across attempts,
+    /// so a deduplicating executor sees one key per node, never one per
+    /// attempt.
+    #[tokio::test]
+    async fn idempotency_key_is_root_plus_node_and_stable_across_attempts() {
+        struct KeyRecordingFlaky {
+            keys: Mutex<Vec<String>>,
+            calls: Mutex<HashMap<String, usize>>,
+        }
+        impl NodeExecutor for KeyRecordingFlaky {
+            async fn execute(&self, ctx: ExecutionCtx) -> Result<NodeOutput, ClassifiedError> {
+                self.keys
+                    .lock()
+                    .expect("mutex")
+                    .push(ctx.idempotency_key.clone());
+                let mut calls = self.calls.lock().expect("mutex");
+                let count = calls.entry(ctx.node_id.clone()).or_insert(0);
+                *count += 1;
+                if *count < 3 {
+                    Err(ClassifiedError::classified("E-DEP", true, "flaky"))
+                } else {
+                    Ok(NodeOutput {
+                        payload: ctx.node_id.clone(),
+                    })
+                }
+            }
+        }
+        let config = crate::scheduler::SchedulerConfig {
+            retryable_codes: vec!["E-DEP".to_string()],
+            ..test_config()
+        };
+        let scheduler = crate::scheduler::Scheduler::new(config);
+        let graph = scheduler
+            .validate(vec![task("a", &[], "s1")])
+            .expect("valid");
+        let executor = Arc::new(KeyRecordingFlaky {
+            keys: Mutex::new(Vec::new()),
+            calls: Mutex::new(HashMap::new()),
+        });
+        let report = scheduler
+            .run(
+                &graph,
+                Arc::clone(&executor),
+                CancellationToken::new(),
+                "corr-idem",
+            )
+            .await
+            .expect("runs");
+        assert!(report.is_full_success());
+        assert_eq!(report.nodes[0].attempts, 3);
+        let keys = executor.keys.lock().expect("mutex");
+        assert_eq!(keys.len(), 3);
+        assert!(
+            keys.iter().all(|key| key == "graph/a"),
+            "root+node key stable across attempts, got {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_run_is_a_full_success() {
+        let config = test_config();
+        let scheduler = crate::scheduler::Scheduler::new(config);
+        let graph = scheduler
+            .validate(vec![task("a", &[], "s1"), task("b", &["a"], "s1")])
+            .expect("valid");
+        let executor = Arc::new(ScriptExecutor {
+            fail_ids: HashMap::new(),
+            fast_fail_assign_count: Mutex::new(HashMap::new()),
+        });
+        let report = scheduler
+            .run(&graph, executor, CancellationToken::new(), "corr-clean")
+            .await
+            .expect("runs");
+        assert!(report.is_full_success());
+        assert!(report.cancelled().is_empty());
+        assert!(report.timed_out().is_empty());
+        assert_eq!(report.succeeded(), vec!["a", "b"]);
     }
 }

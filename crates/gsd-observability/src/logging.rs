@@ -226,6 +226,8 @@ pub struct GraphEvent {
     from_state: Option<String>,
     to_state: Option<String>,
     attempt: Option<u32>,
+    duration_ms: Option<u64>,
+    outcome: Option<String>,
     error_code: Option<String>,
     detail: String,
 }
@@ -238,6 +240,8 @@ impl GraphEvent {
             from_state: None,
             to_state: None,
             attempt: None,
+            duration_ms: None,
+            outcome: None,
             error_code: None,
             detail: String::new(),
         }
@@ -263,6 +267,14 @@ impl GraphEvent {
         self.attempt
     }
 
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.duration_ms
+    }
+
+    pub fn outcome(&self) -> Option<&str> {
+        self.outcome.as_deref()
+    }
+
     pub fn error_code(&self) -> Option<&str> {
         self.error_code.as_deref()
     }
@@ -284,6 +296,16 @@ impl GraphEvent {
 
     pub fn with_attempt(mut self, attempt: u32) -> Self {
         self.attempt = Some(attempt);
+        self
+    }
+
+    pub fn with_duration_ms(mut self, ms: u64) -> Self {
+        self.duration_ms = Some(ms);
+        self
+    }
+
+    pub fn with_outcome(mut self, outcome: impl Into<String>) -> Self {
+        self.outcome = Some(outcome.into());
         self
     }
 
@@ -314,6 +336,12 @@ impl GraphEvent {
         if let Some(attempt) = self.attempt {
             out.push_str(&format!(" attempt={attempt}"));
         }
+        if let Some(ms) = self.duration_ms {
+            out.push_str(&format!(" duration_ms={ms}"));
+        }
+        if let Some(outcome) = &self.outcome {
+            out.push_str(&format!(" outcome={outcome}"));
+        }
         if let Some(code) = &self.error_code {
             out.push_str(&format!(" error_code={code}"));
         }
@@ -337,11 +365,65 @@ impl GraphEvent {
             from_state = ?self.from_state,
             to_state = ?self.to_state,
             attempt = ?self.attempt,
+            duration_ms = ?self.duration_ms,
+            outcome = ?self.outcome,
             error_code = ?self.error_code,
             detail = %self.detail,
             "graph event"
         );
     }
+
+    /// Structured JSON for one event (root/node/subagent/tool/attempt/duration/outcome).
+    pub fn to_json(&self) -> String {
+        let mut out = format!(
+            "{{\"event\":\"{}\",\"root\":\"{}\",\"node\":\"{}\",\"subagent\":\"{}\",\"tool\":\"{}\"",
+            self.kind,
+            json_escape(&self.correlation.correlation_id),
+            json_escape(&self.correlation.node_id),
+            json_escape(&self.correlation.subagent_id),
+            json_escape(&self.correlation.tool_name)
+        );
+        if let Some(v) = &self.from_state {
+            out.push_str(&format!(",\"from_state\":\"{}\"", json_escape(v)));
+        }
+        if let Some(v) = &self.to_state {
+            out.push_str(&format!(",\"to_state\":\"{}\"", json_escape(v)));
+        }
+        if let Some(a) = self.attempt {
+            out.push_str(&format!(",\"attempt\":{a}"));
+        }
+        if let Some(ms) = self.duration_ms {
+            out.push_str(&format!(",\"duration_ms\":{ms}"));
+        }
+        if let Some(v) = &self.outcome {
+            out.push_str(&format!(",\"outcome\":\"{}\"", json_escape(v)));
+        }
+        if let Some(v) = &self.error_code {
+            out.push_str(&format!(",\"error_code\":\"{}\"", json_escape(v)));
+        }
+        if !self.detail.is_empty() {
+            out.push_str(&format!(",\"detail\":\"{}\"", json_escape(&self.detail)));
+        }
+        out.push('}');
+        out
+    }
+}
+
+/// Escapes a string for inclusion in JSON output.
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// In-memory event recorder for tests and short-lived diagnostics.
@@ -384,6 +466,24 @@ impl EventRecorder {
             .iter()
             .filter(|event| event.kind() == kind)
             .count()
+    }
+
+    /// Structured graph dump (no UI): JSON array of up to `max_events`
+    /// events. Signals (burn/latency) are derivable from counters, not
+    /// embedded here. Secrets already redacted at build time.
+    pub fn dump_json(&self, max_events: usize) -> String {
+        let events = self.events.lock().expect("event recorder lock");
+        let total = events.len();
+        let take = total.min(max_events);
+        let mut out = format!("{{\"total\":{total},\"shown\":{take},\"events\":[");
+        for (i, e) in events[..take].iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&e.to_json());
+        }
+        out.push_str("]}");
+        out
     }
 }
 
@@ -1111,5 +1211,36 @@ mod tests {
         let event =
             GraphEvent::new(EventKind::Validate, CorrelationContext::new("c")).with_detail(long);
         assert!(event.detail().chars().count() <= MAX_DETAIL_CHARS);
+    }
+
+    #[test]
+    fn event_carries_duration_outcome_and_json_dump() {
+        let event = GraphEvent::new(
+            EventKind::Dispatch,
+            CorrelationContext::new("root-1")
+                .with_node("n-1")
+                .with_subagent("sub-1")
+                .with_tool("swarm_tool"),
+        )
+        .with_attempt(2)
+        .with_duration_ms(42)
+        .with_outcome("success")
+        .with_detail("ok api_key=supersecret1");
+        let summary = event.summary();
+        assert!(summary.contains("duration_ms=42"), "{summary}");
+        assert!(summary.contains("outcome=success"), "{summary}");
+        let json = event.to_json();
+        assert!(json.contains("\"root\":\"root-1\""), "{json}");
+        assert!(json.contains("\"attempt\":2"), "{json}");
+        assert!(json.contains("\"duration_ms\":42"), "{json}");
+        assert!(json.contains("\"outcome\":\"success\""), "{json}");
+        assert!(!json.contains("supersecret1"), "{json}");
+        assert!(json.contains(REDACTED), "{json}");
+        let recorder = EventRecorder::new();
+        recorder.record(&event);
+        let dump = recorder.dump_json(10);
+        assert!(dump.contains("\"total\":1"), "{dump}");
+        assert!(dump.contains("\"root\":\"root-1\""), "{dump}");
+        assert!(!dump.contains("supersecret1"), "{dump}");
     }
 }

@@ -248,6 +248,30 @@ impl MetricsRegistry {
         self.inc("gsd_conversion_errors_total", 1);
     }
 
+    pub fn inc_validation_failure(&self) {
+        self.inc("gsd_validation_fails_total", 1);
+    }
+
+    /// Records a tool/node latency sample (ms): count, sum, last.
+    pub fn record_latency_ms(&self, ms: f64) {
+        self.inc("gsd_latency_count", 1);
+        self.inc("gsd_latency_sum_ms", ms.max(0.0) as u64);
+        self.set("gsd_latency_last_ms", ms);
+    }
+
+    /// Records queue-wait sample (ms): count, sum, last.
+    pub fn record_queue_wait_ms(&self, ms: f64) {
+        self.inc("gsd_queue_wait_count", 1);
+        self.inc("gsd_queue_wait_sum_ms", ms.max(0.0) as u64);
+        self.set("gsd_queue_wait_last_ms", ms);
+    }
+
+    /// Parallelism gauge (current in-flight); alias of concurrency.
+    pub fn set_parallelism(&self, running: u64) {
+        self.set_concurrency(running);
+        self.set("gsd_parallelism", running as f64);
+    }
+
     /// The single event-to-counter mapping. A transition counts the
     /// node under its destination state; a PyO3 boundary error counts
     /// as a conversion error.
@@ -266,6 +290,27 @@ impl MetricsRegistry {
             EventKind::Cancel => self.inc_cancel(),
             EventKind::Aggregate => self.inc_aggregate(),
             EventKind::PyO3Error => self.inc_conversion_error(),
+        }
+        if event.kind() == EventKind::Validate
+            && matches!(
+                event.outcome(),
+                Some("failure") | Some("failed") | Some("error")
+            )
+        {
+            self.inc_validation_failure();
+        }
+        if let Some(ms) = event.duration_ms() {
+            self.record_latency_ms(ms as f64);
+        }
+        if let Some(out) = event.outcome() {
+            match out {
+                "success" => self.inc_tool_outcome(ToolOutcome::Success),
+                "failure" | "failed" => self.inc_tool_outcome(ToolOutcome::Failure),
+                "timeout" => self.inc_tool_outcome(ToolOutcome::Timeout),
+                "cancelled" => self.inc_tool_outcome(ToolOutcome::Cancelled),
+                "error" => self.inc_tool_outcome(ToolOutcome::Error),
+                _ => {}
+            }
         }
     }
 }
@@ -295,6 +340,10 @@ pub struct ResourceLimits {
     pub max_queue_depth: u64,
     /// Maximum concurrently executing nodes.
     pub max_concurrency: usize,
+    /// Maximum payload bytes per node/tool call.
+    pub max_payload_bytes: u64,
+    /// Maximum recursion depth for nested decomposition.
+    pub max_recursion_depth: usize,
 }
 
 impl Default for ResourceLimits {
@@ -309,6 +358,8 @@ impl Default for ResourceLimits {
             python_invocation_timeout_ms: 60_000,
             max_queue_depth: 4096,
             max_concurrency: 64,
+            max_payload_bytes: 1024 * 1024,
+            max_recursion_depth: 32,
         }
     }
 }
@@ -324,6 +375,8 @@ pub enum LimitViolation {
     MemoryBytes { requested: u64, limit: u64 },
     PythonInvocations { requested: usize, limit: usize },
     QueueDepth { requested: u64, limit: u64 },
+    PayloadBytes { requested: u64, limit: u64 },
+    RecursionDepth { requested: usize, limit: usize },
 }
 
 impl fmt::Display for LimitViolation {
@@ -349,6 +402,12 @@ impl fmt::Display for LimitViolation {
             }
             LimitViolation::QueueDepth { requested, limit } => {
                 write!(f, "queue depth {requested} exceed limit {limit}")
+            }
+            LimitViolation::PayloadBytes { requested, limit } => {
+                write!(f, "payload {requested} bytes exceed limit {limit} bytes")
+            }
+            LimitViolation::RecursionDepth { requested, limit } => {
+                write!(f, "recursion depth {requested} exceed limit {limit}")
             }
         }
     }
@@ -426,6 +485,26 @@ impl ResourceLimits {
     pub fn cap_concurrency(&self, requested: usize) -> usize {
         requested.min(self.max_concurrency)
     }
+
+    pub fn check_payload(&self, bytes: u64) -> Result<(), LimitViolation> {
+        if bytes > self.max_payload_bytes {
+            return Err(LimitViolation::PayloadBytes {
+                requested: bytes,
+                limit: self.max_payload_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn check_recursion(&self, depth: usize) -> Result<(), LimitViolation> {
+        if depth > self.max_recursion_depth {
+            return Err(LimitViolation::RecursionDepth {
+                requested: depth,
+                limit: self.max_recursion_depth,
+            });
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +570,26 @@ impl GraphTelemetry {
         fan_out: usize,
     ) -> Result<(), LimitViolation> {
         self.limits.check_graph(nodes, depth, fan_out)
+    }
+
+    /// Structured graph dump (no UI): events + counter snapshot.
+    /// Signals derivable: burn_rate from total vs error counters.
+    pub fn graph_dump_json(&self, max_events: usize) -> String {
+        let dump = self.recorder.dump_json(max_events);
+        let mut out = String::from("{\"dump\":");
+        out.push_str(&dump);
+        out.push_str(",\"counters\":{");
+        for (i, (name, value)) in self.registry.snapshot().iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\"{}\":{value}",
+                crate::logging::json_escape(name)
+            ));
+        }
+        out.push_str("}}");
+        out
     }
 }
 
@@ -658,5 +757,42 @@ mod tests {
         let telemetry = GraphTelemetry::default();
         assert!(telemetry.check_graph(1, 1, 1).is_ok());
         assert!(telemetry.check_graph(9999, 1, 1).is_err());
+    }
+
+    #[test]
+    fn new_counters_and_payload_recursion_bounds() {
+        let registry = MetricsRegistry::new();
+        registry.inc_validation_failure();
+        assert_eq!(registry.counter("gsd_validation_fails_total"), 1);
+        registry
+            .record_event(&GraphEvent::new(EventKind::Validate, corr()).with_outcome("failure"));
+        assert_eq!(registry.counter("gsd_validation_fails_total"), 2);
+        registry.record_latency_ms(12.0);
+        registry.record_queue_wait_ms(3.0);
+        registry.set_parallelism(5);
+        assert_eq!(registry.counter("gsd_latency_count"), 1);
+        assert_eq!(registry.counter("gsd_queue_wait_count"), 1);
+        assert_eq!(registry.gauge("gsd_parallelism"), 5.0);
+        let limits = ResourceLimits::default();
+        assert!(limits.check_payload(100).is_ok());
+        assert!(matches!(
+            limits.check_payload(limits.max_payload_bytes + 1),
+            Err(LimitViolation::PayloadBytes { .. })
+        ));
+        assert!(limits.check_recursion(1).is_ok());
+        assert!(matches!(
+            limits.check_recursion(limits.max_recursion_depth + 1),
+            Err(LimitViolation::RecursionDepth { .. })
+        ));
+        let telemetry = GraphTelemetry::default();
+        telemetry.record(
+            &GraphEvent::new(EventKind::Dispatch, corr())
+                .with_duration_ms(7)
+                .with_outcome("success"),
+        );
+        let dump = telemetry.graph_dump_json(10);
+        assert!(dump.contains("gsd_latency_count"), "{dump}");
+        assert!(dump.contains("\"counters\""), "{dump}");
+        assert!(!dump.contains("supersecret"), "{dump}");
     }
 }

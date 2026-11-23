@@ -13,8 +13,8 @@ pub mod logging;
 pub mod metrics;
 
 pub use logging::{
-    is_sensitive_key, path_for_kind, redact_text, CorrelationContext, EventKind, EventRecorder,
-    FeatureFlags, GraphEvent, Path, PathDisabled,
+    is_sensitive_key, json_escape, path_for_kind, redact_text, CorrelationContext, EventKind,
+    EventRecorder, FeatureFlags, GraphEvent, Path, PathDisabled,
 };
 pub use metrics::{GraphTelemetry, LimitViolation, MetricsRegistry, ResourceLimits, ToolOutcome};
 

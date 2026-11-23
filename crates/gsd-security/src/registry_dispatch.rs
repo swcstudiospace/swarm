@@ -951,4 +951,175 @@ mod tests {
             serde_json::json!(["c", "a", "b"])
         );
     }
+
+    // --- concurrency (shared-tool thread safety) ---
+
+    /// Compile-time proof: `dispatch` takes `&self`, so a dispatcher shared
+    /// via `Arc` across threads is the concurrency boundary; the only state
+    /// mutated under `&self` is `Mutex`/`AtomicUsize` guarded.
+    #[test]
+    fn dispatcher_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Registry>();
+        assert_send_sync::<Dispatcher>();
+    }
+
+    /// Many agents call the one shared tool concurrently: every call
+    /// succeeds, the handler runs exactly once per call, and the audit log
+    /// records every call — no lost update under contention.
+    #[test]
+    fn concurrent_shared_dispatch_all_succeed() {
+        let reg = registry_with(Tool::new("shared_clock", "shared", OwnerScope::Shared));
+        let mut d = Dispatcher::with_shared_limits(
+            reg,
+            SharedLimits {
+                max_concurrent: 64,
+                max_calls_per_window: 4096,
+                window: Duration::from_secs(60),
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        d.register_native(
+            "shared_clock",
+            Box::new(move |_p: &Value| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"ok": true}))
+            }),
+        );
+        let d = Arc::new(d);
+        let callers: Vec<String> = (0..32).map(|i| format!("A{:02}", i % 30 + 1)).collect();
+        std::thread::scope(|scope| {
+            for caller in &callers {
+                let d = Arc::clone(&d);
+                scope.spawn(move || {
+                    let out = d
+                        .dispatch(caller, "shared_clock", serde_json::json!({}))
+                        .unwrap();
+                    assert_eq!(out.route, Route::Native);
+                    assert_eq!(out.caller, *caller);
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 32);
+        let log = d.audit_log();
+        assert_eq!(log.len(), 32);
+        assert!(log.iter().all(|e| e.kind == AuditKind::DispatchedNative));
+    }
+
+    /// The shared in-flight cap holds under contention: a second call while
+    /// one is inside the handler is `RateLimited` — never queued, never a
+    /// panic — and the first call still completes.
+    #[test]
+    fn concurrent_shared_in_flight_cap_is_enforced() {
+        let reg = registry_with(Tool::new("shared_clock", "shared", OwnerScope::Shared));
+        let mut d = Dispatcher::with_shared_limits(
+            reg,
+            SharedLimits {
+                max_concurrent: 1,
+                max_calls_per_window: 4096,
+                window: Duration::from_secs(60),
+            },
+        );
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered_cb = Arc::clone(&entered);
+        let release_cb = Arc::clone(&release);
+        d.register_native(
+            "shared_clock",
+            Box::new(move |_p: &Value| {
+                entered_cb.store(true, Ordering::SeqCst);
+                let (lock, cvar) = &*release_cb;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+                Ok(serde_json::json!({"ok": true}))
+            }),
+        );
+        let d = Arc::new(d);
+        let first = {
+            let d = Arc::clone(&d);
+            std::thread::spawn(move || d.dispatch("A01", "shared_clock", serde_json::json!({})))
+        };
+        // Wait until the handler is actually inside before the second call.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "handler never entered");
+            std::thread::yield_now();
+        }
+        let err = d
+            .dispatch("A02", "shared_clock", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, DispatchError::RateLimited { .. }),
+            "got {err:?}"
+        );
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let out = first.join().expect("first thread panicked").unwrap();
+        assert_eq!(out.route, Route::Native);
+        assert_eq!(out.caller, "A01");
+        assert!(d
+            .audit_log()
+            .iter()
+            .any(|e| e.kind == AuditKind::RateLimited));
+    }
+
+    /// Cross-agent denial holds under contention too: concurrent wrong-caller
+    /// calls to a unique tool are all rejected and all audit-logged, and the
+    /// owner is still served natively afterwards.
+    #[test]
+    fn concurrent_unique_cross_agent_all_denied() {
+        let reg = registry_with(Tool::new("kpol_pss_check", "A24", OwnerScope::Unique));
+        let mut d = Dispatcher::new(reg);
+        d.register_native(
+            "kpol_pss_check",
+            ok_handler(serde_json::json!({"ok": true})),
+        );
+        let d = Arc::new(d);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let d = Arc::clone(&d);
+                scope.spawn(move || {
+                    assert!(matches!(
+                        d.dispatch("A05", "kpol_pss_check", serde_json::json!({})),
+                        Err(DispatchError::Unauthorized { .. })
+                    ));
+                });
+            }
+        });
+        let log = d.audit_log();
+        assert_eq!(log.len(), 16);
+        assert!(log.iter().all(|e| e.kind == AuditKind::CrossAgentRejected));
+        let out = d
+            .dispatch("A24", "kpol_pss_check", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(out.route, Route::Native);
+    }
+
+    /// The migrated shared graph tool serves concurrent callers with the
+    /// same accept/reject decision as the sequential path: parity with the
+    /// Python legacy route holds under contention too.
+    #[test]
+    fn concurrent_graph_validate_parity() {
+        let d = Arc::new(graph_validate_dispatcher(false));
+        let valid = graph_payload(&["c", "a", "b"], &[("a", "b"), ("b", "c")]);
+        let cycle = graph_payload(&["a", "b"], &[("a", "b"), ("b", "a")]);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let d = Arc::clone(&d);
+                let valid = valid.clone();
+                let cycle = cycle.clone();
+                scope.spawn(move || {
+                    let out = d.dispatch("A05", GRAPH_VALIDATE_TOOL, valid).unwrap();
+                    assert_eq!(out.value["order"], serde_json::json!(["a", "b", "c"]));
+                    assert!(d.dispatch("A05", GRAPH_VALIDATE_TOOL, cycle).is_err());
+                });
+            }
+        });
+    }
 }
