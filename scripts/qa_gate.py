@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -160,12 +161,25 @@ def _node_test_evidence(stdout: str, stderr: str) -> tuple[int, int, bool]:
 
 
 
+def _python_prefix(root: Path) -> list[str]:
+    """Command prefix for Python on this target repo.
+
+    QF-001: bare /usr/bin/python3 may lack project deps (e.g. tenacity).
+    Prefer the current interpreter when already in a venv, else uv when available.
+    """
+    if sys.prefix != sys.base_prefix or Path(sys.executable).name not in ("python3", "python"):
+        return [sys.executable]
+    if shutil.which("uv") is not None:
+        return ["uv", "run", "--project", str(root), "python"]
+    return [sys.executable]
+
+
 def detect_runners(root: Path) -> list[dict]:
     runners = []
     if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or list(root.glob("tests/test_*.py")):
         # Same interpreter that runs `sys.executable -m pytest`. A pytest binary on PATH is not required.
         if importlib.util.find_spec("pytest") is not None:
-            runners.append({"name": "pytest", "cmd": [sys.executable, "-m", "pytest", "-q", "--maxfail=50", "-p", "no:cacheprovider"],
+            runners.append({"name": "pytest", "cmd": [*_python_prefix(root), "-m", "pytest", "-q", "--maxfail=50", "-p", "no:cacheprovider"],
                             "pass_re": r"(\d+) passed", "fail_re": r"(\d+) failed|(\d+) error"})
     pkg = root / "package.json"
     if pkg.exists():
@@ -271,7 +285,7 @@ def run(args, ctx) -> dict:
 
     # optional coverage (pytest-cov) threshold
     if args.min_coverage and any(e["runner"] == "pytest" for e in executed):
-        proc = sh([sys.executable, "-m", "pytest", "-q", "--cov", "--cov-report=term", "-p", "no:cacheprovider"], cwd=ctx.root, timeout=args.timeout)
+        proc = sh([*_python_prefix(ctx.root), "-m", "pytest", "-q", "--cov", "--cov-report=term", "-p", "no:cacheprovider"], cwd=ctx.root, timeout=args.timeout)
         out = proc.stdout + proc.stderr
         m = re.search(r"TOTAL.*?(\d+)%", out)
         if m:
