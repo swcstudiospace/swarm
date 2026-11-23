@@ -1,7 +1,7 @@
 """Unit tests for the Graph Quality Gate backend (T2484-be, A05).
 
-Covers API-GsdQualityGate 1.1.0 (12 operations) against the Python oracle
-with native parity where the 18-symbol surface applies. Tests never assume
+Covers API-GsdQualityGate 1.2.0 (18 operations) against the Python oracle
+with native parity where the 25-symbol surface applies. Tests never assume
 the native build is present: parity asserts skip when ``swarm._native``
 cannot be imported, and fallback behavior is asserted instead.
 """
@@ -54,7 +54,7 @@ def create_active_task(store: TaskStore, task_id: str, *, state: str = "IN_PROGR
 # --- Contract route surface (be_contract_conformance + route hygiene) -------
 
 
-def test_router_exposes_all_12_contract_routes():
+def test_router_exposes_all_18_contract_routes():
     routes = {(m, p) for m, p in build_router().routes}
     assert routes == {
         ("GET", "/graph/inventory"),
@@ -63,6 +63,12 @@ def test_router_exposes_all_12_contract_routes():
         ("GET", "/graph/dispatch/{taskId}"),
         ("GET", "/graph/packs/{packId}/parity"),
         ("GET", "/graph/engine/selector"),
+        ("GET", "/graph/validation"),
+        ("POST", "/graph/order"),
+        ("GET", "/graph/bindings"),
+        ("GET", "/graph/parity/coverage"),
+        ("POST", "/graph/orchestrate"),
+        ("GET", "/graph/quality/crates"),
         ("GET", "/quality/gates/{gateId}"),
         ("GET", "/quality/parity/{module}"),
         ("GET", "/quality/sweep/{sweepId}"),
@@ -70,7 +76,7 @@ def test_router_exposes_all_12_contract_routes():
         ("GET", "/quality/ci/{prNumber}"),
         ("GET", "/quality/engine"),
     }
-    assert len(build_router().routes) == 12
+    assert len(build_router().routes) == 18
 
 
 def test_method_status_allowlist_per_contract():
@@ -91,7 +97,7 @@ def test_graph_inventory_live_counts(tmp_path):
     body = graph_inventory(ctx)
     assert body["principal_total"] == 394
     assert body["shared_total"] == 25
-    assert body["native_symbols"] in (0, 18)
+    assert body["native_symbols"] in (0, 25)
     assert body["gaps"] == body["principal_total"] - body["native_symbols"]
     assert body["gaps"] >= 0
     status, via_http = handle(ctx, "GET", "/graph/inventory", None)
@@ -99,18 +105,18 @@ def test_graph_inventory_live_counts(tmp_path):
     assert via_http == body
 
 
-def test_native_surface_is_18_symbols_when_built(tmp_path):
+def test_native_surface_is_25_symbols_when_built(tmp_path):
     ctx = make_ctx(tmp_path)
     module = native_module(ctx)
     names = native_public_names(module)
     if module is not None:
-        assert len(names) == 18
-        assert names == song_18()
+        assert len(names) == 25
+        assert names == song_25()
     # Python-only fallback never fabricates a native count.
     assert native_public_names(None) == []
 
 
-def song_18() -> list[str]:
+def song_25() -> list[str]:
     return sorted(
         [
             "AimdLimiter",
@@ -118,11 +124,18 @@ def song_18() -> list[str]:
             "ChatTicket",
             "ClaimTable",
             "Governor",
+            "GraphReport",
             "NativeCleanupFence",
             "code_from_wire",
             "decode_reply_wire",
+            "error_from_py",
+            "graph_api_version",
+            "graph_schedule",
+            "graph_submit",
+            "graph_validate",
             "orch_status_invoke",
             "redact_spans",
+            "registry_lookup",
             "retry_policy",
             "run_scheduler",
             "sched_backoff_s",
@@ -462,7 +475,7 @@ def test_unknown_operation_is_404(tmp_path):
 
 
 def test_stub_matches_runtime_module_ac34_ac35():
-    # AC-34/35: 18 stub entries match 18 public runtime names, 0 missing.
+    # AC-34/35: 25 stub entries match 25 public runtime names, 0 missing.
     import ast
     import re
 
@@ -474,14 +487,14 @@ def test_stub_matches_runtime_module_ac34_ac35():
             stubbed.add(node.name)
         elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
             stubbed.add(node.name)
-    assert len(stubbed) == 18
+    assert len(stubbed) == 25
     ctx = AppContext(root=ROOT)
     names = set(native_public_names(native_module(ctx)))
     if names:
         assert names == stubbed
     else:
-        # Pure-Python run without the build: stub alone still has 18 entries.
-        assert len(stubbed) == 18
+        # Pure-Python run without the build: stub alone still has 25 entries.
+        assert len(stubbed) == 25
     assert re.search(r"__all__", stub) is not None
 
 

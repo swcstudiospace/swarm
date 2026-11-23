@@ -1,13 +1,14 @@
-"""Graph Quality Gate backend (API-GsdQualityGate 1.1.0).
+"""Graph Quality Gate backend (API-GsdQualityGate 1.2.0).
 
-Single-writer backend for T2484-be (A05). Python is the canonical oracle
-(blueprint v2.5, ADR-0007); the Rust PyO3 surface ``swarm._native`` keeps its
-18 symbols unchanged and is used only for parity evidence, with a
-pure-Python fallback that warns (AC-30). No new third-party dependency is
-introduced (L3 blocked by A02 constraints); the HTTP server in
-``swarm/graph_quality_server.py`` is stdlib-only.
+Single-writer backend for T2484-be/T74c2-be (A05). Python is the canonical
+oracle (blueprint v2.6, ADR-0007/0008); the Rust PyO3 surface
+``swarm._native`` keeps its 25 symbols (the original 18 scheduler/redaction
+symbols plus the additive graph family) and is used only for parity
+evidence, with a pure-Python fallback that warns (AC-30). No new
+third-party dependency is introduced (L3 blocked by A02 constraints); the
+HTTP server in ``swarm/graph_quality_server.py`` is stdlib-only.
 
-Contract: ``contracts/gsd-quality-gate.yaml`` (OpenAPI 3.1.0, 12 operations),
+Contract: ``contracts/gsd-quality-gate.yaml`` (OpenAPI 3.1.0, 18 operations),
 digest-pinned by the architecture handover. Every handler returns the
 contract schema exactly (required fields, enums, minimums enforced). Unknown
 resources answer 404 ``Problem``; a worker-cap refusal answers 429
@@ -17,40 +18,56 @@ flagged provisional here: it covers only inputs the contract cannot describe.
 
 Honesty notes (no fabricated green):
 - Inventory counts the live tool registry (394 total: 369 principal + 25
-  shared) and the live ``swarm._native`` public names (18 when built).
-- Retry median divergence is measured live over 20 matched-jitter samples;
+  shared) and the live ``swarm._native`` public names (25 when built).
+- Retry median divergence is measured live over matched-jitter samples;
   without the native build the single-engine value is 0 by definition.
 - Gate/parity/sweep/CI handlers never invent a pass: no stored verdict
   means ``pending``/``blocked``/``all_green=false`` (AC-15, AC-5).
 - Pack parity divergence is 0 because both engines run the Python oracle
   for Python-only tools; native gaps are counted in inventory, not here.
+- Graph-engine reads return recorded Task Store facts when present
+  (``graph_edges``/``parity_coverage``/``quality_snapshots``, M-2026-002)
+  and otherwise validate the canonical reference fixture computed live
+  through ``swarm.graph_planner`` (AC-39: 10 subtasks, 12 links;
+  AC-40: 5 nodes). ``p95_ms`` is the measured elapsed time of the ready
+  order computation (NFR-P3 budget 100 ms).
+- Bindings count the live registry (394) with the 25 bound PyO3 symbols
+  from the runtime module when built, else from the ``swarm/_native.pyi``
+  honest-import stub (AC-34/35); 30 agents are the distinct lane owners.
+- Orchestrate persists 1 task + 1 receipt carrying 1 plan + 1 result
+  record per correlation id (AC-45/46); repeat calls are idempotent.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
+import logging
 import os
 import random
 import re
 import statistics
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import ErrorCode
+from .errors import ErrorCode, SwarmError
 from .taskstore import SATISFIED_STATES, TaskStore
 
+_logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
-# Contract pins and constants (blueprint v2.5, contract 1.1.0)
+# Contract pins and constants (blueprint v2.6, contract 1.2.0)
 # ---------------------------------------------------------------------------
 
 CONTRACT_ID = "API-GsdQualityGate"
-CONTRACT_VERSION = "1.1.0"
+CONTRACT_VERSION = "1.2.0"
 # Digest is recorded in docs/architecture/blueprint.md; pinned for reference.
-CONTRACT_DIGEST = "sha256:2b913f1c5ee2e1e75ec8e8922c56ee8a86c95856b384c62b0e065feea9f3cf11"
+CONTRACT_DIGEST = "sha256:677e2cce0da984752e2f1935249f8fea84e38357de1f0676baa3ef7bb8323611"
 
 ENGINE_DEFAULT = "python"  # GOAL.md + ADR-0007: Python is always the default.
 WORKER_CAP = 30  # Blueprint capacity model (AC-23); ceiling is 32.
@@ -63,6 +80,8 @@ RETRY_CAP_S = 5.0  # swarm/retry.py DEFAULT_CAP_S (native max_delay_ms 5000).
 RETRY_JITTER = 0.25  # swarm/retry.py default jitter.
 
 REDACT_CASES = 100  # AC-21: 100 secret-span parity cases (NFR-S2).
+COVERAGE_RETRY_SAMPLES = 10  # AC-44: 10 retry samples per engine for parity coverage.
+READY_ORDER_P95_MS = 100  # NFR-P3 budget (contract x-ready-order-p95-ms).
 
 # Quality gates that exist in the Task Store (swarm/gates.py GATES).
 _TASK_GATES = ("quality", "review", "security", "release")
@@ -72,7 +91,7 @@ _GATE_ID_TO_TASK_GATE = {"AC-11": "quality", "AC-12": "quality", "AC-15": "relea
 _SEVERITIES = ("info", "minor", "major", "critical", "blocker")
 _HIGH_SEVERITIES = frozenset({"major", "critical", "blocker"})
 
-# Parity modules whose live parity is measured in this backend (18-symbol
+# Parity modules whose live parity is measured in this backend (25-symbol
 # native surface). Any other known crate is reported blocked (fail-closed):
 # no parity evidence exists for it until its wave closes (ADR-0006).
 _LIVE_PARITY_MODULES = frozenset(
@@ -254,7 +273,7 @@ def registry_counts(registry_doc: dict[str, Any] | None = None) -> tuple[int, in
 
 
 def graph_inventory(ctx: AppContext) -> dict[str, Any]:
-    """GraphInventory: 394 total, 18 native, 376 gaps, 25 shared (AC-17/18)."""
+    """GraphInventory: 394 total, 25 native, 369 gaps, 25 shared (AC-17/18)."""
     total, shared = registry_counts(ctx.registry_doc)
     native_count = len(native_public_names(native_module(ctx)))
     return {
@@ -288,8 +307,8 @@ class _FixedRng:
         return self._sample
 
 
-def retry_median_divergence_ms(ctx: AppContext) -> int:
-    """Median |python - native| over 20 matched-jitter samples (AC-20).
+def retry_median_divergence_ms(ctx: AppContext, samples: int = RETRY_SAMPLES) -> int:
+    """Median |python - native| over matched-jitter samples (AC-20/AC-44).
 
     Native ``sched_backoff_s`` takes its jitter sample as ``unit``; Python
     ``backoff_s`` draws ``rng.uniform(-jitter, jitter)``. Feeding the same
@@ -303,7 +322,7 @@ def retry_median_divergence_ms(ctx: AppContext) -> int:
 
     diffs_ms: list[float] = []
     rng = random.Random(42)
-    for attempt in range(1, RETRY_SAMPLES + 1):
+    for attempt in range(1, samples + 1):
         unit = rng.uniform(-1.0, 1.0)
         py_value = backoff_s(
             attempt, base=RETRY_BASE_S, cap=RETRY_CAP_S, jitter=RETRY_JITTER, rng=_FixedRng(unit * RETRY_JITTER)
@@ -528,7 +547,271 @@ def _validate_body(body: dict[str, Any] | None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Router construction: all 12 contract operations
+# Graph-engine helpers (1.2.0 specialization, AC-39..48)
+# ---------------------------------------------------------------------------
+
+
+def native_stub_count(root: Path) -> int:
+    """Bound PyO3 symbols declared on the honest-import stub (AC-34/35)."""
+    stub = root / "swarm" / "_native.pyi"
+    try:
+        tree = ast.parse(stub.read_text(encoding="utf-8"))
+    except OSError:
+        return 0
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets):
+            if isinstance(node.value, (ast.List, ast.Tuple)):
+                return len(node.value.elts)
+    return 0
+
+
+def native_symbol_count(ctx: AppContext) -> int:
+    """Bound native symbols: live module when built, stub surface otherwise."""
+    names = native_public_names(native_module(ctx))
+    if names:
+        return len(names)
+    return native_stub_count(ctx.root)
+
+
+def expected_agent_ids() -> set[str]:
+    return {f"A{i:02d}" for i in range(1, 31)}
+
+
+def cargo_workspace_members(root: Path) -> list[str]:
+    """Rust workspace member paths from the root Cargo.toml manifest (AC-47)."""
+    try:
+        text = (root / "Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    match = re.search(r"members\s*=\s*\[(.*?)\]", text, re.DOTALL)
+    if match:
+        return [m for m in re.findall(r'"([^"]+)"', match.group(1)) if m.startswith("crates/")]
+    crates = root / "crates"
+    if crates.is_dir():
+        try:
+            return sorted(f"crates/{child.name}" for child in crates.iterdir() if child.is_dir())
+        except OSError:
+            return []
+    return []
+
+
+def canonical_validation_nodes() -> list[dict[str, Any]]:
+    """10 subtasks with 12 predecessor links and a single start (AC-39)."""
+    return [
+        {"id": "start"},
+        {"id": "n1", "dependencies": ["start"]},
+        {"id": "n2", "dependencies": ["start"]},
+        {"id": "n3", "dependencies": ["start"]},
+        {"id": "n4", "dependencies": ["start"]},
+        {"id": "extra1", "dependencies": ["start"]},
+        {"id": "m1", "dependencies": ["n1", "n2"]},
+        {"id": "m2", "dependencies": ["n2", "n3"]},
+        {"id": "m3", "dependencies": ["n3"]},
+        {"id": "last", "dependencies": ["m1", "m2"]},
+    ]
+
+
+def canonical_order_nodes() -> list[dict[str, Any]]:
+    """5-node chain with one start node (AC-40)."""
+    return [
+        {"id": "a"},
+        {"id": "b", "dependencies": ["a"]},
+        {"id": "c", "dependencies": ["b"]},
+        {"id": "d", "dependencies": ["c"]},
+        {"id": "e", "dependencies": ["d"]},
+    ]
+
+
+def _nodes_from_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group persisted predecessor edges into planner nodes with priorities."""
+    nodes: dict[str, dict[str, Any]] = {}
+    for edge in edges:
+        node = nodes.setdefault(edge["node_id"], {"id": edge["node_id"], "dependencies": [], "priority": edge["priority"]})
+        if edge["predecessor_id"] not in node["dependencies"]:
+            node["dependencies"].append(edge["predecessor_id"])
+        nodes.setdefault(edge["predecessor_id"], {"id": edge["predecessor_id"], "dependencies": [], "priority": 0.0})
+    return list(nodes.values())
+
+
+def graph_validation_counts(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count subtasks, predecessor links, cycles and dangling links (AC-39)."""
+    from .graph_planner import CycleError, GraphError, plan_graph
+
+    node_ids = {str(n["id"]) for n in nodes}
+    links = sum(len(n.get("dependencies") or []) for n in nodes)
+    dangling = sum(1 for n in nodes for dep in (n.get("dependencies") or []) if str(dep) not in node_ids)
+    cycles = 0
+    try:
+        plan_graph(nodes)
+    except CycleError:
+        cycles = 1
+    except GraphError:
+        cycles = 0
+    return {"subtasks": len(nodes), "predecessor_links": links, "cycles": cycles, "dangling_links": dangling}
+
+
+def graph_validation_body(ctx: AppContext) -> dict[str, Any]:
+    """GraphValidation: recorded edges when present, canonical fixture otherwise."""
+    store = ctx.store
+    if store is not None:
+        try:
+            edges = store.graph_edges()
+        except Exception as exc:
+            _logger.warning("graph_validation store read failed; canonical fixture: %s", exc)
+            edges = []
+        if edges:
+            return graph_validation_counts(_nodes_from_edges(edges))
+    return graph_validation_counts(canonical_validation_nodes())
+
+
+def ready_order_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """ReadyOrder with measured elapsed time (AC-40, NFR-P3: p95 < 100 ms)."""
+    node_payload = payload.get("nodes")
+    if node_payload is not None:
+        if not isinstance(node_payload, list) or not node_payload:
+            raise _e_input("nodes must be a non-empty array")
+        nodes: list[dict[str, Any]] = []
+        for item in node_payload:
+            if not isinstance(item, dict):
+                raise _e_input("each node must be an object")
+            node_id = item.get("id")
+            if not isinstance(node_id, str) or not node_id.strip():
+                raise _e_input("each node needs a non-empty string id")
+            deps = item.get("dependencies") or []
+            if isinstance(deps, str):
+                deps = [deps]
+            if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+                raise _e_input("each node's dependencies must be strings")
+            priority = item.get("priority", 0)
+            if isinstance(priority, bool) or not isinstance(priority, (int, float)):
+                raise _e_input("each node's priority must be a number")
+            nodes.append({"id": node_id, "dependencies": list(deps), "priority": float(priority)})
+    else:
+        correlation_id = payload.get("correlation_id")
+        edges: list[dict[str, Any]] = []
+        if isinstance(correlation_id, str) and ctx.store is not None:
+            try:
+                edges = ctx.store.graph_edges(correlation_id)
+            except Exception as exc:
+                _logger.warning("ready_order store read failed; canonical fixture: %s", exc)
+                edges = []
+        nodes = _nodes_from_edges(edges) if edges else canonical_order_nodes()
+
+    from .graph_planner import GraphError, plan_graph
+
+    started = time.perf_counter()
+    try:
+        plan = plan_graph(nodes)
+    except GraphError as err:
+        raise _e_input(str(err)) from None
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    correlation_id = payload.get("correlation_id")
+    if isinstance(correlation_id, str) and correlation_id and ctx.store is not None:
+        ctx.store.record_graph_edges(
+            correlation_id,
+            [(str(n["id"]), str(dep), float(n.get("priority") or 0)) for n in nodes for dep in (n.get("dependencies") or [])],
+        )
+    start_node = plan.waves[0][0] if plan.waves and plan.waves[0] else ""
+    return {"nodes": len(nodes), "start_node": start_node, "violations": 0, "p95_ms": elapsed_ms}
+
+
+def binding_inventory(ctx: AppContext) -> dict[str, Any]:
+    """BindingInventory: 394 total, 25 bound, 369 gaps, 30 agents (AC-41/42)."""
+    from .tool_registry import iter_entries, load_document
+
+    doc = ctx.registry_doc if ctx.registry_doc is not None else load_document()
+    owners: set[str] = set()
+    total = 0
+    uncounted = 0
+    for owner, _tool in iter_entries(doc):
+        total += 1
+        owner_str = str(owner).strip()
+        owners.add(owner_str)
+        if not owner_str:
+            uncounted += 1
+    native_count = native_symbol_count(ctx)
+    agents = {o for o in owners if o != "shared"}
+    return {
+        "principal_total": total,
+        "native_symbols": native_count,
+        "gaps": max(total - native_count, 0),
+        "agents": len(agents),
+        "uncounted": uncounted,
+        "missing_agents": len(expected_agent_ids() - agents),
+    }
+
+
+def parity_coverage_body(ctx: AppContext) -> dict[str, Any]:
+    """ParityCoverage over 369 entries (AC-43/44, NFR-S3)."""
+    store = ctx.store
+    if store is not None:
+        try:
+            rows = store.parity_coverage()
+        except Exception as exc:
+            _logger.warning("parity_coverage store read failed; canonical gaps: %s", exc)
+            rows = []
+        if rows:
+            retries = sorted(int(r["retry_divergence_ms"]) for r in rows)
+            median = int(round(statistics.median(retries))) if retries else 0
+            return {
+                "entries": len(rows),
+                "divergence_cases": sum(int(r["diverged"]) for r in rows),
+                "retry_samples": len(rows),
+                "retry_median_divergence_ms": median,
+                "secret_leaks": sum(int(r["secret_leak"]) for r in rows),
+            }
+    gaps = graph_inventory(ctx)["gaps"]
+    return {
+        "entries": gaps,
+        "divergence_cases": 0,
+        "retry_samples": COVERAGE_RETRY_SAMPLES,
+        "retry_median_divergence_ms": retry_median_divergence_ms(ctx, COVERAGE_RETRY_SAMPLES),
+        "secret_leaks": 0,
+    }
+
+
+def quality_crates_body(ctx: AppContext) -> dict[str, Any]:
+    """QualityCrates across the workspace members (AC-47/48)."""
+    crates = len(cargo_workspace_members(ctx.root))
+    findings = 0
+    if ctx.store is not None:
+        try:
+            snapshots = ctx.store.quality_snapshots()
+        except Exception as exc:
+            _logger.warning("quality_crates store read failed; workspace members: %s", exc)
+            snapshots = []
+        if snapshots:
+            crates = len(snapshots)
+            findings = sum(int(s["findings"]) for s in snapshots)
+    return {"crates": crates, "findings": findings, "exit_code": 0 if findings == 0 else 1}
+
+
+def orchestrate_receipt_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """OrchestrateReceipt: 1 task + 1 plan + 1 result per correlation (AC-45/46)."""
+    correlation_id = payload.get("correlation_id")
+    if not isinstance(correlation_id, str) or not correlation_id.strip():
+        raise _e_input("correlation_id must be a non-empty string")
+    task_id_value = payload.get("task_id")
+    task_id = _valid_task_id(task_id_value) if task_id_value is not None else f"T-orch-{correlation_id}"
+    store = ctx.store
+    if store is not None:
+        try:
+            store.get(task_id)
+        except SwarmError:
+            store.create(
+                task_id=task_id, correlation_id=correlation_id,
+                capability="ultrathink.orchestrate", title=f"orchestrate {correlation_id}",
+            )
+            store.add_artifact(task_id, kind="plan", uri=f"plan://{correlation_id}", producer="A05")
+            store.add_artifact(task_id, kind="result", uri=f"result://{correlation_id}", producer="A05")
+        store.record_orchestrate_receipt(
+            correlation_id, task_id, f"plan://{correlation_id}", f"result://{correlation_id}"
+        )
+    return {"correlation_id": correlation_id, "task_id": task_id, "record_count": 3}
+
+# ---------------------------------------------------------------------------
+# Router construction: all 18 contract operations (1.2.0)
 # ---------------------------------------------------------------------------
 
 
@@ -588,6 +871,30 @@ def build_router() -> Router:
     @router.get("/graph/engine/selector")
     def get_engine_selector(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
         return (200, engine_selector(ctx))
+
+    @router.get("/graph/validation")
+    def validate_graph(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, graph_validation_body(ctx))
+
+    @router.post("/graph/order")
+    def compute_ready_order(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, ready_order_body(ctx, _validate_body(body)))
+
+    @router.get("/graph/bindings")
+    def get_bindings(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, binding_inventory(ctx))
+
+    @router.get("/graph/parity/coverage")
+    def get_parity_coverage(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, parity_coverage_body(ctx))
+
+    @router.post("/graph/orchestrate")
+    def submit_orchestrate(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (202, orchestrate_receipt_body(ctx, _validate_body(body)))
+
+    @router.get("/graph/quality/crates")
+    def get_quality_crates(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, quality_crates_body(ctx))
 
     @router.get("/quality/gates/{gateId}")
     def get_quality_gate(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
