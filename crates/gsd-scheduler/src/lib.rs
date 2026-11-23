@@ -9,6 +9,7 @@ pub mod clock;
 pub mod dag;
 pub mod dag_build;
 pub mod dynamic;
+pub mod execution;
 pub mod force_parallel_dispatch;
 pub mod hitl;
 pub mod join_affinity_guard;
@@ -18,11 +19,16 @@ mod panic_text;
 pub mod policy;
 pub mod policy_config;
 pub mod ready_frontier;
+pub mod scheduler;
 mod semaphore;
 
 pub use aimd_limiter::AimdLimiter;
 pub use dag::*;
 pub use dag_build::*;
+pub use execution::{
+    CancellationToken, ClassifiedError, ExecutionCtx, ExecutionReport, NodeExecutor, NodeOutput,
+    NodeResult, NodeStatus,
+};
 pub use force_parallel_dispatch::{
     effective_global_cap, run_force_parallel, sort_dispatch_order, DispatchConfig, DispatchMode,
     DispatchReport, TaskFailure, TaskOutcome,
@@ -32,6 +38,7 @@ pub use nexus_barrier_join::*;
 pub use policy::*;
 pub use policy_config::*;
 pub use ready_frontier::*;
+pub use scheduler::{DispatchDecision, Scheduler, SchedulerConfig, ValidatedGraph};
 pub use semaphore::*;
 
 use gsd_proto::gsd::v1::TaskId;
@@ -63,6 +70,8 @@ pub enum SchedulerError {
     Deadlock(String),
     #[error("Invalid DAG: {0}")]
     InvalidDag(String),
+    #[error("Concurrency/queue capacity reached: {0}")]
+    Capacity(String),
     #[error("Other: {0}")]
     Other(String),
 }

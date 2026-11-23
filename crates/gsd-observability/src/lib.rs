@@ -1,6 +1,22 @@
 //! Observability Stack for GSD-Core
 //!
 //! Structured logging, distributed tracing, metrics, replay/debugging.
+//!
+//! Graph telemetry lives in [`logging`] (structured events with
+//! correlation ids, centralized redaction, feature flags) and
+//! [`metrics`] (counters/gauges, resource limits, the
+//! [`GraphTelemetry`] bundle). Rollback: flip a [`FeatureFlags`]
+//! switch to suppress one path, or remove the two `pub mod` lines
+//! below — `TracingLayer`/`MetricsSink` are unchanged either way.
+
+pub mod logging;
+pub mod metrics;
+
+pub use logging::{
+    is_sensitive_key, path_for_kind, redact_text, CorrelationContext, EventKind, EventRecorder,
+    FeatureFlags, GraphEvent, Path, PathDisabled,
+};
+pub use metrics::{GraphTelemetry, LimitViolation, MetricsRegistry, ResourceLimits, ToolOutcome};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
