@@ -1522,8 +1522,11 @@ function braceAlternatives(word: string): string[] | undefined {
   return done;
 }
 
-/** One path component's glob as a case-insensitive regex; an extglob group matches anything (a superset). */
-function globRegex(pattern: string): RegExp {
+/**
+ * One path component's glob as a case-insensitive regex; an extglob group matches anything (a superset). Undefined when
+ * the result is not a valid regex (`[z-a]`): the caller then treats the pattern as a possible match, never as match-all.
+ */
+function globRegex(pattern: string): RegExp | undefined {
   let re = "";
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
@@ -1546,7 +1549,7 @@ function globRegex(pattern: string): RegExp {
   try {
     return new RegExp(`^${re}$`, "i");
   } catch {
-    return /^.*$/;
+    return undefined;
   }
 }
 
@@ -1557,7 +1560,8 @@ function globRegex(pattern: string): RegExp {
 function mayName(pattern: string, name: string): boolean {
   if (!GLOB_CHAR.test(pattern)) return pattern.toLowerCase() === name.toLowerCase();
   if (name.startsWith(".") && !/^(?:\.|\[|[@!+*?]\()/.test(pattern)) return false;
-  return globRegex(pattern).test(name);
+  const re = globRegex(pattern);
+  return re === undefined || re.test(name);
 }
 
 /**
@@ -1939,21 +1943,31 @@ const INTERPRETER_VALUE_FLAG =
 /** python's module-run option: `-m mod`, `-mmod`, or clustered behind no-value flags (`-Bm mod`); group 1 is `mod`. */
 const MODULE_OPTION = /^-[bBdEiIOPqsSuvxR]*m(.*)$/;
 
+/** Module runners that execute the script named among their operands (`-m runpy x.py`, `-m cProfile -o out.prof x.py`). */
+const RUNNER_MODULES: Record<string, true> = { runpy: true, cProfile: true, profile: true, trace: true, pdb: true, coverage: true };
+
 /**
- * The repo script a segment executes (WR-07, WR-02): argv[0] itself, the first word after `python`/`python3[.N]`/
+ * The repo scripts a segment executes (WR-07, WR-02): argv[0] itself, the first word after `python`/`python3[.N]`/
  * `bun`/`node`/`deno`/`uv`/`pipx` and their `run`/flags, or the module after `-m` (`python3 -m scripts.rev_gate`).
+ * A runner module (RUNNER_MODULES) executes every script among its operands, so each of them is a candidate stem.
  * The stem is the executed file's basename or the module's last dotted name, so `cd scripts && python3 rev_gate.py`
  * is a run too. A script only named (`cat scripts/x.py`, `grep … scripts/ts/x.ts`, `pytest tests/test_x_gate.py`,
  * `python3 -m pytest scripts/x.py`) is not a run.
  */
-function executedScript({ words, argv0 }: Segment): { stem: string; args: string[] } | undefined {
+function executedScript({ words, argv0 }: Segment): { stems: string[]; args: string[] } | undefined {
   let i = 0;
   while (i < words.length && (INTERPRETER.test(words[i]) || words[i] === "run" || (i > 0 && words[i].startsWith("-")))) {
     const mod = i > 0 ? MODULE_OPTION.exec(words[i]) : null;
     if (mod !== null) {
       const at = mod[1] === "" ? i + 1 : i; // `-m mod` or `-mmod`
       const name = /(?:^|\.)([A-Za-z0-9_]+)$/.exec(mod[1] === "" ? (words[at] ?? "") : mod[1]);
-      return name === null ? undefined : { stem: name[1], args: words.slice(at + 1) };
+      if (name === null) return undefined;
+      const args = words.slice(at + 1);
+      if (Object.hasOwn(RUNNER_MODULES, name[1])) {
+        const stems = args.map((w) => scriptStemOf(w)).filter((s): s is string => s !== undefined);
+        if (stems.length > 0) return { stems, args };
+      }
+      return { stems: [name[1]], args };
     }
     // `python3 -` names stdin as the program. The next word is an argument, not the script file.
     if (i > 0 && STDIN_FILE.test(words[i])) return undefined;
@@ -1962,7 +1976,7 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
   }
   const word = i === 0 ? argv0 : words[i];
   const m = /(?:^|\/)([A-Za-z0-9_-]+)\.(?:py|ts)$/.exec(word ?? "");
-  return m === null ? undefined : { stem: m[1], args: words.slice(i + 1) };
+  return m === null ? undefined : { stems: [m[1]], args: words.slice(i + 1) };
 }
 
 const ORCH_STEMS: Record<string, true> = { orch_plan: true, orch_status: true };
@@ -2267,14 +2281,25 @@ function globOperandMatches(path: string, stems: Record<string, true>): boolean 
   return false;
 }
 
-/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand, a glob basename included): the copy is how a renamed run used to get past the stem check.
- *
- * A `[` `*` or `?` inside quotes is a literal (`cp 'scripts/re[v]_gate.py'` copies that name). An unquoted one is a glob. */
+/** Commands that write a copy of their input under a name of their own choosing when the output is a file (`cat x > y`). */
+const STREAM_COPIER: Record<string, true> = {
+  cat: true, head: true, tail: true, sed: true, awk: true, tr: true, sort: true, cut: true, nl: true, tac: true, base64: true,
+  xxd: true, od: true, gzip: true, zcat: true, xz: true, bzip2: true, openssl: true, strings: true, iconv: true, jq: true,
+};
+/** Commands that copy every stream they are given, so a guarded name anywhere in the same command is a copy (`cat x | tee y`). */
+const COPY_WRITER: Record<string, true> = { tee: true, dd: true, rsync: true, scp: true, sponge: true, link: true };
+
+/**
+ * `cp`/`mv`/`install`/`ln` of a guarded script (any operand, a glob basename included), or a stream copier whose output is
+ * a file (`cat scripts/rev_gate.py > /tmp/r.py`): the copy is how a renamed run used to get past the stem check.
+ * A `[` `*` or `?` inside quotes is a literal (`cp 'scripts/re[v]_gate.py'` copies that name). An unquoted one is a glob.
+ */
 function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
   const raw = shellWords(seg.text);
   if (raw.length === 0) return false;
   const cmd = posix.basename(unquote(raw[0]));
-  if (!/^(?:cp|mv|install|ln)$/.test(cmd)) return false;
+  const copies = /^(?:cp|mv|install|ln)$/.test(cmd) || (Object.hasOwn(STREAM_COPIER, cmd) && shellWords(seg.marked).some((w) => hasUnquoted(w, (c) => c === ">")));
+  if (!copies) return false;
   const args: { raw: string; plain: string }[] = [];
   for (let i = 1; i < raw.length; i++) {
     const word = raw[i];
@@ -2283,7 +2308,8 @@ function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
       if (op[0] === word) i++;
       continue;
     }
-    const plain = unquote(word);
+    // an attached output redirection (`scripts/x.py>/tmp/y`) ends the operand at its `>`
+    const plain = unquote(word).split(">")[0];
     const plains = /["'\\]/.test(word) ? [plain] : (braceAlternatives(plain) ?? [plain]);
     for (const item of plains) args.push({ raw: word, plain: item });
   }
@@ -2298,40 +2324,65 @@ function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
 }
 
 /**
+ * A `tee`/`dd`/`rsync`/… in the same command as a guarded name: whatever it copies is that script under another name.
+ * `dd if=scripts/rev_gate.py of=/tmp/r.py` and `cat scripts/rev_gate.py | tee /tmp/r.py` are both copies.
+ */
+function copiedThroughWriter(seg: Segment, command: string, stems: Record<string, true>): boolean {
+  if (!Object.hasOwn(COPY_WRITER, seg.words[0] ?? "")) return false;
+  return shellWords(command).some((w) => {
+    const stem = scriptStemOf(unquote(w).replace(/^[A-Za-z_]+=/, ""));
+    return stem !== undefined && Object.hasOwn(stems, stem);
+  });
+}
+
+/** A segment that copies a guarded script (see relocatesStem and copiedThroughWriter). */
+const copiesStem = (seg: Segment, command: string, stems: Record<string, true>): boolean =>
+  relocatesStem(seg, stems) || copiedThroughWriter(seg, command, stems);
+
+/**
  * A direct run of a gate script (qa/quality/rev/review/sec/security/release_gate, rel_plan) by any swarm agent, the
  * gate's owner included: a shell run scores whatever tree cwd points at and can overwrite its own verdict, so gates
  * are recorded only through swarm_gate (Phase 5 D-1). A stdin redirect of the script file is the same run
  * (`python3 < scripts/rev_gate.py`), and so is copying the file aside (`cp scripts/rev_gate.py /tmp/r.py`).
  */
-const gateScriptRun = (seg: Segment): boolean => {
-  const run = executedScript(seg);
-  if (run !== undefined && Object.hasOwn(GATE_STEMS, run.stem)) return true;
+const gateScriptRun = (seg: Segment, _facts: GuardFacts, command: string): boolean => {
+  if ((executedScript(seg)?.stems ?? []).some((stem) => Object.hasOwn(GATE_STEMS, stem))) return true;
   const stem = stdinScriptStem(seg);
-  return (stem !== undefined && Object.hasOwn(GATE_STEMS, stem)) || relocatesStem(seg, GATE_STEMS);
+  return (stem !== undefined && Object.hasOwn(GATE_STEMS, stem)) || copiesStem(seg, command, GATE_STEMS);
 };
 
 /** Assignment authority is available only through the typed tool, never by running or relocating its script. */
 const ASSIGNMENT_STEMS: Record<string, true> = { orch_assign: true };
-function assignmentScriptRun(seg: Segment): boolean {
-  const run = executedScript(seg);
-  if (run?.stem === "orch_assign") return true;
-  return stdinScriptStem(seg) === "orch_assign" || relocatesStem(seg, ASSIGNMENT_STEMS);
+function assignmentScriptRun(seg: Segment, _facts: GuardFacts, command: string): boolean {
+  const runs = (executedScript(seg)?.stems ?? []).some((stem) => Object.hasOwn(ASSIGNMENT_STEMS, stem));
+  return runs || stdinScriptStem(seg) === "orch_assign" || copiesStem(seg, command, ASSIGNMENT_STEMS);
 }
 
 /** A run of `orch_plan.py|ts` (or module), or of `orch_status.py|ts` (or module) with `--ingest`/`--transition`. */
-function orchStateScript(seg: Segment): boolean {
+function orchStateScript(seg: Segment, command: string): boolean {
   const run = executedScript(seg);
-  if (run !== undefined && (run.stem === "orch_plan" || (run.stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))))) {
+  if (run !== undefined && run.stems.some((stem) => stem === "orch_plan" || (stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))))) {
     return true;
   }
   const stem = stdinScriptStem(seg);
   if (stem === "orch_plan") return true;
   if (stem === "orch_status" && seg.words.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))) return true;
-  return relocatesStem(seg, ORCH_STEMS);
+  return copiesStem(seg, command, ORCH_STEMS);
 }
 
-/** `claude` / `grok` / `omp` (a path's basename too): a nested agent CLI has no swarm guard and still reaches MCP. */
-const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(seg.words[0] ?? "");
+/** Agent CLIs a swarm session must not start: a nested one has no swarm guard and still reaches the operator's MCP. */
+const NESTED_AGENT: Record<string, true> = { claude: true, "claude-code": true, grok: true, omp: true };
+/** Launchers that run a package or script named among their operands (`npx claude`, `bunx omp`, `node /x/bin/omp`). */
+const AGENT_LAUNCHER: Record<string, true> = {
+  npx: true, pnpx: true, bunx: true, uvx: true, pipx: true, pnpm: true, yarn: true, npm: true, bun: true, deno: true, node: true,
+};
+/** `claude` / `grok` / `omp` run directly, or through a launcher (`npx claude -p`, `bunx omp`, `node /x/bin/omp`). */
+const nestedAgentCli = (seg: Segment): boolean => {
+  const [head = "", ...operands] = seg.words;
+  if (Object.hasOwn(NESTED_AGENT, head)) return true;
+  // a launcher operand names the CLI by basename, without an `@version` (`@anthropic-ai/claude-code@1.0`)
+  return Object.hasOwn(AGENT_LAUNCHER, head) && operands.some((word) => Object.hasOwn(NESTED_AGENT, posix.basename(word.replace(/@[^/]*$/, ""))));
+};
 
 /** A flag name that never takes the next word as its value. */
 const NO_VALUE_FLAG = /(?!)/;
@@ -3160,7 +3211,7 @@ export const RULES: readonly Rule[] = [
     id: "orch-state-shell",
     capability: "swarm-state",
     reason: SWARM_STATE_REASON,
-    pattern: (seg, facts) => facts.agent !== ORCHESTRATOR && (orchStateScript(seg) || sqliteOnSwarm(seg, facts)),
+    pattern: (seg, facts, command) => facts.agent !== ORCHESTRATOR && (orchStateScript(seg, command) || sqliteOnSwarm(seg, facts)),
     samples: [
       "python3 scripts/orch_status.py --ingest r.json",
       "python3 scripts/orch_status.py --transition T-1 DONE",
@@ -3234,6 +3285,7 @@ export const RULES: readonly Rule[] = [
       "python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x",
       "python3 < scripts/rev_gate.py", "python3 - --task-id T < scripts/rev_gate.py", "python3 -<scripts/rev_gate.py --task-id T",
       "bash -c 'python3 -' < scripts/rev_gate.py", "cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py", "cp scripts/re[v]_gate.py /tmp/r.py",
+      "cat scripts/rev_gate.py > /tmp/r.py", "cat scripts/rev_gate.py | tee /tmp/r.py", "python3 -m runpy scripts/rev_gate.py",
     ],
   },
   // D-08: dotglob would let a leading `*`/`?` name `.swarm`/`.omp` (shell targets assume it off, as bash starts)
@@ -3273,7 +3325,7 @@ export const RULES: readonly Rule[] = [
     id: "nested-agent",
     capability: "mcp",
     pattern: nestedAgentCli,
-    samples: ["claude -p", "grok -p --yolo", "omp -p --no-extensions --approval-mode yolo", "bash -lc \"claude -p\""],
+    samples: ["claude -p", "grok -p --yolo", "omp -p --no-extensions --approval-mode yolo", "bash -lc \"claude -p\"", "npx claude -p", "bunx omp -p"],
   },
   {
     id: "git-force-push",

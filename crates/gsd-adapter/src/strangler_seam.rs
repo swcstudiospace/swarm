@@ -282,6 +282,45 @@ fn invoke_checked<B: CoreBackend + ?Sized>(
     enforce_exit_contract(reply.exit_code, &reply.stdout, "")
 }
 
+/// One call whose Rust answer differed from the Python answer. The seam returned Python's answer; this record keeps the
+/// difference for the caller to persist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mismatch {
+    /// Script stem of the call.
+    pub script: String,
+    /// Flags of the call, as [`Invocation::argv`] carried them.
+    pub argv: Vec<String>,
+    /// Python's answer, which is the one returned (G-python-truth).
+    pub python: Reply,
+    /// Rust's answer, which was not returned.
+    pub rust: Reply,
+}
+
+/// Runs `call` through both engines and returns Python's answer (G-python-truth: Python wins).
+///
+/// Python runs first and its reply is the one returned. When the Rust reply differs from it in exit code or in stdout
+/// bytes, the difference comes back as a [`Mismatch`] beside that reply; when they agree the record is `None`. Both
+/// engines run on `call`, so this is for routes whose Rust answer has no side effects. Each answer passes through
+/// [`invoke`], so a refusal on either side is a reply like any other.
+pub fn invoke_python_truth(
+    python: &dyn CoreBackend,
+    rust: &dyn CoreBackend,
+    call: &Invocation,
+) -> (Reply, Option<Mismatch>) {
+    let truth = invoke(python, call);
+    let candidate = invoke(rust, call);
+    if truth == candidate {
+        return (truth, None);
+    }
+    let record = Mismatch {
+        script: call.script.clone(),
+        argv: call.argv.clone(),
+        python: truth.clone(),
+        rust: candidate,
+    };
+    (truth, Some(record))
+}
+
 /// Canonicalises `path`. When it does not exist, the longest existing ancestor is canonicalised
 /// and the missing tail is appended after `.` and `..` are removed lexically, as
 /// `Path(base, value).resolve()` does in `swarm/paths.py`.

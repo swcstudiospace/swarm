@@ -7,9 +7,3 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/swcstudiospace/agent-swarm"
 categories = ["concurrency", "distributed-systems", "crdt", "pubsub"]
 keywords = ["nexus", "crdt", "pubsub", "coordination", "shared-memory"]
-
-[dev-dependencies]
-tokio = { workspace = true }
-tokio-test = "0.4"
-proptest = "1.2"
-tempfile = { workspace = true }

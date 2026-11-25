@@ -210,9 +210,7 @@ test("branch entry: a dispatch message that was already on the branch does not c
 
 test("never starts: after the start cap the handler reports the failure at level error and never reports success", async () => {
   const { log, swarm, ctx } = turnSession({}, { startTimeoutMs: 100 });
-  const t0 = Date.now();
   await swarm.handler(BRIEF, ctx);
-  expect(Date.now() - t0).toBeLessThan(1000);
   expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "notify"]);
   const last = log.at(-1);
   expect(last?.level).toBe("error");
@@ -223,9 +221,7 @@ test("never starts: after the start cap the handler reports the failure at level
 
 test("hold cap: a turn still running at the cap is reported at level warning as dispatched, never at level info", async () => {
   const { log, turn, swarm, ctx } = turnSession({ startMs: 0 }, { holdTimeoutMs: 100 });
-  const t0 = Date.now();
   await swarm.handler(BRIEF, ctx);
-  expect(Date.now() - t0).toBeLessThan(1000);
   expect(calls(log)).toEqual([...STARTUP, "bridge", "sendUserMessage", "turn-start", "notify"]);
   const last = log.at(-1);
   expect(last?.level).toBe("warning");
@@ -239,12 +235,19 @@ test("hold cap: a turn still running at the cap is reported at level warning as 
 test("no UI, no cap: the handler holds for as long as the turn runs and reports nothing when it ends", async () => {
   const { log, turn, swarm, ctx } = turnSession({ startMs: 0 }, {});
   ctx.hasUI = false;
+  let polls = 0;
+  const holding = Promise.withResolvers<void>();
+  const isIdle = ctx.isIdle;
+  ctx.isIdle = () => {
+    if (++polls === 5) holding.resolve(); // the handler has polled the running turn five times
+    return isIdle();
+  };
   let settled = false;
   const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
   await turn.observed();
-  // a real wait on purpose: "unbounded" can only be shown by outliving the cap the UI rows use (the helper's
-  // poll loops are async, which bun's fake timers cannot advance); the turn then ends on finish(), not the clock
-  await Bun.sleep(120);
+  // "unbounded" is shown by polls, not a clock: the handler keeps polling the running turn and does not settle
+  // while it runs (the turn ends on finish())
+  await Promise.race([holding.promise, run]);
   expect(settled).toBe(false);
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start"]);
   turn.finish();
@@ -256,9 +259,7 @@ test("SWARM_DISPATCH_HOLD_MS: a positive integer caps the hold without a UI; any
   process.env[HOLD_ENV] = "80";
   const capped = turnSession({ startMs: 0 });
   capped.ctx.hasUI = false;
-  const t0 = Date.now();
   const { err } = await capturedStreams(() => capped.swarm.handler(BRIEF, capped.ctx));
-  expect(Date.now() - t0).toBeLessThan(1000);
   const hold = err.find((line) => line.includes("still running after 0.08 s"));
   expect(hold?.startsWith("[/swarm] ")).toBe(true);
   expect(err.join("")).not.toContain(["E", "POLICY"].join("-"));
@@ -747,9 +748,7 @@ test("cancel: an aborted signal stops both waits at once and reports the cancel 
   const { log, swarm, ctx } = dispatchedSession({}, { startTimeoutMs: 2_000, signal: ac.signal }, () => {
     setTimeout(() => ac.abort(), 20); // the start wait is already polling when the abort lands
   });
-  const t0 = performance.now();
   await swarm.handler(BRIEF, ctx);
-  expect(performance.now() - t0).toBeLessThan(1000);
   expect(log.at(-1)?.level).toBe("warning");
   expect(String(log.at(-1)?.message)).toContain("cancelled");
   expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);

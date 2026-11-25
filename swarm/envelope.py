@@ -216,7 +216,8 @@ def _ed25519_material() -> tuple[_Ed25519Signer | None, str | None]:
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
             return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(raw)), None
-        except Exception:
+        except Exception as exc:
+            _LOG.debug("SWARM_ED25519_KEY could not be loaded (%s)", type(exc).__name__)
             return None, ("fail-closed: SWARM_ED25519_KEY is set but cannot be loaded "
                           "(cryptography missing or seed is not 32-byte hex)")
     # Both raw signer variables take precedence over private references, even a dev HMAC.
@@ -244,7 +245,8 @@ def _ed25519_material() -> tuple[_Ed25519Signer | None, str | None]:
             return None, None
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         return Ed25519PrivateKey.from_private_bytes(seed), None
-    except Exception:
+    except Exception as exc:
+        _LOG.debug("private Ed25519 signing reference could not be loaded (%s)", type(exc).__name__)
         return None, "fail-closed: private Ed25519 signing reference cannot be loaded safely"
 
 

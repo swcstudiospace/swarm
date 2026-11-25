@@ -212,7 +212,11 @@ async fn connect(path: &Path) -> SqliteConnection {
 
 async fn exec(path: &Path, sql: &str) {
     let mut conn = connect(path).await;
-    sqlx::query(sql).execute(&mut conn).await.expect(sql);
+    sqlx::QueryBuilder::new(sql)
+        .build()
+        .execute(&mut conn)
+        .await
+        .expect(sql);
     conn.close().await.expect("close");
 }
 
@@ -222,7 +226,8 @@ async fn checkpoint(path: &Path) {
 
 async fn scalar_int(path: &Path, sql: &str) -> i64 {
     let mut conn = connect(path).await;
-    let value: i64 = sqlx::query_scalar(sql)
+    let value: i64 = sqlx::QueryBuilder::new(sql)
+        .build_query_scalar()
         .fetch_one(&mut conn)
         .await
         .expect(sql);
@@ -288,10 +293,10 @@ async fn content(path: &Path) -> Content {
         "artifacts",
         "sqlite_sequence",
     ] {
-        let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY rowid"))
-            .fetch_all(&mut conn)
-            .await
-            .expect(table);
+        let mut qb = sqlx::QueryBuilder::new("SELECT * FROM ");
+        qb.push(table);
+        qb.push(" ORDER BY rowid");
+        let rows = qb.build().fetch_all(&mut conn).await.expect(table);
         let mut cells = Vec::new();
         for row in &rows {
             let mut line = Vec::new();

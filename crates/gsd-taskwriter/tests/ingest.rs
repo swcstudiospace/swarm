@@ -885,10 +885,10 @@ async fn content(path: &Path) -> Content {
         "artifacts",
         "sqlite_sequence",
     ] {
-        let rows = sqlx::query(&format!("SELECT * FROM {name} ORDER BY rowid"))
-            .fetch_all(&mut conn)
-            .await
-            .expect(name);
+        let mut qb = sqlx::QueryBuilder::new("SELECT * FROM ");
+        qb.push(name);
+        qb.push(" ORDER BY rowid");
+        let rows = qb.build().fetch_all(&mut conn).await.expect(name);
         let mut cells = Vec::new();
         let mut names: Vec<String> = Vec::new();
         for row in &rows {
@@ -1395,7 +1395,8 @@ async fn state_of(path: &Path, task_id: &str) -> String {
 
 async fn fixture_text(path: &Path, sql: &str) -> String {
     let mut conn = connect(path).await;
-    let value: String = sqlx::query_scalar(sql)
+    let value: String = sqlx::QueryBuilder::new(sql)
+        .build_query_scalar()
         .fetch_one(&mut conn)
         .await
         .expect(sql);
@@ -1405,7 +1406,8 @@ async fn fixture_text(path: &Path, sql: &str) -> String {
 
 async fn count(path: &Path, sql: &str) -> i64 {
     let mut conn = connect(path).await;
-    let value: i64 = sqlx::query_scalar(sql)
+    let value: i64 = sqlx::QueryBuilder::new(sql)
+        .build_query_scalar()
         .fetch_one(&mut conn)
         .await
         .expect(sql);

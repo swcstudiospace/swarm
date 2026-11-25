@@ -286,6 +286,8 @@ def adr_transition(payload: dict[str, Any]) -> dict[str, Any]:
     def work() -> dict[str, Any]:
         src, dst = payload["from_status"], payload["to_status"]
         superseded_by = payload.get("superseded_by")
+        if src not in _ADR_NEXT:
+            return _invalid("from_status", f"unknown ADR status {src!r}")
         if src == dst:
             allowed, reason = False, f"status is already {src}"
         elif not _ADR_NEXT[src]:
@@ -301,7 +303,7 @@ def adr_transition(payload: dict[str, Any]) -> dict[str, Any]:
                 reason += f" by {superseded_by}"
         return {"state": "SUCCESS", "allowed": allowed, "reason": reason}
 
-    return respond(payload, work)
+    return respond(payload, work, ("from_status", "to_status"))
 
 
 def nfr_budget(payload: dict[str, Any]) -> dict[str, Any]:
@@ -401,7 +403,7 @@ def nfr_allocation(payload: dict[str, Any]) -> dict[str, Any]:
             "fully_allocated": len(allocated) == len(ids) and not unknown,
         }
 
-    return respond(payload, work)
+    return respond(payload, work, ("nfrs", "bindings"))
 
 
 def breaking_readiness(payload: dict[str, Any]) -> dict[str, Any]:

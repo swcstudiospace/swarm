@@ -18,7 +18,7 @@ Capabilities: `design.blueprint`, `design.contract`, `design.adr`, `design.fitne
 
 Consumes: `requirements.spec`, `acceptance.criteria`, `incident.alert`, `patch.task`, `cloud.architecture`, `wellarch.review`.
 
-Produces: `architecture.blueprint`, `api.contract`, `adr.set`, `tech.stack`.
+Produces: `architecture.blueprint`, `api.contract`, `adr.set`, `tech.stack`, `threat.model`, `capacity.model`.
 
 ## Lane tools
 

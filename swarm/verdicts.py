@@ -8,6 +8,7 @@ Inside a headless agent session (SWARM_AGENT_SESSION=1, no signing keys) nothing
 the gate script with its keys after the session (WR-12).
 """
 from __future__ import annotations
+from contextlib import closing, nullcontext
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -78,7 +79,10 @@ def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner:
     from pathlib import Path
     if not path:
         return {}
-    raw = json.loads(Path(path).read_text())
+    try:
+        raw = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        raise SwarmError(ErrorCode.E_INPUT, f"{path}: not a readable JSON findings file ({type(exc).__name__})") from exc
     if not isinstance(raw, dict) or not all(isinstance(v, list) for v in raw.values()):
         raise SwarmError(ErrorCode.E_INPUT, f"{path}: expected an object {{target task id: [findings]}}")
     out: dict[str, list[dict[str, Any]]] = {}
@@ -95,7 +99,8 @@ def check_per_target_keys(own: dict[str, list[dict[str, Any]]], task_id: str | N
     if not own or not task_id:
         return
     try:
-        task = TaskStore(root=root).get(task_id)
+        with closing(TaskStore(root=root)) as store:
+            task = store.get(task_id)
     except SwarmError:
         return
     gate_for = (task.get("notes_json") or {}).get("gate_for")
@@ -116,22 +121,22 @@ def gate_risk_class(task_id: str | None, root: str | Path | None = None) -> str 
     from .taskstore import TaskStore
     if not task_id:
         return None
-    store = TaskStore(root=root)
-    try:
-        task = store.get(task_id)
-    except SwarmError:
-        return None
-    notes = task.get("notes_json") or {}
-    if not notes.get("gate"):
-        return None
-    risks = [task.get("risk_class")]
-    for target in notes.get("gate_for") or []:
+    with closing(TaskStore(root=root)) as store:
         try:
-            risks.append(store.get(target).get("risk_class"))
+            task = store.get(task_id)
         except SwarmError:
-            continue
-    known = [r for r in risks if r in RISK_ORDER]
-    return max(known, key=RISK_ORDER.index) if known else None
+            return None
+        notes = task.get("notes_json") or {}
+        if not notes.get("gate"):
+            return None
+        risks = [task.get("risk_class")]
+        for target in notes.get("gate_for") or []:
+            try:
+                risks.append(store.get(target).get("risk_class"))
+            except SwarmError:
+                continue
+        known = [r for r in risks if r in RISK_ORDER]
+        return max(known, key=RISK_ORDER.index) if known else None
 
 
 def _per_target_blocks(per_target: dict[str, list[dict[str, Any]]] | None) -> bool:
@@ -245,10 +250,17 @@ def issue_gate(ctx: Ctx, *, gate: str, agent_id: str, findings: list[dict[str, A
     simulate (--dry-run): canned pass, SIM-1 fail for SWARM_DRYRUN_FAIL targets, plus
     the caller's findings; every envelope carries a signed dry_run: true, and rows are recorded only when A01
     flagged the gate task as a runner dry-run (notes.dry_run), where they also count only on flagged targets."""
+    from .taskstore import TaskStore
+    with closing(TaskStore(root=ctx.root)) if ctx.task_id else nullcontext() as store:
+        return _issue_gate(ctx, store, gate=gate, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
+                           extra=extra, simulate=simulate, per_target=per_target)
+
+
+def _issue_gate(ctx: Ctx, store: TaskStore | None, *, gate: str, agent_id: str, findings: list[dict[str, Any]],
+                runs: dict[str, Any], expires_s: int, extra: dict[str, Any] | None, simulate: bool,
+                per_target: dict[str, list[dict[str, Any]]] | None) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     import json
     from .paths import swarm_dir
-    from .taskstore import TaskStore
-    store = TaskStore(root=ctx.root) if ctx.task_id else None
     targets = (resolve_targets(store, ctx.task_id, gate=gate, correlation_id=ctx.correlation_id)
                if store else None)  # E-POLICY before any write
     gate_task = store.get(ctx.task_id) if store and ctx.task_id and targets is not None else None

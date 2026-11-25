@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quality gate</title>
+<link rel="stylesheet" href="../src/tokens.css">
+</head>
+<body>
+<main>
+  <h1>Quality gate</h1>
+  <section aria-labelledby="verdict-strip-h">
+    <h2 id="verdict-strip-h">Verdict strip</h2>
+    <ul>
+      <li><span class="badge">Parity gates: 0/0 clean</span></li>
+      <li><span class="badge">Workspace suite: 0 gates tracked</span></li>
+      <li><span class="badge">Sweep findings: 0 paths without verdicts</span></li>
+      <li><span class="badge">CI gate: unknown</span></li>
+    </ul>
+  </section>
+  <section aria-labelledby="run-table-h">
+    <h2 id="run-table-h">Run table</h2>
+    <p>No results yet.</p>
+  </section>
+  <section aria-labelledby="alert-actions-h">
+    <h2 id="alert-actions-h">Alert actions</h2>
+    <div>
+      <button type="button" data-action="view-findings">View findings</button>
+      <button type="button" data-variant="ghost" data-action="open-ci">Open CI gate</button>
+    </div>
+  </section>
+  <section aria-labelledby="primary-cta-h">
+    <h2 id="primary-cta-h">Primary action</h2>
+    <button type="button" data-action="primary-cta">Run quality gate</button>
+  </section>
+</main>
+</body>
+</html>

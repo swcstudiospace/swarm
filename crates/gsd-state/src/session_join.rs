@@ -9,26 +9,32 @@
 //! Cancel follows the runner's flag rule. A [`CancelMarker`] is written at `cancel/<corr>` with the
 //! sanitized correlation id. Each running task then has [`CancelTiming::cooperative`] (3 s) to stop, walked
 //! in [`CANCEL_SLICE`] (500 ms) slices. A task still running when that window closes is force-dropped and
-//! ends `CANCELLED_TIMED_OUT` with `metadata["terminal_reason"] = "timed_out"`. A task that returns a
+//! ends `FAILED` with `metadata["terminal_reason"] = "timed_out"`. A task that returns a
 //! failure after the marker was set, inside the window, ends `CANCELLED_TIMED_OUT` with reason
 //! `cancelled`. A task that returns success keeps `SUCCEEDED`.
 //!
 //! A nexus run has no cooperative exit of its own. Its join future is dropped at the end of the window,
-//! and each started thread ends `CANCELLED_TIMED_OUT` with reason `timed_out`. Stage merges that had not
+//! and each started thread ends `FAILED` with reason `timed_out`. Stage merges that had not
 //! returned by then are discarded; no retention semantics are implemented.
 //!
-//! A nexus participant's `E-TIMEOUT` straggler ends `CANCELLED_TIMED_OUT` with reason `timed_out`, the same
+//! A nexus participant's `E-TIMEOUT` straggler ends `FAILED` with reason `timed_out`, the same
 //! terminal a matrix task stopped at the window ends. A `RateLimited` outcome ends its task `FAILED`: the verdict
 //! stays on the collected record, and retry belongs to the caller.
+//!
+//! A retry attempt (attempt above 1) resets each of its threads that ended `FAILED` by a timeout, or
+//! `CANCELLED_TIMED_OUT` by a cancel, to IDLE through a named retry reset in `gsd-pool`, before it runs the task
+//! again. Those resets are the only edges out of those phases, and only the join retry path applies them. A retry
+//! under a key already collected is deduplicated and runs no worker.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gsd_pool::thread_state_transition_table::ALL_PHASES;
+use gsd_pool::thread_state_transition_table::{retry_reset, retry_reset_failed, ALL_PHASES};
 use gsd_pool::{transition, ThreadPhase};
 use gsd_proto::gsd::v1::{SessionState, Task, ThreadState, ThreadStateKind};
+use gsd_scheduler::join_affinity_guard::{Engine, JoinAffinityGuard};
 use gsd_scheduler::{
     run_matrix_join, CompletionLog, CompletionRecord, DispatchConfig, MatrixBatch, NexusJoinReport,
     NexusPlan, SchedulerError, SchedulerResult, SemaphoreManager, TaskFailure, TaskOutcome,
@@ -46,7 +52,7 @@ use crate::session_dispatch::{admit_thread, handoff_thread, DispatchError};
 pub const CANCEL_GRACE: Duration = Duration::from_secs(3);
 /// Granularity of the cooperative wait: the window is walked in 500 ms slices.
 pub const CANCEL_SLICE: Duration = Duration::from_millis(500);
-/// Metadata key on a [`ThreadState`] holding the [`TerminalReason`] of a `CANCELLED_TIMED_OUT` thread.
+/// Metadata key on a [`ThreadState`] holding the [`TerminalReason`] of a thread that ended by a cancel or timeout.
 pub const TERMINAL_REASON_KEY: &str = "terminal_reason";
 /// Prefix of the cancel marker key, `cancel/<correlation id>`.
 pub const CANCEL_KEY_PREFIX: &str = "cancel/";
@@ -157,7 +163,8 @@ impl CompletionLedger {
     }
 }
 
-/// Why a thread ended `CANCELLED_TIMED_OUT`. Stored as `metadata["terminal_reason"]`.
+/// Why a thread ended by a cancel window: `CANCELLED_TIMED_OUT` for `Cancelled`, `FAILED` for `TimedOut`.
+/// Stored as `metadata["terminal_reason"]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalReason {
     /// The thread failed on its way out of a cancel, inside the cooperative window.
@@ -321,7 +328,7 @@ pub struct JoinCompletion {
     /// before any stage merged. A task that did not run, or did not reach a terminal phase, has no
     /// entry.
     pub stages: Vec<StageEmit>,
-    /// Tasks stopped when the cooperative window closed. Each ends `CANCELLED_TIMED_OUT` (`timed_out`).
+    /// Tasks stopped when the cooperative window closed. Each ends `FAILED` (`timed_out`).
     pub forced: Vec<String>,
     /// Tasks that failed inside the cooperative window after the marker. Each ends `CANCELLED_TIMED_OUT`
     /// (`cancelled`).
@@ -375,10 +382,11 @@ struct RunState {
 ///
 /// A task whose key is already in `ledger` is not run: its worker is not called, and it reports
 /// [`Emit::Deduplicated`] while the rest of the batch runs. Every other task must be bound to an IDLE
-/// thread. A task that starts is admitted and handed off to `RUNNING` through the B7 helpers, and its
+/// thread, or on a retry attempt to a thread that ended `CANCELLED_TIMED_OUT`, or `FAILED` by a timeout, which is
+/// reset to IDLE first. A task that starts is admitted and handed off to `RUNNING` through the B7 helpers, and its
 /// end is written as its thread's terminal phase. If the cancel marker is set before a task starts,
 /// that task is not run and is listed in `not_started`. A task still running when the cooperative
-/// window closes is dropped and ends `CANCELLED_TIMED_OUT` (`timed_out`). A task that did not run,
+/// window closes is dropped and ends `FAILED` (`timed_out`). A task that did not run,
 /// whether cancelled before its start or refused at start (listed in `start_failed`), or whose
 /// outcome is rate-limited, is not collected and has no entry in `stages`.
 pub async fn collect_matrix_completions<W, Fut>(
@@ -411,7 +419,7 @@ where
         .filter(|id| !replayed.contains(*id))
         .cloned()
         .collect();
-    prepare_fresh(&ctx.session, &fresh)?;
+    prepare_fresh(&ctx.session, &fresh, ctx.attempt)?;
 
     let run = Arc::new(RunState {
         replayed,
@@ -432,7 +440,7 @@ where
             Arc::clone(&shared),
         )
     };
-    let report = run_matrix_join(batch, config, semaphores, wrapped).await?;
+    let report = run_matrix_join(Engine::Rust, batch, config, semaphores, wrapped).await?;
 
     let skipped = take(&run.skipped);
     let started = take(&run.started);
@@ -492,7 +500,7 @@ where
 /// `run` performs the staged fan-out and fan-in, normally by calling `run_nexus_barrier_join` with the
 /// caller's transport. This keeps the Nexus endpoints out of `gsd-state`. Every thread of `plan` must be
 /// bound and IDLE. All of them are started before `run` is awaited. If the cancel window closes first,
-/// `run` is dropped and each started thread ends `CANCELLED_TIMED_OUT` (`timed_out`). If any stage key is
+/// `run` is dropped and each started thread ends `FAILED` (`timed_out`). If any stage key is
 /// already in `ledger`, the whole run is deduplicated and `run` is not called. A task named in two
 /// stages is refused before any thread is written. An error after the threads start ends each thread
 /// still `RUNNING` as `FAILED`, and nothing is collected.
@@ -507,6 +515,16 @@ where
     Fut: Future<Output = SchedulerResult<NexusJoinReport>>,
 {
     ctx.check()?;
+    let pin = Engine::Rust;
+    let guard = JoinAffinityGuard::new(format!("join-seq-{}", ctx.join_seq), pin);
+    guard
+        .check_steps(
+            plan.stages
+                .iter()
+                .flatten()
+                .map(|task| plan.engines.get(task_id_of(task)).copied().unwrap_or(pin)),
+        )
+        .map_err(SchedulerError::from)?;
     reject_repeated_across_stages(plan)?;
     let stage_count = u32::try_from(plan.stages.len())
         .map_err(|_| JoinError::TooManyStages(plan.stages.len()))?;
@@ -526,7 +544,7 @@ where
         .collect::<BTreeSet<String>>()
         .into_iter()
         .collect();
-    prepare_fresh(&ctx.session, &ids)?;
+    prepare_fresh(&ctx.session, &ids, ctx.attempt)?;
     for id in &ids {
         if let Err(error) = start_task(&ctx.session, id) {
             fail_running_threads(&ctx.session, &ids);
@@ -689,9 +707,12 @@ async fn forced_after(cancel: CancelSignal, cooperative: Duration) {
     }
 }
 
-/// Refuses unless every task in `ids` is bound to a thread that is IDLE.
-fn prepare_fresh(session: &Mutex<SessionState>, ids: &[String]) -> JoinResult<()> {
-    let guard = session.lock();
+/// Refuses unless every task in `ids` is bound to a thread that is IDLE. On a retry attempt (`attempt` above 1),
+/// a thread that ended `CANCELLED_TIMED_OUT`, or `FAILED` by a timeout, is first returned to IDLE through its
+/// retry reset. Every thread is checked before any is reset, so a refusal changes nothing.
+fn prepare_fresh(session: &Mutex<SessionState>, ids: &[String], attempt: u32) -> JoinResult<()> {
+    let mut guard = session.lock();
+    let mut resets = Vec::new();
     for id in ids {
         let thread_id =
             thread_for_task(&guard, id).ok_or_else(|| DispatchError::Unbound(id.clone()))?;
@@ -700,13 +721,45 @@ fn prepare_fresh(session: &Mutex<SessionState>, ids: &[String]) -> JoinResult<()
             .get(&thread_id)
             .ok_or_else(|| DispatchError::UnknownThread(thread_id.clone()))?;
         let phase = phase_of(thread, &thread_id)?;
-        if phase != ThreadPhase::Idle {
-            return Err(JoinError::NotIdle {
-                thread: thread_id,
-                phase: phase.as_str(),
-            });
+        match phase {
+            ThreadPhase::Idle => {}
+            ThreadPhase::CancelledTimedOut if attempt > 1 => resets.push(thread_id),
+            ThreadPhase::Failed if attempt > 1 && ended_by_timeout(thread) => {
+                resets.push(thread_id);
+            }
+            _ => {
+                return Err(JoinError::NotIdle {
+                    thread: thread_id,
+                    phase: phase.as_str(),
+                });
+            }
         }
     }
+    for thread_id in &resets {
+        reset_for_retry(&mut guard, thread_id)?;
+    }
+    Ok(())
+}
+
+/// Returns a thread that ended `CANCELLED_TIMED_OUT`, or `FAILED` by a timeout, to IDLE through its retry reset,
+/// and drops its terminal reason. Called only by [`prepare_fresh`] on a retry attempt.
+fn reset_for_retry(state: &mut SessionState, thread_id: &str) -> JoinResult<()> {
+    let thread = state
+        .threads
+        .get_mut(thread_id)
+        .ok_or_else(|| DispatchError::UnknownThread(thread_id.to_string()))?;
+    let from = phase_of(thread, thread_id)?;
+    let next = if from == ThreadPhase::Failed {
+        retry_reset_failed(from)
+    } else {
+        retry_reset(from)
+    }
+    .map_err(DispatchError::from)?;
+    thread
+        .metadata
+        .insert(PHASE_KEY.to_string(), next.as_str().to_string());
+    thread.metadata.remove(TERMINAL_REASON_KEY);
+    thread.state = ThreadStateKind::Idle as i32;
     Ok(())
 }
 
@@ -744,8 +797,14 @@ pub(crate) fn phase_of(
         })
 }
 
+/// Whether the thread ended by a join timeout, which is recorded as `terminal_reason` `timed_out`.
+fn ended_by_timeout(thread: &ThreadState) -> bool {
+    thread.metadata.get(TERMINAL_REASON_KEY).map(String::as_str)
+        == Some(TerminalReason::TimedOut.as_str())
+}
+
 /// Writes `terminal` to thread `thread_id` through the B1 transition table, and sets its proto state and
-/// `terminal_reason` when it is a cancel.
+/// `terminal_reason` when it is a cancel. A timeout ends `FAILED`; a cancel ends `CANCELLED_TIMED_OUT`.
 pub(crate) fn apply_terminal(
     state: &mut SessionState,
     thread_id: &str,
@@ -759,7 +818,12 @@ pub(crate) fn apply_terminal(
     let (to, kind) = match terminal {
         Terminal::Succeeded => (ThreadPhase::Succeeded, ThreadStateKind::Completed),
         Terminal::Failed => (ThreadPhase::Failed, ThreadStateKind::Failed),
-        Terminal::Cancelled(_) => (ThreadPhase::CancelledTimedOut, ThreadStateKind::Terminated),
+        Terminal::Cancelled(TerminalReason::TimedOut) => {
+            (ThreadPhase::Failed, ThreadStateKind::Failed)
+        }
+        Terminal::Cancelled(TerminalReason::Cancelled) => {
+            (ThreadPhase::CancelledTimedOut, ThreadStateKind::Terminated)
+        }
     };
     let next = transition(from, to).map_err(DispatchError::from)?;
     thread
@@ -800,8 +864,8 @@ fn terminal_for(outcome: &TaskOutcome, forced: bool, cooperative: bool) -> Termi
     }
 }
 
-/// Maps a nexus record to its terminal. An `E-TIMEOUT` straggler ends `CANCELLED_TIMED_OUT` (`timed_out`),
-/// as a matrix task stopped at the window does. Every other outcome maps as in [`terminal_for`].
+/// Maps a nexus record to its terminal. An `E-TIMEOUT` straggler ends `FAILED` (`timed_out`), as a matrix
+/// task stopped at the window does. Every other outcome maps as in [`terminal_for`].
 fn nexus_terminal_for(outcome: &TaskOutcome) -> Terminal {
     match outcome {
         TaskOutcome::Failed { code, .. } if *code == PARTIAL_JOIN_TIMEOUT => {
@@ -1009,6 +1073,7 @@ mod tests {
             stage,
             tasks: ids.iter().map(|id| task(id)).collect(),
             attempts: HashMap::new(),
+            engines: HashMap::new(),
         }
     }
 
@@ -1186,8 +1251,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn cancel_past_the_cooperative_window_ends_cancelled_timed_out() -> TestResult {
+    #[tokio::test(start_paused = true)]
+    async fn cancel_past_the_cooperative_window_ends_failed_timed_out() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
         let timing = CancelTiming {
@@ -1218,21 +1283,18 @@ mod tests {
         assert_eq!(marker.key, "cancel/corr-1");
         assert_eq!(completion.forced, vec!["t1".to_string()]);
         assert!(completion.cancel_requested);
-        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
         assert_eq!(
             metadata_of(&session, "th1")
                 .get(TERMINAL_REASON_KEY)
                 .map(String::as_str),
             Some("timed_out")
         );
-        assert_eq!(
-            state_kind(&session, "th1"),
-            ThreadStateKind::Terminated as i32
-        );
+        assert_eq!(state_kind(&session, "th1"), ThreadStateKind::Failed as i32);
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn worker_that_stops_inside_the_window_ends_cancelled_with_reason() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1303,7 +1365,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_join_retried_under_the_same_key_applies_its_completion_once() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1392,7 +1454,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_join_retried_under_the_same_key_applies_its_completion_once() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1439,7 +1501,7 @@ mod tests {
                 emit: Emit::Collected,
             }]
         );
-        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
 
         // Retry under the same (stage, join seq, attempt) with an uncancelled signal.
         let (_fresh_control, fresh) = cancel_channel();
@@ -1467,13 +1529,418 @@ mod tests {
             "the retry must not run the worker"
         );
         assert_eq!(ledger.len(), 1);
-        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
         assert_eq!(
             metadata_of(&session, "th1")
                 .get(TERMINAL_REASON_KEY)
                 .map(String::as_str),
             Some("timed_out")
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_attempt_is_reset_and_retried_once_per_key() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (control, signal) = cancel_channel();
+        let timing = CancelTiming {
+            cooperative: Duration::from_secs(3),
+        };
+        let ctx = context(&session, 22, timing, signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::clone(&calls);
+        // Attempt 1 counts itself, then stops with a failure once the cancel marker is set.
+        let cooperative = move |_task: Task, cancel: CancelSignal| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            async move {
+                cancel.cancelled().await;
+                Err::<(), TaskFailure>(TaskFailure::Exception("stopped at cancel".to_string()))
+            }
+        };
+        let request = async {
+            sleep(Duration::from_millis(10)).await;
+            control.request("corr-22", "test", 0.0, timing)
+        };
+
+        let (joined, _marker) = tokio::join!(
+            collect_matrix_completions(
+                &ctx,
+                &mut ledger,
+                batch(0, &["t1"]),
+                DispatchConfig::default(),
+                semaphores(),
+                cooperative,
+            ),
+            request
+        );
+        let cancelled = joined?;
+        let attempt_1 = JoinKey {
+            task_id: "t1".to_string(),
+            stage: 0,
+            join_seq: 22,
+            attempt: 1,
+        };
+        let attempt_2 = JoinKey {
+            attempt: 2,
+            ..attempt_1.clone()
+        };
+        assert_eq!(cancelled.cancelled, vec!["t1".to_string()]);
+        assert_eq!(
+            cancelled.stages,
+            vec![StageEmit {
+                key: attempt_1.clone(),
+                emit: Emit::Collected,
+            }]
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+
+        // Retry at attempt 2 on a fresh signal. The retry path returns the cancelled thread to IDLE
+        // through the retry reset, then runs the task once under the attempt-2 key.
+        let (_fresh_control, fresh) = cancel_channel();
+        let retry_ctx = JoinContext {
+            attempt: 2,
+            ..context(&session, 22, timing, fresh.clone())
+        };
+        let retried = collect_matrix_completions(
+            &retry_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(
+            retried.stages,
+            vec![StageEmit {
+                key: attempt_2.clone(),
+                emit: Emit::Collected,
+            }]
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
+        assert!(!metadata_of(&session, "th1").contains_key(TERMINAL_REASON_KEY));
+
+        // Replays of both attempts are deduplicated: no worker runs and the thread is unchanged.
+        let replay_2 = JoinContext {
+            attempt: 2,
+            ..context(&session, 22, timing, fresh.clone())
+        };
+        let replayed_2 = collect_matrix_completions(
+            &replay_2,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(
+            replayed_2.stages,
+            vec![StageEmit {
+                key: attempt_2.clone(),
+                emit: Emit::Deduplicated,
+            }]
+        );
+        let replay_1 = JoinContext {
+            attempt: 1,
+            ..context(&session, 22, timing, fresh)
+        };
+        let replayed_1 = collect_matrix_completions(
+            &replay_1,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(
+            replayed_1.stages,
+            vec![StageEmit {
+                key: attempt_1.clone(),
+                emit: Emit::Deduplicated,
+            }]
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one worker run per attempt; replays run none"
+        );
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.log(&attempt_1).map(|log| log.records().len()),
+            Some(1)
+        );
+        assert_eq!(
+            ledger.log(&attempt_2).map(|log| log.records().len()),
+            Some(1)
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_thread_is_refused_by_a_join_that_is_not_a_retry() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (control, signal) = cancel_channel();
+        let timing = CancelTiming {
+            cooperative: Duration::from_secs(3),
+        };
+        let ctx = context(&session, 23, timing, signal);
+        let mut ledger = CompletionLedger::default();
+        let cooperative = |_task: Task, cancel: CancelSignal| async move {
+            cancel.cancelled().await;
+            Err::<(), TaskFailure>(TaskFailure::Exception("stopped at cancel".to_string()))
+        };
+        let request = async {
+            sleep(Duration::from_millis(10)).await;
+            control.request("corr-23", "test", 0.0, timing)
+        };
+
+        let (joined, _marker) = tokio::join!(
+            collect_matrix_completions(
+                &ctx,
+                &mut ledger,
+                batch(0, &["t1"]),
+                DispatchConfig::default(),
+                semaphores(),
+                cooperative,
+            ),
+            request
+        );
+        assert_eq!(joined?.cancelled, vec!["t1".to_string()]);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+
+        // A join at a new join seq is not a retry, so the cancelled thread is refused and left as it is.
+        let (_next_control, next) = cancel_channel();
+        let next_ctx = context(&session, 24, timing, next);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refused = collect_matrix_completions(
+            &next_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await;
+        match refused {
+            Err(JoinError::NotIdle {
+                thread,
+                phase: found,
+            }) => {
+                assert_eq!(thread, "th1");
+                assert_eq!(found, "CANCELLED_TIMED_OUT");
+            }
+            other => return Err(format!("expected NotIdle, got {other:?}").into()),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::CancelledTimedOut);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_attempt_is_reset_and_retried_once_per_key() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (control, signal) = cancel_channel();
+        let timing = CancelTiming {
+            cooperative: Duration::from_millis(30),
+        };
+        let ctx = context(&session, 25, timing, signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::clone(&calls);
+        // Attempt 1 never stops on its own, so the cooperative window forces it: the thread ends FAILED (timed_out).
+        let never = move |_task: Task, _cancel: CancelSignal| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<(), TaskFailure>>()
+        };
+        let request = async {
+            sleep(Duration::from_millis(10)).await;
+            control.request("corr-25", "test", 0.0, timing)
+        };
+
+        let (joined, _marker) = tokio::join!(
+            collect_matrix_completions(
+                &ctx,
+                &mut ledger,
+                batch(0, &["t1"]),
+                DispatchConfig::default(),
+                semaphores(),
+                never,
+            ),
+            request
+        );
+        let timed_out = joined?;
+        let attempt_1 = JoinKey {
+            task_id: "t1".to_string(),
+            stage: 0,
+            join_seq: 25,
+            attempt: 1,
+        };
+        let attempt_2 = JoinKey {
+            attempt: 2,
+            ..attempt_1.clone()
+        };
+        assert_eq!(timed_out.forced, vec!["t1".to_string()]);
+        assert_eq!(
+            timed_out.stages,
+            vec![StageEmit {
+                key: attempt_1.clone(),
+                emit: Emit::Collected,
+            }]
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
+        assert_eq!(
+            metadata_of(&session, "th1")
+                .get(TERMINAL_REASON_KEY)
+                .map(String::as_str),
+            Some("timed_out")
+        );
+
+        // Retry at attempt 2 on a fresh signal. The retry path resets the timed-out thread to IDLE, then runs
+        // the task once under the attempt-2 key.
+        let (_fresh_control, fresh) = cancel_channel();
+        let retry_ctx = JoinContext {
+            attempt: 2,
+            ..context(&session, 25, timing, fresh.clone())
+        };
+        let retried = collect_matrix_completions(
+            &retry_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(
+            retried.stages,
+            vec![StageEmit {
+                key: attempt_2.clone(),
+                emit: Emit::Collected,
+            }]
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
+        assert!(!metadata_of(&session, "th1").contains_key(TERMINAL_REASON_KEY));
+
+        // Replays of both attempts are deduplicated: no worker runs and the thread is unchanged.
+        let replay_2 = JoinContext {
+            attempt: 2,
+            ..context(&session, 25, timing, fresh.clone())
+        };
+        let replayed_2 = collect_matrix_completions(
+            &replay_2,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(
+            replayed_2.stages,
+            vec![StageEmit {
+                key: attempt_2.clone(),
+                emit: Emit::Deduplicated,
+            }]
+        );
+        let replay_1 = JoinContext {
+            attempt: 1,
+            ..context(&session, 25, timing, fresh)
+        };
+        let replayed_1 = collect_matrix_completions(
+            &replay_1,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await?;
+        assert_eq!(
+            replayed_1.stages,
+            vec![StageEmit {
+                key: attempt_1.clone(),
+                emit: Emit::Deduplicated,
+            }]
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one worker run per attempt; replays run none"
+        );
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.log(&attempt_1).map(|log| log.records().len()),
+            Some(1)
+        );
+        assert_eq!(
+            ledger.log(&attempt_2).map(|log| log.records().len()),
+            Some(1)
+        );
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_thread_without_a_timeout_is_refused_by_a_retry() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 26, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Attempt 1 fails outright with no cancel, so the thread ends FAILED with no terminal reason.
+        let failing = |_task: Task, _cancel: CancelSignal| {
+            std::future::ready(Err::<(), TaskFailure>(TaskFailure::Exception(
+                "boom".to_string(),
+            )))
+        };
+        let first = collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            failing,
+        )
+        .await?;
+        assert_eq!(first.stages.len(), 1);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
+        assert!(!metadata_of(&session, "th1").contains_key(TERMINAL_REASON_KEY));
+
+        // A retry at attempt 2 must not reset it: the thread did not end by a timeout.
+        let (_fresh_control, fresh) = cancel_channel();
+        let retry_ctx = JoinContext {
+            attempt: 2,
+            ..context(&session, 26, CancelTiming::default(), fresh)
+        };
+        let refused = collect_matrix_completions(
+            &retry_ctx,
+            &mut ledger,
+            batch(0, &["t1"]),
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await;
+        match refused {
+            Err(JoinError::NotIdle {
+                thread,
+                phase: found,
+            }) => {
+                assert_eq!(thread, "th1");
+                assert_eq!(found, "FAILED");
+            }
+            other => return Err(format!("expected NotIdle, got {other:?}").into()),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Failed);
         Ok(())
     }
 
@@ -1486,6 +1953,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: "j".to_string(),
             stages: vec![vec![task("t1"), task("t2")]],
+            engines: HashMap::new(),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let report = || {
@@ -1512,8 +1980,8 @@ mod tests {
         .await?;
         assert_eq!(first.stages[0].emit, Emit::Collected);
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Succeeded);
-        // A nexus straggler ends CANCELLED_TIMED_OUT (timed_out), not FAILED.
-        assert_eq!(phase(&session, "th2")?, ThreadPhase::CancelledTimedOut);
+        // A nexus straggler ends FAILED (timed_out), so a retry attempt can reset it.
+        assert_eq!(phase(&session, "th2")?, ThreadPhase::Failed);
         assert_eq!(
             metadata_of(&session, "th2")
                 .get(TERMINAL_REASON_KEY)
@@ -1532,7 +2000,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn nexus_cancel_past_the_window_stops_every_started_thread() -> TestResult {
         let session = shared(bound_state(&[("th1", "t1"), ("th2", "t2")], 1).await?);
         let (control, signal) = cancel_channel();
@@ -1544,6 +2012,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: "j".to_string(),
             stages: vec![vec![task("t1")], vec![task("t2")]],
+            engines: HashMap::new(),
         };
         let request = async {
             sleep(Duration::from_millis(10)).await;
@@ -1562,7 +2031,7 @@ mod tests {
         assert!(completion.stages.is_empty());
         assert!(ledger.is_empty());
         for thread in ["th1", "th2"] {
-            assert_eq!(phase(&session, thread)?, ThreadPhase::CancelledTimedOut);
+            assert_eq!(phase(&session, thread)?, ThreadPhase::Failed);
             assert_eq!(
                 metadata_of(&session, thread)
                     .get(TERMINAL_REASON_KEY)
@@ -1691,6 +2160,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: String::new(),
             stages: vec![vec![task("t1"), task("t2")]],
+            engines: HashMap::new(),
         };
 
         let refused = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
@@ -1720,6 +2190,7 @@ mod tests {
         let plan = NexusPlan {
             join_id: "j".to_string(),
             stages: vec![vec![task("t1")], vec![task("t1")]],
+            engines: HashMap::new(),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -1737,6 +2208,69 @@ mod tests {
             refused,
             Err(JoinError::Scheduler(SchedulerError::Other(_)))
         ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ledger.is_empty());
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matrix_step_on_another_engine_is_refused_before_any_write() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 14, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let mut mixed = batch(0, &["t1"]);
+        mixed.engines = HashMap::from([("t1".to_string(), Engine::Python)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let refused = collect_matrix_completions(
+            &ctx,
+            &mut ledger,
+            mixed,
+            DispatchConfig::default(),
+            semaphores(),
+            counting(Arc::clone(&calls)),
+        )
+        .await;
+
+        let Err(JoinError::Scheduler(SchedulerError::Other(message))) = &refused else {
+            return Err(format!("expected an E-CONTRACT refusal, got {refused:?}").into());
+        };
+        assert!(message.contains("E-CONTRACT"), "{message}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ledger.is_empty());
+        assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nexus_step_on_another_engine_is_refused_before_any_write() -> TestResult {
+        let session = shared(bound_state(&[("th1", "t1")], 1).await?);
+        let (_control, signal) = cancel_channel();
+        let ctx = context(&session, 13, CancelTiming::default(), signal);
+        let mut ledger = CompletionLedger::default();
+        let plan = NexusPlan {
+            join_id: "j".to_string(),
+            stages: vec![vec![task("t1")]],
+            engines: HashMap::from([("t1".to_string(), Engine::Python)]),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+
+        let refused = collect_nexus_completions(&ctx, &mut ledger, &plan, || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok::<NexusJoinReport, SchedulerError>(stage_report(
+                0,
+                Vec::new(),
+            )))
+        })
+        .await;
+
+        let Err(JoinError::Scheduler(SchedulerError::Other(message))) = &refused else {
+            return Err(format!("expected an E-CONTRACT refusal, got {refused:?}").into());
+        };
+        assert!(message.contains("E-CONTRACT"), "{message}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(ledger.is_empty());
         assert_eq!(phase(&session, "th1")?, ThreadPhase::Idle);

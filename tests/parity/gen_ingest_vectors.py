@@ -491,6 +491,10 @@ def _gates(clock: base._Clock) -> Iterator[Row]:
         for loops in (1, 2):
             w = _gate_world(clock, f"gate-review-fails-after-{loops}-rework-loops-{mode}", "gate", rework=loops)
             _verdict(w, "T-1", kind="fail")
+            if loops == 2 and mode == "ingest":
+                # 84d9b86 keeps G-1 at IN_REVIEW for a signed fail on T-1 that G-1 issued. The rust engine does not verify
+                # that signature, so it refuses this case (not_started) rather than approving G-1.
+                w.expect_rust = "not_started"
             yield w.call("G-1", reported("G-1", "IN_REVIEW") | verdicts(**{"T-1": "request_changes"}), mode=mode)
 
         w = _gate_world(clock, f"gate-review-agent-passes-{mode}", "gate")

@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -490,17 +489,28 @@ def test_any_true_opt_in_key_in_the_object_counts_even_after_a_false_one(tmp_pat
     assert [f["rule"] for f in out["findings"]] == ["mainnet-without-opt-in"]
 
 
-def test_a_yaml_alias_bomb_is_cut_off_quickly_and_reported(tmp_path):
+def test_a_yaml_alias_bomb_is_cut_off_at_the_node_budget_and_reported(tmp_path, monkeypatch):
     pytest.importorskip("yaml")
     lines = ["l0: &l0 [x, x, x, x, x, x, x, x, x]"]
     for level in range(1, 10):
         lines.append(f"l{level}: &l{level} [" + ", ".join([f"*l{level - 1}"] * 9) + "]")  # 9^9 nodes when expanded
     write(tmp_path, "bomb.yaml", "\n".join(lines) + "\n")
     write(tmp_path, "ok.json", net(1))
-    started = time.monotonic()
-    code, out = cli(tmp_path)
-    assert time.monotonic() - started < 20
-    assert {f["rule"] for f in out["findings"]} == {"scan-truncated", "mainnet-without-opt-in", "scan-incomplete"} and code == 1
+    mod = module()
+    walks = [0]
+    real_walk = mod._Scan.walk
+
+    def counted_walk(self, *args, **kwargs):
+        walks[0] += 1
+        return real_walk(self, *args, **kwargs)
+
+    monkeypatch.setattr(mod._Scan, "walk", counted_walk)
+    out = mod.scan(tmp_path, tmp_path)
+    # counted work, not wall time: a visited node makes at most one walk call per child (ten keys at most, nine items per list), so
+    # the calls stay within a small multiple of MAX_NODES. Without the node budget the walk would expand the shared graph to 9^9 nodes.
+    assert 0 < walks[0] <= 20 * mod.MAX_NODES, walks[0]
+    assert out["status"] == "fail"
+    assert {f["rule"] for f in out["findings"]} == {"scan-truncated", "mainnet-without-opt-in", "scan-incomplete"}
     assert [f for f in out["findings"] if f["rule"] == "scan-truncated"][0]["file"] == "bomb.yaml"
 
 
