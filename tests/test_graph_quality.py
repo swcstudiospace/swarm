@@ -51,12 +51,14 @@ def create_active_task(store: TaskStore, task_id: str, *, state: str = "IN_PROGR
         store.transition(task_id, step, actor="A01", reason="test")
 
 
-# --- Contract route surface (be_contract_conformance + route hygiene) -------
-
+# --- Contract route surface: 18 legacy + 6 creator = 24 under 1.4.0 --------
+# QF-101: contract 1.4.0 (T6dc4-arch) adds six additive /creator/* operations
+# over the 18-operation 1.2.0 surface; the router must expose all of them.
+# Keep the legacy test name for -k selector compatibility with QA.
 
 def test_router_exposes_all_18_contract_routes():
     routes = {(m, p) for m, p in build_router().routes}
-    assert routes == {
+    legacy_18 = {
         ("GET", "/graph/inventory"),
         ("GET", "/graph/codes"),
         ("POST", "/graph/dispatch"),
@@ -76,7 +78,29 @@ def test_router_exposes_all_18_contract_routes():
         ("GET", "/quality/ci/{prNumber}"),
         ("GET", "/quality/engine"),
     }
-    assert len(build_router().routes) == 18
+    creator_6 = {
+        ("POST", "/creator/requests"),
+        ("GET", "/creator/gaps"),
+        ("POST", "/creator/capabilities"),
+        ("POST", "/creator/capabilities/{capabilityId}/revise"),
+        ("POST", "/creator/specialists"),
+        ("GET", "/creator/runs/{runId}/gate"),
+    }
+    assert legacy_18 <= routes
+    assert creator_6 <= routes
+    assert len(legacy_18) == 18
+    assert len(creator_6) == 6
+    enterprise_6 = {
+        ("GET", "/patterns/catalog"),
+        ("GET", "/trackers/gsd-phases"),
+        ("GET", "/graph/status"),
+        ("GET", "/shelf/search"),
+        ("GET", "/creator/proposals"),
+        ("GET", "/creator/promotions/{proposalId}/gate"),
+    }
+    assert enterprise_6 <= routes
+    assert len(enterprise_6) == 6
+    assert len(routes) == 30
 
 
 def test_method_status_allowlist_per_contract():
