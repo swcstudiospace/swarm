@@ -20,7 +20,7 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .graph_quality import AppContext, handle
 from .taskstore import TaskStore
@@ -60,13 +60,17 @@ def make_handler(ctx: AppContext) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _serve(self, method: str) -> None:
-            path = urlsplit(self.path).path.rstrip("/") or "/"
+            split = urlsplit(self.path)
+            path = split.path.rstrip("/") or "/"
+            query = {name: values[0] for name, values in parse_qs(split.query, keep_blank_values=True).items() if values}
             try:
                 raw = self.rfile.read(int(self.headers.get("content-length") or 0)) if method in ("POST", "PUT", "PATCH") else b""
                 body = _parse_json_body(raw) if raw else None
             except ValueError as exc:
                 self._reply(400, {"code": "E-INPUT", "message": str(exc)})
                 return
+            if query:
+                body = {**body, **query} if isinstance(body, dict) else query
             try:
                 status, payload = handle(ctx, method, path, body)
             except ValueError as exc:  # pragma: no cover - handle maps refusals

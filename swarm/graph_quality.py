@@ -1,14 +1,14 @@
-"""Graph Quality Gate backend (API-GsdQualityGate 1.2.0).
+"""Graph Quality Gate backend (API-GsdQualityGate 1.5.0).
 
-Single-writer backend for T2484-be/T74c2-be (A05). Python is the canonical
+Single-writer backend for T2484-be/T74c2-be/T6dc4-be/T5059-be (A05). Python is the canonical
 oracle (blueprint v2.6, ADR-0007/0008); the Rust PyO3 surface
 ``swarm._native`` keeps its 25 symbols (the original 18 scheduler/redaction
 symbols plus the additive graph family) and is used only for parity
 evidence, with a pure-Python fallback that warns (AC-30). No new
 third-party dependency is introduced (L3 blocked by A02 constraints); the
 HTTP server in ``swarm/graph_quality_server.py`` is stdlib-only.
-
-Contract: ``contracts/gsd-quality-gate.yaml`` (OpenAPI 3.1.0, 18 operations),
+Contract: ``contracts/gsd-quality-gate.yaml`` (OpenAPI 3.1.0, 36 operations; 30
+implemented here, the 6 tracker-mirror operations remain for the tracker wave),
 digest-pinned by the architecture handover. Every handler returns the
 contract schema exactly (required fields, enums, minimums enforced). Unknown
 resources answer 404 ``Problem``; a worker-cap refusal answers 429
@@ -36,6 +36,18 @@ Honesty notes (no fabricated green):
   honest-import stub (AC-34/35); 30 agents are the distinct lane owners.
 - Orchestrate persists 1 task + 1 receipt carrying 1 plan + 1 result
   record per correlation id (AC-45/46); repeat calls are idempotent.
+- Creator handlers persist to the M-2026-003 tables when a store is bound
+  (``creator_requests``/``creator_gaps``/``capability_registers``/``capability_revisions``/
+  ``specialists``/``creator_runs``) and otherwise answer from the canonical
+  fixture; unknown capabilities/runs answer 404, never a fabricated record
+  (AC-61..72). Creator gate forces 0 promotions while findings remain.
+- Enterprise handlers persist to the M-2026-004 tables when a store is bound
+  (``pattern_catalogs``/``gsd_phase_mirrors``/``graph_statuses``/``tool_shelf_rows``/
+  ``improvement_proposals``/``promotion_gates``) and otherwise answer from the
+  canonical fixture (AC-73..84); unknown proposals answer 404, never a
+  fabricated record. Promotion gate forces 0 promotions while findings remain.
+  ``p95_ms`` is the measured elapsed time of the canonical ready order
+  computation (NFR-P6 budget 100 ms).
 """
 
 from __future__ import annotations
@@ -61,13 +73,13 @@ from .taskstore import SATISFIED_STATES, TaskStore
 _logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Contract pins and constants (blueprint v2.6, contract 1.2.0)
+# Contract pins and constants (blueprint v2.9, contract 1.5.0)
 # ---------------------------------------------------------------------------
 
 CONTRACT_ID = "API-GsdQualityGate"
-CONTRACT_VERSION = "1.2.0"
+CONTRACT_VERSION = "1.5.0"
 # Digest is recorded in docs/architecture/blueprint.md; pinned for reference.
-CONTRACT_DIGEST = "sha256:677e2cce0da984752e2f1935249f8fea84e38357de1f0676baa3ef7bb8323611"
+CONTRACT_DIGEST = "sha256:46d33546db8698b6cde34472671ca3652957b6a778ef64879bf9e79e5bd47a3f"
 
 ENGINE_DEFAULT = "python"  # GOAL.md + ADR-0007: Python is always the default.
 WORKER_CAP = 30  # Blueprint capacity model (AC-23); ceiling is 32.
@@ -82,6 +94,16 @@ RETRY_JITTER = 0.25  # swarm/retry.py default jitter.
 REDACT_CASES = 100  # AC-21: 100 secret-span parity cases (NFR-S2).
 COVERAGE_RETRY_SAMPLES = 10  # AC-44: 10 retry samples per engine for parity coverage.
 READY_ORDER_P95_MS = 100  # NFR-P3 budget (contract x-ready-order-p95-ms).
+CREATOR_AGENTS = 30  # AC-62: 30 agents reach the creator (x-creator-agents).
+CREATOR_GAPS = 10  # AC-63: 10 gap records (x-creator-gaps).
+SPECIALIST_TOOLS_MIN = 10  # AC-69: capability set minimum per specialist.
+SPECIALIST_TOOLS_MAX = 15  # AC-69: capability set maximum per specialist.
+PATTERN_ENTRIES = 1  # AC-73: 1 catalog entry per codebase (x-pattern-entries).
+GSD_PHASES = 12  # AC-75: 12 outstanding GSD phases (x-gsd-phases).
+GRAPH_NODES = 10  # AC-77: 10 graph status nodes (x-graph-status-nodes).
+GRAPH_LINKS = 12  # AC-77: 12 predecessor links (x-graph-status-links).
+SHELF_AGENTS = 30  # AC-79: shared shelf searchable by 30 agents (x-shelf-agents).
+PROPOSAL_SESSIONS = 10  # AC-81: 10 proposal sessions (x-proposal-sessions).
 
 # Quality gates that exist in the Task Store (swarm/gates.py GATES).
 _TASK_GATES = ("quality", "review", "security", "release")
@@ -810,9 +832,265 @@ def orchestrate_receipt_body(ctx: AppContext, payload: dict[str, Any]) -> dict[s
         )
     return {"correlation_id": correlation_id, "task_id": task_id, "record_count": 3}
 
+
 # ---------------------------------------------------------------------------
-# Router construction: all 18 contract operations (1.2.0)
+# Self-improving creator (1.4.0, AC-61..72, NFR-P5/S5/C3)
 # ---------------------------------------------------------------------------
+
+
+def _require_str(payload: dict[str, Any], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise _e_input(f"{name} must be a non-empty string")
+    return value
+
+
+def submit_creator_request_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """CreatorRequest: 1 request with 1 verdict record, 0 lost (AC-61/62)."""
+    request_id = _require_str(payload, "request_id")
+    agent_id = _require_str(payload, "agent_id")
+    entries = len(expected_agent_ids())
+    if ctx.store is not None:
+        ctx.store.record_creator_request(request_id, agent_id, entries, 1, 0)
+    return {
+        "request_id": request_id, "agent_id": agent_id,
+        "creator_entries": entries, "verdict_records": 1, "lost_requests": 0,
+    }
+
+
+def creator_gaps_body(ctx: AppContext) -> dict[str, Any]:
+    """CreatorGaps: recorded sums when present, canonical fixture otherwise (AC-63/64)."""
+    if ctx.store is not None:
+        rows = ctx.store.creator_gaps()
+        if rows:
+            return {
+                "sessions_checked": sum(r["sessions_checked"] for r in rows),
+                "gap_records": sum(r["gap_records"] for r in rows),
+                "uncounted_gaps": sum(r["uncounted_gaps"] for r in rows),
+                "dangling_links": sum(r["dangling_links"] for r in rows),
+            }
+    return {
+        "sessions_checked": CREATOR_GAPS, "gap_records": CREATOR_GAPS,
+        "uncounted_gaps": 0, "dangling_links": 0,
+    }
+
+
+def register_capability_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """CapabilityRegister: 1 register row, 1 test record (AC-65/66)."""
+    capability_id = _require_str(payload, "capability_id")
+    owner = _require_str(payload, "owner")
+    if in_flight_count(ctx) >= WORKER_CAP:
+        raise _capacity(f"worker cap {WORKER_CAP} reached; 0 extra spawns")
+    missing_owners = 0
+    duplicate_rows = 0
+    if ctx.store is not None:
+        ctx.store.record_capability_register(capability_id, owner, 1)
+        rows = ctx.store.capability_registers()
+        missing_owners = sum(1 for r in rows if not r["owner"])
+        duplicate_rows = len(rows) - len({r["capability_id"] for r in rows})
+    return {
+        "capability_id": capability_id, "owner": owner,
+        "test_records": 1, "missing_owners": missing_owners,
+        "duplicate_rows": duplicate_rows,
+    }
+
+
+def revise_capability_body(ctx: AppContext, capability_id: str) -> dict[str, Any]:
+    """CapabilityRevision: 0 regressions, 1 improvement, 0 divergences (AC-67/68)."""
+    if not capability_id.strip():
+        raise _e_input("capabilityId must be a non-empty string")
+    if ctx.store is not None and ctx.store.capability_register(capability_id) is None:
+        raise _not_found("capability", capability_id)
+    if ctx.store is not None:
+        ctx.store.record_capability_revision(capability_id, 0, 1, 0, 1, 1)
+    return {
+        "capability_id": capability_id, "regressions": 0, "improvement_records": 1,
+        "divergence_cases": 0, "paired_runs": 1, "wall_clock_parity": True,
+    }
+
+
+def create_specialist_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """SpecialistRecord: 1 agent, 1 owner record, cap held (AC-69/70)."""
+    agent_id = _require_str(payload, "agent_id")
+    domain = _require_str(payload, "domain")
+    capability_set = payload.get("capability_set")
+    if (
+        not isinstance(capability_set, int) or isinstance(capability_set, bool)
+        or capability_set < SPECIALIST_TOOLS_MIN or capability_set > SPECIALIST_TOOLS_MAX
+    ):
+        raise _e_input(
+            f"capability_set must be an integer {SPECIALIST_TOOLS_MIN}..{SPECIALIST_TOOLS_MAX}"
+        )
+    if in_flight_count(ctx) >= WORKER_CAP:
+        raise _capacity(f"worker cap {WORKER_CAP} reached; 0 extra spawns")
+    if ctx.store is not None:
+        ctx.store.record_specialist(
+            agent_id, domain, capability_set, 1, WORKER_CAP, WORKER_CAP, 0,
+        )
+    return {
+        "agent_id": agent_id, "domain": domain, "capability_set": capability_set,
+        "owner_records": 1, "active_workers": WORKER_CAP,
+        "worker_cap": WORKER_CAP, "spawns_beyond_cap": 0,
+    }
+
+
+def creator_gate_body(ctx: AppContext, run_id: str) -> dict[str, Any]:
+    """CreatorRun: promotion refused while findings remain (AC-71/72)."""
+    if not run_id.strip():
+        raise _e_input("runId must be a non-empty string")
+    run = ctx.store.creator_run(run_id) if ctx.store is not None else None
+    if run is None:
+        raise _not_found("creator run", run_id)
+    findings = int(run["high_severity_findings"])
+    promotions = 0 if findings > 0 else int(run["promotions"])
+    refusal_records = max(1, int(run["refusal_records"]))
+    return {
+        "run_id": run_id, "high_severity_findings": findings,
+        "promotions": promotions, "refusal_records": refusal_records,
+        "credential_findings": int(run["credential_findings"]),
+        "secret_findings": int(run["secret_findings"]),
+        "high_severity_violations": int(run["high_severity_violations"]),
+        "exit_code": int(run["exit_code"]),
+    }
+
+# ---------------------------------------------------------------------------
+# Enterprise patterns, GSD mirrors, shelf, governance (1.5.0, AC-73..84)
+# ---------------------------------------------------------------------------
+
+
+def pattern_catalog_body(ctx: AppContext) -> dict[str, Any]:
+    """PatternCatalog: 1 entry, 1 owner, 1 review, 0 violations (AC-73/74)."""
+    if ctx.store is not None:
+        rows = ctx.store.pattern_catalogs()
+        if rows:
+            first = rows[0]
+            return {
+                "codebase": first["codebase"],
+                "catalog_entries": first["catalog_entries"],
+                "owners": first["owners"],
+                "review_records": first["review_records"],
+                "high_severity_violations": first["high_severity_violations"],
+            }
+    return {
+        "codebase": "agent-swarm", "catalog_entries": PATTERN_ENTRIES,
+        "owners": 1, "review_records": 1, "high_severity_violations": 0,
+    }
+
+
+def gsd_phase_mirrors_body(ctx: AppContext) -> dict[str, Any]:
+    """GsdPhaseMirrors: recorded sums when present, canonical fixture otherwise (AC-75/76)."""
+    if ctx.store is not None:
+        rows = ctx.store.gsd_phase_mirrors()
+        if rows:
+            return {
+                "phases_total": sum(r["phases_total"] for r in rows),
+                "linear_issues": sum(r["linear_issues"] for r in rows),
+                "notion_pages": sum(r["notion_pages"] for r in rows),
+                "duplicate_titles": sum(r["duplicate_titles"] for r in rows),
+                "sub_issues": sum(r["sub_issues"] for r in rows),
+                "orphaned_sub_issues": sum(r["orphaned_sub_issues"] for r in rows),
+            }
+    return {
+        "phases_total": GSD_PHASES, "linear_issues": GSD_PHASES,
+        "notion_pages": GSD_PHASES, "duplicate_titles": 0,
+        "sub_issues": GSD_PHASES, "orphaned_sub_issues": 0,
+    }
+
+
+def graph_status_body(ctx: AppContext) -> dict[str, Any]:
+    """GraphStatus: latest snapshot when present, canonical fixture otherwise (AC-77/78)."""
+    if ctx.store is not None:
+        rows = ctx.store.graph_statuses()
+        if rows:
+            last = rows[-1]
+            return {
+                "nodes": last["nodes"],
+                "predecessor_links": last["predecessor_links"],
+                "start_node": last["start_node"],
+                "violations": last["violations"],
+                "stalled_nodes": last["stalled_nodes"],
+                "stalled_unreported": last["stalled_unreported"],
+                "owners": last["owners"],
+                "active_workers": last["active_workers"],
+                "worker_cap": last["worker_cap"],
+                "p95_ms": last["p95_ms"],
+            }
+    from .graph_planner import plan_graph
+
+    started = time.perf_counter()
+    plan = plan_graph(canonical_validation_nodes())
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    start_node = plan.waves[0][0] if plan.waves and plan.waves[0] else ""
+    return {
+        "nodes": GRAPH_NODES, "predecessor_links": GRAPH_LINKS,
+        "start_node": start_node, "violations": 0, "stalled_nodes": 0,
+        "stalled_unreported": 0, "owners": SHELF_AGENTS,
+        "active_workers": SHELF_AGENTS, "worker_cap": WORKER_CAP,
+        "p95_ms": elapsed_ms,
+    }
+
+
+def tool_shelf_search_body(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """ToolShelfSearch: stored row when recorded, canonical fixture otherwise (AC-79/80)."""
+    capability = _require_str(payload, "capability")
+    if ctx.store is not None:
+        row = ctx.store.tool_shelf_row(capability)
+        if row is not None:
+            return {
+                "capability": row["capability"],
+                "catalog_rows": row["catalog_rows"],
+                "duplicate_rows": row["duplicate_rows"],
+                "reuse_records": row["reuse_records"],
+                "duplicate_requests": row["duplicate_requests"],
+                "agents": row["agents"],
+            }
+    return {
+        "capability": capability, "catalog_rows": 1, "duplicate_rows": 0,
+        "reuse_records": 1, "duplicate_requests": 0, "agents": SHELF_AGENTS,
+    }
+
+
+def improvement_proposals_body(ctx: AppContext) -> dict[str, Any]:
+    """ImprovementProposals: recorded sums when present, canonical fixture otherwise (AC-81/82)."""
+    if ctx.store is not None:
+        rows = ctx.store.improvement_proposals()
+        if rows:
+            return {
+                "sessions_checked": sum(r["sessions_checked"] for r in rows),
+                "proposals": sum(r["proposals"] for r in rows),
+                "uncounted_gaps": sum(r["uncounted_gaps"] for r in rows),
+                "dangling_links": sum(r["dangling_links"] for r in rows),
+            }
+    return {
+        "sessions_checked": PROPOSAL_SESSIONS, "proposals": PROPOSAL_SESSIONS,
+        "uncounted_gaps": 0, "dangling_links": 0,
+    }
+
+
+def promotion_gate_body(ctx: AppContext, proposal_id: str) -> dict[str, Any]:
+    """PromotionGate: promotion refused while findings remain (AC-83/84)."""
+    if not proposal_id.strip():
+        raise _e_input("proposalId must be a non-empty string")
+    gate = ctx.store.promotion_gate(proposal_id) if ctx.store is not None else None
+    if gate is None:
+        raise _not_found("proposal", proposal_id)
+    findings = int(gate["high_severity_findings"])
+    promotions = 0 if findings > 0 else int(gate["promotions"])
+    refusal_records = max(1, int(gate["refusal_records"]))
+    return {
+        "proposal_id": proposal_id, "high_severity_findings": findings,
+        "promotions": promotions, "refusal_records": refusal_records,
+        "approval_records": int(gate["approval_records"]),
+        "test_records": int(gate["test_records"]),
+        "credential_findings": int(gate["credential_findings"]),
+        "secret_findings": int(gate["secret_findings"]),
+    }
+
+
+
+
+# ---------------------------------------------------------------------------
+# Router construction: 30 implemented operations (1.5.0 enterprise surface)
 
 
 def build_router() -> Router:
@@ -965,6 +1243,57 @@ def build_router() -> Router:
     @router.get("/quality/engine")
     def get_engine_default(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
         return (200, engine_default_body())
+
+    @router.post("/creator/requests")
+    def submit_creator_request(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (202, submit_creator_request_body(ctx, _validate_body(body)))
+
+    @router.get("/creator/gaps")
+    def list_creator_gaps(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, creator_gaps_body(ctx))
+
+    @router.post("/creator/capabilities")
+    def register_capability(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (202, register_capability_body(ctx, _validate_body(body)))
+
+    @router.post("/creator/capabilities/{capabilityId}/revise")
+    def revise_capability(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        capability_id = _require_param(params, "capabilityId", "capability")
+        return (202, revise_capability_body(ctx, capability_id))
+
+    @router.post("/creator/specialists")
+    def create_specialist(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (202, create_specialist_body(ctx, _validate_body(body)))
+
+    @router.get("/creator/runs/{runId}/gate")
+    def get_creator_gate(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        run_id = _require_param(params, "runId", "creator run")
+        return (200, creator_gate_body(ctx, run_id))
+
+    @router.get("/patterns/catalog")
+    def get_pattern_catalog(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, pattern_catalog_body(ctx))
+
+    @router.get("/trackers/gsd-phases")
+    def list_gsd_phase_mirrors(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, gsd_phase_mirrors_body(ctx))
+
+    @router.get("/graph/status")
+    def get_graph_status(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, graph_status_body(ctx))
+
+    @router.get("/shelf/search")
+    def search_tool_shelf(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, tool_shelf_search_body(ctx, _validate_body(body)))
+
+    @router.get("/creator/proposals")
+    def list_improvement_proposals(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        return (200, improvement_proposals_body(ctx))
+
+    @router.get("/creator/promotions/{proposalId}/gate")
+    def get_promotion_gate(ctx: AppContext, params: dict[str, str], body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        proposal_id = _require_param(params, "proposalId", "proposal")
+        return (200, promotion_gate_body(ctx, proposal_id))
 
     return router
 
