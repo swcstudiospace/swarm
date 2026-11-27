@@ -98,9 +98,19 @@ def test_router_exposes_all_18_contract_routes():
         ("GET", "/creator/proposals"),
         ("GET", "/creator/promotions/{proposalId}/gate"),
     }
+    tracker_6 = {
+        ("GET", "/trackers/mirrors"),
+        ("GET", "/trackers/parent-links"),
+        ("GET", "/trackers/locks"),
+        ("GET", "/trackers/pattern-gate"),
+        ("GET", "/trackers/scheduler-ready"),
+        ("POST", "/trackers/ready-order/recompute"),
+    }
+    assert tracker_6 <= routes
     assert enterprise_6 <= routes
     assert len(enterprise_6) == 6
-    assert len(routes) == 30
+    assert len(tracker_6) == 6
+    assert len(routes) == 36
 
 
 def test_method_status_allowlist_per_contract():
