@@ -12,7 +12,7 @@
 use gsd_security::registry::{
     is_known_owner, prefix_for_owner, OwnerScope, Registry, RegistryError, Tool,
 };
-use gsd_security::registry_dispatch::{AuditKind, DispatchError, Dispatcher, Route};
+use gsd_security::registry_dispatch::{AuditKind, DispatchError, Dispatcher, Handler, Route};
 use serde_json::{json, Value};
 
 /// All 30 agent ids with their expected tool-name prefix, mirroring
@@ -73,7 +73,7 @@ fn registry_with_all() -> Registry {
     reg
 }
 
-fn ok_handler(payload: Value) -> Box<dyn Fn(&Value) -> Result<Value, DispatchError> + Send + Sync> {
+fn ok_handler(payload: Value) -> Handler {
     Box::new(move |_p: &Value| Ok(payload.clone()))
 }
 
