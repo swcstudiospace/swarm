@@ -121,10 +121,11 @@ class FakeTrackerAdapter:
 
     def seed(self, fake_id: str, *, status_fake: str = "open") -> dict[str, Any]:
         """Direct seed (reconciliation fixtures). Offline mode does not block reads."""
-        record = {"fake_id": fake_id, "tbd_real_id": None, "status_fake": status_fake,
+        record: dict[str, Any] = {"fake_id": fake_id, "tbd_real_id": None, "status_fake": status_fake,
                   "idempotency_key": f"seed:{fake_id}", "body": {}}
         self._by_id[fake_id] = record
-        self._by_key[record["idempotency_key"]] = record
+        key: str = record["idempotency_key"]
+        self._by_key[key] = record
         return dict(record)
 
 
