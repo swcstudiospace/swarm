@@ -37,7 +37,6 @@ from typing import Any
 
 from .atomic_file import write_text_atomic
 from .errors import ErrorCode, SwarmError
-from .paths import swarm_dir
 from .scheduler_ports import LEGAL_TRANSITIONS, PhaseVerdict
 from .state_store import _db_path, _tx
 

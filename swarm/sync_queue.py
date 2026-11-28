@@ -27,7 +27,6 @@ Existing reuse / gaps:
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 import time
 import uuid

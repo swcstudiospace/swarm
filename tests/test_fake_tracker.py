@@ -15,7 +15,7 @@ def test_live_urls_denied_before_any_transport():
 
 def test_create_or_return_idempotent_and_lost_reply():
     t = FakeTrackerAdapter("fake://linear")
-    a = t.create_or_return(idempotency_key="k1", fake_id=fake_id_for("9"), body={"status_fake": "open"})
+    _ = t.create_or_return(idempotency_key="k1", fake_id=fake_id_for("9"), body={"status_fake": "open"})
     b = t.create_or_return(idempotency_key="k1", fake_id=fake_id_for("9"), body={"status_fake": "open"})
     assert b["deduped"] is True and len(t.list_all()) == 1
     # lost reply: stored once, retry still dedupes
