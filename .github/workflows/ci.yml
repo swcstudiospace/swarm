@@ -107,6 +107,7 @@ jobs:
       - name: parity cells - swarm._native
         run: |
           if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
+            "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
             "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0"
             VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked
           fi
@@ -271,6 +272,7 @@ jobs:
         env:
           SCHEDULER_CONTINUOUS_SHA256: ${{ vars.SCHEDULER_CONTINUOUS_SHA256 }}
         run: |
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
           "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet "maturin==1.15.0" "mypy==1.18.2"
           if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
             VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --release --locked
