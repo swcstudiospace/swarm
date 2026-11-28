@@ -309,7 +309,8 @@ def _request(url: str, body: dict[str, Any], env: Mapping[str, str], accept: str
             got = (int(e.code), _read_capped(e).decode("utf-8", errors="replace"))  # a bad body falls to the except below
     except RequestBusy:
         raise  # local contention is not evidence of an outage; classified by the public caller
-    except Exception:  # noqa: BLE001 - fail open: nothing may escape this client
+    except Exception as exc:  # noqa: BLE001 - fail open: nothing may escape this client
+        _LOG.debug("substrate request failed: %s", type(exc).__name__)
         got = None
     if got is None:  # network failure, deadline, oversized or malformed reply: back off
         _down_until = time.monotonic() + BACKOFF_S

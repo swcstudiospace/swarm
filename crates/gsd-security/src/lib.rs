@@ -3,6 +3,7 @@
 //! Thread isolation, capability tokens, audit logging, PII redaction.
 pub mod registry;
 pub mod registry_dispatch;
+pub mod unique_batch1;
 
 pub use registry::{
     is_conventional_name, is_known_owner, prefix_for_owner, Idempotency, LegacyFallback,
@@ -311,7 +312,7 @@ impl AuditLogger {
         let json = serde_json::to_string(&entry)?;
         let mut file = self.file.lock();
         writeln!(file, "{}", json)?;
-        file.flush()?;
+        file.sync_data()?;
 
         Ok(())
     }

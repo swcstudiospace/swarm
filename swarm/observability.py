@@ -191,13 +191,13 @@ def emit_error_agg(subagent_id: str, agg: dict[str, Any], *, task_id: str | None
     """
     try:
         payload = {
+            **kw,
             "subagent_id": subagent_id,
             "error_agg": agg,
             "state": state,
             "task_id": task_id,
             "ts": time.time(),
             "per_id_partial": True,
-            **kw
         }
         store = get_swarm_state_store(root=root)
         store.append_gsd_audit("emit_error_agg", subagent_id=subagent_id, state=state, identity=corr, root=root)

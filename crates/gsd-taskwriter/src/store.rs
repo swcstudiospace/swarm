@@ -90,7 +90,7 @@ const REQUIRED_SCHEMA: [(&str, &[&str]); 4] = [
 ];
 
 /// JSON text columns of `tasks` and the text `TaskStore._row` parses when the stored value is empty.
-const JSON_COLUMNS: [(&str, &str); 5] = [
+pub(crate) const JSON_COLUMNS: [(&str, &str); 5] = [
     ("inputs", "[]"),
     ("outputs", "[]"),
     ("acceptance", "[]"),
@@ -466,34 +466,32 @@ impl Tx {
                 ));
             }
         }
-        let mut sql = String::from("UPDATE tasks SET state=?");
+        let mut qb = sqlx::QueryBuilder::new("UPDATE tasks SET state=");
+        qb.push_bind(change.to);
         for column in change.columns {
-            sql.push_str(", ");
-            sql.push_str(column.column());
-            sql.push_str("=?");
-        }
-        sql.push_str(", updated_at=? WHERE task_id=? AND state=?");
-        let mut update = sqlx::query(&sql).bind(change.to);
-        for column in change.columns {
-            update = match column {
-                PlanColumn::Attempt(value) | PlanColumn::ReworkLoops(value) => update.bind(*value),
-                PlanColumn::Notes(text) => update.bind(*text),
+            qb.push(", ");
+            qb.push(column.column());
+            qb.push("=");
+            match column {
+                PlanColumn::Attempt(value) | PlanColumn::ReworkLoops(value) => qb.push_bind(*value),
+                PlanColumn::Notes(text) => qb.push_bind(*text),
             };
         }
+        qb.push(", updated_at=");
+        qb.push_bind(change.updated_at);
+        qb.push(" WHERE task_id=");
+        qb.push_bind(change.task_id);
+        qb.push(" AND state=");
+        qb.push_bind(change.from);
+        let update = qb.build();
         self.wrote = true;
-        let done = update
-            .bind(change.updated_at)
-            .bind(change.task_id)
-            .bind(change.from)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(|error| {
-                failure(
-                    true,
-                    ErrorKind::Database,
-                    format!("task store state update: {error}"),
-                )
-            })?;
+        let done = update.execute(&mut *self.tx).await.map_err(|error| {
+            failure(
+                true,
+                ErrorKind::Database,
+                format!("task store state update: {error}"),
+            )
+        })?;
         if done.rows_affected() != 1 {
             return Err(WriterError::final_error(
                 ErrorKind::ConcurrentTransition,
@@ -573,23 +571,21 @@ impl Tx {
         updated_at: f64,
     ) -> Result<(), WriterError> {
         self.wrote = true;
-        let sql = format!(
-            "UPDATE tasks SET {}=?, updated_at=? WHERE task_id=?",
-            column.column()
-        );
-        let done = sqlx::query(&sql)
-            .bind(text)
-            .bind(updated_at)
-            .bind(task_id)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(|error| {
-                failure(
-                    true,
-                    ErrorKind::Database,
-                    format!("task store update of {}: {error}", column.column()),
-                )
-            })?;
+        let mut qb = sqlx::QueryBuilder::new("UPDATE tasks SET ");
+        qb.push(column.column());
+        qb.push("=");
+        qb.push_bind(text);
+        qb.push(", updated_at=");
+        qb.push_bind(updated_at);
+        qb.push(" WHERE task_id=");
+        qb.push_bind(task_id);
+        let done = qb.build().execute(&mut *self.tx).await.map_err(|error| {
+            failure(
+                true,
+                ErrorKind::Database,
+                format!("task store update of {}: {error}", column.column()),
+            )
+        })?;
         if done.rows_affected() != 1 {
             return Err(WriterError::final_error(
                 ErrorKind::Database,

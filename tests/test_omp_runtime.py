@@ -605,7 +605,7 @@ def test_timeout_kills_the_session_process_group(tmp_path):
 
 def test_extension_load_failure_fails_gate_session_and_records_no_gate(tmp_path):
     """T-06-06 / T-06-27: omp only warns on stderr when the -e guard package fails to load, and would run the
-    session unguarded. The runner fails that task closed (E-DEP), applies none of its result and records no gate,
+    session unguarded. The runner fails that task closed (E-POLICY), applies none of its result and records no gate,
     and it does not retry the unguarded session in the same run."""
     swarm = tmp_path / ".swarm"
     env = _env(swarm, SWARM_SIGNING_KEY="runner-secret")
@@ -624,7 +624,7 @@ def test_extension_load_failure_fails_gate_session_and_records_no_gate(tmp_path)
     states = _states(swarm)
     assert states["T-be"] == "IN_REVIEW" and states["T-rev"] == "FAILED"
     reasons = _failed_reasons(swarm, "T-rev")
-    assert len(reasons) == 1 and reasons[0].startswith("E-DEP") and "Failed to load extension" in reasons[0]
+    assert len(reasons) == 1 and reasons[0].startswith("E-POLICY") and "Failed to load extension" in reasons[0]
     rev_calls = [c for c in omp_calls(stub) if "T-rev" in c["stdin"]]
     assert len(rev_calls) == 1
 

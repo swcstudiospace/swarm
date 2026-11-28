@@ -16,7 +16,7 @@ Capabilities: `test.plan`, `test.unit`, `test.integration`, `test.e2e`, `test.pe
 
 ## Inputs, outputs, and handoffs
 
-Consumes: `acceptance.criteria`, `code.patch`, `build.artifact`, `ux.spec`, `schema.migration`, `invariant.suite`, `gas.report`.
+Consumes: `acceptance.criteria`, `code.patch`, `build.artifact`, `ux.spec`, `schema.migration`, `invariant.suite`, `gas.report`, `deploy.telemetry`.
 
 Produces: `test.plan`, `test.suite`, `test.results`, `defect.report`, `gate.verdict`.
 

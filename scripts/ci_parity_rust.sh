@@ -28,6 +28,7 @@ if ! python3 -c 'import swarm._native' >/dev/null 2>&1; then
   echo "== build the swarm._native extension (not importable) =="
   venv="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/parity-venv.XXXXXX")"
   python3 -m venv "$venv"
+  "$venv/bin/python" -m pip install --quiet --upgrade pip
   "$venv/bin/python" -m pip install --quiet "maturin==$MATURIN_VERSION"
   VIRTUAL_ENV="$venv" "$venv/bin/maturin" develop --locked
   python="$venv/bin/python"

@@ -15,8 +15,8 @@ tracing-subscriber = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
-metrics = { workspace = true }
 dashmap = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
+[[bench]]
+name = "graph_bench"
+harness = false

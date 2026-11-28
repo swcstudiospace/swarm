@@ -191,10 +191,11 @@ def _stamp_is_ours(stamp: dict | None, target: Path, sources: dict[str, str]) ->
         require_real_dirs(target, dest.parent)
         if dest.is_symlink():
             raise UnsafeDestination(f"{dest} is a symlink")
-        if not dest.exists():
+        blob = _open_nofollow_read(dest, target)
+        if blob is None:
             continue
         prev = recorded.get(rel)
-        if not isinstance(prev, str) or prev != _bytes_sha(dest.read_bytes()):
+        if not isinstance(prev, str) or prev != _bytes_sha(blob):
             return False
     return True
 
@@ -230,7 +231,8 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
         if _same_text(dest, content, target):
             continue
         prev = recorded.get(rel) if isinstance(recorded, dict) else None
-        current = _bytes_sha(dest.read_bytes()) if dest.is_file() else None
+        blob = _open_nofollow_read(dest, target) if dest.is_file() else None
+        current = _bytes_sha(blob) if blob is not None else None
         if isinstance(prev, str) and prev == current:
             writes[rel] = content
         else:
@@ -258,7 +260,10 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
                 continue
             if not dest.is_file():
                 continue
-            if _bytes_sha(dest.read_bytes()) == prev:
+            blob = _open_nofollow_read(dest, target)
+            if blob is None:
+                continue
+            if _bytes_sha(blob) == prev:
                 removals.append(rel)
             else:
                 kept.append(rel)
@@ -316,7 +321,9 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
             require_real_dirs(dest_root, path.parent)
             if path.is_symlink() or not path.is_file():
                 continue
-            data = path.read_bytes()
+            data = _open_nofollow_read(path, dest_root)
+            if data is None:
+                continue
             _save_backup(path, data, dest_root)
             try:
                 path.unlink()

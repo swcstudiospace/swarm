@@ -28,7 +28,6 @@ pub mod thread_state_transition_table;
 mod warm_reuse;
 use crate::warm_reuse::WarmPool;
 
-
 pub use cancel::{CancelOutcome, CancelReport};
 pub use chat::{
     BudgetPort, BudgetRefusal, BudgetReservation, ChatError, ChatPool, ChatRuntimeConfig,

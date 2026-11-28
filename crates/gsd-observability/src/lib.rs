@@ -13,8 +13,8 @@ pub mod logging;
 pub mod metrics;
 
 pub use logging::{
-    is_sensitive_key, path_for_kind, redact_text, CorrelationContext, EventKind, EventRecorder,
-    FeatureFlags, GraphEvent, Path, PathDisabled,
+    is_sensitive_key, json_escape, path_for_kind, redact_text, CorrelationContext, EventKind,
+    EventRecorder, FeatureFlags, GraphEvent, Path, PathDisabled,
 };
 pub use metrics::{GraphTelemetry, LimitViolation, MetricsRegistry, ResourceLimits, ToolOutcome};
 
@@ -221,10 +221,17 @@ pub fn global_tracing() -> Arc<TracingLayer> {
         .clone()
 }
 
+/// Installs `layer` into `cell`; a layer already there is kept and the rejection is logged.
+fn install_global_tracing(cell: &std::sync::OnceLock<Arc<TracingLayer>>, layer: Arc<TracingLayer>) {
+    if cell.set(layer).is_err() {
+        tracing::warn!("global tracing layer already installed; keeping the existing one");
+    }
+}
+
 pub fn init_default_observability() {
     let layer = TracingLayer::new(ObservabilityConfig::default());
     layer.init_logging();
-    GLOBAL_TRACING.set(Arc::new(layer)).ok();
+    install_global_tracing(&GLOBAL_TRACING, Arc::new(layer));
 }
 
 #[cfg(test)]
@@ -312,6 +319,26 @@ mod tests {
             // The first call installs the global subscriber; the second is rejected.
             layer.init_logging();
             layer.init_logging();
+        });
+
+        assert_eq!(warnings.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejected_global_tracing_install_emits_warning() {
+        let warnings = WarnCounter::default();
+        let cell: std::sync::OnceLock<Arc<TracingLayer>> = std::sync::OnceLock::new();
+
+        tracing::subscriber::with_default(Registry::default().with(warnings.clone()), || {
+            // The first install fills the cell; the second is rejected.
+            install_global_tracing(
+                &cell,
+                Arc::new(TracingLayer::new(ObservabilityConfig::default())),
+            );
+            install_global_tracing(
+                &cell,
+                Arc::new(TracingLayer::new(ObservabilityConfig::default())),
+            );
         });
 
         assert_eq!(warnings.0.load(Ordering::SeqCst), 1);

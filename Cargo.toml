@@ -23,7 +23,6 @@ members = [
 "crates/gsd-sched-core",
 "crates/gsd-envelope",
 "crates/gsd-taskwriter",
-    "pyo3/bindings",
 ]
 # ipc is used by no member and has an incomplete module tree (its owning phase re-adds it); cli has an invalid manifest.
 exclude = ["crates/gsd-ipc", "crates/gsd-cli"]
@@ -64,7 +63,7 @@ config = { version = "0.14", features = ["yaml", "toml"] }
 figment = { version = "0.10", features = ["yaml", "toml"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 aws-sdk-s3 = "1.6"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "json", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "uuid"] }
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager", "script", "streams"] }
 minijinja = { version = "2.9", features = ["serde", "loader"] }
 termtree = "0.5"
@@ -140,7 +139,6 @@ base64ct = "1.7"
 data-encoding = "2.6"
 querystring = "1"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "local-offset", "macros"] }
-chrono = { version = "0.4", features = ["serde", "clock", "rkyv"] }
 jiff = { version = "0.2", features = ["tz", "serde", "tzdb"] }
 ksuid = { version = "0.2", features = ["serde"] }
 nanoid = "0.5"
@@ -163,11 +161,11 @@ thunderdome = "0.6"
 yrs = "0.23"
 automerge = "0.11"
 # WASM runtime: exact pin; first used in P5 (wasmtime per D-P3-5; the guest is a wasm32-unknown-unknown core module wrapped as a component, D-P5-13)
-wasmtime = { version = "=50.0.1", features = ["component-model"] }
+wasmtime = { version = "=50.0.2", features = ["component-model"] }
 
 [workspace.metadata.gsd-pins]
 rustc = "1.98.1"
-wasmtime = "50.0.1"
+wasmtime = "50.0.2"
 wit-bindgen = "0.57.1"
 wasm_target = "wasm32-unknown-unknown"
 

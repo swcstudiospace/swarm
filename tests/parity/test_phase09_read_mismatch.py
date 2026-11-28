@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness  # noqa: E402
 
-ARGS = ["--history", "T-1"]
+ARGS = ["--history", "T-1", "--advisory"]  # --advisory is accepted by the Python parser but is outside the Rust read grammar, so rust_serves is False. This guarantees the default selector (GSD_ENGINE unset) stays on Python (prints Python's bytes, no binary starts) regardless of the DEFAULT_ENGINE flip, which is the premise the label asserts. The direct double leg below still diverges, so exactly one comparison fails and the mismatch fixture is recorded (row 16, Python wins).
 DOUBLE_STDOUT = '{"status": "ok", "test_double": "corrupted comparison leg"}\n'
 
 

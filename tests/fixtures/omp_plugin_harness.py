@@ -265,6 +265,7 @@ def _plugin(ctx: _Ctx, label: str, args: list[str]) -> dict[str, Any]:
             [ctx.omp, *args],
             cwd=ctx.workspace,
             env=ctx.env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -564,6 +565,7 @@ def _omp_version(omp: str) -> str:
             [omp, "--version"],
             cwd=scratch,
             env=_isolated_env(scratch),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -633,6 +635,16 @@ def run_matrix(
     }
 
 
+def run_ac14701_matrix(
+    transcript_dir: str | Path | None = None,
+    omp_bin: str | None = None,
+    cases: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """AC-14.7-01 matrix: real plugin-manager register/enable, fresh `omp` start without -e, and runtime discovery
+    transcripts for each case, written under `transcript_dir` (a fresh temp directory when omitted)."""
+    return run_matrix(transcript_dir, omp_bin, cases)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AC-14.7-01 real OMP plugin-manager matrix (operator-invoked).")
     parser.add_argument("--matrix", action="store_true", help=f"run the matrix; requires {MATRIX_ENV}=1")
@@ -646,7 +658,9 @@ def main(argv: list[str] | None = None) -> int:
     if not matrix_enabled():
         print(f"refusing: set {MATRIX_ENV}=1 to run real plugin-manager steps", file=sys.stderr)
         return 2
-    result = run_matrix(ns.out, ns.omp, ns.case)
+    out = ns.out or tempfile.mkdtemp(prefix="swarm-omp-transcripts-")
+    print(f"transcript directory: {out}", file=sys.stderr)
+    result = run_ac14701_matrix(out, ns.omp, ns.case)
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0 if all(case["capture_complete"] for case in result["cases"]) else 1

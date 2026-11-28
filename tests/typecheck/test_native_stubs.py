@@ -21,6 +21,7 @@ EXPECTED_NAMES = frozenset(
         "sched_order_ready", "sched_normalize_claim", "sched_claims_overlap", "sched_backoff_s", "sched_drain_plan", "ClaimTable", "AimdLimiter",
         "run_scheduler", "NativeCleanupFence",
         "Governor", "ChatPool", "ChatTicket",
+        "GraphReport", "error_from_py", "graph_api_version", "graph_schedule", "graph_submit", "graph_validate", "registry_lookup",
     }
 )
 STUB_PATH = Path(__file__).resolve().parents[2] / "swarm" / "_native.pyi"

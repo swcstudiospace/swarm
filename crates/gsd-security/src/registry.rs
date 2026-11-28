@@ -270,6 +270,12 @@ pub enum RegistryError {
     InvalidName { name: String, reason: String },
     #[error("invalid owner {owner:?} for tool {name:?}: owner must be A01..A30 or shared")]
     InvalidOwner { name: String, owner: String },
+    #[error("scope mismatch for tool {name:?}: owner {owner:?} with scope {scope:?} (agent owners are Unique, the shared owner is Shared)")]
+    ScopeMismatch {
+        name: String,
+        owner: String,
+        scope: OwnerScope,
+    },
     #[error("invalid {field} schema for tool {name:?}: {reason}")]
     InvalidSchema {
         name: String,
@@ -331,6 +337,21 @@ impl Registry {
             });
         }
         let prefix = prefix_for_owner(&tool.owner).expect("owner checked above");
+        // Scope is structural (mirrors the Python shared-vs-agent lists):
+        // a shared-pool tool is Shared, every agent tool is Unique.
+        // Anything else would shadow the owner's unique contract.
+        let expected_scope = if tool.owner == "shared" {
+            OwnerScope::Shared
+        } else {
+            OwnerScope::Unique
+        };
+        if tool.scope != expected_scope {
+            return Err(RegistryError::ScopeMismatch {
+                name: tool.name.clone(),
+                owner: tool.owner.clone(),
+                scope: tool.scope,
+            });
+        }
         if !tool.name.starts_with(prefix) {
             return Err(RegistryError::InvalidName {
                 name: tool.name.clone(),
@@ -534,5 +555,73 @@ mod tests {
             t.legacy_fallback.python_path,
             "swarm.tool_registry.call_tool"
         );
+    }
+
+    // --- thread-safety (shared-first migration) ---
+
+    /// Compile-time proof the registry is safe to publish to worker threads:
+    /// discovery borrows `&self`; `register` (the only `&mut` path) runs
+    /// before sharing, so no lock is needed on the read side.
+    #[test]
+    fn registry_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Registry>();
+    }
+
+    /// Concurrent discovery on an `Arc`-shared registry returns the
+    /// single-threaded result for every caller: no mutation, no shadowing,
+    /// no data race, one shared-tool registration visible to all agents.
+    #[test]
+    fn concurrent_discovery_matches_single_threaded() {
+        let mut reg = Registry::new();
+        let mut unique = tool("be_probe_tool", "A05", OwnerScope::Unique);
+        unique.capabilities = vec!["be.api".to_string()];
+        reg.register(unique).unwrap();
+        reg.register(tool("shared_probe_tool", "shared", OwnerScope::Shared))
+            .unwrap();
+        let names_of = |r: &Registry, agent: &str| {
+            r.tools_for_agent(agent)
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let expected_a05 = names_of(&reg, "A05");
+        let expected_a06 = names_of(&reg, "A06");
+        assert_eq!(expected_a05.len(), 2);
+        assert_eq!(expected_a06.len(), 1);
+        let shared = std::sync::Arc::new(reg);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let shared = std::sync::Arc::clone(&shared);
+                let expected_a05 = &expected_a05;
+                let expected_a06 = &expected_a06;
+                scope.spawn(move || {
+                    assert_eq!(shared.get("shared_probe_tool").unwrap().owner, "shared");
+                    assert!(shared.get("fe_probe_tool").is_none());
+                    assert_eq!(
+                        shared
+                            .tools_for_agent("A05")
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect::<Vec<_>>(),
+                        *expected_a05
+                    );
+                    assert_eq!(
+                        shared
+                            .tools_for_agent("A06")
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect::<Vec<_>>(),
+                        *expected_a06
+                    );
+                    assert_eq!(
+                        shared.names(),
+                        vec!["be_probe_tool".to_string(), "shared_probe_tool".to_string()]
+                    );
+                    assert_eq!(shared.len(), 2);
+                });
+            }
+        });
+        assert_eq!(shared.len(), 2);
     }
 }

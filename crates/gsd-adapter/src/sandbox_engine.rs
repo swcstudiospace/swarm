@@ -1138,7 +1138,6 @@ mod tests {
         let c = call(root.path(), &swarm, &["--json"]);
         let refusals = [
             sandbox.swarm_run(&c),
-            sandbox.orch_plan(&c),
             sandbox.orch_assign(&c),
             sandbox.qa_gate(&c),
             sandbox.rev_gate(&c),
@@ -1147,6 +1146,14 @@ mod tests {
             sandbox.swarm_tool(&c),
             sandbox.lane_verb(&c),
         ];
+        // orch_plan is served under `sandbox-write` (the CI feature): a bare `--json` call reaches
+        // argument validation and answers `E-INPUT`, not the `E-DEP` refusal, so it is only listed
+        // when the guest has no plan mode.
+        #[cfg(not(feature = "sandbox-write"))]
+        assert_eq!(
+            sandbox.orch_plan(&c).err().map(|e| e.code()),
+            Some(ErrorCode::Dep)
+        );
         for refusal in refusals {
             assert_eq!(refusal.err().map(|e| e.code()), Some(ErrorCode::Dep));
         }
@@ -1315,7 +1322,11 @@ mod tests {
 
         // An error the guest reports is its answer too, and is not failed over.
         let unknown = call(root.path(), &swarm, &["--history", "T-9999", "--json"]);
-        let _ = sandbox.orch_status(&unknown);
+        let host_error = host()?
+            .orch_status(&unknown)
+            .err()
+            .ok_or("host answered an unknown task")?;
+        assert_eq!(sandbox.orch_status(&unknown).err(), Some(host_error));
         assert_eq!(sandbox.failover(), None);
         Ok(())
     }
