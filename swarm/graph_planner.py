@@ -153,6 +153,17 @@ def _field(node: Any, name: str, default: Any) -> Any:
 
 def _coerce(node: Any) -> TaskNode:
     if isinstance(node, TaskNode):
+        # TaskNode construction does not enforce numeric/id invariants, so
+        # re-validate on the planning path exactly as mapping inputs are.
+        if not isinstance(node.id, str) or not node.id.strip():
+            raise GraphError(f"node id must be a non-empty string, got {node.id!r}")
+        _number(node.complexity, f"complexity of {node.id!r}")
+        if node.complexity < 0:
+            raise GraphError(f"complexity of {node.id!r} must be >= 0, got {node.complexity}")
+        _number(node.priority, f"priority of {node.id!r}")
+        duration = _number(node.duration, f"duration of {node.id!r}", allow_none=True)
+        if duration is not None and duration < 0:
+            raise GraphError(f"duration of {node.id!r} must be >= 0, got {duration}")
         return node
     node_id = _field(node, "id", None)
     if not isinstance(node_id, str) or not node_id.strip():

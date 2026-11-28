@@ -19,7 +19,9 @@ pub struct TaskDag {
     graph: DiGraph<Task, ()>,
     index: HashMap<String, NodeIndex>,
     completed: HashSet<String>,
-    /// Tasks that ended as failed or cancelled: never ready again; their dependents stay blocked.
+    /// Tasks that ended as failed or cancelled, plus every dependent of a failed task:
+    /// never ready again. Failure propagates downstream so a dependent reaches a terminal
+    /// state instead of hanging forever behind a failed dependency.
     failed: HashSet<String>,
 }
 
@@ -54,11 +56,19 @@ impl TaskDag {
             }
         }
 
+        let parent_failed = parents
+            .iter()
+            .any(|parent| self.failed.contains(self.key_of(*parent)));
         let node = self.graph.add_node(task);
         for parent in parents {
             self.graph.add_edge(parent, node, ());
         }
-        self.index.insert(id, node);
+        self.index.insert(id.clone(), node);
+        // A dependent of an already-failed task can never become ready: mark it failed
+        // at insertion so it is terminal from the start instead of hanging.
+        if parent_failed {
+            self.failed.insert(id);
+        }
         Ok(node)
     }
 
@@ -137,8 +147,9 @@ impl TaskDag {
         Ok(())
     }
 
-    /// Marks `id` as failed. A failed task is never ready again, and its dependents stay blocked,
-    /// because a task becomes ready only when every dependency is complete.
+    /// Marks `id` as failed. A failed task is never ready again, and failure propagates to
+    /// every non-complete dependent, so a task behind a failed dependency reaches a terminal
+    /// failed state instead of staying blocked forever.
     ///
     /// Returns `TaskNotFound` when `id` is not in the DAG, and `InvalidDag` when `id` is already
     /// marked complete.
@@ -153,7 +164,40 @@ impl TaskDag {
             )));
         }
         self.failed.insert(id.value.clone());
+        let node = self.index[&id.value];
+        self.propagate_failed(node);
         Ok(())
+    }
+
+    /// Returns `true` when `id` is failed, directly or through a failed dependency.
+    /// A failed task is terminal: it never becomes ready and cannot be marked complete.
+    pub fn is_failed(&self, id: &str) -> bool {
+        self.failed.contains(id)
+    }
+
+    /// Marks every non-complete dependent of `start` failed, transitively. A completed task
+    /// stops propagation: its dependents can still become ready through it. The visited set
+    /// keeps this terminating even if the graph ever contains a cycle.
+    fn propagate_failed(&mut self, start: NodeIndex) {
+        let mut stack = vec![start];
+        let mut visited = HashSet::new();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            let next: Vec<NodeIndex> = self
+                .graph
+                .neighbors_directed(node, Direction::Outgoing)
+                .collect();
+            for child in next {
+                let key = self.key_of(child).to_string();
+                if self.completed.contains(&key) {
+                    continue;
+                }
+                self.failed.insert(key);
+                stack.push(child);
+            }
+        }
     }
 
     /// Returns tasks that are neither complete nor failed and whose dependencies are all complete,
@@ -279,7 +323,7 @@ mod tests {
         Ok(())
     }
 
-    /// A failed task is never ready again, and its dependents stay blocked until it completes.
+    /// A failed task is never ready again, and its dependents reach a terminal failed state.
     #[test]
     fn a_failed_task_is_never_ready_and_keeps_its_dependents_blocked() -> SchedulerResult<()> {
         let mut dag = TaskDag::new();
@@ -360,6 +404,71 @@ mod tests {
             value: "A".to_string(),
         })?;
         assert_eq!(ready_ids(&dag), vec!["B".to_string()]);
+        Ok(())
+    }
+
+    /// Regression: a task whose dependency failed must reach a terminal failed state instead
+    /// of hanging neither ready nor finished.
+    #[test]
+    fn a_task_behind_a_failed_dependency_reaches_a_terminal_state() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &["A"]))?;
+        dag.add_task(task("C", &["B"]))?;
+        dag.mark_failed(&TaskId {
+            value: "A".to_string(),
+        })?;
+        assert!(
+            ready_ids(&dag).is_empty(),
+            "nothing downstream of a failure is ready"
+        );
+        assert!(
+            dag.is_failed("B"),
+            "direct dependent is failed, not hanging"
+        );
+        assert!(
+            dag.is_failed("C"),
+            "transitive dependent is failed, not hanging"
+        );
+        for id in ["B", "C"] {
+            let tid = TaskId {
+                value: id.to_string(),
+            };
+            assert!(
+                matches!(dag.mark_complete(&tid), Err(SchedulerError::InvalidDag(_))),
+                "a task behind a failed dependency cannot be completed"
+            );
+        }
+        Ok(())
+    }
+
+    /// A task submitted after its dependency already failed is failed from insertion.
+    #[test]
+    fn a_task_added_behind_a_failed_dependency_is_immediately_terminal() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.mark_failed(&TaskId {
+            value: "A".to_string(),
+        })?;
+        dag.add_task(task("B", &["A"]))?;
+        assert!(ready_ids(&dag).is_empty());
+        assert!(dag.is_failed("B"));
+        Ok(())
+    }
+
+    /// Failure propagates only downstream: an unrelated task stays ready.
+    #[test]
+    fn a_failure_does_not_block_an_unrelated_task() -> SchedulerResult<()> {
+        let mut dag = TaskDag::new();
+        dag.add_task(task("A", &[]))?;
+        dag.add_task(task("B", &["A"]))?;
+        dag.add_task(task("X", &[]))?;
+        dag.mark_failed(&TaskId {
+            value: "A".to_string(),
+        })?;
+        assert_eq!(ready_ids(&dag), vec!["X".to_string()]);
+        assert!(dag.is_failed("B"));
+        assert!(!dag.is_failed("X"));
         Ok(())
     }
 }

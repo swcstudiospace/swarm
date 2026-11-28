@@ -171,3 +171,49 @@ def test_branch_names_are_unique_and_slugified() -> None:
     plan = plan_graph([{"id": "add login form"}, {"id": "add/login"}])
     assert set(plan.branches.values()) == {"graph/add-login-form", "graph/add-login"}
     assert len(set(plan.branches.values())) == 2
+
+
+@pytest.mark.parametrize("node", [
+    TaskNode(id="a", complexity=float("nan")),
+    TaskNode(id="a", complexity=float("inf")),
+    TaskNode(id="a", complexity=-1.0),
+    TaskNode(id="a", duration=float("inf")),
+    TaskNode(id="a", duration=-1.0),
+    TaskNode(id="a", complexity=True),
+    TaskNode(id="  "),
+])
+def test_tasknode_invalid_types_are_refused_at_plan_time(node: TaskNode) -> None:
+    # Direct TaskNode construction bypasses mapping coercion; the planner
+    # must still refuse invalid numeric/id invariants (no NaN/inf leaks).
+    with pytest.raises(GraphError):
+        plan_graph([node])
+
+
+def test_tasknode_invalid_priority_type_is_refused_at_plan_time() -> None:
+    with pytest.raises(GraphError):
+        plan_graph([TaskNode(id="a", priority="high")])  # type: ignore[arg-type]
+
+
+def test_disconnected_components_plan_as_separate_wave_zero() -> None:
+    plan = plan_graph([
+        {"id": "solo-a"},
+        {"id": "solo-b"},
+        {"id": "root"}, {"id": "child", "dependencies": ["root"]},
+    ])
+    # Every component is placed; dep-less nodes share wave 0.
+    assert plan.waves[0] == ("root", "solo-a", "solo-b")
+    assert plan.waves[1] == ("child",)
+
+
+def test_sequential_fallback_flattens_waves_with_same_order() -> None:
+    nodes = [
+        {"id": "start"},
+        {"id": "n1", "dependencies": ["start"]},
+        {"id": "n2", "dependencies": ["start"]},
+        {"id": "last", "dependencies": ["n1", "n2"]},
+    ]
+    plan = plan_graph(nodes)
+    sequential_makespan = sum(a.duration for a in plan.assignments.values())
+    assert plan.order == tuple(n for wave in plan.waves for n in wave)
+    # Flattened singletons preserve order and cost the sum (CW1 §7 fallback).
+    assert sequential_makespan >= plan.makespan
