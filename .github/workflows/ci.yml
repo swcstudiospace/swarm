@@ -45,7 +45,7 @@ jobs:
       - name: ruff
         run: ruff check .
       - name: pytest
-        run: python3 -m pytest
+        run: env -u SWARM_REQUIRE_KEY -u SWARM_ED25519_KEY -u SWARM_ED25519_KEY_FILE -u SWARM_SIGNING_KEY -u SWARM_ALLOW_INSECURE_DEV_KEY -u SWARM_TASK_ID -u SWARM_CORRELATION_ID -u SWARM_AGENT python3 -m pytest
       - name: build_agents check
         run: python3 scripts/build_agents.py --check
       - name: pin hash

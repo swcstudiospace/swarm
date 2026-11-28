@@ -278,15 +278,15 @@ def graph_api_version() -> str:
     """The graph family version (``"graph/1"``)."""
     ...
 
-def graph_validate(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = True) -> GraphReport:
+def graph_validate(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = ...) -> GraphReport:
     """Validate the graph and return the topological order in a ``GraphReport``."""
     ...
 
-def graph_schedule(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = True) -> list[str]:
+def graph_schedule(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = ...) -> list[str]:
     """The topological dispatch order of the graph."""
     ...
 
-def graph_submit(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = True) -> str:
+def graph_submit(nodes: list[str], edges: list[tuple[str, str]], *, legacy_fallback: bool = ...) -> str:
     """Validate the graph and return the deterministic submission receipt."""
     ...
 
