@@ -616,10 +616,6 @@ mod tests {
                 task("b", &[], "s1"),
                 task("c", &[], "s1"),
             ])
-            .map(|graph| {
-                // validate itself is fine; run() enforces the bound.
-                graph
-            })
             .expect("validate ok");
         // Drive the bound through run(): it must refuse, not buffer.
         let result = futures_block_on(scheduler.run(
