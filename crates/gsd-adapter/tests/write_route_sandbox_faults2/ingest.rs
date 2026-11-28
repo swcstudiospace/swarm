@@ -292,10 +292,12 @@ async fn content(path: &Path) -> Vec<(&'static str, Vec<Vec<Cell>>)> {
     let mut conn = connect(path).await;
     let mut out = Vec::new();
     for table in ["tasks", "transitions", "verdicts", "artifacts"] {
-        let rows = sqlx::query(&sqlx::AssertSqlSafe(format!("SELECT * FROM {table} ORDER BY rowid")))
-            .fetch_all(&mut conn)
-            .await
-            .expect(table);
+        let rows = sqlx::query(&sqlx::AssertSqlSafe(format!(
+            "SELECT * FROM {table} ORDER BY rowid"
+        )))
+        .fetch_all(&mut conn)
+        .await
+        .expect(table);
         let cells = rows
             .iter()
             .map(|row| {
